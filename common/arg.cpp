@@ -458,6 +458,37 @@ static void atx_apply_residency_policy_file(common_params & params, const std::s
     const json policy = json::parse(read_file(path));
     atx_set_env("ATX_MOE_RESIDENCY_POLICY", path);
 
+    auto read_layers = [&](const char * key) -> bool {
+        if (!policy.contains(key)) {
+            return false;
+        }
+        std::vector<int> layers;
+        const auto & val = policy.at(key);
+        if (val.is_string()) {
+            layers = parse_atx_int_set(val.get<std::string>());
+        } else if (val.is_array()) {
+            for (const auto & item : val) {
+                const int layer = item.get<int>();
+                if (layer < 0) {
+                    throw std::invalid_argument("policy layer id must be non-negative");
+                }
+                layers.push_back(layer);
+            }
+            std::sort(layers.begin(), layers.end());
+            layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+        } else {
+            throw std::invalid_argument(string_format("policy key '%s' must be a string or array", key));
+        }
+        atx_prepend_exact_moe_layer_residency(params.tensor_buft_overrides, layers);
+        return true;
+    };
+
+    const bool has_layer_policy =
+        read_layers("keep_layers") ||
+        read_layers("layers") ||
+        read_layers("moe_keep_layers") ||
+        read_layers("promote_layers");
+
     auto read_experts = [&](const char * key) -> bool {
         if (!policy.contains(key)) {
             return false;
@@ -537,11 +568,13 @@ static void atx_apply_residency_policy_file(common_params & params, const std::s
         read_layer_experts("moe_keep_layer_experts") ||
         has_expert_policy;
 
-    if (!has_expert_policy) {
-        throw std::invalid_argument("residency policy file does not contain keep_experts or keep_layer_experts");
+    if (!has_layer_policy && !has_expert_policy) {
+        throw std::invalid_argument("residency policy file does not contain keep_layers, keep_experts, or keep_layer_experts");
     }
 
-    atx_enable_expert_residency(params);
+    if (has_expert_policy) {
+        atx_enable_expert_residency(params);
+    }
 }
 
 static std::string clean_file_name(const std::string & fname) {
@@ -2637,14 +2670,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_KEEP_EXPERTS"));
     add_opt(common_arg(
         {"--moe-residency-policy"}, "FILE",
-        "ATX: JSON policy file with keep_experts and/or keep_layer_experts for MoE expert residency",
+        "ATX: JSON policy file with keep_layers, keep_experts, and/or keep_layer_experts for MoE residency",
         [](common_params & params, const std::string & value) {
             atx_apply_residency_policy_file(params, value);
         }
     ).set_env("LLAMA_ARG_MOE_RESIDENCY_POLICY"));
     add_opt(common_arg(
         {"--moe-residency-stats"}, "FILE",
-        "ATX: write MoE expert residency cache hit/miss, byte, and tensor mapping stats to FILE",
+        "ATX: write MoE expert residency cache, staging, host-copy, per-layer, and tensor mapping stats to FILE",
         [](common_params &, const std::string & value) {
             if (value.empty()) {
                 throw std::invalid_argument("empty residency stats path");
@@ -2652,6 +2685,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             atx_set_env("ATX_MOE_RESIDENCY_STATS", value);
         }
     ).set_env("LLAMA_ARG_MOE_RESIDENCY_STATS"));
+    add_opt(common_arg(
+        {"--moe-direct-cuda"},
+        "ATX experimental: let CUDA consume resident exact experts directly from compact hot-expert cache instead of staging resident hits",
+        [](common_params &) {
+            atx_set_env("ATX_MOE_DIRECT_CUDA", "1");
+        }
+    ).set_env("LLAMA_ARG_MOE_DIRECT_CUDA"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

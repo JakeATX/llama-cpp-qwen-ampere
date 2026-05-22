@@ -8,6 +8,8 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-atx-moe-residency.h"
+#include "ggml-backend.h"
 #include "llama.h"
 #include "log.h"
 
@@ -179,6 +181,15 @@ int main(int argc, char ** argv) {
     ctx_http.post("/completion",               ex_wrapper(routes.post_completions)); // legacy
     ctx_http.post("/completions",              ex_wrapper(routes.post_completions));
     ctx_http.post("/v1/completions",           ex_wrapper(routes.post_completions_oai));
+    ctx_http.post("/shutdown",                 [](const server_http_req &) {
+        auto res = std::make_unique<server_http_res>();
+        res->data = "{\"ok\":true}\n";
+        res->content_type = "application/json; charset=utf-8";
+        if (shutdown_handler) {
+            shutdown_handler(SIGINT);
+        }
+        return res;
+    });
     ctx_http.post("/chat/completions",         ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/chat/completions",      ex_wrapper(routes.post_chat_completions));
     ctx_http.post("/v1/responses",             ex_wrapper(routes.post_responses_oai));
@@ -261,8 +272,10 @@ int main(int argc, char ** argv) {
         // setup clean up function, to be called before exit
         clean_up = [&ctx_http, &ctx_server]() {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
+            ggml_backend_atx_moe_residency_flush_stats();
             ctx_http.stop();
             ctx_server.terminate();
+            ggml_backend_atx_moe_residency_flush_stats();
             llama_backend_free();
         };
 

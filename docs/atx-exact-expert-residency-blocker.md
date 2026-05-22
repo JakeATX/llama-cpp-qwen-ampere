@@ -13,6 +13,13 @@ The blocker has been addressed for V1 by adding an ATX scheduler expert-slice ca
 
 The implementation preserves packed GGUF files and copies routed slices through the existing `ggml_mul_mat_id` scheduler path. Selected expert slices are hydrated into a durable Metal/shared-buffer cache on first use and reused on later routed hits.
 
+Performance update:
+
+- V1 exact expert residency remains a memory-compatibility path, not the final fast path. Resident cache hits are still copied into the packed `ggml_mul_mat_id` staging tensor on each routed use.
+- The scheduler now coalesces cold misses into contiguous expert ranges and reports staging, host-copy, resident-copy, sync, and per-layer counters. This reduces tiny host copy calls and makes the transfer bottleneck measurable.
+- Whole-layer promotion remains the near-term throughput path because it keeps packed tensors on GPU and lets the existing `ggml_mul_mat_id` kernel consume them directly.
+- Exact expert residency should not be called fast until resident hits avoid per-token staging copies or a compact/mixed-source matmul path is implemented.
+
 Validated so far:
 
 - Qwen3.6-35B-A3B `UD-Q4_K_XL` server smoke with `--moe-keep-experts 0-31`
@@ -45,9 +52,11 @@ The V1 fix adds a separate cache that is durable across graph executions. Treati
 
 The scheduler-cache V1 is enough to measure exact expert and layer-expert policies on the target Metal machine. Longer-term designs that may improve performance further:
 
-1. Add a split-expert tensor layout or converter so each layer expert can be loaded as its own tensor or as compact resident/nonresident groups.
-2. Extend `ggml_mul_mat_id` and the Metal backend to accept mixed expert sources with dynamic ID remapping.
-3. Add a public backend range-copy API so resident cache slices can be blitted GPU-to-GPU into the temporary `mul_mat_id` input copy without host-mediated `set_tensor` calls.
+1. Use saliency to promote hot whole layers first, preserving packed tensor execution while selecting layers more intelligently than the fixed attention-spaced baseline.
+2. Add compact per-layer hot expert tensors with ID remapping so selected experts can be consumed directly by a backend kernel and only cold misses use staging.
+3. Add a split-expert tensor layout or converter so each layer expert can be loaded as its own tensor or as compact resident/nonresident groups.
+4. Extend `ggml_mul_mat_id` and the CUDA/Metal backend to accept mixed expert sources with dynamic ID remapping.
+5. Add a public backend range-copy API so resident cache slices can be blitted GPU-to-GPU into the temporary `mul_mat_id` input copy without host-mediated `set_tensor` calls.
 
 Any of those paths must preserve:
 

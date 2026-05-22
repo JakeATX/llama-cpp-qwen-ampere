@@ -29,7 +29,6 @@ extern "C" {
     typedef struct ggml_backend_reg * ggml_backend_reg_t;
     typedef struct ggml_backend_device * ggml_backend_dev_t;
 
-
     //
     // Backend buffer type
     //

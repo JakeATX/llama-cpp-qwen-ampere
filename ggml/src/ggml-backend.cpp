@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend.h"
+#include "ggml-atx-moe-residency.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
@@ -22,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <fstream>
@@ -1594,14 +1596,32 @@ struct atx_moe_cache_entry {
     ggml_backend_buffer_t buffer = nullptr;
     ggml_context * ctx = nullptr;
     std::unordered_map<int, ggml_tensor *> expert_tensors;
+    ggml_tensor * expert_map_tensor = nullptr;
     std::unordered_set<int> hydrated;
     std::vector<int> resident_experts;
     size_t expert_size = 0;
     size_t slice_size = 0;
+    size_t hot_stride_channel = 0;
     int64_t n_expert = 0;
     int layer = -1;
     bool init_failed = false;
     bool warned_private = false;
+};
+
+struct atx_moe_layer_stats {
+    uint64_t used_expert_slices_seen = 0;
+    uint64_t resident_cache_hit_slices = 0;
+    uint64_t resident_staging_copy_calls = 0;
+    uint64_t resident_direct_hit_slices = 0;
+    uint64_t resident_bytes_copied = 0;
+    uint64_t resident_cache_hydrate_slices = 0;
+    uint64_t resident_bytes_hydrated = 0;
+    uint64_t cold_expert_miss_slices = 0;
+    uint64_t cold_expert_miss_range_calls = 0;
+    uint64_t host_expert_slice_copies = 0;
+    uint64_t host_expert_range_copy_calls = 0;
+    uint64_t host_expert_single_copy_calls = 0;
+    uint64_t host_bytes_copied = 0;
 };
 
 struct atx_moe_residency_state {
@@ -1622,16 +1642,45 @@ struct atx_moe_residency_state {
     uint64_t moe_named_node_misses = 0;
     uint64_t resident_cache_hydrate_slices = 0;
     uint64_t resident_cache_hit_slices = 0;
+    uint64_t resident_staging_copy_calls = 0;
+    uint64_t resident_direct_hit_slices = 0;
+    uint64_t direct_cache_registrations = 0;
+    uint64_t direct_cache_query_hits = 0;
+    uint64_t direct_cache_query_misses = 0;
     uint64_t host_expert_slice_copies = 0;
+    uint64_t host_expert_range_copy_calls = 0;
+    uint64_t host_expert_single_copy_calls = 0;
     uint64_t cache_miss_slices = 0;
+    uint64_t used_expert_slices_seen = 0;
+    uint64_t cold_expert_miss_slices = 0;
+    uint64_t cold_expert_miss_range_calls = 0;
     uint64_t resident_bytes_hydrated = 0;
     uint64_t resident_bytes_copied = 0;
     uint64_t host_bytes_copied = 0;
+    uint64_t input_cpy_staging_bytes = 0;
+    uint64_t input_backend_sync_calls = 0;
+    uint64_t input_backend_sync_ns = 0;
+    uint64_t ids_backend_sync_calls = 0;
+    uint64_t ids_backend_sync_ns = 0;
+    uint64_t resident_cache_hydrate_sync_calls = 0;
+    uint64_t resident_cache_hydrate_sync_ns = 0;
+    bool direct_cuda = false;
+    std::map<int, atx_moe_layer_stats> layer_stats;
+    std::map<int, std::map<int, uint64_t>> routed_expert_counts;
+    std::unordered_map<const ggml_tensor *, ggml_atx_moe_direct_cache> direct_caches;
 };
 
 static atx_moe_residency_state & atx_moe_state() {
     static atx_moe_residency_state state;
     return state;
+}
+
+static void atx_moe_sync_backend(ggml_backend_t backend, uint64_t & calls, uint64_t & ns) {
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_backend_synchronize(backend);
+    const auto t1 = std::chrono::steady_clock::now();
+    calls++;
+    ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
 }
 
 static std::string atx_json_escape(const std::string & s) {
@@ -1736,6 +1785,7 @@ static void atx_moe_write_stats() {
 
     out << "{\n";
     out << "  \"enabled\": " << (state.enabled ? "true" : "false") << ",\n";
+    out << "  \"direct_cuda\": " << (state.direct_cuda ? "true" : "false") << ",\n";
     out << "  \"global_experts\": [";
     bool first = true;
     for (const int expert : state.global_experts) {
@@ -1765,12 +1815,68 @@ static void atx_moe_write_stats() {
     out << "    \"moe_named_node_misses\": " << state.moe_named_node_misses << ",\n";
     out << "    \"resident_cache_hydrate_slices\": " << state.resident_cache_hydrate_slices << ",\n";
     out << "    \"resident_cache_hit_slices\": " << state.resident_cache_hit_slices << ",\n";
+    out << "    \"resident_staging_copy_calls\": " << state.resident_staging_copy_calls << ",\n";
+    out << "    \"resident_direct_hit_slices\": " << state.resident_direct_hit_slices << ",\n";
+    out << "    \"direct_cache_registrations\": " << state.direct_cache_registrations << ",\n";
+    out << "    \"direct_cache_query_hits\": " << state.direct_cache_query_hits << ",\n";
+    out << "    \"direct_cache_query_misses\": " << state.direct_cache_query_misses << ",\n";
     out << "    \"host_expert_slice_copies\": " << state.host_expert_slice_copies << ",\n";
+    out << "    \"host_expert_range_copy_calls\": " << state.host_expert_range_copy_calls << ",\n";
+    out << "    \"host_expert_single_copy_calls\": " << state.host_expert_single_copy_calls << ",\n";
     out << "    \"cache_miss_slices\": " << state.cache_miss_slices << ",\n";
+    out << "    \"used_expert_slices_seen\": " << state.used_expert_slices_seen << ",\n";
+    out << "    \"cold_expert_miss_slices\": " << state.cold_expert_miss_slices << ",\n";
+    out << "    \"cold_expert_miss_range_calls\": " << state.cold_expert_miss_range_calls << ",\n";
     out << "    \"resident_bytes_hydrated\": " << state.resident_bytes_hydrated << ",\n";
     out << "    \"resident_bytes_copied\": " << state.resident_bytes_copied << ",\n";
-    out << "    \"host_bytes_copied\": " << state.host_bytes_copied << "\n";
+    out << "    \"host_bytes_copied\": " << state.host_bytes_copied << ",\n";
+    out << "    \"input_cpy_staging_bytes\": " << state.input_cpy_staging_bytes << ",\n";
+    out << "    \"input_backend_sync_calls\": " << state.input_backend_sync_calls << ",\n";
+    out << "    \"input_backend_sync_ns\": " << state.input_backend_sync_ns << ",\n";
+    out << "    \"ids_backend_sync_calls\": " << state.ids_backend_sync_calls << ",\n";
+    out << "    \"ids_backend_sync_ns\": " << state.ids_backend_sync_ns << ",\n";
+    out << "    \"resident_cache_hydrate_sync_calls\": " << state.resident_cache_hydrate_sync_calls << ",\n";
+    out << "    \"resident_cache_hydrate_sync_ns\": " << state.resident_cache_hydrate_sync_ns << "\n";
     out << "  },\n";
+    out << "  \"per_layer\": {";
+    first = true;
+    for (const auto & item : state.layer_stats) {
+        const atx_moe_layer_stats & stats = item.second;
+        out << (first ? "" : ",") << "\n    \"" << item.first << "\": {"
+            << "\"used_expert_slices_seen\": " << stats.used_expert_slices_seen << ", "
+            << "\"resident_cache_hit_slices\": " << stats.resident_cache_hit_slices << ", "
+            << "\"resident_staging_copy_calls\": " << stats.resident_staging_copy_calls << ", "
+            << "\"resident_direct_hit_slices\": " << stats.resident_direct_hit_slices << ", "
+            << "\"resident_bytes_copied\": " << stats.resident_bytes_copied << ", "
+            << "\"resident_cache_hydrate_slices\": " << stats.resident_cache_hydrate_slices << ", "
+            << "\"resident_bytes_hydrated\": " << stats.resident_bytes_hydrated << ", "
+            << "\"cold_expert_miss_slices\": " << stats.cold_expert_miss_slices << ", "
+            << "\"cold_expert_miss_range_calls\": " << stats.cold_expert_miss_range_calls << ", "
+            << "\"host_expert_slice_copies\": " << stats.host_expert_slice_copies << ", "
+            << "\"host_expert_range_copy_calls\": " << stats.host_expert_range_copy_calls << ", "
+            << "\"host_expert_single_copy_calls\": " << stats.host_expert_single_copy_calls << ", "
+            << "\"host_bytes_copied\": " << stats.host_bytes_copied
+            << "}";
+        first = false;
+    }
+    out << (state.layer_stats.empty() ? "" : "\n  ") << "},\n";
+    out << "  \"routed_expert_counts\": {";
+    if (!state.routed_expert_counts.empty()) {
+        out << "\n";
+    }
+    size_t layer_count_i = 0;
+    for (const auto & layer_counts : state.routed_expert_counts) {
+        out << "    \"" << layer_counts.first << "\": {";
+        size_t expert_count_i = 0;
+        for (const auto & expert_count : layer_counts.second) {
+            out << (expert_count_i == 0 ? "" : ", ")
+                << "\"" << expert_count.first << "\": " << expert_count.second;
+            expert_count_i++;
+        }
+        out << "}";
+        out << (++layer_count_i == state.routed_expert_counts.size() ? "\n" : ",\n");
+    }
+    out << (state.routed_expert_counts.empty() ? "" : "  ") << "},\n";
     out << "  \"tensor_mappings\": [\n";
     for (size_t i = 0; i < state.mappings.size(); ++i) {
         const atx_moe_tensor_mapping & mapping = state.mappings[i];
@@ -1790,6 +1896,36 @@ static void atx_moe_write_stats() {
     out << "}\n";
 }
 
+void ggml_backend_atx_moe_residency_flush_stats(void) {
+    atx_moe_write_stats();
+}
+
+bool ggml_backend_atx_moe_residency_get_direct_cache(
+        const struct ggml_tensor * staged_src,
+        struct ggml_atx_moe_direct_cache * out) {
+    atx_moe_residency_state & state = atx_moe_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.direct_cuda) {
+        if (out != nullptr) {
+            *out = {};
+        }
+        return false;
+    }
+    auto found = state.direct_caches.find(staged_src);
+    if (found == state.direct_caches.end()) {
+        state.direct_cache_query_misses++;
+        if (out != nullptr) {
+            *out = {};
+        }
+        return false;
+    }
+    state.direct_cache_query_hits++;
+    if (out != nullptr) {
+        *out = found->second;
+    }
+    return true;
+}
+
 static void atx_moe_residency_init() {
     atx_moe_residency_state & state = atx_moe_state();
     if (state.initialized) {
@@ -1800,6 +1936,7 @@ static void atx_moe_residency_init() {
     const char * global_experts = getenv("ATX_MOE_KEEP_EXPERTS");
     const char * layer_experts  = getenv("ATX_MOE_KEEP_LAYER_EXPERTS");
     const char * stats_path     = getenv("ATX_MOE_RESIDENCY_STATS");
+    const char * direct_cuda    = getenv("ATX_MOE_DIRECT_CUDA");
 
     for (const int expert : atx_parse_int_ranges_backend(global_experts, 255, "expert")) {
         state.global_experts.insert(expert);
@@ -1807,6 +1944,7 @@ static void atx_moe_residency_init() {
     atx_parse_layer_experts_backend(layer_experts, state.layer_experts);
 
     state.enabled = !state.global_experts.empty() || !state.layer_experts.empty();
+    state.direct_cuda = direct_cuda != nullptr && direct_cuda[0] != '\0' && direct_cuda[0] != '0';
     if (stats_path != nullptr && stats_path[0] != '\0') {
         state.stats_path = stats_path;
     }
@@ -1816,8 +1954,8 @@ static void atx_moe_residency_init() {
     }
 
     if (state.enabled) {
-        GGML_LOG_INFO("ATX MoE residency: enabled with %zu global experts and %zu layer-specific entries\n",
-                state.global_experts.size(), state.layer_experts.size());
+        GGML_LOG_INFO("ATX MoE residency: enabled with %zu global experts and %zu layer-specific entries%s\n",
+                state.global_experts.size(), state.layer_experts.size(), state.direct_cuda ? " (direct CUDA experimental)" : "");
     }
 }
 
@@ -1895,11 +2033,16 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
     entry.input = input;
     entry.n_expert = n_expert;
     entry.expert_size = expert_size;
-    entry.slice_size = expert_size + std::min<size_t>(expert_size, 512);
+    // The legacy staging cache keeps a little padding after each slice because
+    // input_cpy may be consumed by kernels that read padded packed tensors.
+    // Direct CUDA mode consumes the compact cache as the source tensor, so the
+    // hot expert stride must match the original quantized expert block layout.
+    entry.slice_size = expert_size + (state.direct_cuda ? 0 : std::min<size_t>(expert_size, 512));
+    entry.hot_stride_channel = entry.slice_size / ggml_type_size(input->type);
     entry.layer = layer;
     entry.resident_experts = resident_experts;
 
-    const size_t ctx_size = ggml_tensor_overhead() * (resident_experts.size() + 4) + 4096;
+    const size_t ctx_size = ggml_tensor_overhead() * (resident_experts.size() + 6) + 4096;
     struct ggml_init_params ctx_params = {
         /* .mem_size   = */ ctx_size,
         /* .mem_buffer = */ nullptr,
@@ -1913,7 +2056,11 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
         return inserted.first->second.init_failed ? nullptr : &inserted.first->second;
     }
 
-    const size_t total_size = entry.slice_size * resident_experts.size();
+    const size_t hot_size = entry.slice_size * resident_experts.size();
+    const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[split_backend_id]);
+    const size_t map_offset = GGML_PAD(hot_size, alignment);
+    const size_t map_size = (size_t) n_expert * sizeof(int32_t);
+    const size_t total_size = map_offset + map_size;
     entry.buffer = ggml_backend_buft_alloc_buffer(sched->bufts[split_backend_id], total_size);
     if (entry.buffer == nullptr) {
         entry.init_failed = true;
@@ -1929,6 +2076,16 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
         ggml_backend_tensor_alloc(entry.buffer, t, (uint8_t *) base + i * entry.slice_size);
         entry.expert_tensors[resident_experts[i]] = t;
     }
+    entry.expert_map_tensor = ggml_new_tensor_1d(entry.ctx, GGML_TYPE_I32, n_expert);
+    ggml_format_name(entry.expert_map_tensor, "atx_moe_cache_L%d_expert_map", layer);
+    ggml_backend_tensor_alloc(entry.buffer, entry.expert_map_tensor, (uint8_t *) base + map_offset);
+
+    std::vector<int32_t> expert_map((size_t) n_expert, -1);
+    for (size_t i = 0; i < resident_experts.size(); ++i) {
+        expert_map[(size_t) resident_experts[i]] = (int32_t) i;
+    }
+    ggml_backend_tensor_set_async(sched->backends[split_backend_id], entry.expert_map_tensor, expert_map.data(), 0, map_size);
+    ggml_backend_synchronize(sched->backends[split_backend_id]);
 
     atx_moe_tensor_mapping mapping;
     mapping.name = ggml_get_name(input);
@@ -1953,8 +2110,13 @@ static bool atx_moe_copy_resident_expert(
         int64_t n_expert,
         size_t expert_size,
         const std::vector<int> & resident_experts,
-        int layer) {
+        int layer,
+        bool allow_direct_cuda) {
     atx_moe_residency_state & state = atx_moe_state();
+    if (state.direct_cuda && !allow_direct_cuda) {
+        return false;
+    }
+
     atx_moe_cache_entry * cache = atx_moe_get_cache_entry(sched, input, split_backend_id, n_expert, expert_size, resident_experts, layer);
     if (cache == nullptr) {
         state.cache_miss_slices++;
@@ -1967,17 +2129,32 @@ static bool atx_moe_copy_resident_expert(
         return false;
     }
 
+    if (state.direct_cuda && cache->expert_map_tensor != nullptr && cache->buffer != nullptr) {
+        ggml_atx_moe_direct_cache direct{};
+        direct.hot_data = ggml_backend_buffer_get_base(cache->buffer);
+        direct.expert_map = (const int32_t *) cache->expert_map_tensor->data;
+        direct.n_expert = cache->n_expert;
+        direct.hot_stride_channel = cache->hot_stride_channel;
+        state.direct_caches[input_cpy] = direct;
+        state.direct_cache_registrations++;
+    }
+
     ggml_tensor * cache_tensor = tensor_it->second;
     const size_t expert_offset = (size_t) expert_id * expert_size;
     const size_t padding = std::min<size_t>(expert_size, 512);
-    const size_t copy_size = expert_size + (expert_id < n_expert - 1 ? padding : 0);
+    const size_t copy_size = expert_size + (!state.direct_cuda && expert_id < n_expert - 1 ? padding : 0);
 
     if (cache->hydrated.find(expert_id) == cache->hydrated.end()) {
         ggml_backend_tensor_set_async(split_backend, cache_tensor, (const uint8_t *) input->data + expert_offset, 0, copy_size);
-        ggml_backend_synchronize(split_backend);
+        atx_moe_sync_backend(split_backend, state.resident_cache_hydrate_sync_calls, state.resident_cache_hydrate_sync_ns);
         cache->hydrated.insert(expert_id);
         state.resident_cache_hydrate_slices++;
         state.resident_bytes_hydrated += copy_size;
+        if (layer >= 0) {
+            atx_moe_layer_stats & layer_stats = state.layer_stats[layer];
+            layer_stats.resident_cache_hydrate_slices++;
+            layer_stats.resident_bytes_hydrated += copy_size;
+        }
     }
 
     const char * buft_name = ggml_backend_buft_name(sched->bufts[split_backend_id]);
@@ -1990,9 +2167,28 @@ static bool atx_moe_copy_resident_expert(
         return false;
     }
 
+    if (state.direct_cuda) {
+        state.resident_cache_hit_slices++;
+        state.resident_direct_hit_slices++;
+        if (layer >= 0) {
+            atx_moe_layer_stats & layer_stats = state.layer_stats[layer];
+            layer_stats.resident_cache_hit_slices++;
+            layer_stats.resident_direct_hit_slices++;
+        }
+        return true;
+    }
+
     ggml_backend_tensor_set_async(split_backend, input_cpy, cache_tensor->data, expert_offset, copy_size);
     state.resident_cache_hit_slices++;
+    state.resident_staging_copy_calls++;
     state.resident_bytes_copied += copy_size;
+    state.input_cpy_staging_bytes += copy_size;
+    if (layer >= 0) {
+        atx_moe_layer_stats & layer_stats = state.layer_stats[layer];
+        layer_stats.resident_cache_hit_slices++;
+        layer_stats.resident_staging_copy_calls++;
+        layer_stats.resident_bytes_copied += copy_size;
+    }
     return true;
 }
 
@@ -2074,8 +2270,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         atx_resident_experts_for_layer(atx_state, atx_tensor.layer, n_expert) :
                         std::vector<int>();
                     const bool atx_use_resident_cache = atx_state.enabled && !atx_resident_experts.empty();
+                    const bool atx_direct_cuda_supported_node =
+                        atx_state.direct_cuda &&
+                        node->op == GGML_OP_MUL_MAT_ID &&
+                        ggml_is_quantized(input->type) &&
+                        input->type != GGML_TYPE_TQ4_1S &&
+                        input->type != GGML_TYPE_TQ3_1S;
 
-                    ggml_backend_synchronize(input_backend);
+                    atx_moe_sync_backend(input_backend, atx_state.input_backend_sync_calls, atx_state.input_backend_sync_ns);
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -2096,9 +2298,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // Metal get_async wraps the destination pointer with newBufferWithBytesNoCopy,
                         // which is not safe for arbitrary std::vector allocations on this path.
                         // A synchronous get is fine here because we immediately need the routed IDs.
-                        ggml_backend_synchronize(ids_backend);
+                        atx_moe_sync_backend(ids_backend, atx_state.ids_backend_sync_calls, atx_state.ids_backend_sync_ns);
                         ggml_backend_tensor_get(ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                        ggml_backend_synchronize(ids_backend);
+                        atx_moe_sync_backend(ids_backend, atx_state.ids_backend_sync_calls, atx_state.ids_backend_sync_ns);
 
                         // find the used experts
                         used_ids.clear();
@@ -2108,6 +2310,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
                                 GGML_ASSERT(id >= 0 && id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
+                                if (atx_tensor.matched && atx_tensor.layer >= 0) {
+                                    atx_state.routed_expert_counts[atx_tensor.layer][id]++;
+                                }
                             }
                         }
 
@@ -2129,23 +2334,86 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
-                        atx_state.host_expert_slice_copies += (uint64_t) (last_id - first_id + 1);
-                        atx_state.host_bytes_copied += expert_size_copy + padding_end;
+                        const uint64_t copied_slices = (uint64_t) (last_id - first_id + 1);
+                        const uint64_t copied_bytes = (uint64_t) (expert_size_copy + padding_end);
+                        atx_state.host_expert_slice_copies += copied_slices;
+                        atx_state.host_expert_range_copy_calls++;
+                        if (copied_slices == 1) {
+                            atx_state.host_expert_single_copy_calls++;
+                        }
+                        atx_state.host_bytes_copied += copied_bytes;
+                        atx_state.input_cpy_staging_bytes += copied_bytes;
+                        if (atx_tensor.matched) {
+                            atx_moe_layer_stats & layer_stats = atx_state.layer_stats[atx_tensor.layer];
+                            layer_stats.host_expert_slice_copies += copied_slices;
+                            layer_stats.host_expert_range_copy_calls++;
+                            if (copied_slices == 1) {
+                                layer_stats.host_expert_single_copy_calls++;
+                            }
+                            layer_stats.host_bytes_copied += copied_bytes;
+                        }
                     };
 
                     if (atx_use_resident_cache) {
-                        std::set<int> resident_set(atx_resident_experts.begin(), atx_resident_experts.end());
-                        for (int id = 0; id < n_expert; ++id) {
-                            if (!ggml_bitset_get(used_ids.data(), id)) {
-                                continue;
+                        std::vector<uint8_t> resident_mask((size_t) n_expert, 0);
+                        for (const int resident_id : atx_resident_experts) {
+                            if (resident_id >= 0 && resident_id < n_expert) {
+                                resident_mask[(size_t) resident_id] = 1;
                             }
-                            if (resident_set.find(id) != resident_set.end() &&
-                                    atx_moe_copy_resident_expert(sched, split_backend, input_cpy, input, split_backend_id,
-                                        id, n_expert, expert_size, atx_resident_experts, atx_tensor.layer)) {
-                                continue;
-                            }
-                            copy_experts(id, id);
                         }
+                        int32_t cold_first_id = -1;
+                        int32_t cold_last_id = -1;
+                        auto flush_cold_experts = [&]() {
+                            if (cold_first_id < 0) {
+                                return;
+                            }
+                            atx_state.cold_expert_miss_range_calls++;
+                            if (atx_tensor.matched) {
+                                atx_state.layer_stats[atx_tensor.layer].cold_expert_miss_range_calls++;
+                            }
+                            copy_experts(cold_first_id, cold_last_id);
+                            cold_first_id = -1;
+                            cold_last_id = -1;
+                        };
+                        for (int32_t id = 0; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                flush_cold_experts();
+                                continue;
+                            }
+                            atx_state.used_expert_slices_seen++;
+                            if (atx_tensor.matched) {
+                                atx_state.layer_stats[atx_tensor.layer].used_expert_slices_seen++;
+                            }
+                            if (resident_mask[(size_t) id] != 0 &&
+                                    atx_moe_copy_resident_expert(sched, split_backend, input_cpy, input, split_backend_id,
+                                        id, n_expert, expert_size, atx_resident_experts, atx_tensor.layer, atx_direct_cuda_supported_node)) {
+                                if (atx_state.direct_cuda && cold_first_id >= 0) {
+                                    // Keep an existing cold host-copy range coalesced across
+                                    // resident hot experts. Direct CUDA will consume the hot
+                                    // cache, but copying through the hot slice is often cheaper
+                                    // than splitting the host transfer into tiny ranges.
+                                    cold_last_id = id;
+                                } else {
+                                    flush_cold_experts();
+                                }
+                                continue;
+                            }
+                            atx_state.cold_expert_miss_slices++;
+                            if (atx_tensor.matched) {
+                                atx_state.layer_stats[atx_tensor.layer].cold_expert_miss_slices++;
+                            }
+                            if (cold_first_id < 0) {
+                                cold_first_id = id;
+                                cold_last_id = id;
+                            } else if (id == cold_last_id + 1) {
+                                cold_last_id = id;
+                            } else {
+                                flush_cold_experts();
+                                cold_first_id = id;
+                                cold_last_id = id;
+                            }
+                        }
+                        flush_cold_experts();
                     } else {
                         int id = 0;
                         while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {

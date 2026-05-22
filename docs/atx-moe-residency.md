@@ -26,7 +26,7 @@ The following flags are implemented through an ATX scheduler expert-slice cache:
 - `--moe-keep-layer-experts 37:103,40:7`
   - Keep exact layer-expert cells in the expert cache.
 - `--moe-residency-policy policy.json`
-  - Load `keep_experts` and/or `keep_layer_experts` from JSON.
+  - Load `keep_layers`, `keep_experts`, and/or `keep_layer_experts` from JSON. `keep_layers` uses the fast packed whole-layer path; exact expert keys use the scheduler cache.
 - `--moe-residency-stats stats.json`
   - Write cache hit/miss, host-copy, hydration, and tensor mapping counters.
 
@@ -42,8 +42,17 @@ The stats file is the source of truth for whether a policy actually hit resident
 Current V1 caveats:
 
 - Expert residency disables CPU weight repacking for the model run because the selective MoE copy path requires host-visible source buffers.
-- On Apple Silicon this uses Metal shared buffers. The cache is durable and GPU-visible, but copy reuse is still mediated through the scheduler copy path.
+- The cache is durable and GPU-visible, but V1 resident hits are still copied into the packed `ggml_mul_mat_id` staging input. This is functionally correct but can be transfer-bound and slower than whole-layer residency.
+- Cold misses in the exact-cache path are coalesced into contiguous expert ranges before staging. Older V1 builds copied every cold expert one at a time.
 - MTP validation requires `--parallel 1`; the repaired local `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` path passed the smoke with `--spec-type mtp`; see `runs/atx_expert_residency/checkpoint_06_mtp_BLOCKER.RESOLVED.md`.
+
+Additional telemetry fields distinguish memory-saving residency from a fast direct-use path:
+
+- `resident_staging_copy_calls`: resident cache hits copied into `input_cpy`; nonzero means exact experts are still not consumed directly by the matmul kernel.
+- `cold_expert_miss_slices` and `cold_expert_miss_range_calls`: cold routed experts that fell back to host staging, with range coalescing.
+- `host_expert_range_copy_calls` and `host_expert_single_copy_calls`: copy call shape after coalescing.
+- `input_cpy_staging_bytes`: total bytes staged into the packed temporary input from both host and resident cache sources.
+- `per_layer`: per-layer used slices, resident hits, cold misses, bytes, and copy call counts.
 
 ## Packed Tensor Background
 
@@ -86,6 +95,24 @@ Exact expert cache:
   --moe-keep-experts 0-31 \
   --moe-residency-stats runs/atx_expert_residency/smoke/xl_policy_stats.json \
   --ctx-size 2048 \
+  --parallel 1
+```
+
+Saliency-promoted whole-layer policy:
+
+```json
+{
+  "config_id": "hybrid_promote_5",
+  "kind": "hybrid_promote_layers",
+  "keep_layers": [25, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+}
+```
+
+```bash
+./build-atx-cuda/bin/llama-server \
+  -m /path/to/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf \
+  --moe-residency-policy hybrid_promote_5.json \
+  --ctx-size 4096 \
   --parallel 1
 ```
 

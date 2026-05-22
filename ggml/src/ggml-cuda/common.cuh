@@ -1486,4 +1486,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
     ggml_glu_op glu_op;
+    const void * atx_hot_data = nullptr;
+    const int32_t * atx_expert_map = nullptr;
+    uint32_t atx_hot_stride_channel = 0;
+    const void * atx_gate_hot_data = nullptr;
+    const int32_t * atx_gate_expert_map = nullptr;
+    uint32_t atx_gate_hot_stride_channel = 0;
 };

@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "ggml-atx-moe-residency.h"
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -97,6 +98,15 @@ void ggml_cuda_mul_mat_q(
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
+    ggml_atx_moe_direct_cache direct{};
+    const char * atx_hot_x = nullptr;
+    const int32_t * atx_expert_map = nullptr;
+    int64_t atx_hot_stride_channel = 0;
+    if (ids && ggml_backend_atx_moe_residency_get_direct_cache(src0, &direct)) {
+        atx_hot_x = (const char *) direct.hot_data;
+        atx_expert_map = direct.expert_map;
+        atx_hot_stride_channel = (int64_t) direct.hot_stride_channel;
+    }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -212,12 +222,15 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         use_stream_k, ne12};
+    args.atx_hot_x = atx_hot_x;
+    args.atx_expert_map = atx_expert_map;
+    args.atx_hot_stride_channel = atx_hot_stride_channel;
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
