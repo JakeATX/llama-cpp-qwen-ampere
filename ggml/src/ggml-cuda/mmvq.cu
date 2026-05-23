@@ -1085,6 +1085,7 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.atx_hot_data = direct.hot_data;
             fusion_local.atx_expert_map = direct.expert_map;
             fusion_local.atx_hot_stride_channel = (uint32_t) direct.hot_stride_channel;
+            ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMVQ);
         }
     }
 
@@ -1107,6 +1108,7 @@ void ggml_cuda_mul_mat_vec_q(
                     fusion_local.atx_gate_hot_data = gate_direct.hot_data;
                     fusion_local.atx_gate_expert_map = gate_direct.expert_map;
                     fusion_local.atx_gate_hot_stride_channel = (uint32_t) gate_direct.hot_stride_channel;
+                    ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMVQ);
                 }
             }
         }

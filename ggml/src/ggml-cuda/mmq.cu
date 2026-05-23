@@ -106,6 +106,7 @@ void ggml_cuda_mul_mat_q(
         atx_hot_x = (const char *) direct.hot_data;
         atx_expert_map = direct.expert_map;
         atx_hot_stride_channel = (int64_t) direct.hot_stride_channel;
+        ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMQ);
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

@@ -10,10 +10,23 @@ extern "C" {
 #endif
 
 struct ggml_atx_moe_direct_cache {
+    const void * packed_src;
     const void * hot_data;
     const int32_t * expert_map;
+    int type;
+    int layer;
+    int tensor_kind;
     int64_t n_expert;
+    int64_t n_hot;
+    size_t expert_stride_bytes;
+    size_t hot_stride_bytes;
     size_t hot_stride_channel;
+};
+
+enum ggml_atx_moe_direct_kernel {
+    GGML_ATX_MOE_DIRECT_KERNEL_MMVQ = 1,
+    GGML_ATX_MOE_DIRECT_KERNEL_MMQ  = 2,
+    GGML_ATX_MOE_DIRECT_KERNEL_MMF  = 3,
 };
 
 // ATX: explicit flush for MoE residency telemetry. Long-lived servers call this
@@ -26,6 +39,12 @@ GGML_API void ggml_backend_atx_moe_residency_flush_stats(void);
 GGML_API bool ggml_backend_atx_moe_residency_get_direct_cache(
         const struct ggml_tensor * staged_src,
         struct ggml_atx_moe_direct_cache * out);
+
+GGML_API bool ggml_backend_atx_moe_residency_direct_enabled(void);
+GGML_API bool ggml_backend_atx_moe_residency_direct_require(void);
+GGML_API bool ggml_backend_atx_moe_residency_strict_hot_no_stage(void);
+GGML_API void ggml_backend_atx_moe_residency_note_direct_dispatch(int kernel);
+GGML_API void ggml_backend_atx_moe_residency_note_direct_fallback(const char * reason);
 
 #ifdef  __cplusplus
 }

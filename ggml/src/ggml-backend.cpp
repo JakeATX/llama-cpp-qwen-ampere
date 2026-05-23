@@ -1603,7 +1603,9 @@ struct atx_moe_cache_entry {
     size_t slice_size = 0;
     size_t hot_stride_channel = 0;
     int64_t n_expert = 0;
+    int64_t n_hot = 0;
     int layer = -1;
+    int tensor_kind = 0;
     bool init_failed = false;
     bool warned_private = false;
 };
@@ -1647,6 +1649,13 @@ struct atx_moe_residency_state {
     uint64_t direct_cache_registrations = 0;
     uint64_t direct_cache_query_hits = 0;
     uint64_t direct_cache_query_misses = 0;
+    uint64_t direct_kernel_dispatch_mmvq = 0;
+    uint64_t direct_kernel_dispatch_mmq = 0;
+    uint64_t direct_kernel_dispatch_mmf = 0;
+    uint64_t direct_kernel_fallbacks = 0;
+    uint64_t direct_require_violations = 0;
+    uint64_t hot_staging_violations = 0;
+    uint64_t hot_staging_bytes = 0;
     uint64_t host_expert_slice_copies = 0;
     uint64_t host_expert_range_copy_calls = 0;
     uint64_t host_expert_single_copy_calls = 0;
@@ -1664,7 +1673,16 @@ struct atx_moe_residency_state {
     uint64_t ids_backend_sync_ns = 0;
     uint64_t resident_cache_hydrate_sync_calls = 0;
     uint64_t resident_cache_hydrate_sync_ns = 0;
+    std::string mode = "off";
+    std::string prewarm = "lazy";
+    std::string pin_cpu_experts = "auto";
+    std::string cold_copy_mode = "cpu-id-readback";
+    std::string policy_output_path;
+    std::string trace_path;
+    bool debug = false;
     bool direct_cuda = false;
+    bool direct_require = false;
+    bool strict_hot_no_stage = false;
     std::map<int, atx_moe_layer_stats> layer_stats;
     std::map<int, std::map<int, uint64_t>> routed_expert_counts;
     std::unordered_map<const ggml_tensor *, ggml_atx_moe_direct_cache> direct_caches;
@@ -1785,7 +1803,13 @@ static void atx_moe_write_stats() {
 
     out << "{\n";
     out << "  \"enabled\": " << (state.enabled ? "true" : "false") << ",\n";
+    out << "  \"mode\": \"" << atx_json_escape(state.mode) << "\",\n";
     out << "  \"direct_cuda\": " << (state.direct_cuda ? "true" : "false") << ",\n";
+    out << "  \"direct_require\": " << (state.direct_require ? "true" : "false") << ",\n";
+    out << "  \"strict_hot_no_stage\": " << (state.strict_hot_no_stage ? "true" : "false") << ",\n";
+    out << "  \"prewarm_experts\": \"" << atx_json_escape(state.prewarm) << "\",\n";
+    out << "  \"pin_cpu_experts\": \"" << atx_json_escape(state.pin_cpu_experts) << "\",\n";
+    out << "  \"cold_copy_mode\": \"" << atx_json_escape(state.cold_copy_mode) << "\",\n";
     out << "  \"global_experts\": [";
     bool first = true;
     for (const int expert : state.global_experts) {
@@ -1820,6 +1844,13 @@ static void atx_moe_write_stats() {
     out << "    \"direct_cache_registrations\": " << state.direct_cache_registrations << ",\n";
     out << "    \"direct_cache_query_hits\": " << state.direct_cache_query_hits << ",\n";
     out << "    \"direct_cache_query_misses\": " << state.direct_cache_query_misses << ",\n";
+    out << "    \"direct_kernel_dispatch_mmvq\": " << state.direct_kernel_dispatch_mmvq << ",\n";
+    out << "    \"direct_kernel_dispatch_mmq\": " << state.direct_kernel_dispatch_mmq << ",\n";
+    out << "    \"direct_kernel_dispatch_mmf\": " << state.direct_kernel_dispatch_mmf << ",\n";
+    out << "    \"direct_kernel_fallbacks\": " << state.direct_kernel_fallbacks << ",\n";
+    out << "    \"direct_require_violations\": " << state.direct_require_violations << ",\n";
+    out << "    \"hot_staging_violations\": " << state.hot_staging_violations << ",\n";
+    out << "    \"hot_staging_bytes\": " << state.hot_staging_bytes << ",\n";
     out << "    \"host_expert_slice_copies\": " << state.host_expert_slice_copies << ",\n";
     out << "    \"host_expert_range_copy_calls\": " << state.host_expert_range_copy_calls << ",\n";
     out << "    \"host_expert_single_copy_calls\": " << state.host_expert_single_copy_calls << ",\n";
@@ -1900,6 +1931,47 @@ void ggml_backend_atx_moe_residency_flush_stats(void) {
     atx_moe_write_stats();
 }
 
+bool ggml_backend_atx_moe_residency_direct_enabled(void) {
+    atx_moe_residency_state & state = atx_moe_state();
+    return state.direct_cuda;
+}
+
+bool ggml_backend_atx_moe_residency_direct_require(void) {
+    atx_moe_residency_state & state = atx_moe_state();
+    return state.direct_require;
+}
+
+bool ggml_backend_atx_moe_residency_strict_hot_no_stage(void) {
+    atx_moe_residency_state & state = atx_moe_state();
+    return state.strict_hot_no_stage;
+}
+
+void ggml_backend_atx_moe_residency_note_direct_dispatch(int kernel) {
+    atx_moe_residency_state & state = atx_moe_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (kernel == GGML_ATX_MOE_DIRECT_KERNEL_MMVQ) {
+        state.direct_kernel_dispatch_mmvq++;
+    } else if (kernel == GGML_ATX_MOE_DIRECT_KERNEL_MMQ) {
+        state.direct_kernel_dispatch_mmq++;
+    } else {
+        state.direct_kernel_dispatch_mmf++;
+    }
+}
+
+void ggml_backend_atx_moe_residency_note_direct_fallback(const char * reason) {
+    atx_moe_residency_state & state = atx_moe_state();
+    {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.direct_kernel_fallbacks++;
+        if (state.direct_require) {
+            state.direct_require_violations++;
+        }
+    }
+    if (state.direct_require) {
+        GGML_ABORT("ATX MoE direct required but CUDA direct fallback occurred: %s\n", reason ? reason : "unknown");
+    }
+}
+
 bool ggml_backend_atx_moe_residency_get_direct_cache(
         const struct ggml_tensor * staged_src,
         struct ggml_atx_moe_direct_cache * out) {
@@ -1937,14 +2009,56 @@ static void atx_moe_residency_init() {
     const char * layer_experts  = getenv("ATX_MOE_KEEP_LAYER_EXPERTS");
     const char * stats_path     = getenv("ATX_MOE_RESIDENCY_STATS");
     const char * direct_cuda    = getenv("ATX_MOE_DIRECT_CUDA");
+    const char * mode           = getenv("ATX_MOE_RESIDENCY_MODE");
+    const char * direct_require = getenv("ATX_MOE_DIRECT_REQUIRE");
+    const char * strict_hot     = getenv("ATX_MOE_DIRECT_STRICT_HOT_NO_STAGE");
+    const char * prewarm        = getenv("ATX_MOE_PREWARM_EXPERTS");
+    const char * pin_cpu        = getenv("ATX_MOE_PIN_CPU_EXPERTS");
+    const char * cold_copy      = getenv("ATX_MOE_COLD_COPY_MODE");
+    const char * policy_output  = getenv("ATX_MOE_POLICY_OUTPUT");
+    const char * trace_path     = getenv("ATX_MOE_RESIDENCY_TRACE");
+    const char * debug          = getenv("ATX_MOE_RESIDENCY_DEBUG");
 
     for (const int expert : atx_parse_int_ranges_backend(global_experts, 255, "expert")) {
         state.global_experts.insert(expert);
     }
     atx_parse_layer_experts_backend(layer_experts, state.layer_experts);
 
-    state.enabled = !state.global_experts.empty() || !state.layer_experts.empty();
-    state.direct_cuda = direct_cuda != nullptr && direct_cuda[0] != '\0' && direct_cuda[0] != '0';
+    if (mode != nullptr && mode[0] != '\0') {
+        state.mode = mode;
+    } else if (direct_cuda != nullptr && direct_cuda[0] != '\0' && direct_cuda[0] != '0') {
+        state.mode = "direct";
+    } else if (!state.global_experts.empty() || !state.layer_experts.empty()) {
+        state.mode = "exact-v1";
+    }
+    if (state.mode != "off" && state.mode != "layer" && state.mode != "exact-v1" &&
+            state.mode != "direct" && state.mode != "hybrid" && state.mode != "auto") {
+        GGML_ABORT("ATX MoE residency: invalid mode '%s'\n", state.mode.c_str());
+    }
+
+    state.enabled = state.mode != "off" && (!state.global_experts.empty() || !state.layer_experts.empty());
+    state.direct_cuda = state.enabled &&
+        (state.mode == "direct" || state.mode == "hybrid" || state.mode == "auto" ||
+         (direct_cuda != nullptr && direct_cuda[0] != '\0' && direct_cuda[0] != '0'));
+    state.direct_require = direct_require != nullptr && direct_require[0] != '\0' && direct_require[0] != '0';
+    state.strict_hot_no_stage = strict_hot != nullptr && strict_hot[0] != '\0' && strict_hot[0] != '0';
+    if (prewarm != nullptr && prewarm[0] != '\0') {
+        state.prewarm = prewarm;
+    }
+    if (pin_cpu != nullptr && pin_cpu[0] != '\0') {
+        state.pin_cpu_experts = pin_cpu;
+    }
+    if (cold_copy != nullptr && cold_copy[0] != '\0') {
+        state.cold_copy_mode = cold_copy;
+    }
+    if (policy_output != nullptr && policy_output[0] != '\0') {
+        state.policy_output_path = policy_output;
+    }
+    if (trace_path != nullptr && trace_path[0] != '\0') {
+        state.trace_path = trace_path;
+    }
+    state.debug = debug != nullptr && debug[0] != '\0' && debug[0] != '0';
+
     if (stats_path != nullptr && stats_path[0] != '\0') {
         state.stats_path = stats_path;
     }
@@ -1954,8 +2068,10 @@ static void atx_moe_residency_init() {
     }
 
     if (state.enabled) {
-        GGML_LOG_INFO("ATX MoE residency: enabled with %zu global experts and %zu layer-specific entries%s\n",
-                state.global_experts.size(), state.layer_experts.size(), state.direct_cuda ? " (direct CUDA experimental)" : "");
+        GGML_LOG_INFO("ATX MoE residency: mode=%s with %zu global experts and %zu layer-specific entries%s%s\n",
+                state.mode.c_str(), state.global_experts.size(), state.layer_experts.size(),
+                state.direct_cuda ? " (direct CUDA)" : "",
+                state.strict_hot_no_stage ? " (strict hot-no-stage)" : "");
     }
 }
 
@@ -2041,6 +2157,17 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
     entry.hot_stride_channel = entry.slice_size / ggml_type_size(input->type);
     entry.layer = layer;
     entry.resident_experts = resident_experts;
+    entry.n_hot = (int64_t) resident_experts.size();
+    const atx_moe_tensor_name parsed_tensor = atx_parse_moe_tensor_name(ggml_get_name(input));
+    if (parsed_tensor.kind == "ffn_gate_exps.weight") {
+        entry.tensor_kind = 1;
+    } else if (parsed_tensor.kind == "ffn_up_exps.weight") {
+        entry.tensor_kind = 2;
+    } else if (parsed_tensor.kind == "ffn_down_exps.weight") {
+        entry.tensor_kind = 3;
+    } else if (parsed_tensor.kind == "ffn_gate_up_exps.weight") {
+        entry.tensor_kind = 4;
+    }
 
     const size_t ctx_size = ggml_tensor_overhead() * (resident_experts.size() + 6) + 4096;
     struct ggml_init_params ctx_params = {
@@ -2131,10 +2258,18 @@ static bool atx_moe_copy_resident_expert(
 
     if (state.direct_cuda && cache->expert_map_tensor != nullptr && cache->buffer != nullptr) {
         ggml_atx_moe_direct_cache direct{};
+        direct.packed_src = input->data;
         direct.hot_data = ggml_backend_buffer_get_base(cache->buffer);
         direct.expert_map = (const int32_t *) cache->expert_map_tensor->data;
+        direct.type = (int) input->type;
+        direct.layer = cache->layer;
+        direct.tensor_kind = cache->tensor_kind;
         direct.n_expert = cache->n_expert;
+        direct.n_hot = cache->n_hot;
+        direct.expert_stride_bytes = cache->expert_size;
+        direct.hot_stride_bytes = cache->slice_size;
         direct.hot_stride_channel = cache->hot_stride_channel;
+        state.direct_caches[input] = direct;
         state.direct_caches[input_cpy] = direct;
         state.direct_cache_registrations++;
     }
@@ -2276,6 +2411,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_is_quantized(input->type) &&
                         input->type != GGML_TYPE_TQ4_1S &&
                         input->type != GGML_TYPE_TQ3_1S;
+                    if (atx_state.direct_cuda && atx_use_resident_cache && !atx_direct_cuda_supported_node) {
+                        atx_state.direct_kernel_fallbacks++;
+                        if (atx_state.direct_require) {
+                            atx_state.direct_require_violations++;
+                            GGML_ABORT("ATX MoE direct required but tensor '%s' cannot use direct CUDA (type=%s, op=%d)\n",
+                                    ggml_get_name(input), ggml_type_name(input->type), (int) node->op);
+                        }
+                    }
 
                     atx_moe_sync_backend(input_backend, atx_state.input_backend_sync_calls, atx_state.input_backend_sync_ns);
 
@@ -2323,6 +2466,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (atx_state.direct_cuda && atx_state.strict_hot_no_stage && !atx_resident_experts.empty()) {
+                            uint64_t hot_slices_in_range = 0;
+                            for (const int resident_id : atx_resident_experts) {
+                                if (resident_id >= first_id && resident_id <= last_id) {
+                                    hot_slices_in_range++;
+                                }
+                            }
+                            if (hot_slices_in_range != 0) {
+                                const uint64_t bytes = hot_slices_in_range * (uint64_t) expert_size;
+                                atx_state.hot_staging_violations += hot_slices_in_range;
+                                atx_state.hot_staging_bytes += bytes;
+                                if (atx_tensor.matched) {
+                                    atx_state.layer_stats[atx_tensor.layer].resident_staging_copy_calls += hot_slices_in_range;
+                                }
+                                GGML_ABORT("ATX MoE direct strict hot-no-stage violation: layer=%d range=%d..%d includes %llu hot expert slices\n",
+                                        atx_tensor.layer, first_id, last_id, (unsigned long long) hot_slices_in_range);
+                            }
+                        }
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -2387,7 +2548,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             if (resident_mask[(size_t) id] != 0 &&
                                     atx_moe_copy_resident_expert(sched, split_backend, input_cpy, input, split_backend_id,
                                         id, n_expert, expert_size, atx_resident_experts, atx_tensor.layer, atx_direct_cuda_supported_node)) {
-                                if (atx_state.direct_cuda && cold_first_id >= 0) {
+                                if (atx_state.direct_cuda && !atx_state.strict_hot_no_stage && cold_first_id >= 0) {
                                     // Keep an existing cold host-copy range coalesced across
                                     // resident hot experts. Direct CUDA will consume the hot
                                     // cache, but copying through the hot slice is often cheaper

@@ -2669,6 +2669,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_KEEP_EXPERTS"));
     add_opt(common_arg(
+        {"--moe-residency-mode"}, "{off,layer,exact-v1,direct,hybrid,auto}",
+        "ATX: select MoE residency runtime mode; exact-v1 uses staged hot experts, direct/hybrid/auto use CUDA direct hot-cache when possible",
+        [](common_params & params, const std::string & value) {
+            static const std::set<std::string> valid = {"off", "layer", "exact-v1", "direct", "hybrid", "auto"};
+            if (valid.find(value) == valid.end()) {
+                throw std::invalid_argument("invalid MoE residency mode");
+            }
+            atx_set_env("ATX_MOE_RESIDENCY_MODE", value);
+            if (value != "off" && value != "layer") {
+                atx_enable_expert_residency(params);
+            }
+            if (value == "direct" || value == "hybrid" || value == "auto") {
+                atx_set_env("ATX_MOE_DIRECT_CUDA", "1");
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENCY_MODE"));
+    add_opt(common_arg(
         {"--moe-residency-policy"}, "FILE",
         "ATX: JSON policy file with keep_layers, keep_experts, and/or keep_layer_experts for MoE residency",
         [](common_params & params, const std::string & value) {
@@ -2690,8 +2707,83 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "ATX experimental: let CUDA consume resident exact experts directly from compact hot-expert cache instead of staging resident hits",
         [](common_params &) {
             atx_set_env("ATX_MOE_DIRECT_CUDA", "1");
+            atx_set_env("ATX_MOE_RESIDENCY_MODE", "direct");
         }
     ).set_env("LLAMA_ARG_MOE_DIRECT_CUDA"));
+    add_opt(common_arg(
+        {"--moe-direct-require"},
+        "ATX: abort when direct/hybrid mode would fall back for a tensor that requires CUDA direct residency",
+        [](common_params &) {
+            atx_set_env("ATX_MOE_DIRECT_REQUIRE", "1");
+        }
+    ).set_env("LLAMA_ARG_MOE_DIRECT_REQUIRE"));
+    add_opt(common_arg(
+        {"--moe-direct-strict-hot-no-stage"},
+        "ATX: abort if a hot resident expert is copied through input_cpy instead of consumed from the direct VRAM cache",
+        [](common_params &) {
+            atx_set_env("ATX_MOE_DIRECT_STRICT_HOT_NO_STAGE", "1");
+        }
+    ).set_env("LLAMA_ARG_MOE_DIRECT_STRICT_HOT_NO_STAGE"));
+    add_opt(common_arg(
+        {"--moe-prewarm-experts"}, "{off,lazy,eager}",
+        "ATX: hot expert prewarm behavior for direct/hybrid MoE residency",
+        [](common_params &, const std::string & value) {
+            static const std::set<std::string> valid = {"off", "lazy", "eager"};
+            if (valid.find(value) == valid.end()) {
+                throw std::invalid_argument("invalid MoE prewarm mode");
+            }
+            atx_set_env("ATX_MOE_PREWARM_EXPERTS", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_PREWARM_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-pin-cpu-experts"}, "{auto,on,off}",
+        "ATX: control pinned host storage for cold MoE experts",
+        [](common_params &, const std::string & value) {
+            static const std::set<std::string> valid = {"auto", "on", "off"};
+            if (valid.find(value) == valid.end()) {
+                throw std::invalid_argument("invalid MoE CPU pin mode");
+            }
+            atx_set_env("ATX_MOE_PIN_CPU_EXPERTS", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_PIN_CPU_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-cold-copy-mode"}, "{cpu-id-readback,device-bitset,device-ranges,auto}",
+        "ATX: select cold expert detection/copy strategy for MoE offload",
+        [](common_params &, const std::string & value) {
+            static const std::set<std::string> valid = {"cpu-id-readback", "device-bitset", "device-ranges", "auto"};
+            if (valid.find(value) == valid.end()) {
+                throw std::invalid_argument("invalid MoE cold copy mode");
+            }
+            atx_set_env("ATX_MOE_COLD_COPY_MODE", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_COLD_COPY_MODE"));
+    add_opt(common_arg(
+        {"--moe-policy-output"}, "FILE",
+        "ATX: write the normalized effective MoE policy metadata to FILE",
+        [](common_params &, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("empty MoE policy output path");
+            }
+            atx_set_env("ATX_MOE_POLICY_OUTPUT", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_POLICY_OUTPUT"));
+    add_opt(common_arg(
+        {"--moe-residency-trace"}, "FILE",
+        "ATX: write detailed MoE residency trace events to FILE",
+        [](common_params &, const std::string & value) {
+            if (value.empty()) {
+                throw std::invalid_argument("empty MoE residency trace path");
+            }
+            atx_set_env("ATX_MOE_RESIDENCY_TRACE", value);
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENCY_TRACE"));
+    add_opt(common_arg(
+        {"--moe-residency-debug"},
+        "ATX: enable verbose MoE residency diagnostics",
+        [](common_params &) {
+            atx_set_env("ATX_MOE_RESIDENCY_DEBUG", "1");
+        }
+    ).set_env("LLAMA_ARG_MOE_RESIDENCY_DEBUG"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
