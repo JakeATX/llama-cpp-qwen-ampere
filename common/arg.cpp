@@ -487,6 +487,7 @@ static void atx_apply_residency_policy_file(common_params & params, const std::s
         read_layers("keep_layers") ||
         read_layers("layers") ||
         read_layers("moe_keep_layers") ||
+        read_layers("bottleneck_keep_layers") ||
         read_layers("promote_layers");
 
     auto read_experts = [&](const char * key) -> bool {
@@ -2757,6 +2758,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             atx_set_env("ATX_MOE_COLD_COPY_MODE", value);
         }
     ).set_env("LLAMA_ARG_MOE_COLD_COPY_MODE"));
+    add_opt(common_arg(
+        {"--moe-cold-coalesce-gap"}, "N",
+        "ATX: coalesce cold expert copy ranges across up to N unused non-hot experts to reduce tiny host copies",
+        [](common_params &, const std::string & value) {
+            const int gap = std::stoi(value);
+            if (gap < 0) {
+                throw std::invalid_argument("MoE cold coalesce gap must be non-negative");
+            }
+            atx_set_env("ATX_MOE_COLD_COALESCE_GAP", std::to_string(gap));
+        }
+    ).set_env("LLAMA_ARG_MOE_COLD_COALESCE_GAP"));
     add_opt(common_arg(
         {"--moe-policy-output"}, "FILE",
         "ATX: write the normalized effective MoE policy metadata to FILE",

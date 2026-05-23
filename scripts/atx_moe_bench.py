@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt", default="Write a compact Python function that merges two sorted lists.")
     p.add_argument("--repetitions", type=int, default=3)
     p.add_argument("--out", required=True)
+    p.add_argument("--cold-copy-mode", default="auto")
+    p.add_argument("--cold-coalesce-gap", type=int, default=0)
     p.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
     return p.parse_args()
 
@@ -52,6 +54,8 @@ def run_once(args: argparse.Namespace, rep: int, out_dir: Path) -> dict:
         cmd += ["--moe-residency-mode", args.mode]
     if args.mode in {"direct", "hybrid", "auto"}:
         cmd += ["--moe-direct-require", "--moe-direct-strict-hot-no-stage"]
+    if args.mode != "off":
+        cmd += ["--moe-cold-copy-mode", args.cold_copy_mode, "--moe-cold-coalesce-gap", str(args.cold_coalesce_gap)]
     cmd += args.extra
 
     t0 = time.perf_counter()

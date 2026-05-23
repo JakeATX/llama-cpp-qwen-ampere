@@ -1624,6 +1624,15 @@ struct atx_moe_layer_stats {
     uint64_t host_expert_range_copy_calls = 0;
     uint64_t host_expert_single_copy_calls = 0;
     uint64_t host_bytes_copied = 0;
+    uint64_t host_copy_submit_ns = 0;
+    uint64_t max_host_range_slices = 0;
+    uint64_t coalesced_unused_gap_slices = 0;
+    uint64_t decode_used_expert_slices_seen = 0;
+    uint64_t decode_cold_expert_miss_slices = 0;
+    uint64_t decode_resident_direct_hit_slices = 0;
+    uint64_t prompt_used_expert_slices_seen = 0;
+    uint64_t prompt_cold_expert_miss_slices = 0;
+    uint64_t prompt_resident_direct_hit_slices = 0;
 };
 
 struct atx_moe_residency_state {
@@ -1659,6 +1668,9 @@ struct atx_moe_residency_state {
     uint64_t host_expert_slice_copies = 0;
     uint64_t host_expert_range_copy_calls = 0;
     uint64_t host_expert_single_copy_calls = 0;
+    uint64_t host_copy_submit_ns = 0;
+    uint64_t max_host_range_slices = 0;
+    uint64_t coalesced_unused_gap_slices = 0;
     uint64_t cache_miss_slices = 0;
     uint64_t used_expert_slices_seen = 0;
     uint64_t cold_expert_miss_slices = 0;
@@ -1673,6 +1685,12 @@ struct atx_moe_residency_state {
     uint64_t ids_backend_sync_ns = 0;
     uint64_t resident_cache_hydrate_sync_calls = 0;
     uint64_t resident_cache_hydrate_sync_ns = 0;
+    uint64_t decode_used_expert_slices_seen = 0;
+    uint64_t decode_cold_expert_miss_slices = 0;
+    uint64_t decode_resident_direct_hit_slices = 0;
+    uint64_t prompt_used_expert_slices_seen = 0;
+    uint64_t prompt_cold_expert_miss_slices = 0;
+    uint64_t prompt_resident_direct_hit_slices = 0;
     std::string mode = "off";
     std::string prewarm = "lazy";
     std::string pin_cpu_experts = "auto";
@@ -1680,6 +1698,7 @@ struct atx_moe_residency_state {
     std::string policy_output_path;
     std::string trace_path;
     bool debug = false;
+    int cold_coalesce_gap = 0;
     bool direct_cuda = false;
     bool direct_require = false;
     bool strict_hot_no_stage = false;
@@ -1854,6 +1873,9 @@ static void atx_moe_write_stats() {
     out << "    \"host_expert_slice_copies\": " << state.host_expert_slice_copies << ",\n";
     out << "    \"host_expert_range_copy_calls\": " << state.host_expert_range_copy_calls << ",\n";
     out << "    \"host_expert_single_copy_calls\": " << state.host_expert_single_copy_calls << ",\n";
+    out << "    \"host_copy_submit_ns\": " << state.host_copy_submit_ns << ",\n";
+    out << "    \"max_host_range_slices\": " << state.max_host_range_slices << ",\n";
+    out << "    \"coalesced_unused_gap_slices\": " << state.coalesced_unused_gap_slices << ",\n";
     out << "    \"cache_miss_slices\": " << state.cache_miss_slices << ",\n";
     out << "    \"used_expert_slices_seen\": " << state.used_expert_slices_seen << ",\n";
     out << "    \"cold_expert_miss_slices\": " << state.cold_expert_miss_slices << ",\n";
@@ -1867,7 +1889,13 @@ static void atx_moe_write_stats() {
     out << "    \"ids_backend_sync_calls\": " << state.ids_backend_sync_calls << ",\n";
     out << "    \"ids_backend_sync_ns\": " << state.ids_backend_sync_ns << ",\n";
     out << "    \"resident_cache_hydrate_sync_calls\": " << state.resident_cache_hydrate_sync_calls << ",\n";
-    out << "    \"resident_cache_hydrate_sync_ns\": " << state.resident_cache_hydrate_sync_ns << "\n";
+    out << "    \"resident_cache_hydrate_sync_ns\": " << state.resident_cache_hydrate_sync_ns << ",\n";
+    out << "    \"decode_used_expert_slices_seen\": " << state.decode_used_expert_slices_seen << ",\n";
+    out << "    \"decode_cold_expert_miss_slices\": " << state.decode_cold_expert_miss_slices << ",\n";
+    out << "    \"decode_resident_direct_hit_slices\": " << state.decode_resident_direct_hit_slices << ",\n";
+    out << "    \"prompt_used_expert_slices_seen\": " << state.prompt_used_expert_slices_seen << ",\n";
+    out << "    \"prompt_cold_expert_miss_slices\": " << state.prompt_cold_expert_miss_slices << ",\n";
+    out << "    \"prompt_resident_direct_hit_slices\": " << state.prompt_resident_direct_hit_slices << "\n";
     out << "  },\n";
     out << "  \"per_layer\": {";
     first = true;
@@ -1886,11 +1914,52 @@ static void atx_moe_write_stats() {
             << "\"host_expert_slice_copies\": " << stats.host_expert_slice_copies << ", "
             << "\"host_expert_range_copy_calls\": " << stats.host_expert_range_copy_calls << ", "
             << "\"host_expert_single_copy_calls\": " << stats.host_expert_single_copy_calls << ", "
-            << "\"host_bytes_copied\": " << stats.host_bytes_copied
+            << "\"host_bytes_copied\": " << stats.host_bytes_copied << ", "
+            << "\"host_copy_submit_ns\": " << stats.host_copy_submit_ns << ", "
+            << "\"max_host_range_slices\": " << stats.max_host_range_slices << ", "
+            << "\"coalesced_unused_gap_slices\": " << stats.coalesced_unused_gap_slices << ", "
+            << "\"decode_used_expert_slices_seen\": " << stats.decode_used_expert_slices_seen << ", "
+            << "\"decode_cold_expert_miss_slices\": " << stats.decode_cold_expert_miss_slices << ", "
+            << "\"decode_resident_direct_hit_slices\": " << stats.decode_resident_direct_hit_slices << ", "
+            << "\"prompt_used_expert_slices_seen\": " << stats.prompt_used_expert_slices_seen << ", "
+            << "\"prompt_cold_expert_miss_slices\": " << stats.prompt_cold_expert_miss_slices << ", "
+            << "\"prompt_resident_direct_hit_slices\": " << stats.prompt_resident_direct_hit_slices
             << "}";
         first = false;
     }
     out << (state.layer_stats.empty() ? "" : "\n  ") << "},\n";
+    out << "  \"bottleneck_layers\": [";
+    std::vector<std::pair<int, atx_moe_layer_stats>> bottleneck_layers(state.layer_stats.begin(), state.layer_stats.end());
+    std::sort(bottleneck_layers.begin(), bottleneck_layers.end(), [](const auto & a, const auto & b) {
+        if (a.second.host_bytes_copied != b.second.host_bytes_copied) {
+            return a.second.host_bytes_copied > b.second.host_bytes_copied;
+        }
+        return a.second.host_expert_single_copy_calls > b.second.host_expert_single_copy_calls;
+    });
+    first = true;
+    for (const auto & item : bottleneck_layers) {
+        const atx_moe_layer_stats & stats = item.second;
+        if (stats.host_bytes_copied == 0 && stats.cold_expert_miss_slices == 0) {
+            continue;
+        }
+        const double hot_coverage = stats.used_expert_slices_seen == 0 ? 0.0 :
+            (double) stats.resident_direct_hit_slices / (double) stats.used_expert_slices_seen;
+        const double single_range_ratio = stats.host_expert_range_copy_calls == 0 ? 0.0 :
+            (double) stats.host_expert_single_copy_calls / (double) stats.host_expert_range_copy_calls;
+        out << (first ? "" : ",") << "\n    {"
+            << "\"layer\": " << item.first << ", "
+            << "\"host_bytes_copied\": " << stats.host_bytes_copied << ", "
+            << "\"cold_expert_miss_slices\": " << stats.cold_expert_miss_slices << ", "
+            << "\"host_expert_range_copy_calls\": " << stats.host_expert_range_copy_calls << ", "
+            << "\"host_expert_single_copy_calls\": " << stats.host_expert_single_copy_calls << ", "
+            << "\"coalesced_unused_gap_slices\": " << stats.coalesced_unused_gap_slices << ", "
+            << "\"single_range_ratio\": " << single_range_ratio << ", "
+            << "\"host_copy_submit_ns\": " << stats.host_copy_submit_ns << ", "
+            << "\"hot_coverage\": " << hot_coverage
+            << "}";
+        first = false;
+    }
+    out << (first ? "" : "\n  ") << "],\n";
     out << "  \"routed_expert_counts\": {";
     if (!state.routed_expert_counts.empty()) {
         out << "\n";
@@ -2018,6 +2087,7 @@ static void atx_moe_residency_init() {
     const char * policy_output  = getenv("ATX_MOE_POLICY_OUTPUT");
     const char * trace_path     = getenv("ATX_MOE_RESIDENCY_TRACE");
     const char * debug          = getenv("ATX_MOE_RESIDENCY_DEBUG");
+    const char * coalesce_gap   = getenv("ATX_MOE_COLD_COALESCE_GAP");
 
     for (const int expert : atx_parse_int_ranges_backend(global_experts, 255, "expert")) {
         state.global_experts.insert(expert);
@@ -2058,6 +2128,9 @@ static void atx_moe_residency_init() {
         state.trace_path = trace_path;
     }
     state.debug = debug != nullptr && debug[0] != '\0' && debug[0] != '0';
+    if (coalesce_gap != nullptr && coalesce_gap[0] != '\0') {
+        state.cold_coalesce_gap = std::max(0, std::stoi(coalesce_gap));
+    }
 
     if (stats_path != nullptr && stats_path[0] != '\0') {
         state.stats_path = stats_path;
@@ -2238,6 +2311,7 @@ static bool atx_moe_copy_resident_expert(
         size_t expert_size,
         const std::vector<int> & resident_experts,
         int layer,
+        bool is_decode,
         bool allow_direct_cuda) {
     atx_moe_residency_state & state = atx_moe_state();
     if (state.direct_cuda && !allow_direct_cuda) {
@@ -2305,10 +2379,20 @@ static bool atx_moe_copy_resident_expert(
     if (state.direct_cuda) {
         state.resident_cache_hit_slices++;
         state.resident_direct_hit_slices++;
+        if (is_decode) {
+            state.decode_resident_direct_hit_slices++;
+        } else {
+            state.prompt_resident_direct_hit_slices++;
+        }
         if (layer >= 0) {
             atx_moe_layer_stats & layer_stats = state.layer_stats[layer];
             layer_stats.resident_cache_hit_slices++;
             layer_stats.resident_direct_hit_slices++;
+            if (is_decode) {
+                layer_stats.decode_resident_direct_hit_slices++;
+            } else {
+                layer_stats.prompt_resident_direct_hit_slices++;
+            }
         }
         return true;
     }
@@ -2461,6 +2545,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                         prev_ids_tensor = ids_tensor;
                     }
+                    const bool atx_is_decode_step = (ids_tensor->ne[1] <= 1);
 
                     atx_state.tensors_seen++;
 
@@ -2489,16 +2574,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        const auto copy_t0 = std::chrono::steady_clock::now();
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        const auto copy_t1 = std::chrono::steady_clock::now();
                         const uint64_t copied_slices = (uint64_t) (last_id - first_id + 1);
                         const uint64_t copied_bytes = (uint64_t) (expert_size_copy + padding_end);
+                        const uint64_t copy_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(copy_t1 - copy_t0).count();
                         atx_state.host_expert_slice_copies += copied_slices;
                         atx_state.host_expert_range_copy_calls++;
+                        atx_state.host_copy_submit_ns += copy_ns;
+                        atx_state.max_host_range_slices = std::max<uint64_t>(atx_state.max_host_range_slices, copied_slices);
                         if (copied_slices == 1) {
                             atx_state.host_expert_single_copy_calls++;
                         }
@@ -2508,6 +2598,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             atx_moe_layer_stats & layer_stats = atx_state.layer_stats[atx_tensor.layer];
                             layer_stats.host_expert_slice_copies += copied_slices;
                             layer_stats.host_expert_range_copy_calls++;
+                            layer_stats.host_copy_submit_ns += copy_ns;
+                            layer_stats.max_host_range_slices = std::max<uint64_t>(layer_stats.max_host_range_slices, copied_slices);
                             if (copied_slices == 1) {
                                 layer_stats.host_expert_single_copy_calls++;
                             }
@@ -2524,6 +2616,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                         int32_t cold_first_id = -1;
                         int32_t cold_last_id = -1;
+                        int32_t cold_gap_slices = 0;
                         auto flush_cold_experts = [&]() {
                             if (cold_first_id < 0) {
                                 return;
@@ -2535,19 +2628,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             copy_experts(cold_first_id, cold_last_id);
                             cold_first_id = -1;
                             cold_last_id = -1;
+                            cold_gap_slices = 0;
                         };
                         for (int32_t id = 0; id < n_expert; ++id) {
                             if (!ggml_bitset_get(used_ids.data(), id)) {
+                                if (cold_first_id >= 0 && atx_state.cold_coalesce_gap > 0 &&
+                                        cold_gap_slices < atx_state.cold_coalesce_gap &&
+                                        !(atx_state.strict_hot_no_stage && resident_mask[(size_t) id] != 0)) {
+                                    cold_last_id = id;
+                                    cold_gap_slices++;
+                                    atx_state.coalesced_unused_gap_slices++;
+                                    if (atx_tensor.matched) {
+                                        atx_state.layer_stats[atx_tensor.layer].coalesced_unused_gap_slices++;
+                                    }
+                                    continue;
+                                }
                                 flush_cold_experts();
                                 continue;
                             }
                             atx_state.used_expert_slices_seen++;
+                            if (atx_is_decode_step) {
+                                atx_state.decode_used_expert_slices_seen++;
+                            } else {
+                                atx_state.prompt_used_expert_slices_seen++;
+                            }
                             if (atx_tensor.matched) {
-                                atx_state.layer_stats[atx_tensor.layer].used_expert_slices_seen++;
+                                atx_moe_layer_stats & layer_stats = atx_state.layer_stats[atx_tensor.layer];
+                                layer_stats.used_expert_slices_seen++;
+                                if (atx_is_decode_step) {
+                                    layer_stats.decode_used_expert_slices_seen++;
+                                } else {
+                                    layer_stats.prompt_used_expert_slices_seen++;
+                                }
                             }
                             if (resident_mask[(size_t) id] != 0 &&
                                     atx_moe_copy_resident_expert(sched, split_backend, input_cpy, input, split_backend_id,
-                                        id, n_expert, expert_size, atx_resident_experts, atx_tensor.layer, atx_direct_cuda_supported_node)) {
+                                        id, n_expert, expert_size, atx_resident_experts, atx_tensor.layer, atx_is_decode_step, atx_direct_cuda_supported_node)) {
                                 if (atx_state.direct_cuda && !atx_state.strict_hot_no_stage && cold_first_id >= 0) {
                                     // Keep an existing cold host-copy range coalesced across
                                     // resident hot experts. Direct CUDA will consume the hot
@@ -2560,18 +2676,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 continue;
                             }
                             atx_state.cold_expert_miss_slices++;
+                            if (atx_is_decode_step) {
+                                atx_state.decode_cold_expert_miss_slices++;
+                            } else {
+                                atx_state.prompt_cold_expert_miss_slices++;
+                            }
                             if (atx_tensor.matched) {
-                                atx_state.layer_stats[atx_tensor.layer].cold_expert_miss_slices++;
+                                atx_moe_layer_stats & layer_stats = atx_state.layer_stats[atx_tensor.layer];
+                                layer_stats.cold_expert_miss_slices++;
+                                if (atx_is_decode_step) {
+                                    layer_stats.decode_cold_expert_miss_slices++;
+                                } else {
+                                    layer_stats.prompt_cold_expert_miss_slices++;
+                                }
                             }
                             if (cold_first_id < 0) {
                                 cold_first_id = id;
                                 cold_last_id = id;
+                                cold_gap_slices = 0;
                             } else if (id == cold_last_id + 1) {
                                 cold_last_id = id;
+                                cold_gap_slices = 0;
                             } else {
                                 flush_cold_experts();
                                 cold_first_id = id;
                                 cold_last_id = id;
+                                cold_gap_slices = 0;
                             }
                         }
                         flush_cold_experts();

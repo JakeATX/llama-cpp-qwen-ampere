@@ -18,10 +18,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--llama-cli")
     p.add_argument("--model", action="append", required=True)
     p.add_argument("--policy", required=True)
+    p.add_argument("--attention-policy")
+    p.add_argument("--bottleneck-policy")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--ctx-size", type=int, default=512)
     p.add_argument("--tokens", type=int, default=64)
     p.add_argument("--repetitions", type=int, default=3)
+    p.add_argument("--target-decode-tps", type=float, default=80.0)
+    p.add_argument("--reference-layer-tps", type=float, default=72.0)
     p.add_argument("--skip-build", action="store_true")
     return p.parse_args()
 
@@ -56,33 +60,52 @@ def main() -> int:
     bench = repo / "scripts" / "atx_moe_bench.py"
     for model in args.model:
         model_name = Path(model).stem
-        for mode in ["off", "exact-v1", "direct", "hybrid"]:
+        scenarios = [
+            ("off", None, "off"),
+            ("exact-v1", args.policy, "exact-v1"),
+            ("direct", args.policy, "direct"),
+            ("hybrid", args.policy, "hybrid"),
+        ]
+        if args.attention_policy:
+            scenarios.append(("attention-layer", args.attention_policy, "layer"))
+        if args.bottleneck_policy:
+            scenarios.append(("bottleneck-auto", args.bottleneck_policy, "auto"))
+        for label, policy, mode in scenarios:
             mode_out = out / model_name / mode
             cmd = [
                 "python", str(bench),
                 "--llama-cli", llama_cli,
                 "--model", model,
-                "--policy", args.policy,
                 "--mode", mode,
                 "--ctx-size", str(args.ctx_size),
                 "--tokens", str(args.tokens),
                 "--repetitions", str(args.repetitions),
                 "--out", str(mode_out),
             ]
+            if policy:
+                cmd += ["--policy", policy]
             rc = run(args, cmd, out / f"{model_name}_{mode}.runner.log")
             bj = mode_out / f"bench_{mode}.json"
             tps = median_tps(bj) if bj.exists() else None
-            rows.append({"model": model_name, "mode": mode, "returncode": rc, "median_generation_tps": tps})
+            rows.append({"model": model_name, "scenario": label, "mode": mode, "returncode": rc, "median_generation_tps": tps})
             if rc != 0:
-                blockers.append(f"- {model_name} {mode}: runner failed, see `{model_name}_{mode}.runner.log`")
+                blockers.append(f"- {model_name} {label}: runner failed, see `{model_name}_{mode}.runner.log`")
 
-    off_by_model = {r["model"]: r for r in rows if r["mode"] == "off"}
-    exact_by_model = {r["model"]: r for r in rows if r["mode"] == "exact-v1"}
+    off_by_model = {r["model"]: r for r in rows if r["scenario"] == "off"}
+    exact_by_model = {r["model"]: r for r in rows if r["scenario"] == "exact-v1"}
+    attention_by_model = {r["model"]: r for r in rows if r["scenario"] == "attention-layer"}
     for r in rows:
         base = off_by_model.get(r["model"], {}).get("median_generation_tps")
         exact = exact_by_model.get(r["model"], {}).get("median_generation_tps")
+        attention = attention_by_model.get(r["model"], {}).get("median_generation_tps") or args.reference_layer_tps
         r["speedup_vs_off"] = (r["median_generation_tps"] / base) if base and r["median_generation_tps"] else None
         r["speedup_vs_exact_v1"] = (r["median_generation_tps"] / exact) if exact and r["median_generation_tps"] else None
+        r["speedup_vs_layer_reference"] = (r["median_generation_tps"] / attention) if attention and r["median_generation_tps"] else None
+        if r["scenario"] == "bottleneck-auto" and r["median_generation_tps"]:
+            if r["median_generation_tps"] < args.target_decode_tps and r["median_generation_tps"] < 1.10 * attention:
+                blockers.append(
+                    f"- {r['model']} bottleneck-auto: {r['median_generation_tps']:.2f} tok/s did not reach "
+                    f"{args.target_decode_tps:.2f} tok/s or 1.10x layer reference ({attention:.2f})")
 
     summary = {"rows": rows, "blockers": blockers}
     (out / "acceptance_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
