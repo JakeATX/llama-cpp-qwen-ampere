@@ -76,6 +76,31 @@ Conclusion: top-by-host-byte bottleneck ranking reduced host traffic by about 12
 
 A one-layer swap probe (`bottleneck_swap_in_40_drop_25`) also regressed: 53.17 tok/s for the base tail set vs 46.11 tok/s for the swap, with MTP acceptance falling from 0.692 to 0.607. This makes the MTP acceptance penalty concrete.
 
+## 20-Iteration Search
+
+Run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\atx_moe_bottleneck_iterate.ps1 `
+  -MaxIterations 20 `
+  -MaxHours 120 `
+  -MaxTokens 64 `
+  -Context 64000 `
+  -OutDir runs\atx_moe_bottleneck\iterate_20_live
+```
+
+Best candidate:
+
+- Policy: `policies/atx_bottleneck_swap_in_0_drop_36_q4kxl_64k.atx.json`
+- Layers: `0,25,26,27,28,31,32,33,34,35,37,38,39`
+- Decode: `62.68 tok/s`
+- Baseline in same run: `55.80 tok/s`
+- Improvement: `1.12x`
+- Host bytes: `5.43 GB` vs baseline `5.57 GB`
+- MTP acceptance: `0.76`, same as baseline
+
+This confirms that one measured bottleneck layer, layer `0`, helps when it replaces some tail layers, with the best tested replacement being layer `36`. It still does not reach the 80 tok/s gate.
+
 ## Next Patch Direction
 
 The most promising path is a throughput-aware layer search:

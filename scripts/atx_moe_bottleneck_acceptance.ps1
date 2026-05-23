@@ -13,6 +13,8 @@ param(
   [string]$KnownFastLayers = "25-28,31-39",
   [string[]]$Scenarios = @("reference", "attention", "known-fast", "bottleneck-auto"),
   [string]$BottleneckPolicyPattern = "bottleneck_base_preserve_13_layers.atx.json",
+  [string]$PolicyPath = "",
+  [string]$PolicyScenarioName = "policy_candidate",
   [int]$SwapCandidates = 3,
   [int]$MaxPromoteLayers = 16,
   [double]$TargetDecodeTps = 80.0,
@@ -300,6 +302,16 @@ if ($Scenarios -contains "attention") {
 }
 if ($Scenarios -contains "known-fast") {
   $rows += Invoke-Scenario -Name "known_fast_tail_layers" -ExtraArgs @("--moe-residency-policy", $knownFastPolicy, "--moe-residency-mode", "layer")
+}
+if ($Scenarios -contains "policy") {
+  if (-not $PolicyPath) { throw "-PolicyPath is required when -Scenarios contains policy" }
+  $rows += Invoke-Scenario -Name $PolicyScenarioName -ExtraArgs @(
+    "--moe-residency-policy", $PolicyPath,
+    "--moe-residency-mode", "auto",
+    "--moe-direct-require",
+    "--moe-direct-strict-hot-no-stage",
+    "--moe-cold-coalesce-gap", "0"
+  )
 }
 
 if ((-not $SkipCompile) -and ($Scenarios -contains "bottleneck-auto")) {
