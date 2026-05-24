@@ -4222,6 +4222,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.tensor_filter.push_back(value);
         }
     ).set_examples({LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--layer-profile"}, "FILE",
+        "write ATX per-layer/profile JSONL timing records to FILE",
+        [](common_params & params, const std::string & value) {
+            params.layer_profile_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--layer-profile-detail"}, "off|summary|ops",
+        string_format("ATX layer profile detail level (default: %s)", params.layer_profile_detail.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "summary" && value != "ops") {
+                throw std::invalid_argument("invalid --layer-profile-detail, expected off, summary, or ops");
+            }
+            params.layer_profile_detail = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--layer-profile-sync"}, "none|token|layer",
+        string_format("ATX layer profile synchronization mode (default: %s)", params.layer_profile_sync.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "none" && value != "token" && value != "layer") {
+                throw std::invalid_argument("invalid --layer-profile-sync, expected none, token, or layer");
+            }
+            params.layer_profile_sync = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--layer-profile-warmup"}, "N",
+        string_format("skip first N profiled graph nodes in ATX layer profile output (default: %d)", params.layer_profile_warmup),
+        [](common_params & params, int value) {
+            params.layer_profile_warmup = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
+    add_opt(common_arg(
+        {"--layer-profile-max-tokens"}, "N",
+        string_format("maximum profiled node records to write, -1 is unlimited (default: %d)", params.layer_profile_max_tokens),
+        [](common_params & params, int value) {
+            params.layer_profile_max_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
 
     // presets
     add_opt(common_arg(
