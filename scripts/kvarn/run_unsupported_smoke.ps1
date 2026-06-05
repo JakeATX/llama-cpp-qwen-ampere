@@ -128,6 +128,13 @@ Invoke-ExpectFailure `
 Invoke-ExpectFailure `
     $results `
     $commonKvarn `
+    @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "bogus" } `
+    "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=bogus" `
+    "KVarN invalid scratch-reference env rejection"
+
+Invoke-ExpectFailure `
+    $results `
+    $commonKvarn `
     @{ "LLAMA_KVARN_DEBUG_UBATCH" = "129" } `
     "KVarN debug ubatch override exceeds tail-ring safety limit" `
     "KVarN unsafe debug ubatch rejection"

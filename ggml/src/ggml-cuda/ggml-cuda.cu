@@ -71,6 +71,7 @@
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <cerrno>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -94,14 +95,54 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 static bool ggml_cuda_kvarn_attn_trace_enabled() {
     const char * env = std::getenv("LLAMA_KVARN_ATTN_TRACE");
-    return env != nullptr && std::atoi(env) != 0;
+    if (env == nullptr) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+        GGML_ABORT("invalid KVarN CUDA environment flag %s=%s; expected integer 0 or 1", "LLAMA_KVARN_ATTN_TRACE", env);
+    }
+    return value != 0;
+}
+
+static bool ggml_cuda_kvarn_env_flag(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+        GGML_ABORT("invalid KVarN CUDA environment flag %s=%s; expected integer 0 or 1", name, env);
+    }
+    return value != 0;
+}
+
+static int ggml_cuda_kvarn_env_int(const char * name, int default_value) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        GGML_ABORT("invalid KVarN CUDA environment integer %s=%s", name, env);
+    }
+    return int(value);
 }
 
 static bool ggml_cuda_kvarn_attn_trace_claim() {
     static std::atomic<int> n_trace{0};
 
-    const char * limit_env = std::getenv("LLAMA_KVARN_ATTN_TRACE_LIMIT");
-    const int limit = limit_env != nullptr ? std::atoi(limit_env) : 64;
+    const int limit = ggml_cuda_kvarn_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
     if (limit <= 0) {
         return true;
     }
@@ -2906,15 +2947,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
                 const int64_t n_kv = int64_t(params.n_sink) + int64_t(params.n_records)*params.group_size + params.n_pending + params.n_tail;
                 const uint32_t kq_mask_type = kq_mask == nullptr ? 0u : (kq_mask->type == GGML_TYPE_F32 ? 1u : 2u);
-                const bool use_scratch_ref = getenv("LLAMA_KVARN_ATTN_REF_SCRATCH") != nullptr &&
-                    std::atoi(getenv("LLAMA_KVARN_ATTN_REF_SCRATCH")) != 0;
+                const bool use_scratch_ref = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
                 if (ggml_cuda_kvarn_attn_trace_enabled() && ggml_cuda_kvarn_attn_trace_claim()) {
-                    const char * fused_batch_env = std::getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
-                    const char * split_env = std::getenv("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
-                    const char * serial_env = std::getenv("LLAMA_KVARN_ATTN_SERIAL_FUSED");
-                    const bool forced_fused_batch = fused_batch_env != nullptr && std::atoi(fused_batch_env) != 0;
-                    const bool forced_split = split_env != nullptr && std::atoi(split_env) != 0;
-                    const bool forced_serial = serial_env != nullptr && std::atoi(serial_env) != 0;
+                    const bool forced_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
+                    const bool forced_split = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
+                    const bool forced_serial = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
                     const bool serial_runtime = forced_serial || (dst->ne[2] > 1 && !forced_fused_batch && !forced_split);
                     const bool split_runtime = use_scratch_ref || forced_split;
                     const char * mode = use_scratch_ref ? "scratch-ref" :
@@ -5580,9 +5617,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 int64_t scratch_floats = n_kv;
-                if (getenv("LLAMA_KVARN_ATTN_REF_SCRATCH") != nullptr &&
-                        std::atoi(getenv("LLAMA_KVARN_ATTN_REF_SCRATCH")) != 0 &&
-                        params.n_records > 0) {
+                if (ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH") && params.n_records > 0) {
                     scratch_floats += 2*op->src[1]->ne[1]*int64_t(params.n_records)*params.head_dim*params.group_size;
                 }
                 const int64_t k_body_bytes = (int64_t)(((size_t) params.head_dim*params.group_size*params.key_bits + 7)/8);

@@ -76,6 +76,9 @@ Current implemented pieces:
   reproduce the unsafe fused-batch path. Do not use this combination as a
   production mode until Qwen3.6 packed-repeat logits pass at the normal
   `llama-results` threshold.
+  KVarN diagnostic environment flags are parsed strictly: malformed values such
+  as `LLAMA_KVARN_ATTN_REF_SCRATCH=bogus` now fail with an explicit invalid
+  environment-flag error instead of being silently treated as disabled.
 - KVarN runtime memory/context skeleton with native slot metadata, sequence
   operations, memory estimates, and production-shaped per-layer/per-KV-head
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
@@ -599,8 +602,9 @@ Verified local smoke:
   and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection, invalid
   `LLAMA_KVARN_DEBUG_UBATCH=0` positive-integer rejection, and server
   `--parallel 2` rejection. Latest static-build rerun on the Qwen2.5 1.5B
-  regression model passed all four checks:
+  regression model passed all five checks:
   `KVarN forced fused-batch rejection: PASS`,
+  `KVarN invalid scratch-reference env rejection: PASS`,
   `KVarN unsafe debug ubatch rejection: PASS`,
   `KVarN invalid debug ubatch rejection: PASS`, and
   `KVarN server multi-slot rejection: PASS`. The optional

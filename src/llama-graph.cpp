@@ -18,28 +18,62 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 
 // dedup helpers
 
+static bool kvarn_graph_parse_env_flag(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+        throw std::runtime_error(std::string("invalid KVarN environment flag ") + name +
+                "=" + env + "; expected integer 0 or 1");
+    }
+    return value != 0;
+}
+
+static int kvarn_graph_parse_env_int(const char * name, int default_value) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(std::string("invalid KVarN environment integer ") + name +
+                "=" + env);
+    }
+    return int(value);
+}
+
 static bool kvarn_graph_attn_trace_enabled() {
-    const char * env = std::getenv("LLAMA_KVARN_ATTN_TRACE");
-    return env != nullptr && std::atoi(env) != 0;
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_TRACE");
 }
 
 static bool kvarn_graph_attn_trace_claim() {
     static std::atomic<int> n_trace{0};
 
-    const char * limit_env = std::getenv("LLAMA_KVARN_ATTN_TRACE_LIMIT");
-    const int limit = limit_env != nullptr ? std::atoi(limit_env) : 64;
+    const int limit = kvarn_graph_parse_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
     if (limit <= 0) {
         return true;
     }
@@ -715,13 +749,11 @@ static void kvarn_graph_update_mixed_attn_params(ggml_tensor * node, const kvarn
 }
 
 static bool kvarn_graph_use_attn_scratch_ref() {
-    const char * env = getenv("LLAMA_KVARN_ATTN_REF_SCRATCH");
-    return env != nullptr && std::atoi(env) != 0;
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
 }
 
 static bool kvarn_graph_use_attn_fused_batch() {
-    const char * env = getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
-    return env != nullptr && std::atoi(env) != 0;
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
 }
 
 static int64_t kvarn_graph_attn_scratch_floats(

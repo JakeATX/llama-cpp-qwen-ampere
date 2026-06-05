@@ -3,12 +3,30 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 
 // NVCC can vectorize shared-memory reduction loads at the end of the scratch
 // region. Keep a small pad so sanitizer-visible overreads stay inside the
 // dynamic shared allocation.
 static constexpr size_t KVARN_ATTN_SHMEM_PAD_FLOATS = 8;
+
+static bool kvarn_env_flag(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+        std::fprintf(stderr, "invalid KVarN CUDA environment flag %s=%s; expected integer 0 or 1\n", name, env);
+        std::abort();
+    }
+    return value != 0;
+}
 
 static __host__ __device__ size_t kvarn_packed_nbytes(size_t n_values, uint32_t bits) {
     return (n_values*bits + 7)/8;
@@ -2160,12 +2178,9 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         void * stream) {
     const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
     const uint32_t n_gqa = n_head/n_head_kv;
-    const char * split_env = std::getenv("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
-    const char * fused_batch_env = std::getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
-    const bool allow_fused_batch = fused_batch_env != nullptr && std::atoi(fused_batch_env) != 0;
-    const char * serial_env = std::getenv("LLAMA_KVARN_ATTN_SERIAL_FUSED");
-    const bool force_serial_fused = serial_env != nullptr && std::atoi(serial_env) != 0;
-    const bool use_split_kernels = split_env != nullptr && std::atoi(split_env) != 0;
+    const bool allow_fused_batch = kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
+    const bool force_serial_fused = kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
+    const bool use_split_kernels = kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
     const bool use_serial_fused = force_serial_fused || (n_queries > 1 && !allow_fused_batch && !use_split_kernels);
 
     int block = 1;

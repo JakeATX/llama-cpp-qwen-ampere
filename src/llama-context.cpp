@@ -13,12 +13,14 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 //
 // llama_context
@@ -30,6 +32,22 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool llama_kvarn_parse_env_flag(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+        throw std::runtime_error(std::string("invalid KVarN environment flag ") + name +
+                "=" + env + "; expected integer 0 or 1");
+    }
+    return value != 0;
 }
 
 llama_context::llama_context(
@@ -199,23 +217,14 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
-        const char * LLAMA_KVARN_ATTN_FUSED_BATCH = getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
-        const char * LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH = getenv("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
-        const bool kvarn_forced_fused_batch =
-            LLAMA_KVARN_ATTN_FUSED_BATCH != nullptr &&
-            atoi(LLAMA_KVARN_ATTN_FUSED_BATCH) != 0;
-        const bool kvarn_unsafe_fused_batch =
-            LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH != nullptr &&
-            atoi(LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH) != 0;
-        if (cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN &&
-                kvarn_forced_fused_batch &&
-                !kvarn_unsafe_fused_batch) {
+        const bool is_kvarn = cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN;
+        const bool kvarn_forced_fused_batch = is_kvarn && llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
+        const bool kvarn_unsafe_fused_batch = is_kvarn && llama_kvarn_parse_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
+        if (kvarn_forced_fused_batch && !kvarn_unsafe_fused_batch) {
             throw std::runtime_error(
                     "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven");
         }
-        if (cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN &&
-                kvarn_forced_fused_batch &&
-                kvarn_unsafe_fused_batch) {
+        if (kvarn_forced_fused_batch && kvarn_unsafe_fused_batch) {
             LLAMA_LOG_WARN(
                     "%s: KVarN forced fused-batch attention is running in an unsafe diagnostic mode; "
                     "Qwen3.6 prompt-batch correctness is not proven\n",
