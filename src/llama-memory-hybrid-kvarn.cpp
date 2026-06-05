@@ -6,6 +6,17 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+
+static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens) {
+    const char * env = std::getenv("LLAMA_KVARN_DEBUG_UBATCH");
+    if (env != nullptr) {
+        const int value = std::atoi(env);
+        return value > 0 ? uint32_t(value) : 1;
+    }
+
+    return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
+}
 
 llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
         const llama_model & model,
@@ -50,14 +61,14 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
         llama_batch_allocr & balloc,
         uint32_t n_ubatch,
         bool embd_all) {
-    GGML_UNUSED(n_ubatch);
     GGML_UNUSED(embd_all);
 
     balloc.split_reset();
 
     std::vector<llama_ubatch> ubatches;
+    const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 ? 1 : kvarn_ubatch_limit(n_ubatch, mem_attn->get_tail_tokens());
     while (true) {
-        auto ubatch = balloc.split_equal(1, true);
+        auto ubatch = balloc.split_equal(n_kvarn_ubatch, true);
         if (ubatch.n_tokens == 0) {
             break;
         }

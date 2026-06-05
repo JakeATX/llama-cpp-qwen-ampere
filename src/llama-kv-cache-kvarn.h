@@ -259,6 +259,7 @@ public:
 
     uint32_t get_size() const;
     uint32_t get_n_layer() const;
+    uint32_t get_tail_tokens() const { return params.tail_tokens; }
     llama_kvarn_memory_estimate estimate() const;
 
     llama_kvarn_runtime_storage_stats storage_stats() const;

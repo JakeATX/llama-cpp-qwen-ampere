@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -21,6 +22,18 @@
 static bool is_power_of_2(uint32_t n) {
     return n != 0 && (n & (n - 1)) == 0;
 }
+
+#ifdef LLAMA_BUILD
+static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens) {
+    const char * env = std::getenv("LLAMA_KVARN_DEBUG_UBATCH");
+    if (env != nullptr) {
+        const int value = std::atoi(env);
+        return value > 0 ? uint32_t(value) : 1;
+    }
+
+    return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
+}
+#endif
 
 static size_t packed_nbytes(size_t n_values, uint32_t bits) {
     return (n_values*bits + 7)/8;
@@ -922,18 +935,17 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_batch(
         llama_batch_allocr & balloc,
         uint32_t n_ubatch,
         bool embd_all) {
-    GGML_UNUSED(n_ubatch);
     GGML_UNUSED(embd_all);
 
 #ifdef LLAMA_BUILD
     balloc.split_reset();
 
     std::vector<llama_ubatch> ubatches;
+    const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 ? 1 : kvarn_ubatch_limit(n_ubatch, params.tail_tokens);
     while (true) {
-        // The KVarN attention graph is currently decode-shaped: one query can
-        // attend all previous cache tokens without a causal prompt mask. Split
-        // prompts into one-token ubatches until masked prompt attention is wired.
-        auto ubatch = balloc.split_simple(1);
+        // Keep each graph within one tail-ring span so tokens written earlier
+        // in the graph are not evicted before their pending-body copy runs.
+        auto ubatch = balloc.split_simple(n_kvarn_ubatch);
         if (ubatch.n_tokens == 0) {
             break;
         }

@@ -3,11 +3,15 @@ param(
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-nofa-vs"),
     [int] $Context = 512,
     [int] $GpuLayers = 99,
+    [int] $Batch = 0,
     [double] $RtnQuantile = 0.95,
     [int] $Repeat = 32,
     [string] $PromptPhrase = "The quick brown fox studies attention kernels and cache layouts carefully. ",
     [string] $OutputFile = (Join-Path $env:TEMP "kvarn-packed-logits.gguf"),
     [string] $PromptFile = (Join-Path $env:TEMP "kvarn-logits-prompt.txt"),
+    [int] $DebugUbatch = 0,
+    [switch] $PackedSerialFused,
+    [switch] $PackedSplitKernels,
     [switch] $KeepArtifacts
 )
 
@@ -18,6 +22,12 @@ if (!($RtnQuantile -gt 0.0 -and $RtnQuantile -le 1.0)) {
 }
 if ($Repeat -le 0) {
     throw "Repeat must be positive"
+}
+if ($Batch -lt 0) {
+    throw "Batch must be non-negative"
+}
+if ($DebugUbatch -lt 0) {
+    throw "DebugUbatch must be non-negative"
 }
 
 function Get-ExePath([string] $buildDir, [string] $name) {
@@ -75,13 +85,29 @@ $commonArgs = @(
     "--kvarn-preset", "kvarn_k4v2_g128",
     "--kvarn-rtn-quantile", $rtnQuantileArg
 )
+if ($Batch -gt 0) {
+    $commonArgs += @("-b", [string] $Batch)
+}
+
+$packedEnv = @{}
+$scratchEnv = @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "1" }
+if ($DebugUbatch -gt 0) {
+    $packedEnv["LLAMA_KVARN_DEBUG_UBATCH"] = [string] $DebugUbatch
+    $scratchEnv["LLAMA_KVARN_DEBUG_UBATCH"] = [string] $DebugUbatch
+}
+if ($PackedSerialFused) {
+    $packedEnv["LLAMA_KVARN_ATTN_SERIAL_FUSED"] = "1"
+}
+if ($PackedSplitKernels) {
+    $packedEnv["LLAMA_KVARN_ATTN_SPLIT_KERNELS"] = "1"
+}
 
 try {
     Write-Host "== Saving packed KVarN logits"
-    [void] (Invoke-Results $results $commonArgs @{})
+    [void] (Invoke-Results $results $commonArgs $packedEnv)
 
     Write-Host "== Checking scratch-reference KVarN logits"
-    $check = Invoke-Results $results ($commonArgs + @("--check")) @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "1" }
+    $check = Invoke-Results $results ($commonArgs + @("--check")) $scratchEnv
     $m = [regex]::Match($check, "NMSE=([0-9.eE+-]+)")
     if (-not $m.Success) {
         throw "Could not find NMSE in llama-results output"

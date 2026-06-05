@@ -38,12 +38,12 @@ Current implemented pieces:
   primitive, with explicit query/output/probability strides.
 - CUDA mixed sink/body/tail attention primitive that attends over FP16
   sink/tail tokens and packed KVarN body records in one stable softmax.
-- The runtime packed mixed-attention path now has a batched fused CUDA kernel
-  that combines score calculation, softmax normalization, and AV accumulation
-  for all query heads in one grid launch. Set `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`
-  to force the previous per-query-head fused launch, or
-  `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` to force the earlier split score/AV
-  kernels for A/B debugging.
+- The runtime packed mixed-attention path has a fused CUDA kernel for one-query
+  decode batches. Multi-query prompt batches currently use the split score/AV
+  CUDA kernels because the fused multi-query variants diverge from the
+  scratch-reference path under prompt batching. Set
+  `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` or `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for
+  A/B debugging of the packed attention variants.
 - CUDA F32 scratch mixed-attention primitive that consumes dequantized body
   scratch tensors and is used as a device-side reference for the packed mixed
   attention primitive.
@@ -65,9 +65,12 @@ Current implemented pieces:
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
   groups into packed KVarN body records plus scale metadata. It does not
   allocate or use the normal KV cache as a fallback.
-- KVarN batch preparation splits caller batches into one-token ubatches. This
-  keeps prompt processing on the decode-shaped graph path until unsplit
-  multi-token prompt storage/sealing is safely enabled and tested.
+- KVarN batch preparation now admits bounded prompt ubatches up to one tail-ring
+  span (`min(n_ubatch, tail_tokens)`) for non-MoE models, so prompt processing
+  can use masked multi-query KVarN attention without evicting a tail slot
+  written earlier in the same graph. MoE models stay on one-token KVarN
+  ubatches for now; Qwen3.6 MoE diverged from scratch-reference logits under
+  bounded prompt batching and remains correct with the one-token split.
 - Hybrid recurrent/full-attention models can compose recurrent memory for SSM
   layers with KVarN storage for full-attention layers. This is used by local
   Qwen3.5/Qwen3.6-family validation instead of rejecting the whole model for
@@ -109,16 +112,16 @@ Current implemented pieces:
   FP32 pending-body tensors, a scratch score buffer, and an optional KQ/causal
   mask in `src[10]`. CUDA dispatch passes F32/F16 masks through to the batched
   F16 sink/body/pending/tail wrapper. The llama graph now builds and fills the
-  KQ mask for KVarN graph inputs, but production runtime preparation still
-  splits actual work into one-token ubatches until unsplit prompt storage and
-  sealing are validated. The graph computes active sink/body/pending/tail counts
-  and the wrapped-tail start slot for each decode token. Context reserve graphs
-  may be built for larger synthetic ubatches.
+  KQ mask for KVarN graph inputs. Production runtime preparation bounds non-MoE
+  prompt chunks to one tail-ring span while prompt batching is being brought up. The
+  graph computes active sink/body/pending/tail counts and the wrapped-tail start
+  slot for each ubatch from the last token position. Context reserve graphs may
+  be built for larger synthetic ubatches.
 - Graph construction writes FP16 sink/tail, stages evicted FP16 tail rows into
   FP32 pending body slots, emits packed K/V body-store nodes when a graph
-  completes one body record, and uses KVarN mixed attention for one-token
-  decode graphs. It currently refuses multi-token prompt batches and graphs
-  that would seal multiple body records at once.
+  completes one body record, and uses KVarN mixed attention for decode and
+  bounded non-MoE prompt batches. It still refuses graph reuse across graphs
+  that include body-store ops or shape changes.
 - When `LLAMA_KVARN_ATTN_REF_SCRATCH=1` is set during graph construction,
   `kvarn_attn_scores` is sized for score probabilities plus K/V body scratch
   for every allocated body record in the current layer. Graph reuse validates
@@ -160,10 +163,9 @@ constructed with native slot metadata. Graph construction identifies
 `llama_kv_cache_kvarn_context` before the normal `llama_kv_cache_context` casts.
 The KVarN graph path stores sink/tail tensors, can seal one completed body
 record from pending K/V staging, and can consume KVarN sink/tail/body/scale
-storage through CUDA mixed attention for one-token decode. KVarN graph reserve
-can build synthetic multi-token graphs for context initialization, but runtime
-execution still uses one-token ubatches until causal prompt-mask support is
-implemented. This trades prompt speed for correctness.
+storage through CUDA mixed attention. Non-MoE runtime execution now uses bounded
+prompt ubatches with KQ masks; MoE runtime execution remains one-token until the
+Qwen3.6 prompt-batch scratch divergence is fixed.
 
 Verified local smoke:
 
@@ -198,8 +200,8 @@ Verified local smoke:
 - Standard prompt-processing benchmark:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -p 64 -n 0 -r 1 -ngl 99 -fa on --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
   Latest local result: normal KV `1081.21` tok/s, KVarN `98.22` tok/s for
-  `pp64`. This is expected to be slow until masked multi-token prompt attention
-  replaces the current one-token KVarN ubatch splitting path.
+  `pp64`. This predates bounded non-MoE prompt batching and should be rerun
+  before final publication.
 - Standard benchmark crossing packed body records:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -p 0 -n 384 -r 1 -ngl 99 -fa on --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
   Latest local result: normal KV `148.34` tok/s, KVarN `35.96` tok/s for
@@ -256,6 +258,10 @@ Verified local smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "<300 hello tokens>" -n 1 -c 384 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with two KVarN body records per full-attention
   layer and a `6.67 MiB` CUDA KVarN buffer.
+- 256-dim hybrid Qwen3.5 bounded prompt-batch smoke:
+  `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "<240 repeated a tokens>" -n 1 -c 512 -b 512 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 --no-display-prompt`.
+  Latest local result passed with two KVarN body records per full-attention
+  layer, a `6.67 MiB` CUDA KVarN buffer, and prompt throughput `572.6` tok/s.
 - 256-dim hybrid Qwen3.6 35B A3B MTP smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed on the RTX 5070 with KVarN allocated on
@@ -321,11 +327,14 @@ Verified local smoke:
   llama.cpp's logits NMSE threshold to pass. Latest local result:
   `KVarN packed-vs-scratch logits: PASS, NMSE = 0.000E+000`.
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
-  Latest local result also passed with `NMSE = 0.000E+000`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512`.
+  Latest local result passed on the bounded prompt-batch path with
+  `NMSE = 0.000E+000`.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Repeat 24`.
-  Latest local result passed with `NMSE = 0.000E+000`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
+  Latest local result passed with `NMSE = 0.000E+000`; this path stays on
+  one-token MoE KVarN ubatches because bounded MoE prompt batching diverged at
+  `NMSE = 9.983E-004`.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
@@ -346,15 +355,17 @@ Verified local smoke:
 
 Required integration path:
 
-1. Enable unsplit KVarN prompt batches now that `GGML_OP_KVARN_ATTN_MIXED`
-   carries an optional KQ/causal mask in `src[10]` and the CUDA packed and
-   scratch-reference mixed-attention paths consume it. Runtime batch
-   preparation still splits to one-token ubatches until prompt storage order,
-   active-window construction, and body-record sealing are validated together.
+1. Finish optimization of KVarN prompt batches. `GGML_OP_KVARN_ATTN_MIXED`
+   carries an optional KQ/causal mask in `src[10]`, and runtime preparation now
+   admits bounded prompt ubatches for non-MoE models. Correctness is currently
+   maintained by using split score/AV CUDA kernels for `n_queries > 1`; the
+   fused multi-query packed-attention kernels and MoE prompt-batch path still
+   need to be fixed before they can be enabled for all prompt batches.
 2. Finish prompt-batch sealing semantics. The graph builder now collects all
    seal records in an ubatch and emits store ops for each record, and the body
-   plan has multi-record seal coverage. Prompt ubatches are still split to one
-   token, so this path is not yet exercised by production prefill batches.
+   plan has multi-record seal coverage. Bounded production prompt ubatches now
+   exercise this path; larger-than-tail-ring prompt chunks remain out of scope
+   until same-graph tail overwrite hazards are handled explicitly.
 3. Promote the device scratch-reference primitives into a graph path that
    materializes body records into scratch K/V tensors before
    `ggml_flash_attn_ext`. The standalone CUDA scratch-dequant primitives and
