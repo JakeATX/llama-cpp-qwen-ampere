@@ -184,6 +184,11 @@ Verified local smoke:
   512-dimensional K/V plus `swa/iswa-likely`, Qwen2.5 1.5B as
   `regression-128,dim-inferred`, Qwen3.5 0.8B as `primary-256,hybrid-ssm`,
   and Qwen3.6 35B A3B MTP IQ3 as `primary-256,hybrid-ssm,moe`.
+- Additional local 256 metadata discovery:
+  `python scripts\kvarn\discover_models.py C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-UD-Q4_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`.
+  Latest local result reports both Qwen3.5 4B files as 256-dim hybrid SSM
+  (`32` layers, `16` heads, `4` KV heads) and the non-MTP Qwen3.6 35B A3B
+  Q3/Q4 files as 256-dim hybrid MoE (`40` layers, `256` experts, `8` active).
 - CUDA FA-off build:
   `cmake -S . -B build-kvarn-cuda-nofa-vs -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF -DGGML_CUDA_NCCL=OFF -DCMAKE_CUDA_ARCHITECTURES=120a-real`.
 - Short KVarN smoke:
@@ -243,10 +248,16 @@ Verified local smoke:
   layers, `2` KV heads, `256` head dim, K4/V2/group128) reports KVarN totals
   of `10.69 MiB` at 4K context and `21.38 MiB` at 8K context. The same geometry
   in FP16 KV would be `48.00 MiB` and `96.00 MiB`.
+- Memory estimator for 256-dim hybrid Qwen3.5 4B full-attention geometry (`8`
+  layers, `4` KV heads, `256` head dim, K4/V2/group128) reports KVarN totals
+  of `28.50 MiB` at 4K context, `57.00 MiB` at 8K context, and `114.00 MiB`
+  at 16K context. The same geometry in FP16 KV would be `128.00 MiB`,
+  `256.00 MiB`, and `512.00 MiB`.
 - Memory estimator for 256-dim hybrid Qwen3.6 35B A3B MTP full-attention
   geometry (`10` layers, `2` KV heads, `256` head dim, K4/V2/group128) reports
-  KVarN totals of `17.81 MiB` at 4K context and `35.62 MiB` at 8K context. The
-  same geometry in FP16 KV would be `80.00 MiB` and `160.00 MiB`.
+  KVarN totals of `17.81 MiB` at 4K context, `35.62 MiB` at 8K context, and
+  `71.25 MiB` at 16K context. The same geometry in FP16 KV would be
+  `80.00 MiB`, `160.00 MiB`, and `320.00 MiB`.
 - Explicit multi-slot startup now fails cleanly before model load with:
   `KVarN currently supports only --parallel 1`.
 - Focused tests passed:
@@ -273,6 +284,15 @@ Verified local smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "<240 repeated a tokens>" -n 1 -c 512 -b 512 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 --no-display-prompt`.
   Latest local result passed with two KVarN body records per full-attention
   layer, a `6.67 MiB` CUDA KVarN buffer, and prompt throughput `572.6` tok/s.
+- 256-dim hybrid Qwen3.5 4B logits-distance comparison:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512 -CheckPackedRepeat`.
+  Latest local result passed with packed-repeat `NMSE = 0.000E+000` and
+  packed-vs-scratch `NMSE = 0.000E+000`.
+- 256-dim hybrid Qwen3.5 4B long-context smoke:
+  `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -p "Hello" -n 256 -c 4096 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95 -s 1234 --temp 0 --ignore-eos --no-display-prompt`.
+  Latest local result on build `b9529-f663181e4` passed with `30` body records
+  per full-attention layer, a `42.72 MiB` CUDA KVarN buffer, and reported
+  prompt/generation throughput `132.1`/`85.5` tok/s.
 - 256-dim hybrid Qwen3.6 35B A3B MTP smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed on the RTX 5070 with KVarN allocated on
@@ -290,12 +310,20 @@ Verified local smoke:
   files cleanly before graph construction with
   `KVarN backend currently supports only 128- or 256-dimensional K/V heads`;
   earlier builds could reach an invalid ISWA graph cast and crash with
-  `0xC0000005`.
+  `0xC0000005`. Current-build rejection was rechecked with
+  `llama-cli -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`
+  and passed with the expected 128/256-only validation error.
 - Fresh `tg64` benchmark gates on the CUDA FA-off build:
   Qwen2.5 1.5B 128-dim normal KV `202.46` tok/s, KVarN `160.37` tok/s;
   Qwen3.5 0.8B 256-dim hybrid normal KV `360.12` tok/s, KVarN
   `148.25` tok/s; Qwen3.6 35B A3B MTP IQ3 256-dim hybrid normal KV
   `13.51` tok/s, KVarN `13.76` tok/s.
+- Current-build 256 benchmark gates on build `f663181e4` with `-fa off`:
+  Qwen3.5 4B `tg128` normal KV `142.77` tok/s, KVarN `97.79` tok/s;
+  Qwen3.5 4B `pp128` normal KV `1124.22` tok/s, KVarN `245.93` tok/s;
+  Qwen3.5 4B body-record-crossing `tg384` normal KV `145.27` tok/s, KVarN
+  `34.90` tok/s; Qwen3.6 35B A3B MTP IQ3 `tg64` normal KV `9.10` tok/s,
+  KVarN `9.81` tok/s.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
