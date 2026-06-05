@@ -2626,8 +2626,15 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (auto * inp_kvarn = dynamic_cast<llm_graph_input_attn_kvarn *>(inp)) {
         ggml_build_forward_expand(gf, q_cur);
-        ggml_build_forward_expand(gf, v_cur);
-        ggml_build_forward_expand(gf, k_cur);
+        if ((k_cur == nullptr) != (v_cur == nullptr)) {
+            throw std::runtime_error("KVarN graph backend requires K and V cache writes to be paired");
+        }
+
+        const bool stores_kv = k_cur != nullptr;
+        if (stores_kv) {
+            ggml_build_forward_expand(gf, v_cur);
+            ggml_build_forward_expand(gf, k_cur);
+        }
 
         // Runtime KVarN memory splits work into one-token ubatches. Context
         // initialization can still reserve a larger worst-case graph; building
@@ -2646,35 +2653,37 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.layout_k.key_bits == 4);
         GGML_ASSERT(layer.layout_v.value_bits == 2);
         GGML_ASSERT(inp_kvarn->mctx_kvarn->body_store_scratch_floats(il) > 0);
-        ggml_build_forward_expand(gf, inp_kvarn->get_body_plan());
-        ggml_build_forward_expand(gf, inp_kvarn->get_body_offsets());
-        ggml_build_forward_expand(gf, inp_kvarn->get_tail_evict_idxs());
-        if (inp_kvarn->get_body_offsets()->ne[0] > 0) {
-            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_k(
-                        ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
-            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_v(
-                        ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
-        }
-        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
-        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
+        if (stores_kv) {
+            ggml_build_forward_expand(gf, inp_kvarn->get_body_plan());
+            ggml_build_forward_expand(gf, inp_kvarn->get_body_offsets());
+            ggml_build_forward_expand(gf, inp_kvarn->get_tail_evict_idxs());
+            if (inp_kvarn->get_body_offsets()->ne[0] > 0) {
+                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_k(
+                            ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
+                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_v(
+                            ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
+            }
+            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
+            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
 
-        const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
-        if (!seal_records.empty()) {
-            inp_kvarn->has_body_store_ops = true;
-        }
-
-        for (const uint32_t seal_record : seal_records) {
-            if (seal_record >= layer.n_records) {
-                throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
+            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
+            if (!seal_records.empty()) {
+                inp_kvarn->has_body_store_ops = true;
             }
 
-            for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                ggml_tensor * k_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
-                ggml_tensor * v_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
-                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_k_body_record_from_pending(
-                            ctx0, k_scratch, il, ih, seal_record));
-                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_v_body_record_from_pending(
-                            ctx0, v_scratch, il, ih, seal_record));
+            for (const uint32_t seal_record : seal_records) {
+                if (seal_record >= layer.n_records) {
+                    throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
+                }
+
+                for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
+                    ggml_tensor * k_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
+                    ggml_tensor * v_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
+                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_k_body_record_from_pending(
+                                ctx0, k_scratch, il, ih, seal_record));
+                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_v_body_record_from_pending(
+                                ctx0, v_scratch, il, ih, seal_record));
+                }
             }
         }
 

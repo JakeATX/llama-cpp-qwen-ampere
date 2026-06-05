@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_hparams;
@@ -229,7 +230,8 @@ public:
             uint32_t kv_size,
             uint32_t n_seq_max,
             uint32_t n_pad,
-            const layer_filter_cb & filter);
+            const layer_filter_cb & filter,
+            const layer_reuse_cb & reuse = nullptr);
 
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
@@ -337,6 +339,7 @@ private:
     uint32_t n_pad;
 
     std::vector<uint32_t> layer_ids;
+    std::unordered_map<int32_t, int32_t> map_layer_ids;
     std::vector<uint32_t> layer_heads;
     std::vector<layer_storage> layer_tensors;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

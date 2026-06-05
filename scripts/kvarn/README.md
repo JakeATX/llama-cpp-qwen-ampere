@@ -81,6 +81,12 @@ Current implemented pieces:
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
   groups into packed KVarN body records plus scale metadata. It does not
   allocate or use the normal KV cache as a fallback.
+- KVarN cache layer-reuse metadata is now wired for models whose later layers
+  reuse an earlier physical KV layer. Reuse-only graph layers attend from the
+  mapped KVarN storage and skip duplicate sink/tail writes, tail-eviction
+  staging, and body-record sealing. This is a prerequisite for Gemma-style
+  K/V reuse, but Gemma still requires a KVarN+ISWA composite before SWA layers
+  can run.
 - KVarN batch preparation now admits bounded prompt ubatches up to one tail-ring
   span (`min(n_ubatch, tail_tokens)`) for dense, hybrid, and MoE models, so
   prompt processing can use masked multi-query KVarN attention without evicting
@@ -300,9 +306,9 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure`.
   Latest local result on 2026-06-05 passed. `test-kvarn-kv` now asserts 512
   memory estimates, runtime layer-view shapes, scale/body tensor sizing, and
-  body-store graph op shapes. `test-kvarn-cuda-scratch-ref` now runs 128, 256,
-  and 512 head-dimension cases through the CUDA packed/scratch reference
-  coverage.
+  body-store graph op shapes, plus KVarN physical-layer reuse mapping.
+  `test-kvarn-cuda-scratch-ref` now runs 128, 256, and 512 head-dimension
+  cases through the CUDA packed/scratch reference coverage.
 - CUDA KVarN coverage now includes the wrapped-tail mixed-attention runtime
   test:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-cuda" --output-on-failure`.
@@ -352,6 +358,11 @@ Verified local smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed on the RTX 5070 with KVarN allocated on
   full-attention layers `3, 7, 11, 15, 19, 23, 27, 31, 35, 39`.
+- 256-dim hybrid Qwen3.5 smoke was rerun after adding KVarN graph support for
+  reuse-only layers:
+  `build-kvarn-cuda-static-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p Hello -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 --no-display-prompt`.
+  Latest local result passed with KVarN storage on the same full-attention
+  layers and no fallback to normal KV.
 - 256-dim hybrid Qwen3.6 35B A3B MTP body-record smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "<300 hello tokens>" -n 1 -c 384 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with two KVarN body records per full-attention

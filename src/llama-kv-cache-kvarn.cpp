@@ -785,7 +785,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t kv_size,
         uint32_t n_seq_max,
         uint32_t n_pad,
-        const layer_filter_cb & filter) :
+        const layer_filter_cb & filter,
+        const layer_reuse_cb & reuse) :
     model(model),
     hparams(hparams),
     params(params),
@@ -844,6 +845,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
 
         layer_ids.push_back(il);
+        map_layer_ids[il] = int32_t(layer_tensors.size());
         const uint32_t n_head_kv = hparams.n_head_kv_arr[il];
         const uint32_t head_k = kvarn_hparams_n_embd_head_k(hparams, il);
         const uint32_t head_v = kvarn_hparams_n_embd_head_v(hparams, il);
@@ -886,6 +888,26 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
 
         std::fprintf(stderr, "%s: KVarN layer %3u storage dev = %s, heads = %u, body records = %u\n",
                 __func__, il, dev_name, n_head_kv, n_records);
+    }
+
+    if (reuse) {
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            const int32_t il_reuse = reuse(il);
+            if (il_reuse < 0) {
+                continue;
+            }
+
+            if (filter && !filter(il)) {
+                continue;
+            }
+
+            const auto it = map_layer_ids.find(il_reuse);
+            if (it == map_layer_ids.end()) {
+                throw std::runtime_error("KVarN cache layer cannot reuse a missing physical layer");
+            }
+
+            map_layer_ids[int32_t(il)] = it->second;
+        }
     }
 
     if (layer_ids.empty()) {
@@ -1258,12 +1280,12 @@ size_t llama_kv_cache_kvarn::backend_tensor_bytes() const {
 }
 
 size_t llama_kv_cache_kvarn::layer_storage_index(uint32_t il) const {
-    const auto it = std::find(layer_ids.begin(), layer_ids.end(), il);
-    if (it == layer_ids.end()) {
+    const auto it = map_layer_ids.find(int32_t(il));
+    if (it == map_layer_ids.end()) {
         throw std::invalid_argument("KVarN layer is not present in runtime storage");
     }
 
-    return size_t(std::distance(layer_ids.begin(), it));
+    return size_t(it->second);
 }
 
 llama_kvarn_layer_view llama_kv_cache_kvarn::get_layer_view(int32_t il) const {

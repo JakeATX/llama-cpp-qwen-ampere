@@ -337,6 +337,19 @@ static void test_runtime_metadata() {
     require(view512.scales_v->ne[0] == 768, "512-dim KVarN layer view scale V shape");
     require(cache512.body_store_scratch_floats(0) == 512*128 + 2*512, "512-dim KVarN body store scratch floats");
 
+    llama_hparams hparams_reuse = make_test_hparams(512);
+    hparams_reuse.n_layer_kv_from_start = 1;
+    llama_kv_cache_kvarn cache_reuse(
+            nullptr, hparams_reuse, params, false, 16, 4, 1, nullptr,
+            [](int32_t il) { return il == 1 ? 0 : -1; });
+    require(cache_reuse.get_n_layer() == 1, "KVarN reuse cache allocates one physical KV layer");
+    const llama_kvarn_layer_view view_reuse0 = cache_reuse.get_layer_view(0);
+    const llama_kvarn_layer_view view_reuse1 = cache_reuse.get_layer_view(1);
+    require(view_reuse1.il == 0, "KVarN reuse layer view maps to physical source layer");
+    require(view_reuse1.sink_tail_k == view_reuse0.sink_tail_k, "KVarN reuse layer shares sink K storage");
+    require(view_reuse1.body_k == view_reuse0.body_k, "KVarN reuse layer shares body K storage");
+    require(cache_reuse.body_store_scratch_floats(1) == 512*128 + 2*512, "KVarN reuse body scratch uses logical layer head dim");
+
 }
 
 static void test_runtime_storage_sealing() {
