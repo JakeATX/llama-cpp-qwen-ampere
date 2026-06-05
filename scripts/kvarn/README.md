@@ -168,6 +168,11 @@ Verified local smoke:
 
 - Compatible model downloaded with
   `hf download Qwen/Qwen2.5-1.5B-Instruct-GGUF qwen2.5-1.5b-instruct-q4_k_m.gguf --local-dir C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF`.
+- Reproducible local model metadata discovery:
+  `python scripts\kvarn\discover_models.py C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`.
+  Latest local result reports Gemma4 as 512-dimensional K/V plus
+  `swa/iswa-likely`, Qwen3.5 0.8B as `primary-256,hybrid-ssm`, and Qwen3.6
+  35B A3B MTP IQ3 as `primary-256,hybrid-ssm,moe`.
 - CUDA FA-off build:
   `cmake -S . -B build-kvarn-cuda-nofa-vs -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF -DGGML_CUDA_NCCL=OFF -DCMAKE_CUDA_ARCHITECTURES=120a-real`.
 - Short KVarN smoke:
@@ -306,6 +311,9 @@ Verified local smoke:
   the same prompt with `LLAMA_KVARN_ATTN_REF_SCRATCH=1 --check`, and requires
   llama.cpp's logits NMSE threshold to pass. Latest local result:
   `KVarN packed-vs-scratch logits: PASS, NMSE = 0.000E+000`.
+- 256-dim runtime packed-vs-scratch logits-distance comparison:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
+  Latest local result also passed with `NMSE = 0.000E+000`.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
