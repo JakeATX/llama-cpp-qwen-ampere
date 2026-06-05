@@ -436,7 +436,13 @@ Verified local smoke:
   With the unsafe diagnostic override enabled after removing an unnecessary
   scratch/probability write from the fused-batch kernel, Qwen3.6 still failed
   packed repeat at `NMSE = 1.569e-02`. Disabling graph reuse still failed at
-  `NMSE = 1.269e-02`, so the remaining issue is not stale graph reuse state.
+  `NMSE = 1.269e-02`, and disabling CUDA graphs with
+  `GGML_CUDA_DISABLE_GRAPHS=1` still failed a shorter repeat-4 fused-vs-scratch
+  check at `NMSE = 1.556e-03`, so the remaining issue is not stale graph reuse
+  or CUDA graph capture.
+  The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
+  after the scratch/probability write removal, with the worst observed
+  `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
