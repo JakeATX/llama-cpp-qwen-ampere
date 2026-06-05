@@ -410,14 +410,11 @@ Verified local smoke:
   Latest local result on 2026-06-05 passed after adding F32/F16 KQ-mask graph
   input coverage to `test-kvarn-kv`.
   Static CUDA focused rerun:
-  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail|test-arg-parser" --output-on-failure`.
-  Latest local result on 2026-06-05 passed all four tests.
-  Latest static CUDA non-standalone rerun:
-  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure`.
-  This passed `test-kvarn-kv`, `test-download-model`,
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn|test-arg-parser|test-download-model" --output-on-failure`.
+  Latest local result on 2026-06-05 passed all six selected tests:
+  `test-kvarn-kv`, `test-kvarn-cuda-scratch-ref`,
+  `test-kvarn-cuda-mixed-tail`, `test-download-model`,
   `test-kvarn-server-load-failure`, and `test-arg-parser`.
-  Latest rerun after KVarN trace environment validation also passed all four
-  tests.
   `test-kvarn-kv` also now covers the lower-level cache constructor rejection
   for asymmetric K/V head dimensions, matching the model-load compatibility
   guard that rejects such models before runtime allocation.
