@@ -340,9 +340,9 @@ Verified local smoke:
   and `KVarN CLI log check: PASS, KVarN layer lines = 56`.
   The script also accepts `-ExpectedKvarnLayers` to require exact routed layer
   IDs; all KVarN exact-layer harnesses accept comma-separated IDs and
-  inclusive ranges such as `0-27` or `0-27,35,41,47`. Latest Gemma 4 12B
-  exact-layer rerun:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "256" -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5,11,17,23,29,35,41,47"`.
+  inclusive ranges such as `0-27`, plus stepped ranges such as `5-47:6`.
+  Latest Gemma 4 12B exact-layer rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "256" -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   This passed with `KVarN expected layer check: PASS, layers =
   5,11,17,23,29,35,41,47` and 16 KVarN layer log lines.
 - `scripts\kvarn\kv_memory_estimate.py` now mirrors the runtime logical memory

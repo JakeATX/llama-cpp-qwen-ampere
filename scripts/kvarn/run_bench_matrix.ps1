@@ -98,13 +98,17 @@ function Get-ExpectedKvarnLayerIds([string] $layers) {
         if ([string]::IsNullOrWhiteSpace($raw)) {
             continue
         }
-        if ($raw -match '^([0-9]+)-([0-9]+)$') {
+        if ($raw -match '^([0-9]+)-([0-9]+)(?::([0-9]+))?$') {
             $start = [int] $Matches[1]
             $end = [int] $Matches[2]
+            $step = if ($Matches.ContainsKey(3) -and -not [string]::IsNullOrEmpty($Matches[3])) { [int] $Matches[3] } else { 1 }
             if ($end -lt $start) {
                 throw "Invalid KVarN layer range '$raw' in ExpectedKvarnLayers"
             }
-            for ($id = $start; $id -le $end; ++$id) {
+            if ($step -le 0) {
+                throw "Invalid KVarN layer range step '$raw' in ExpectedKvarnLayers"
+            }
+            for ($id = $start; $id -le $end; $id += $step) {
                 $ids += $id
             }
         } else {
