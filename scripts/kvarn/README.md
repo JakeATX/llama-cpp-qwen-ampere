@@ -426,7 +426,9 @@ Verified local smoke:
   `-CheckPackedRepeat` diagnostic also passed with packed-repeat
   `NMSE = 0.000E+000`. The harness now parses `NaN`/infinity NMSE values
   explicitly so diagnostic failures can be reported without script parser
-  failures.
+  failures. It also accepts `-CheckPackedSplit`, which reruns the saved logits
+  against `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` to distinguish packed fused-vs-split
+  divergence from packed-vs-scratch divergence.
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512`.
   Latest local result passed on the bounded prompt-batch path with
@@ -472,6 +474,10 @@ Verified local smoke:
   short setup passed packed-repeat and packed-vs-scratch checks at
   `NMSE = 0.000E+000`, keeping the production path intact while narrowing the
   fused issue to graph/model integration rather than isolated mask stride.
+  The direct `-PackedFusedBatch -CheckPackedSplit` logits diagnostic on the
+  same Qwen3.6 repeat-4 setup failed forced fused-vs-forced split at
+  `NMSE = 7.774e-03`, so the remaining unsafe path is now isolated to fused
+  packed attention relative to the supported split packed implementation.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.

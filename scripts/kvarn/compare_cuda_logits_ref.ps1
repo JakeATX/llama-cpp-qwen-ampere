@@ -15,6 +15,7 @@ param(
     [switch] $PackedSerialFused,
     [switch] $PackedSplitKernels,
     [switch] $CheckPackedRepeat,
+    [switch] $CheckPackedSplit,
     [switch] $KeepArtifacts
 )
 
@@ -31,6 +32,10 @@ if ($Batch -lt 0) {
 }
 if ($DebugUbatch -lt 0) {
     throw "DebugUbatch must be non-negative"
+}
+$packedModeCount = (@($PackedFusedBatch.IsPresent, $PackedSerialFused.IsPresent, $PackedSplitKernels.IsPresent) | Where-Object { $_ }).Count
+if ($packedModeCount -gt 1) {
+    throw "PackedFusedBatch, PackedSerialFused, and PackedSplitKernels are mutually exclusive"
 }
 
 function Get-ExePath([string] $buildDir, [string] $name) {
@@ -114,9 +119,11 @@ if ($Batch -gt 0) {
 
 $packedEnv = @{}
 $scratchEnv = @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "1" }
+$splitEnv = @{ "LLAMA_KVARN_ATTN_SPLIT_KERNELS" = "1" }
 if ($DebugUbatch -gt 0) {
     $packedEnv["LLAMA_KVARN_DEBUG_UBATCH"] = [string] $DebugUbatch
     $scratchEnv["LLAMA_KVARN_DEBUG_UBATCH"] = [string] $DebugUbatch
+    $splitEnv["LLAMA_KVARN_DEBUG_UBATCH"] = [string] $DebugUbatch
 }
 if ($PackedSerialFused) {
     $packedEnv["LLAMA_KVARN_ATTN_SERIAL_FUSED"] = "1"
@@ -138,6 +145,13 @@ try {
         $repeatCheck = Invoke-Results $results ($commonArgs + @("--check")) $packedEnv
         $repeatNmse = Get-Nmse $repeatCheck "packed-repeat"
         Write-Host ("KVarN packed repeat logits: PASS, NMSE = {0:E3}" -f $repeatNmse)
+    }
+
+    if ($CheckPackedSplit) {
+        Write-Host "== Checking split-kernel packed KVarN logits"
+        $splitCheck = Invoke-Results $results ($commonArgs + @("--check")) $splitEnv
+        $splitNmse = Get-Nmse $splitCheck "packed-vs-split"
+        Write-Host ("KVarN packed-vs-split logits: PASS, NMSE = {0:E3}" -f $splitNmse)
     }
 
     Write-Host "== Checking scratch-reference KVarN logits"
