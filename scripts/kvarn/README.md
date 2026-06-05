@@ -382,11 +382,9 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
   Latest local result on 2026-06-05 passed after adding F32/F16 KQ-mask graph
   input coverage to `test-kvarn-kv`.
-  A later local rerun on 2026-06-05 passed `test-kvarn-kv` and
-  `test-kvarn-cuda-scratch-ref`; `test-kvarn-cuda-mixed-tail.exe` was blocked
-  at process launch by Windows Application Control, matching the same local
-  policy limitation seen with unsigned shared server binaries. This was an
-  environment launch failure, not a CUDA assertion failure.
+  Static CUDA focused rerun:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail|test-arg-parser" --output-on-failure`.
+  Latest local result on 2026-06-05 passed all four tests.
   The CUDA scratch-reference test now stresses the Qwen3.6 attention topology
   for 256-dimensional heads (`16` query heads, `2` KV heads) and includes a
   sink-only causal, padded-mask case matching the smallest unsafe fused-batch
