@@ -172,7 +172,9 @@ Current implemented pieces:
   The standalone CUDA test covers store/dequant, packed body attention,
   sink/body/tail mixed attention, pending tokens, batched F16 mixed attention,
   wrapped-tail decode order, padded full-attention KQ-mask strides for the
-  256-dimensional forced-fused path, multi-record scratch dequant, and packed
+  256-dimensional forced-fused path, an exact Qwen3.6-shaped 512-token active
+  window (`128` sink, `2` body records, `128` tail, `128` queries, `16` query
+  heads, `2` KV heads), multi-record scratch dequant, and packed
   mixed-attention versus scratch-dequant mixed-attention parity without linking
   the full llama runtime.
 - `tests/test-kvarn-server-load-failure.cpp` covers the server-backed loader
@@ -478,6 +480,11 @@ Verified local smoke:
   same Qwen3.6 repeat-4 setup failed forced fused-vs-forced split at
   `NMSE = 7.774e-03`, so the remaining unsafe path is now isolated to fused
   packed attention relative to the supported split packed implementation.
+  A standalone CUDA primitive test now covers the same 512-token active-window
+  topology (`128` sink + `2*128` body + `128` tail, `128` queries, `16` query
+  heads, `2` KV heads) and still passes split, forced fused, and CPU-reference
+  comparisons, so the model-level failure is above a direct primitive call and
+  remains tied to full graph/runtime integration.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.

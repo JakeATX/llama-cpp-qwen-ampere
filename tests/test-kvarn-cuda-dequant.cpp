@@ -1219,6 +1219,219 @@ static void run_case(uint32_t head_dim) {
     require(mha_mixed_fused_max_err < 1.0e-5f, "CUDA forced fused batched F16 sink/body/tail mixed attention matches CPU reference");
 
     if (head_dim == 256) {
+        const uint32_t n_q36_sink = 128;
+        const uint32_t n_q36_records = 2;
+        const uint32_t n_q36_pending = 0;
+        const uint32_t n_q36_tail = 128;
+        const uint32_t q36_tail_start = 0;
+        const uint32_t n_q36_tokens = n_q36_sink + n_q36_records*group + n_q36_pending + n_q36_tail;
+        const uint32_t q36_mask_stride_tokens = 512;
+
+        std::vector<uint16_t> q36_sink_tail_k(size_t(n_q36_sink + n_q36_tail)*n_head_kv*head_dim);
+        std::vector<uint16_t> q36_sink_tail_v(q36_sink_tail_k.size());
+        std::vector<float> q36_sink_tail_k_ref(q36_sink_tail_k.size());
+        std::vector<float> q36_sink_tail_v_ref(q36_sink_tail_v.size());
+        for (uint32_t t = 0; t < n_q36_sink + n_q36_tail; ++t) {
+            for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t off = (size_t(t)*n_head_kv + ikh)*head_dim + d;
+                    const float k = 0.095f*std::sin(float(d + 17*t + 23*ikh)*0.017f) -
+                                    0.043f*std::cos(float(3*d + 11*t + 7*ikh)*0.011f);
+                    const float v = 0.081f*std::cos(float(5*d + 19*t + 13*ikh)*0.013f) +
+                                    0.052f*std::sin(float(d + 29*t + 5*ikh)*0.019f);
+                    q36_sink_tail_k[off] = f32_to_f16_bits(k);
+                    q36_sink_tail_v[off] = f32_to_f16_bits(v);
+                    q36_sink_tail_k_ref[off] = f16_bits_to_f32(q36_sink_tail_k[off]);
+                    q36_sink_tail_v_ref[off] = f16_bits_to_f32(q36_sink_tail_v[off]);
+                }
+            }
+        }
+
+        std::vector<float> q36_queries(size_t(n_queries)*n_head*head_dim);
+        for (uint32_t iq = 0; iq < n_queries; ++iq) {
+            for (uint32_t ih = 0; ih < n_head; ++ih) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    q36_queries[(size_t(iq)*n_head + ih)*head_dim + d] =
+                        0.130f*std::sin(float(d + 7*ih + 31*iq)*0.023f) -
+                        0.075f*std::cos(float(2*d + 5*ih + 13*iq)*0.017f);
+                }
+            }
+        }
+
+        std::vector<uint16_t> q36_mask(size_t(n_queries)*q36_mask_stride_tokens, f32_to_f16_bits(-1.0e30f));
+        std::vector<float> q36_mask_ref(size_t(n_queries)*q36_mask_stride_tokens, -1.0e30f);
+        for (uint32_t iq = 0; iq < n_queries; ++iq) {
+            for (uint32_t t = 0; t < q36_mask_stride_tokens; ++t) {
+                const float bias = t <= n_q36_sink + n_q36_records*group + iq ? 0.0f : -1.0e30f;
+                const size_t off = size_t(iq)*q36_mask_stride_tokens + t;
+                q36_mask[off] = f32_to_f16_bits(bias);
+                q36_mask_ref[off] = f16_bits_to_f32(q36_mask[off]);
+            }
+        }
+
+        std::vector<float> q36_pending(size_t(n_head_kv)*head_dim, 0.0f);
+        float * q36_queries_d = cuda_upload(q36_queries);
+        uint16_t * q36_sink_tail_k_d = cuda_upload(q36_sink_tail_k);
+        uint16_t * q36_sink_tail_v_d = cuda_upload(q36_sink_tail_v);
+        float * q36_pending_d = cuda_upload(q36_pending);
+        uint16_t * q36_mask_d = cuda_upload(q36_mask);
+        float * q36_split_d = nullptr;
+        float * q36_fused_d = nullptr;
+        float * q36_scores_d = nullptr;
+        float * q36_fused_scores_d = nullptr;
+        require_cuda(cudaMalloc(&q36_split_d, q36_queries.size()*sizeof(float)), "cudaMalloc Qwen3.6-shaped split output");
+        require_cuda(cudaMalloc(&q36_fused_d, q36_queries.size()*sizeof(float)), "cudaMalloc Qwen3.6-shaped fused output");
+        require_cuda(cudaMalloc(&q36_scores_d, n_q36_tokens*sizeof(float)), "cudaMalloc Qwen3.6-shaped split scores");
+        require_cuda(cudaMalloc(&q36_fused_scores_d, n_q36_tokens*sizeof(float)), "cudaMalloc Qwen3.6-shaped fused scores");
+
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q36_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
+                q36_pending_d, q36_pending_d, q36_mask_d,
+                q36_split_d, q36_scores_d,
+                n_queries, n_head, n_head_kv,
+                n_q36_sink, n_q36_records, n_q36_pending, n_q36_tail, q36_tail_start, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(q36_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        require_cuda(cudaGetLastError(), "KVarN CUDA Qwen3.6-shaped split launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA Qwen3.6-shaped split sync");
+
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q36_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
+                q36_pending_d, q36_pending_d, q36_mask_d,
+                q36_fused_d, q36_fused_scores_d,
+                n_queries, n_head, n_head_kv,
+                n_q36_sink, n_q36_records, n_q36_pending, n_q36_tail, q36_tail_start, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(q36_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA Qwen3.6-shaped forced fused launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA Qwen3.6-shaped forced fused sync");
+
+        std::vector<float> q36_split(q36_queries.size());
+        std::vector<float> q36_fused(q36_queries.size());
+        require_cuda(cudaMemcpy(q36_split.data(), q36_split_d, q36_split.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy Qwen3.6-shaped split output");
+        require_cuda(cudaMemcpy(q36_fused.data(), q36_fused_d, q36_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy Qwen3.6-shaped fused output");
+
+        std::vector<float> q36_ref(q36_queries.size(), 0.0f);
+        for (uint32_t iq = 0; iq < n_queries; ++iq) {
+            for (uint32_t ih = 0; ih < n_head; ++ih) {
+                const uint32_t ikh = ih/(n_head/n_head_kv);
+                const float * q_row = q36_queries.data() + (size_t(iq)*n_head + ih)*head_dim;
+                std::vector<float> row_scores(n_q36_tokens, 0.0f);
+
+                for (uint32_t t = 0; t < n_q36_sink; ++t) {
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        row_scores[t] += q_row[d]*q36_sink_tail_k_ref[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                    }
+                    row_scores[t] *= scale;
+                }
+                for (uint32_t r = 0; r < n_q36_records; ++r) {
+                    const size_t rec_off = size_t(r)*n;
+                    for (uint32_t g = 0; g < group; ++g) {
+                        float s = 0.0f;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            s += q_row[d]*multi_k_ref[rec_off + d*group + g];
+                        }
+                        row_scores[size_t(n_q36_sink) + size_t(r)*group + g] = s*scale;
+                    }
+                }
+                for (uint32_t t = 0; t < n_q36_tail; ++t) {
+                    const size_t score_i = size_t(n_q36_sink) + n_q36_records*group + t;
+                    const uint32_t slot = n_q36_sink + (q36_tail_start + t)%n_q36_tail;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        row_scores[score_i] += q_row[d]*q36_sink_tail_k_ref[(size_t(slot)*n_head_kv + ikh)*head_dim + d];
+                    }
+                    row_scores[score_i] *= scale;
+                }
+                for (uint32_t t = 0; t < n_q36_tokens; ++t) {
+                    row_scores[t] += q36_mask_ref[size_t(iq)*q36_mask_stride_tokens + t];
+                }
+
+                float row_max = row_scores[0];
+                for (float s : row_scores) {
+                    row_max = std::max(row_max, s);
+                }
+                std::vector<float> row_probs(n_q36_tokens);
+                float row_denom = 0.0f;
+                for (uint32_t t = 0; t < n_q36_tokens; ++t) {
+                    row_probs[t] = std::exp(row_scores[t] - row_max);
+                    row_denom += row_probs[t];
+                }
+
+                float * out_row = q36_ref.data() + (size_t(iq)*n_head + ih)*head_dim;
+                for (uint32_t t = 0; t < n_q36_sink; ++t) {
+                    const float p = row_probs[t]/row_denom;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        out_row[d] += p*q36_sink_tail_v_ref[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                    }
+                }
+                for (uint32_t r = 0; r < n_q36_records; ++r) {
+                    const size_t rec_off = size_t(r)*n;
+                    for (uint32_t g = 0; g < group; ++g) {
+                        const float p = row_probs[size_t(n_q36_sink) + size_t(r)*group + g]/row_denom;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            out_row[d] += p*multi_v_ref[rec_off + g*head_dim + d];
+                        }
+                    }
+                }
+                for (uint32_t t = 0; t < n_q36_tail; ++t) {
+                    const size_t prob_i = size_t(n_q36_sink) + n_q36_records*group + t;
+                    const float p = row_probs[prob_i]/row_denom;
+                    const uint32_t slot = n_q36_sink + (q36_tail_start + t)%n_q36_tail;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        out_row[d] += p*q36_sink_tail_v_ref[(size_t(slot)*n_head_kv + ikh)*head_dim + d];
+                    }
+                }
+            }
+        }
+
+        float q36_split_err = 0.0f;
+        float q36_fused_err = 0.0f;
+        float q36_fused_vs_split_err = 0.0f;
+        for (size_t i = 0; i < q36_ref.size(); ++i) {
+            q36_split_err = std::max(q36_split_err, std::fabs(q36_ref[i] - q36_split[i]));
+            q36_fused_err = std::max(q36_fused_err, std::fabs(q36_ref[i] - q36_fused[i]));
+            q36_fused_vs_split_err = std::max(q36_fused_vs_split_err, std::fabs(q36_split[i] - q36_fused[i]));
+        }
+        require(q36_split_err < 1.0e-5f, "CUDA Qwen3.6-shaped split mixed attention matches CPU reference");
+        require(q36_fused_err < 1.0e-5f, "CUDA Qwen3.6-shaped forced fused mixed attention matches CPU reference");
+        require(q36_fused_vs_split_err < 1.0e-6f, "CUDA Qwen3.6-shaped forced fused mixed attention matches split output");
+
+        cudaFree(q36_queries_d);
+        cudaFree(q36_sink_tail_k_d);
+        cudaFree(q36_sink_tail_v_d);
+        cudaFree(q36_pending_d);
+        cudaFree(q36_mask_d);
+        cudaFree(q36_split_d);
+        cudaFree(q36_fused_d);
+        cudaFree(q36_scores_d);
+        cudaFree(q36_fused_scores_d);
+
         const uint32_t n_sink_only_queries = 49;
         const uint32_t n_sink_only = 49;
         const uint32_t sink_only_mask_stride_tokens = 512;
