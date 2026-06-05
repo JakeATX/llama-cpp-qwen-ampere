@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)] [string] $SupportedModel,
+    [string] $SupportedIswaModel = "",
     [string] $UnsupportedDimModel = "",
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-nofa-vs"),
     [int] $Context = 256,
@@ -181,6 +182,26 @@ try {
             @{} `
             "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads|KVarN backend supports SWA/ISWA only for Gemma 4 models at this stage" `
             "KVarN unsupported K/V dimension or non-Gemma SWA/ISWA rejection"
+    }
+
+    if ($SupportedIswaModel -ne "") {
+        $iswaArgs = @(
+            "-m", $SupportedIswaModel,
+            "-p", "hello",
+            "-o", $tmpOut,
+            "-c", [string] $Context,
+            "-ngl", [string] $GpuLayers,
+            "-fa", "off",
+            "--kv-cache-quant", "kvarn",
+            "--kvarn-preset", "kvarn_k4v2_g128"
+        )
+
+        Invoke-ExpectFailure `
+            $results `
+            $iswaArgs `
+            @{ "LLAMA_KVARN_DEBUG_UBATCH" = "bogus" } `
+            "KVarN debug ubatch override must be a positive integer" `
+            "KVarN+ISWA invalid debug ubatch rejection"
     }
 } finally {
     Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue

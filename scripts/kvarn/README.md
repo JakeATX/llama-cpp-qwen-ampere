@@ -654,7 +654,11 @@ Verified local smoke:
   `KVarN server multi-slot rejection: PASS`. The optional
   `-UnsupportedDimModel` argument is now reserved for truly unsupported head
   dimensions or non-Gemma SWA/ISWA fixtures; Gemma 4 is a supported KVarN+ISWA
-  path.
+  path. Latest KVarN+ISWA rerun with
+  `-SupportedIswaModel C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf`
+  also passed `KVarN+ISWA invalid debug ubatch rejection: PASS`, proving the
+  Gemma composite path no longer silently ignores malformed
+  `LLAMA_KVARN_DEBUG_UBATCH` values.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses

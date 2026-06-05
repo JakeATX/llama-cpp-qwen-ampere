@@ -7,6 +7,27 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
+
+static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens, bool & invalid_debug_override) {
+    invalid_debug_override = false;
+    const char * env = std::getenv("LLAMA_KVARN_DEBUG_UBATCH");
+    if (env != nullptr) {
+        char * end = nullptr;
+        errno = 0;
+        const long long value = std::strtoll(env, &end, 10);
+        if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+                value <= 0 || value > (long long) std::numeric_limits<uint32_t>::max()) {
+            invalid_debug_override = true;
+            return 0;
+        }
+        return uint32_t(value);
+    }
+
+    return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
+}
 
 llama_kv_cache_kvarn_iswa::llama_kv_cache_kvarn_iswa(
         const llama_model & model,
@@ -92,7 +113,18 @@ llama_memory_context_ptr llama_kv_cache_kvarn_iswa::init_batch(
     balloc.split_reset();
 
     std::vector<llama_ubatch> ubatches;
-    const uint32_t n_kvarn_ubatch = std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, kv_base->get_tail_tokens()));
+    bool invalid_debug_ubatch = false;
+    const uint32_t n_kvarn_ubatch = kvarn_ubatch_limit(n_ubatch, kv_base->get_tail_tokens(), invalid_debug_ubatch);
+    if (invalid_debug_ubatch) {
+        LLAMA_LOG_ERROR("%s: KVarN debug ubatch override must be a positive integer: LLAMA_KVARN_DEBUG_UBATCH=%s\n",
+                __func__, std::getenv("LLAMA_KVARN_DEBUG_UBATCH"));
+        return std::make_unique<llama_kv_cache_kvarn_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+    if (n_kvarn_ubatch > kv_base->get_tail_tokens()) {
+        LLAMA_LOG_ERROR("%s: KVarN debug ubatch override exceeds tail-ring safety limit: %u > %u\n",
+                __func__, n_kvarn_ubatch, kv_base->get_tail_tokens());
+        return std::make_unique<llama_kv_cache_kvarn_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
 
     while (true) {
         auto ubatch = balloc.split_equal(n_kvarn_ubatch, !unified);
