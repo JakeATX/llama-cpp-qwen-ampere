@@ -287,10 +287,16 @@ Verified local smoke:
   `-CheckSlotSaveRejection` to start the server with a temporary
   `--slot-save-path` and verify `/slots/0?action=save` rejects KVarN state
   serialization cleanly instead of writing an empty state.
+  The script now also rejects a smoke as invalid unless captured server logs
+  contain `llama_kv_cache_kvarn:` initialization lines, so a content response
+  alone cannot hide a normal-KV fallback.
   The static server build is used on this Windows machine because Smart App
   Control blocks the unsigned shared `llama-server-impl.dll` from
   `build-kvarn-cuda-nofa-vs` with Code Integrity error `4551`.
-  Latest local result: `KVarN server smoke: PASS, content = '.'`.
+  Latest local result with the log check enabled:
+  `KVarN server smoke: PASS, content = '.'`,
+  `KVarN server log check: PASS, KVarN layer lines = 48`, and
+  `KVarN slot save rejection: PASS`.
 - Larger context allocation/decode smoke:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs -CtxList "512 1024 2048" -RtnQuantile 0.95`.
   FP16 and KVarN smoke paths passed for all three context sizes. Reported
@@ -410,6 +416,11 @@ Verified local smoke:
   with 14 body records per KVarN layer and a `14.07 MiB` CUDA KVarN buffer.
   Gemma 4 12B server smoke passed via
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8152 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95`.
+  Latest rebuilt static-server rerun at `-c 512` with
+  `-MinKvarnLayerLogs 8` passed with content `' and'` and
+  `KVarN server log check: PASS, KVarN layer lines = 23`, proving the server
+  initialized the KVarN+ISWA composite instead of relying on the normal KV
+  cache for full-attention layers.
   Gemma 4 26B A4B short and body-record smokes passed on the local 12 GB RTX
   5070, with KVarN storage on full-attention layers `5, 11, 17, 23, 29`. The
   conservative tensor-budget report marks the Q3 file as exceeding a 10.50 GiB

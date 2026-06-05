@@ -7,6 +7,7 @@ param(
     [double] $RtnQuantile = 0.95,
     [string] $Prompt = "Hello",
     [int] $Predict = 1,
+    [int] $MinKvarnLayerLogs = 1,
     [switch] $CheckSlotSaveRejection
 )
 
@@ -17,6 +18,9 @@ if (!($RtnQuantile -gt 0.0 -and $RtnQuantile -le 1.0)) {
 }
 if ($Predict -le 0) {
     throw "Predict must be positive"
+}
+if ($MinKvarnLayerLogs -lt 0) {
+    throw "MinKvarnLayerLogs must be non-negative"
 }
 
 function Get-ExePath([string] $buildDir, [string] $name) {
@@ -148,7 +152,19 @@ try {
         throw "completion response had empty content: $($response | ConvertTo-Json -Compress)"
     }
 
+    $out = Get-Content -Raw -LiteralPath $stdoutLog -ErrorAction SilentlyContinue
+    $err = Get-Content -Raw -LiteralPath $stderrLog -ErrorAction SilentlyContinue
+    $serverLog = "$out`n$err"
+    if ($serverLog -notmatch "llama_kv_cache_kvarn:") {
+        throw "server log did not show KVarN cache initialization; refusing to accept possible normal-KV fallback`n$serverLog"
+    }
+    $kvarnLayerLogs = ([regex]::Matches($serverLog, "llama_kv_cache_kvarn: KVarN layer")).Count
+    if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
+        throw "server log showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs`n$serverLog"
+    }
+
     Write-Host ("KVarN server smoke: PASS, content = '{0}'" -f $response.content)
+    Write-Host ("KVarN server log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
 
     if ($CheckSlotSaveRejection) {
         $slotBody = @{
