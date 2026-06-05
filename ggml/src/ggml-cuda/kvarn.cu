@@ -5,6 +5,11 @@
 
 #include <cstdlib>
 
+// NVCC can vectorize shared-memory reduction loads at the end of the scratch
+// region. Keep a small pad so sanitizer-visible overreads stay inside the
+// dynamic shared allocation.
+static constexpr size_t KVARN_ATTN_SHMEM_PAD_FLOATS = 8;
+
 static __host__ __device__ size_t kvarn_packed_nbytes(size_t n_values, uint32_t bits) {
     return (n_values*bits + 7)/8;
 }
@@ -671,7 +676,7 @@ void ggml_cuda_kvarn_attn_body(
     }
     block = block > 256 ? 256 : block;
 
-    const size_t shmem = (size_t(group_size) + size_t(block))*sizeof(float);
+    const size_t shmem = (size_t(group_size) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
     kvarn_attn_scores_softmax_kernel<<<1, block, shmem, cuda_stream>>>(
             q, k_body, k_scales, scores, head_dim, group_size, key_bits, scale);
@@ -820,7 +825,7 @@ void ggml_cuda_kvarn_attn_body_n(
     }
     block = block > 256 ? 256 : block;
 
-    const size_t shmem = (size_t(n_tokens) + size_t(block))*sizeof(float);
+    const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
     kvarn_attn_scores_softmax_n_kernel<<<1, block, shmem, cuda_stream>>>(
             q, k_body, k_scales, scores, n_records, head_dim, group_size, key_bits,
@@ -986,7 +991,7 @@ void ggml_cuda_kvarn_attn_body_n_batch(
     }
     block = block > 256 ? 256 : block;
 
-    const size_t shmem = (size_t(n_tokens) + size_t(block))*sizeof(float);
+    const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
     kvarn_attn_scores_softmax_n_batch_kernel<<<n_queries, block, shmem, cuda_stream>>>(
             q, k_body, k_scales, scores, n_records, head_dim, group_size, key_bits,
@@ -1177,7 +1182,7 @@ void ggml_cuda_kvarn_attn_mixed(
     }
     block = block > 256 ? 256 : block;
 
-    const size_t shmem = (size_t(n_tokens) + size_t(block))*sizeof(float);
+    const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
     kvarn_attn_mixed_scores_softmax_kernel<<<1, block, shmem, cuda_stream>>>(
             q, sink_k, k_body, k_scales, tail_k, scores,
@@ -1341,7 +1346,7 @@ void ggml_cuda_kvarn_attn_mixed_f32_scratch(
     }
     block = block > 256 ? 256 : block;
 
-    const size_t shmem = (size_t(n_tokens) + size_t(block))*sizeof(float);
+    const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
     kvarn_attn_mixed_scratch_scores_softmax_kernel<<<1, block, shmem, cuda_stream>>>(
             q, sink_k, body_k, tail_k, scores,
@@ -1550,7 +1555,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
     }
     block = block > 256 ? 256 : block;
 
-    const size_t shmem = (size_t(n_tokens) + size_t(block))*sizeof(float);
+    const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     const int av_block = 128;
     const int av_grid = int((head_dim + av_block - 1)/av_block);
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2169,7 +2174,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     }
     block = block > 256 ? 256 : block;
 
-    const size_t shmem = (size_t(n_tokens) + size_t(block))*sizeof(float);
+    const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     const int av_block = 128;
     const int av_grid = int((head_dim + av_block - 1)/av_block);
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);

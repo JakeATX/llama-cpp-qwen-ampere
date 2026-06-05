@@ -512,6 +512,15 @@ Verified local smoke:
   `-DebugUbatch 128 -PackedFusedBatch -CheckPackedRepeat` exposed a real
   forced fused-batch divergence (`NMSE` around `1e-2` to `2.5e-2`), so the
   runtime now rejects `LLAMA_KVARN_ATTN_FUSED_BATCH=1` explicitly.
+  A minimized Qwen3.6 fused-batch run under CUDA `compute-sanitizer --tool
+  memcheck` found an invalid dynamic shared-memory read in
+  `kvarn_attn_mixed_f16_fused_batch_kernel`; padding the KVarN attention
+  shared-memory allocation fixed that sanitizer error. Latest sanitizer result
+  on the short Qwen3.6 fused-batch reproducer and on the body-record prompt
+  shape reports `ERROR SUMMARY: 0 errors`. The runtime logits guard still
+  fails for forced fused-batch Qwen3.6 at packed-repeat `NMSE = 2.443e-03`, so
+  the production guard remains in place until the remaining correctness issue
+  is fixed.
   With the unsafe diagnostic override enabled after removing an unnecessary
   scratch/probability write from the fused-batch kernel, Qwen3.6 still failed
   packed repeat at `NMSE = 1.569e-02`. Disabling graph reuse still failed at
