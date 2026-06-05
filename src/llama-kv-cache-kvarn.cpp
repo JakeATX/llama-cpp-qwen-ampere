@@ -943,6 +943,13 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_batch(
 
     std::vector<llama_ubatch> ubatches;
     const uint32_t n_kvarn_ubatch = kvarn_ubatch_limit(n_ubatch, params.tail_tokens);
+    if (n_kvarn_ubatch > params.tail_tokens) {
+        std::fprintf(stderr,
+                "%s: KVarN debug ubatch override exceeds tail-ring safety limit: %u > %u\n",
+                __func__, n_kvarn_ubatch, params.tail_tokens);
+        return std::make_unique<llama_kv_cache_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
     while (true) {
         // Keep each graph within one tail-ring span so tokens written earlier
         // in the graph are not evicted before their pending-body copy runs.

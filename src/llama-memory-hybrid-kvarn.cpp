@@ -72,6 +72,12 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
     std::vector<llama_ubatch> ubatches;
     const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 && !kvarn_debug_ubatch_is_set() ?
         1 : kvarn_ubatch_limit(n_ubatch, mem_attn->get_tail_tokens());
+    if (n_kvarn_ubatch > mem_attn->get_tail_tokens()) {
+        LLAMA_LOG_ERROR("%s: KVarN debug ubatch override exceeds tail-ring safety limit: %u > %u\n",
+                __func__, n_kvarn_ubatch, mem_attn->get_tail_tokens());
+        return std::make_unique<llama_memory_hybrid_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
     while (true) {
         auto ubatch = balloc.split_equal(n_kvarn_ubatch, true);
         if (ubatch.n_tokens == 0) {

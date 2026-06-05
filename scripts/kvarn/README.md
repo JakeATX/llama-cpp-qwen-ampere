@@ -63,7 +63,10 @@ Current implemented pieces:
   body tensors. This is a live-runtime correctness oracle for the packed mixed
   attention path.
 - Debug-only prompt-batch controls are available for bring-up:
-  `LLAMA_KVARN_DEBUG_UBATCH=<n>` overrides the bounded KVarN ubatch size.
+  `LLAMA_KVARN_DEBUG_UBATCH=<n>` overrides the bounded KVarN ubatch size only
+  within the tail-ring safety limit. Values above `tail_tokens` are rejected
+  explicitly because they can evict a tail slot before the same graph finishes
+  copying it into pending body storage.
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1` is intentionally disabled in llama.cpp
   runtime contexts because Qwen3.6 prompt-batch logits still diverge; this is
   an explicit unsupported-mode error, not a fallback to split kernels.
@@ -388,12 +391,13 @@ Verified local smoke:
   Latest local result passed on the bounded prompt-batch path with
   packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
   `NMSE = 0.000E+000`.
-- Forced fused-batch rejection check:
+- Unsupported runtime-mode rejection check:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -UnsupportedDimModel C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
-  Latest local result failed before graph execution with
+  Latest local result failed forced fused-batch initialization before graph
+  execution with
   `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`
-  and also verified Gemma 4 12B rejects with the expected unsupported K/V
-  dimension guard.
+  and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection plus Gemma
+  4 12B rejection with the expected unsupported K/V dimension guard.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses

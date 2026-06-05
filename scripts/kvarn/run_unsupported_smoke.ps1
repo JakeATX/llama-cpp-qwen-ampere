@@ -72,6 +72,13 @@ Invoke-ExpectFailure `
     "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven" `
     "KVarN forced fused-batch rejection"
 
+Invoke-ExpectFailure `
+    $results `
+    $commonKvarn `
+    @{ "LLAMA_KVARN_DEBUG_UBATCH" = "129" } `
+    "KVarN debug ubatch override exceeds tail-ring safety limit" `
+    "KVarN unsafe debug ubatch rejection"
+
 if ($UnsupportedDimModel -ne "") {
     $unsupportedArgs = @(
         "-m", $UnsupportedDimModel,
