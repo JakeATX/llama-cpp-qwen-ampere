@@ -337,6 +337,13 @@ Verified local smoke:
   Latest local result on 2026-06-05 passed. `test-kvarn-kv` now asserts 512
   memory estimates, runtime layer-view shapes, scale/body tensor sizing, and
   body-store graph op shapes, plus KVarN physical-layer reuse mapping.
+  `test-arg-parser` now asserts KVarN server auto-parallel normalization,
+  explicit `--parallel -1` normalization to one slot, explicit `--parallel 2`
+  rejection, and invalid KVarN preset/RTN-quantile rejection. Static CUDA
+  parser rerun:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-arg-parser" --output-on-failure`.
+  Latest local result passed after adding the explicit auto-parallel and
+  invalid KVarN scalar-argument regressions.
   `test-kvarn-cuda-scratch-ref` now runs 128, 256, and 512 head-dimension
   cases through the CUDA packed/scratch reference coverage.
 - CUDA KVarN coverage now includes the wrapped-tail mixed-attention runtime

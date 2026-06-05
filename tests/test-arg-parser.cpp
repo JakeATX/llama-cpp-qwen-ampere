@@ -148,12 +148,26 @@ int main(void) {
     assert(params.n_parallel == 1);
 
     params = {};
+    argv = {"binary_name", "--parallel", "-1", "--kv-cache-quant", "kvarn"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN);
+    assert(params.n_parallel == 1);
+
+    params = {};
     argv = {"binary_name", "--parallel", "2", "--kv-cache-quant", "kvarn"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
     params = {};
     argv = {"binary_name", "--kv-cache-quant", "kvarn", "--parallel", "2"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "unknown"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-rtn-quantile", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
