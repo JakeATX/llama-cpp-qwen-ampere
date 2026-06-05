@@ -536,10 +536,14 @@ Verified local smoke:
   forces the previous split score/AV kernels with
   `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`, asserting deterministic generated-text
   parity. Pass `-IncludeUnsafeFusedBatch` only for the explicitly unsafe
-  multi-block fused-batch diagnostic. Latest static 128-dim regression result
-  with `-Predict 32 -Context 256`: default attention `166.47` eval tok/s,
-  explicit serial fused `94.8` eval tok/s, split attention `82.97` eval tok/s,
-  all with `graphs reused = 31`. Historical pre-routing result: batched fused
+  multi-block fused-batch diagnostic. The harness now rejects any successful
+  completion whose output lacks `llama_kv_cache_kvarn:` initialization logs, so
+  dispatch parity cannot pass on a normal-KV fallback. Latest static 128-dim
+  regression result with `-Predict 32 -Context 256`: all three runs logged
+  `KVarN completion log check: PASS, KVarN layer lines = 56`; default
+  attention `172.69` eval tok/s, explicit serial fused `98.34` eval tok/s,
+  split attention `89.41` eval tok/s, all with `graphs reused = 31`.
+  Historical pre-routing result: batched fused
   attention `181.47` eval tok/s, serial fused attention `99.00` eval tok/s,
   split attention `79.92` eval tok/s, all with `graphs reused = 268`.
 - Runtime packed-vs-scratch logits-distance comparison:
