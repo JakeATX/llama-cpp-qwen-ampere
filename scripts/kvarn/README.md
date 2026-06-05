@@ -664,11 +664,14 @@ Verified local smoke:
   and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection, invalid
   `LLAMA_KVARN_DEBUG_UBATCH=0` positive-integer rejection, and server
   `--parallel 2` rejection. Latest static-build rerun on the Qwen2.5 1.5B
-  regression model passed all five checks:
+  regression model passed all eight checks:
   `KVarN forced fused-batch rejection: PASS`,
   `KVarN invalid scratch-reference env rejection: PASS`,
+  `KVarN out-of-range scratch-reference env rejection: PASS`,
+  `KVarN out-of-range CUDA split-kernel env rejection: PASS`,
   `KVarN unsafe debug ubatch rejection: PASS`,
-  `KVarN invalid debug ubatch rejection: PASS`, and
+  `KVarN invalid debug ubatch rejection: PASS`,
+  `KVarN no-kv-offload rejection: PASS`, and
   `KVarN server multi-slot rejection: PASS`. The optional
   `-UnsupportedDimModel` argument is now reserved for truly unsupported head
   dimensions or non-Gemma SWA/ISWA fixtures; Gemma 4 is a supported KVarN+ISWA
