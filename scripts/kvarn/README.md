@@ -871,8 +871,10 @@ Verified local smoke:
   Latest local result: `KVarN server smoke: PASS, content = ','` and
   `KVarN slot save rejection: PASS`.
 - 256-dim Qwen3.6 35B A3B MTP server smoke passed on the static CUDA build:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8146 -Context 384 -Predict 1 -Prompt "Hello" -RtnQuantile 0.95`.
-  Latest local result: `KVarN server smoke: PASS, content = ','`.
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8146 -Context 384 -Predict 1 -Prompt "Hello" -RtnQuantile 0.95 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`.
+  Latest local result passed with exact KVarN MoE layers
+  `3,7,11,15,19,23,27,31,35,39`, 20 KVarN layer log lines, and completion
+  content `","`.
 - Long-context smoke observed with `llama-cli` at `-c 4096`, `-n 768`,
   `--kv-cache-quant kvarn`, and `--kvarn-rtn-quantile 0.95`. The run
   allocated `30` KVarN body records per layer and reported generation
