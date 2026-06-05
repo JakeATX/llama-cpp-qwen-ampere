@@ -20,6 +20,7 @@ param(
     [switch] $CheckPackedSplit,
     [switch] $TraceAttn,
     [int] $TraceLimit = 4,
+    [string] $ExpectedPackedTraceMode = "",
     [switch] $KeepArtifacts
 )
 
@@ -42,6 +43,9 @@ if ($MinKvarnLayerLogs -lt 1) {
 }
 if ($TraceLimit -lt 0) {
     throw "TraceLimit must be non-negative"
+}
+if (-not [string]::IsNullOrWhiteSpace($ExpectedPackedTraceMode) -and -not $TraceAttn) {
+    throw "ExpectedPackedTraceMode requires TraceAttn so the packed CUDA mode is emitted"
 }
 $packedModeCount = (@($PackedFusedBatch.IsPresent, $PackedSerialFused.IsPresent, $PackedSplitKernels.IsPresent) | Where-Object { $_ }).Count
 if ($packedModeCount -gt 1) {
@@ -117,6 +121,25 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
         throw "$label missing expected KVarN layer ids: $($missing -join ',')"
     }
     Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
+}
+
+function Assert-ExpectedPackedTraceMode([string] $text, [string] $expected, [string] $label) {
+    if ([string]::IsNullOrWhiteSpace($expected)) {
+        return
+    }
+
+    $modes = @()
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA mixed-attn trace: mode=([^\s]+)")) {
+        $modes += $m.Groups[1].Value
+    }
+    if ($modes.Count -eq 0) {
+        throw "$label did not emit a KVarN CUDA mixed-attn trace mode"
+    }
+    if ($modes -notcontains $expected) {
+        throw "$label did not emit expected KVarN CUDA mode '$expected'; observed: $($modes -join ',')"
+    }
+
+    Write-Host ("KVarN packed trace mode check: PASS, mode = {0}" -f $expected)
 }
 
 function Invoke-Results([string] $exe, [string[]] $argv, [hashtable] $envSet) {
@@ -225,6 +248,7 @@ Add-TraceEnv $splitEnv
 try {
     Write-Host "== Saving packed KVarN logits"
     $packedText = Invoke-Results $results $commonArgs $packedEnv
+    Assert-ExpectedPackedTraceMode $packedText $ExpectedPackedTraceMode "packed KVarN logits"
     if ($TraceAttn) {
         Write-Host $packedText
     }

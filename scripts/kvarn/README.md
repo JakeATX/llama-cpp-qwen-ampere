@@ -876,7 +876,11 @@ decode implementation: graph reuse must not change deterministic KVarN output,
 and optimization work should continue to use it as a fast regression check.
 `compare_cuda_scratch_ref.ps1` is a stronger live-runtime generated-text guard
 for the current packed attention op, and `compare_cuda_logits_ref.ps1` adds the
-corresponding logits-distance guard.
+corresponding logits-distance guard. For traced dispatcher checks,
+`compare_cuda_logits_ref.ps1 -TraceAttn -ExpectedPackedTraceMode <mode>` now
+also fails if the packed CUDA path does not emit the expected mode, such as
+`fused-batch` for the default validated 128/256-dimensional path or
+`split-512-default` for the current Gemma 4 512-dimensional path.
 
 For `llama-cli` smoke runs, use `--single-turn`; default conversation mode can
 stay interactive after generation and causes external harnesses to terminate it
