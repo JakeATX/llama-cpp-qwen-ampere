@@ -70,6 +70,26 @@ function Invoke-Results([string] $exe, [string[]] $argv, [hashtable] $envSet) {
     return $text
 }
 
+function Get-Nmse([string] $text, [string] $label) {
+    $match = [regex]::Match($text, "NMSE=([0-9.eE+-]+|nan|inf|-inf)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) {
+        throw "Could not find $label NMSE in llama-results output"
+    }
+
+    $value = $match.Groups[1].Value
+    if ($value -ieq "nan") {
+        return [double]::NaN
+    }
+    if ($value -ieq "inf") {
+        return [double]::PositiveInfinity
+    }
+    if ($value -ieq "-inf") {
+        return [double]::NegativeInfinity
+    }
+
+    return [double]::Parse($value, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
 $results = Get-ExePath $BuildDir "llama-results.exe"
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 
@@ -114,21 +134,13 @@ try {
     if ($CheckPackedRepeat) {
         Write-Host "== Checking packed KVarN repeat determinism"
         $repeatCheck = Invoke-Results $results ($commonArgs + @("--check")) $packedEnv
-        $repeatMatch = [regex]::Match($repeatCheck, "NMSE=([0-9.eE+-]+)")
-        if (-not $repeatMatch.Success) {
-            throw "Could not find packed-repeat NMSE in llama-results output"
-        }
-        $repeatNmse = [double]::Parse($repeatMatch.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        $repeatNmse = Get-Nmse $repeatCheck "packed-repeat"
         Write-Host ("KVarN packed repeat logits: PASS, NMSE = {0:E3}" -f $repeatNmse)
     }
 
     Write-Host "== Checking scratch-reference KVarN logits"
     $check = Invoke-Results $results ($commonArgs + @("--check")) $scratchEnv
-    $m = [regex]::Match($check, "NMSE=([0-9.eE+-]+)")
-    if (-not $m.Success) {
-        throw "Could not find NMSE in llama-results output"
-    }
-    $nmse = [double]::Parse($m.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    $nmse = Get-Nmse $check "packed-vs-scratch"
     Write-Host ("KVarN packed-vs-scratch logits: PASS, NMSE = {0:E3}" -f $nmse)
 } finally {
     if (-not $KeepArtifacts) {

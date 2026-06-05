@@ -34,12 +34,6 @@ static void test_layout() {
     require(layout256.v_scale_floats == 512, "256-dim V scale float count");
     require(layout256.total_record_bytes == 29184, "256-dim total record bytes");
 
-    llama_kvarn_layout layout512 = llama_kvarn_make_layout(params, 512);
-    require(layout512.k_body_bytes == 32768, "512-dim K body bytes");
-    require(layout512.v_body_bytes == 16384, "512-dim V body bytes");
-    require(layout512.k_scale_floats == 1152, "512-dim K scale float count");
-    require(layout512.v_scale_floats == 768, "512-dim V scale float count");
-    require(layout512.total_record_bytes == 56832, "512-dim total record bytes");
 }
 
 static void test_pack_roundtrip() {
@@ -83,7 +77,7 @@ static void test_reference_store_dequant() {
     llama_kvarn_params params = llama_kvarn_default_params();
     params.sinkhorn_iters = 4;
 
-    for (const uint32_t head_dim : { 128u, 256u, 512u }) {
+    for (const uint32_t head_dim : { 128u, 256u }) {
     const uint32_t group = params.group_size;
     const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
     std::vector<float> k_tile(size_t(head_dim)*group);
@@ -250,12 +244,6 @@ static void test_memory_estimate() {
     require(est256.scale_bytes == 73728, "256-dim KVarN scale estimate");
     require(est256.total_bytes == 2564096, "256-dim KVarN total estimate");
 
-    llama_hparams hparams512 = make_test_hparams(512);
-    const llama_kvarn_memory_estimate est512 = llama_kvarn_estimate_memory(params, hparams512, 512);
-    require(est512.fp16_sink_tail_bytes == 4194304, "512-dim KVarN sink/tail estimate");
-    require(est512.body_packed_bytes == 786432, "512-dim KVarN body estimate");
-    require(est512.scale_bytes == 122880, "512-dim KVarN scale estimate");
-    require(est512.total_bytes == 5103616, "512-dim KVarN total estimate");
 }
 
 static void test_runtime_metadata() {
@@ -331,16 +319,6 @@ static void test_runtime_metadata() {
     require(view256.scales_v->ne[0] == 512, "256-dim KVarN layer view scale V shape");
     require(cache256.body_store_scratch_floats(0) == 256*128 + 2*256, "256-dim KVarN body store scratch floats");
 
-    llama_hparams hparams512 = make_test_hparams(512);
-    llama_kv_cache_kvarn cache512(nullptr, hparams512, params, false, 16, 4, 1, nullptr);
-    const llama_kvarn_layer_view view512 = cache512.get_layer_view(0);
-    require(view512.head_dim_k == 512, "512-dim KVarN layer view K head dim");
-    require(view512.head_dim_v == 512, "512-dim KVarN layer view V head dim");
-    require(view512.layout_k.k_body_bytes == 32768, "512-dim KVarN layer view K body bytes");
-    require(view512.layout_v.v_body_bytes == 16384, "512-dim KVarN layer view V body bytes");
-    require(view512.scales_k->ne[0] == 1152, "512-dim KVarN layer view scale K shape");
-    require(view512.scales_v->ne[0] == 768, "512-dim KVarN layer view scale V shape");
-    require(cache512.body_store_scratch_floats(0) == 512*128 + 2*512, "512-dim KVarN body store scratch floats");
 }
 
 static void test_runtime_storage_sealing() {
@@ -695,7 +673,7 @@ static void test_kvarn_store_body_ggml_ops() {
     };
     ggml_context_ptr ctx { ggml_init(init_params) };
 
-    for (const int32_t head_dim : { 128, 256, 512 }) {
+    for (const int32_t head_dim : { 128, 256 }) {
     llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
 
     ggml_tensor * k_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, params.group_size, head_dim);

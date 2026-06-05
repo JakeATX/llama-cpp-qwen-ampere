@@ -37,7 +37,7 @@ foreach ($ctx in $CtxList.Split(" ", [System.StringSplitOptions]::RemoveEmptyEnt
     if ($kvarnExit -eq 0) {
         continue
     }
-    if (($kvarnOutput -join "`n") -notmatch "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads|KVarN backend does not support MLA models yet|KVarN backend does not support SWA/ISWA models yet|KVarN backend currently requires every KV layer to run on a backend with CUDA KVarN op support|KVarN graph backend does not yet support attention rotations|KVarN graph backend active body record count exceeds allocated cache capacity|KVarN graph backend is not wired yet|KVarN shift/update graph path is not wired yet") {
+    if (($kvarnOutput -join "`n") -notmatch "KVarN backend currently supports only 128- or 256-dimensional K/V heads|KVarN backend does not support MLA models yet|KVarN backend does not support SWA/ISWA models yet|KVarN backend currently requires every KV layer to run on a backend with CUDA KVarN op support|KVarN graph backend does not yet support attention rotations|KVarN graph backend active body record count exceeds allocated cache capacity|KVarN graph backend is not wired yet|KVarN shift/update graph path is not wired yet") {
         throw "KVarN failure did not include the expected validation or graph-backend guard"
     }
 }

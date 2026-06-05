@@ -9,12 +9,12 @@ Current implemented pieces:
 - Public API and common CLI flags for `--kv-cache-quant none|kvarn`.
 - `kvarn_k4v2_g128` preset defaults: group 128, 4-bit K, 2-bit V, 128 sink
   tokens, 128 tail tokens, 16 Sinkhorn iterations.
-- Runtime K/V head dimensions of 128, 256, and 512 are supported by
-  validation, layout tests, and CUDA parity tests. Local `llama-cli` smokes
-  currently cover 128- and 256-dimensional K/V heads. 256 remains the primary
-  Qwen acceptance path; 512 is included because the local Gemma 4 12B files
-  report 512-dimensional K/V heads, but Gemma4 uses SWA/ISWA cache routing and
-  is explicitly rejected until KVarN has an ISWA cache implementation.
+- Runtime K/V head dimensions of 128 and 256 are supported by validation,
+  layout tests, and CUDA parity tests. Local `llama-cli` smokes currently cover
+  128- and 256-dimensional K/V heads. 256 remains the primary Qwen acceptance
+  path. The local Gemma 4 12B files report 512-dimensional K/V heads and
+  SWA/ISWA cache routing, so they are explicitly rejected until KVarN has a
+  production ISWA cache implementation and a 512-dimensional support decision.
 - CPU reference layout, Hadamard rotation, Sinkhorn-style balancing,
   asymmetric RTN, bit packing, body-record dequant, and a sink/body/tail
   reference cache.
@@ -117,20 +117,20 @@ Current implemented pieces:
   FP32 pending-body tensors, a scratch score buffer, and an optional KQ/causal
   mask in `src[10]`. CUDA dispatch passes F32/F16 masks through to the batched
   F16 sink/body/pending/tail wrapper. The llama graph now builds and fills the
-  KQ mask for KVarN graph inputs. Production runtime preparation bounds non-MoE
-  prompt chunks to one tail-ring span while prompt batching is being brought up. The
+  KQ mask for KVarN graph inputs. Production runtime preparation bounds prompt
+  chunks to one tail-ring span while prompt batching is being brought up. The
   graph computes active sink/body/pending/tail counts and the wrapped-tail start
   slot for each ubatch from the last token position. Context reserve graphs may
   be built for larger synthetic ubatches.
 - Graph construction writes FP16 sink/tail, stages evicted FP16 tail rows into
   FP32 pending body slots, emits packed K/V body-store nodes when a graph
   completes one body record, and uses KVarN mixed attention for decode and
-  bounded non-MoE prompt batches. It still refuses graph reuse across graphs
+  bounded prompt batches. It still refuses graph reuse across graphs
   that include body-store ops or shape changes.
 - When `LLAMA_KVARN_ATTN_REF_SCRATCH=1` is set during graph construction,
   `kvarn_attn_scores` is sized for score probabilities plus K/V body scratch
-  for every allocated body record in the current layer. Graph reuse validates
-  this larger workspace before reusing scratch-reference graphs.
+  for active body records in the current layer. Graph reuse validates this
+  workspace before reusing scratch-reference graphs.
 - KVarN reserve graphs are built with a synthetic single-token ubatch at the
   end of the cache, rather than position zero. This makes reserve-time compute
   buffers include the worst-case body-record scratch required by
@@ -177,10 +177,11 @@ Verified local smoke:
 - Compatible model downloaded with
   `hf download Qwen/Qwen2.5-1.5B-Instruct-GGUF qwen2.5-1.5b-instruct-q4_k_m.gguf --local-dir C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF`.
 - Reproducible local model metadata discovery:
-  `python scripts\kvarn\discover_models.py C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`.
-  Latest local result reports Gemma4 as 512-dimensional K/V plus
-  `swa/iswa-likely`, Qwen3.5 0.8B as `primary-256,hybrid-ssm`, and Qwen3.6
-  35B A3B MTP IQ3 as `primary-256,hybrid-ssm,moe`.
+  `python scripts\kvarn\discover_models.py C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`.
+  Latest local result reports both Gemma4 12B files as unsupported
+  512-dimensional K/V plus `swa/iswa-likely`, Qwen2.5 1.5B as
+  `regression-128,dim-inferred`, Qwen3.5 0.8B as `primary-256,hybrid-ssm`,
+  and Qwen3.6 35B A3B MTP IQ3 as `primary-256,hybrid-ssm,moe`.
 - CUDA FA-off build:
   `cmake -S . -B build-kvarn-cuda-nofa-vs -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF -DGGML_CUDA_NCCL=OFF -DCMAKE_CUDA_ARCHITECTURES=120a-real`.
 - Short KVarN smoke:
@@ -255,6 +256,9 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-cuda" --output-on-failure`.
   Latest local result: `test-kvarn-cuda-scratch-ref` and
   `test-kvarn-cuda-mixed-tail` passed.
+  Focused CUDA and layout coverage also passed after tightening production
+  support to 128- and 256-dimensional K/V heads only:
+  `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
 - 256-dim hybrid Qwen3.5 smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with KVarN allocated on full-attention layers
@@ -275,14 +279,16 @@ Verified local smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "<300 hello tokens>" -n 1 -c 384 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with two KVarN body records per full-attention
   layer and an `11.11 MiB` CUDA KVarN buffer.
-- Gemma 4 12B dense metadata discovered locally:
+- Gemma 4 12B metadata discovered locally:
   `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf` and
   `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf` are `gemma4`,
   48 layers, context `131072`, 16 attention heads, no SSM keys, and K/V head
   length `512`. They are not 256-dimensional despite the original target
-  assumption. KVarN now rejects these files cleanly with
-  `KVarN backend does not support SWA/ISWA models yet`; earlier builds could
-  reach an invalid ISWA graph cast and crash with `0xC0000005`.
+  assumption, and they also use SWA/ISWA cache routing. KVarN rejects these
+  files cleanly before graph construction with
+  `KVarN backend currently supports only 128- or 256-dimensional K/V heads`;
+  earlier builds could reach an invalid ISWA graph cast and crash with
+  `0xC0000005`.
 - Fresh `tg64` benchmark gates on the CUDA FA-off build:
   Qwen2.5 1.5B 128-dim normal KV `202.46` tok/s, KVarN `160.37` tok/s;
   Qwen3.5 0.8B 256-dim hybrid normal KV `360.12` tok/s, KVarN
@@ -330,10 +336,15 @@ Verified local smoke:
   This saves logits from the packed KVarN path with `llama-results`, reruns
   the same prompt with `LLAMA_KVARN_ATTN_REF_SCRATCH=1 --check`, and requires
   llama.cpp's logits NMSE threshold to pass. Latest local result:
-  `KVarN packed-vs-scratch logits: PASS, NMSE = 0.000E+000`.
+  `KVarN packed-vs-scratch logits: PASS, NMSE = 0.000E+000`. The
+  `-CheckPackedRepeat` diagnostic also passed with packed-repeat
+  `NMSE = 0.000E+000`. The harness now parses `NaN`/infinity NMSE values
+  explicitly so debug-only forced fused paths can be reported without script
+  parser failures.
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512`.
   Latest local result passed on the bounded prompt-batch path with
+  packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
   `NMSE = 0.000E+000`.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
@@ -370,10 +381,11 @@ Required integration path:
 
 1. Finish optimization of KVarN prompt batches. `GGML_OP_KVARN_ATTN_MIXED`
    carries an optional KQ/causal mask in `src[10]`, and runtime preparation now
-   admits bounded prompt ubatches for non-MoE models. Correctness is currently
-   maintained by using split score/AV CUDA kernels for `n_queries > 1`; the
-   fused multi-query packed-attention kernels and MoE prompt-batch path still
-   need to be fixed before they can be enabled for all prompt batches.
+   admits bounded prompt ubatches for dense, hybrid, and MoE models.
+   Correctness is currently maintained by using split score/AV CUDA kernels for
+   `n_queries > 1`; the fused multi-query packed-attention path still needs
+   broader evidence before it can replace the split path for all prompt
+   batches.
 2. Finish prompt-batch sealing semantics. The graph builder now collects all
    seal records in an ubatch and emits store ops for each record, and the body
    plan has multi-record seal coverage. Bounded production prompt ubatches now
@@ -424,6 +436,6 @@ with `STATUS_CONTROL_C_EXIT`.
 
 Local smoke models may fail KVarN initialization before graph construction if
 they do not match the production constraints. Expected guarded failures include
-K/V head dimensions other than 128, 256, or 512, MLA, SWA/ISWA, unsupported
-backend placement, attention rotations/KQ bias/sinks, and other explicit
-KVarN graph-backend guards.
+K/V head dimensions other than 128 or 256, MLA, SWA/ISWA, unsupported backend
+placement, attention rotations/KQ bias/sinks, and other explicit KVarN
+graph-backend guards.
