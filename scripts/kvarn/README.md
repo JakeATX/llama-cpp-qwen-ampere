@@ -498,7 +498,7 @@ Verified local smoke:
   blocked by Smart App Control / Device Guard (`CodeIntegrity` event 3077:
   `ggml-base.dll` did not meet Enterprise signing requirements), so traced
   model diagnostics used a separate static CUDA build:
-  `cmake -S . -B build-kvarn-cuda-static-vs -G "Visual Studio 17 2022" -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_CCACHE=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=ON`.
+  `cmake -S . -B build-kvarn-cuda-static-vs -G "Visual Studio 17 2022" -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_CCACHE=OFF -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON`.
   Static llama builds must compile the `llama` target with `LLAMA_BUILD`;
   otherwise KVarN runtime storage falls back to CPU buffers and body-store
   graph execution can fail with
@@ -556,6 +556,9 @@ Verified local smoke:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8135 -CheckSlotSaveRejection`.
   Latest local result: `KVarN server smoke: PASS, content = ','` and
   `KVarN slot save rejection: PASS`.
+- 256-dim Qwen3.6 35B A3B MTP server smoke passed on the static CUDA build:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8146 -Context 384 -Predict 1 -Prompt "Hello" -RtnQuantile 0.95`.
+  Latest local result: `KVarN server smoke: PASS, content = ','`.
 - Long-context smoke observed with `llama-cli` at `-c 4096`, `-n 768`,
   `--kv-cache-quant kvarn`, and `--kvarn-rtn-quantile 0.95`. The run
   allocated `30` KVarN body records per layer and reported generation
