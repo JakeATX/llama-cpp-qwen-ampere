@@ -2954,10 +2954,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     const bool forced_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
                     const bool forced_split = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
                     const bool forced_serial = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
-                    const bool serial_runtime = forced_serial || (dst->ne[2] > 1 && !forced_fused_batch && !forced_split);
                     const bool split_runtime = use_scratch_ref || forced_split;
+                    const bool serial_runtime = !split_runtime && forced_serial;
                     const char * mode = use_scratch_ref ? "scratch-ref" :
-                        (split_runtime ? "split" : (serial_runtime ? "serial-fused" : "fused-batch"));
+                        (split_runtime ? "split" : (serial_runtime ? "serial-fused" :
+                            (forced_fused_batch ? "fused-batch-forced" : "fused-batch")));
 
                     std::fprintf(stderr,
                             "KVarN CUDA mixed-attn trace: mode=%s n_queries=%" PRId64 " n_head=%" PRId64

@@ -9,6 +9,7 @@ param(
     [string] $Prompt = "Hello",
     [int] $MinKvarnLayerLogs = 1,
     [string] $ExpectedKvarnLayers = "",
+    [switch] $IncludeForcedFusedBatch,
     [switch] $IncludeUnsafeFusedBatch
 )
 
@@ -223,25 +224,24 @@ if ($defaultText -ne $serialText -or $defaultText -ne $splitText) {
     throw "KVarN packed mixed attention dispatch mode changed deterministic generated text"
 }
 
-if ($IncludeUnsafeFusedBatch) {
-    Write-Host "== KVarN unsafe multi-block fused-batch packed attention"
-    $unsafe = Invoke-Completion $completion $args @{
+if ($IncludeForcedFusedBatch -or $IncludeUnsafeFusedBatch) {
+    Write-Host "== KVarN forced multi-block fused-batch packed attention"
+    $forced = Invoke-Completion $completion $args @{
         "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1"
-        "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH" = "1"
     }
-    $unsafeText = Get-GeneratedText $unsafe
-    $unsafeGraphs = Get-GraphsReused $unsafe
-    $unsafeTps = Get-EvalTokensPerSecond $unsafe
+    $forcedText = Get-GeneratedText $forced
+    $forcedGraphs = Get-GraphsReused $forced
+    $forcedTps = Get-EvalTokensPerSecond $forced
 
-    if ($defaultText -ne $unsafeText) {
+    if ($defaultText -ne $forcedText) {
         Write-Host "== default generated text =="
         Write-Host $defaultText
-        Write-Host "== unsafe fused-batch generated text =="
-        Write-Host $unsafeText
-        throw "KVarN unsafe fused-batch attention changed deterministic generated text"
+        Write-Host "== forced fused-batch generated text =="
+        Write-Host $forcedText
+        throw "KVarN forced fused-batch attention changed deterministic generated text"
     }
 
-    Write-Host ("KVarN unsafe fused-batch attention: graphs reused = {0}, eval tok/s = {1}" -f $unsafeGraphs, $unsafeTps)
+    Write-Host ("KVarN forced fused-batch attention: graphs reused = {0}, eval tok/s = {1}" -f $forcedGraphs, $forcedTps)
 }
 
 Write-Host "KVarN packed attention dispatch parity: PASS"

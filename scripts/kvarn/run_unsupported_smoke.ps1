@@ -123,13 +123,6 @@ try {
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
-        @{ "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1" } `
-        "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven" `
-        "KVarN forced fused-batch rejection"
-
-    Invoke-ExpectFailure `
-        $results `
-        $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_FUSED_BATCH" = "bogus" } `
         "invalid KVarN environment flag LLAMA_KVARN_ATTN_FUSED_BATCH=bogus" `
         "KVarN invalid fused-batch env rejection"

@@ -753,10 +753,6 @@ static bool kvarn_graph_use_attn_scratch_ref() {
     return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
 }
 
-static bool kvarn_graph_use_attn_fused_batch() {
-    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
-}
-
 static int64_t kvarn_graph_attn_scratch_floats(
         const kvarn_active_window & window,
         int64_t n_head_kv,
@@ -793,10 +789,6 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
     this->mctx_kvarn = mctx;
 
     if (has_body_store_ops) {
-        return false;
-    }
-
-    if (kvarn_graph_use_attn_fused_batch()) {
         return false;
     }
 
@@ -950,10 +942,6 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         if (base_has_body_store_ops) {
             return false;
         }
-        if (kvarn_graph_use_attn_fused_batch()) {
-            return false;
-        }
-
         const kvarn_active_window window = kvarn_graph_active_window(params.cparams.kvarn, params.ubatch, base_ctx->get_size());
         if (!window.valid) {
             return false;

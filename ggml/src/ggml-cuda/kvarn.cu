@@ -2179,10 +2179,10 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         void * stream) {
     const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
     const uint32_t n_gqa = n_head/n_head_kv;
-    const bool allow_fused_batch = kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
+    (void) kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
     const bool force_serial_fused = kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
     const bool use_split_kernels = kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
-    const bool use_serial_fused = force_serial_fused || (n_queries > 1 && !allow_fused_batch && !use_split_kernels);
+    const bool use_serial_fused = force_serial_fused && !use_split_kernels;
 
     int block = 1;
     while (block < int(n_tokens)) {
