@@ -8,6 +8,7 @@ param(
     [string] $KvarnPreset = "kvarn_k4v2_g128",
     [double] $RtnQuantile = 0.95,
     [int] $Repetitions = 1,
+    [int] $MinKvarnLayerLogs = 1,
     [ValidateSet("csv", "json", "jsonl", "md", "sql")] [string] $OutputFormat = "md",
     [string] $OutputDir = "",
     [switch] $Warmup,
@@ -24,6 +25,9 @@ if ($Repetitions -le 0) {
 }
 if ($GpuLayers -lt 0) {
     throw "GpuLayers must be non-negative"
+}
+if ($MinKvarnLayerLogs -lt 1) {
+    throw "MinKvarnLayerLogs must be positive"
 }
 if (-not (Test-Path -LiteralPath $Model)) {
     throw "Model not found at $Model"
@@ -97,6 +101,7 @@ $manifest = @(
     "kvarn_preset=$KvarnPreset",
     "kvarn_rtn_quantile=$rtnQuantileArg",
     "repetitions=$Repetitions",
+    "min_kvarn_layer_logs=$MinKvarnLayerLogs",
     "output_format=$OutputFormat",
     "warmup=$($Warmup.IsPresent)",
     "extra_args=$($ExtraArgs -join ' ')"
@@ -158,8 +163,8 @@ foreach ($case in (Get-BenchCases $CaseList)) {
             throw "llama-bench case '$($case.Name)' succeeded but logs did not show KVarN cache initialization; see $logPath"
         }
         $kvarnLayerLogs = ([regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer")).Count
-        if ($kvarnLayerLogs -lt 1) {
-            throw "llama-bench case '$($case.Name)' succeeded but did not show any KVarN layer allocation lines; see $logPath"
+        if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
+            throw "llama-bench case '$($case.Name)' succeeded but showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs; see $logPath"
         }
         if ($text -notmatch "(?i)\bkvarn\b") {
             throw "llama-bench case '$($case.Name)' output did not include a KVarN benchmark row; see $logPath"
