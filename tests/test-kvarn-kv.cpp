@@ -35,6 +35,12 @@ static void test_layout() {
     require(layout256.v_scale_floats == 512, "256-dim V scale float count");
     require(layout256.total_record_bytes == 29184, "256-dim total record bytes");
 
+    llama_kvarn_layout layout512 = llama_kvarn_make_layout(params, 512);
+    require(layout512.k_body_bytes == 32768, "512-dim K body bytes");
+    require(layout512.v_body_bytes == 16384, "512-dim V body bytes");
+    require(layout512.k_scale_floats == 1152, "512-dim K scale float count");
+    require(layout512.v_scale_floats == 768, "512-dim V scale float count");
+    require(layout512.total_record_bytes == 56832, "512-dim total record bytes");
 }
 
 static void test_pack_roundtrip() {
@@ -78,7 +84,7 @@ static void test_reference_store_dequant() {
     llama_kvarn_params params = llama_kvarn_default_params();
     params.sinkhorn_iters = 4;
 
-    for (const uint32_t head_dim : { 128u, 256u }) {
+    for (const uint32_t head_dim : { 128u, 256u, 512u }) {
     const uint32_t group = params.group_size;
     const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
     std::vector<float> k_tile(size_t(head_dim)*group);

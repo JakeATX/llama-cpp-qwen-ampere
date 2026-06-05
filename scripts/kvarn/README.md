@@ -336,7 +336,9 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure`.
   Latest local result on 2026-06-05 passed. `test-kvarn-kv` now asserts 512
   memory estimates, runtime layer-view shapes, scale/body tensor sizing, and
-  body-store graph op shapes, plus KVarN physical-layer reuse mapping.
+  body-store graph op shapes, plus KVarN physical-layer reuse mapping. It also
+  covers 512-dimensional record layout totals and CPU reference
+  store/dequant, so the 512 path is not only covered through memory metadata.
   `test-arg-parser` now asserts KVarN server auto-parallel normalization,
   explicit `--parallel -1` normalization to one slot, explicit `--parallel 2`
   rejection, and invalid KVarN preset/RTN-quantile rejection. Static CUDA
@@ -344,6 +346,14 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-arg-parser" --output-on-failure`.
   Latest local result passed after adding the explicit auto-parallel and
   invalid KVarN scalar-argument regressions.
+  Static CUDA layout/reference rerun:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv" --output-on-failure`.
+  Latest local result passed after adding the 512-dimensional layout
+  total-record-byte and CPU reference store/dequant regressions. Matching
+  script check `python scripts\kvarn\kv_memory_estimate.py --self-test` passed;
+  `python scripts\kvarn\kv_memory_estimate.py --layers 8 --kv-heads 1 --head-dim 512 --ctx 512`
+  reports KVarN total `5103616` bytes (`4.87 MiB`) and `2` body records per
+  layer/head, matching the Gemma 4 12B runtime smoke geometry.
   `test-kvarn-cuda-scratch-ref` now runs 128, 256, and 512 head-dimension
   cases through the CUDA packed/scratch reference coverage.
 - CUDA KVarN coverage now includes the wrapped-tail mixed-attention runtime
