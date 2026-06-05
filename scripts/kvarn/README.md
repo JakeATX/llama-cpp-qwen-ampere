@@ -534,6 +534,14 @@ Verified local smoke:
   same command measured `592.08` pp t/s and `154.04` tg t/s with KVarN storage
   on `CUDA0`. The production routing uses serial fused only for multi-query
   prompt batches, preserving the existing single-query fused generation path.
+  Static normal-vs-KVarN 256-dim benchmark on Qwen3.5 0.8B with active body
+  records:
+  `build-kvarn-cuda-static-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p 512 -n 128 -r 1 -ngl 99 -fa off --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
+  Latest local result: normal KV `pp512 = 4023.35` tok/s and
+  `tg128 = 437.93` tok/s; KVarN `pp512 = 77.03` tok/s and
+  `tg128 = 137.07` tok/s. The KVarN run allocated `2` body records per KVarN
+  layer on `CUDA0`, with reported KVarN buffer size `6.67 MiB` and metadata
+  estimate `3.67 MiB`.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.
