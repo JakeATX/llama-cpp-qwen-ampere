@@ -45,7 +45,39 @@ def first_value(reader: GGUFReader, keys: list[str]) -> Any:
     return None
 
 
-def metadata_for(path: Path) -> dict[str, str]:
+def tensor_name(tensor: Any) -> str:
+    name = getattr(tensor, "name", "")
+    if isinstance(name, bytes):
+        return name.decode("utf-8", errors="replace")
+    return str(name)
+
+
+def tensor_nbytes(tensor: Any) -> int:
+    value = getattr(tensor, "n_bytes", None)
+    if value is not None:
+        return int(value)
+    data = getattr(tensor, "data", None)
+    if data is not None and hasattr(data, "nbytes"):
+        return int(data.nbytes)
+    return 0
+
+
+def is_expert_tensor(name: str) -> bool:
+    lower = name.lower()
+    return "_exps" in lower or ".experts" in lower or "expert" in lower
+
+
+def gib(nbytes: int | float) -> float:
+    return float(nbytes) / float(1024 ** 3)
+
+
+def fmt_gib(value: float | None) -> str:
+    if value is None:
+        return ""
+    return f"{value:.2f}"
+
+
+def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float) -> dict[str, str]:
     reader = GGUFReader(path)
     arch = scalar(field_value(reader, "general.architecture"))
     prefix = arch if arch else "<unknown>"
@@ -141,9 +173,36 @@ def metadata_for(path: Path) -> dict[str, str]:
     if expert_count not in (None, 0, "0"):
         notes.append("moe")
 
+    tensor_total = 0
+    tensor_expert = 0
+    for tensor in reader.tensors:
+        nbytes = tensor_nbytes(tensor)
+        tensor_total += nbytes
+        if is_expert_tensor(tensor_name(tensor)):
+            tensor_expert += nbytes
+
+    tensor_total_gib = gib(tensor_total)
+    tensor_expert_gib = gib(tensor_expert)
+    nonexpert_gib = tensor_total_gib - tensor_expert_gib
+    expert_pct = (100.0 * tensor_expert_gib / tensor_total_gib) if tensor_total_gib > 0.0 else 0.0
+    usable_vram_gib: float | None = None
+    full_offload_fit = ""
+    vram_margin_gib: float | None = None
+    if gpu_vram_gib is not None:
+        usable_vram_gib = max(0.0, gpu_vram_gib - vram_reserve_gib)
+        vram_margin_gib = usable_vram_gib - tensor_total_gib
+        full_offload_fit = "yes" if vram_margin_gib >= 0.0 else "no"
+
     return {
         "path": str(path),
         "size_gib": f"{path.stat().st_size / (1024 ** 3):.2f}",
+        "tensor_gib": fmt_gib(tensor_total_gib),
+        "nonexpert_gib": fmt_gib(nonexpert_gib),
+        "expert_gib": fmt_gib(tensor_expert_gib),
+        "expert_pct": f"{expert_pct:.1f}",
+        "usable_vram_gib": fmt_gib(usable_vram_gib),
+        "full_offload_fit": full_offload_fit,
+        "vram_margin_gib": fmt_gib(vram_margin_gib),
         "arch": arch,
         "layers": scalar(first_value(reader, [f"{prefix}.block_count", "general.block_count"])),
         "ctx": scalar(first_value(reader, [f"{prefix}.context_length", "general.context_length"])),
@@ -183,6 +242,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Summarize local GGUF metadata relevant to KVarN validation.")
     parser.add_argument("paths", nargs="+", type=Path, help="GGUF files or directories to scan")
     parser.add_argument("--contains", default="", help="case-insensitive substring filter for path")
+    parser.add_argument("--gpu-vram-gib", type=float, default=None, help="GPU VRAM budget in GiB for full-offload fit checks")
+    parser.add_argument("--vram-reserve-gib", type=float, default=1.5, help="VRAM reserve in GiB subtracted from --gpu-vram-gib")
     args = parser.parse_args()
 
     models = iter_models(args.paths)
@@ -193,11 +254,18 @@ def main() -> int:
     rows: list[dict[str, str]] = []
     for path in models:
         try:
-            rows.append(metadata_for(path))
+            rows.append(metadata_for(path, args.gpu_vram_gib, args.vram_reserve_gib))
         except Exception as exc:  # noqa: BLE001
             rows.append({
                 "path": str(path),
                 "size_gib": "",
+                "tensor_gib": "",
+                "nonexpert_gib": "",
+                "expert_gib": "",
+                "expert_pct": "",
+                "usable_vram_gib": "",
+                "full_offload_fit": "",
+                "vram_margin_gib": "",
                 "arch": "",
                 "layers": "",
                 "ctx": "",
@@ -219,6 +287,13 @@ def main() -> int:
 
     print_table(rows, [
         "size_gib",
+        "tensor_gib",
+        "nonexpert_gib",
+        "expert_gib",
+        "expert_pct",
+        "usable_vram_gib",
+        "full_offload_fit",
+        "vram_margin_gib",
         "arch",
         "layers",
         "ctx",
