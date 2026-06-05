@@ -10,6 +10,7 @@ param(
     [string] $OutputFile = (Join-Path $env:TEMP "kvarn-packed-logits.gguf"),
     [string] $PromptFile = (Join-Path $env:TEMP "kvarn-logits-prompt.txt"),
     [int] $DebugUbatch = 0,
+    [switch] $PackedFusedBatch,
     [switch] $PackedSerialFused,
     [switch] $PackedSplitKernels,
     [switch] $KeepArtifacts
@@ -97,6 +98,9 @@ if ($DebugUbatch -gt 0) {
 }
 if ($PackedSerialFused) {
     $packedEnv["LLAMA_KVARN_ATTN_SERIAL_FUSED"] = "1"
+}
+if ($PackedFusedBatch) {
+    $packedEnv["LLAMA_KVARN_ATTN_FUSED_BATCH"] = "1"
 }
 if ($PackedSplitKernels) {
     $packedEnv["LLAMA_KVARN_ATTN_SPLIT_KERNELS"] = "1"

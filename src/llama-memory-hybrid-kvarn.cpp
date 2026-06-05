@@ -18,6 +18,10 @@ static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens) {
     return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
 }
 
+static bool kvarn_debug_ubatch_is_set() {
+    return std::getenv("LLAMA_KVARN_DEBUG_UBATCH") != nullptr;
+}
+
 llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
         const llama_model & model,
         llama_kvarn_params params,
@@ -66,7 +70,8 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
     balloc.split_reset();
 
     std::vector<llama_ubatch> ubatches;
-    const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 ? 1 : kvarn_ubatch_limit(n_ubatch, mem_attn->get_tail_tokens());
+    const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 && !kvarn_debug_ubatch_is_set() ?
+        1 : kvarn_ubatch_limit(n_ubatch, mem_attn->get_tail_tokens());
     while (true) {
         auto ubatch = balloc.split_equal(n_kvarn_ubatch, true);
         if (ubatch.n_tokens == 0) {

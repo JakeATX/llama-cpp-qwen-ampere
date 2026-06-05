@@ -60,6 +60,12 @@ Current implemented pieces:
   runs a F16 sink/body/pending/tail mixed-attention wrapper over the scratch
   body tensors. This is a live-runtime correctness oracle for the packed mixed
   attention path.
+- Debug-only prompt-batch controls are available for bring-up:
+  `LLAMA_KVARN_DEBUG_UBATCH=<n>` forces KVarN ubatch size, including MoE
+  models that production keeps at one token, and
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1` forces the fused multi-query packed
+  attention path. These are not production fallbacks; they are used to
+  reproduce prompt-batch divergence against `LLAMA_KVARN_ATTN_REF_SCRATCH=1`.
 - KVarN runtime memory/context skeleton with native slot metadata, sequence
   operations, memory estimates, and production-shaped per-layer/per-KV-head
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
@@ -334,7 +340,8 @@ Verified local smoke:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path stays on
   one-token MoE KVarN ubatches because bounded MoE prompt batching diverged at
-  `NMSE = 9.983E-004`.
+  `NMSE = 9.983E-004`. Forcing fused bounded MoE prompt batching with
+  `-DebugUbatch 128 -PackedFusedBatch` diverged further at `NMSE = 1.375E-002`.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
