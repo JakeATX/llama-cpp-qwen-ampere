@@ -266,10 +266,10 @@ Verified local smoke:
   This verifies the `llama-bench` KVarN option plumbing. Latest local result:
   normal KV `154.75` tok/s, KVarN `84.48` tok/s for `tg64`.
 - Standard prompt-processing benchmark:
-  `build-kvarn-cuda-nofa-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -p 64 -n 0 -r 1 -ngl 99 -fa on --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
-  Latest local result: normal KV `1081.21` tok/s, KVarN `98.22` tok/s for
-  `pp64`. This predates bounded non-MoE prompt batching and should be rerun
-  before final publication.
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp64:64:0" -RtnQuantile 0.95 -FlashAttn off -Repetitions 1`.
+  Latest static local result on build `50f2196a0`: normal KV `585.88` tok/s,
+  KVarN `220.31` tok/s for `pp64`; the benchmark harness verified 28 KVarN
+  layer log lines, so the result cannot hide a normal-KV fallback.
 - Standard benchmark crossing packed body records:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -p 0 -n 384 -r 1 -ngl 99 -fa on --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
   Latest local result: normal KV `148.34` tok/s, KVarN `35.96` tok/s for
