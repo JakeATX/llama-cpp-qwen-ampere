@@ -2023,6 +2023,18 @@ static void llama_kvarn_validate_memory_support(
         throw std::runtime_error("KVarN backend does not support MLA models yet");
     }
 
+    if (hparams.use_alibi || hparams.f_max_alibi_bias > 0.0f) {
+        throw std::runtime_error("KVarN backend does not support ALiBi attention bias yet");
+    }
+
+    if (hparams.attn_soft_cap) {
+        throw std::runtime_error("KVarN backend does not support attention logit soft-capping yet");
+    }
+
+    if (hparams.f_attn_out_scale != 0.0f) {
+        throw std::runtime_error("KVarN backend does not support Grok-style attention output scaling yet");
+    }
+
     const bool has_swa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
     const bool supports_kvarn_iswa = model.arch == LLM_ARCH_GEMMA4;
     if (has_swa && !supports_kvarn_iswa) {
@@ -2036,6 +2048,11 @@ static void llama_kvarn_validate_memory_support(
         }
         if (hparams.is_recr(il)) {
             continue;
+        }
+        if (model.layers[il].attn_sinks != nullptr) {
+            throw std::runtime_error(format(
+                    "KVarN backend does not support attention sinks yet; layer %u has attn_sinks",
+                    il));
         }
         const uint32_t head_k = hparams.n_embd_head_k(il);
         const uint32_t head_v = hparams.n_embd_head_v(il);

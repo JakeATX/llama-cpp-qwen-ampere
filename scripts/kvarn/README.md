@@ -182,6 +182,11 @@ Current implemented pieces:
 - KVarN context initialization rejects `--no-kv-offload` explicitly because
   current KVarN graph/backend ops are CUDA-only; disabling KV offload would
   allocate KVarN storage on CPU and fail later through backend op rejection.
+- KVarN model validation rejects attention features whose math is not yet
+  implemented by the custom mixed-attention op: ALiBi/max attention bias,
+  attention logit soft-capping, Grok-style attention output scaling, and
+  learned attention sinks. These are explicit unsupported-model errors rather
+  than silently running a non-equivalent KVarN attention path.
 - Unit tests in `tests/test-kvarn-kv.cpp` and a standalone CUDA parity test in
   `tests/test-kvarn-cuda-dequant.cpp`, registered as
   `test-kvarn-cuda-scratch-ref`.
