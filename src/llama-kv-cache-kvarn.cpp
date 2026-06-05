@@ -34,9 +34,6 @@ static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens) {
     return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
 }
 
-static bool kvarn_debug_ubatch_is_set() {
-    return std::getenv("LLAMA_KVARN_DEBUG_UBATCH") != nullptr;
-}
 #endif
 
 static size_t packed_nbytes(size_t n_values, uint32_t bits) {
@@ -945,8 +942,7 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_batch(
     balloc.split_reset();
 
     std::vector<llama_ubatch> ubatches;
-    const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 && !kvarn_debug_ubatch_is_set() ?
-        1 : kvarn_ubatch_limit(n_ubatch, params.tail_tokens);
+    const uint32_t n_kvarn_ubatch = kvarn_ubatch_limit(n_ubatch, params.tail_tokens);
     while (true) {
         // Keep each graph within one tail-ring span so tokens written earlier
         // in the graph are not evicted before their pending-body copy runs.

@@ -2614,7 +2614,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
         const int64_t scores_floats = std::max<int64_t>(
                 kvarn_graph_attn_scratch_floats(
-                    window, layer.n_head_kv, layer.n_records, layer.head_dim_k, cparams.kvarn.group_size),
+                    window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size),
                 inp_kvarn->mctx_kvarn->get_size());
         ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
         ggml_set_name(scores, "kvarn_attn_scores");

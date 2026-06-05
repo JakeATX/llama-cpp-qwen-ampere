@@ -61,8 +61,7 @@ Current implemented pieces:
   body tensors. This is a live-runtime correctness oracle for the packed mixed
   attention path.
 - Debug-only prompt-batch controls are available for bring-up:
-  `LLAMA_KVARN_DEBUG_UBATCH=<n>` forces KVarN ubatch size, including MoE
-  models that production keeps at one token, and
+  `LLAMA_KVARN_DEBUG_UBATCH=<n>` overrides the bounded KVarN ubatch size, and
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1` forces the fused multi-query packed
   attention path. These are not production fallbacks; they are used to
   reproduce prompt-batch divergence against `LLAMA_KVARN_ATTN_REF_SCRATCH=1`.
@@ -72,11 +71,11 @@ Current implemented pieces:
   groups into packed KVarN body records plus scale metadata. It does not
   allocate or use the normal KV cache as a fallback.
 - KVarN batch preparation now admits bounded prompt ubatches up to one tail-ring
-  span (`min(n_ubatch, tail_tokens)`) for non-MoE models, so prompt processing
-  can use masked multi-query KVarN attention without evicting a tail slot
-  written earlier in the same graph. MoE models stay on one-token KVarN
-  ubatches for now; Qwen3.6 MoE diverged from scratch-reference logits under
-  bounded prompt batching and remains correct with the one-token split.
+  span (`min(n_ubatch, tail_tokens)`) for dense, hybrid, and MoE models, so
+  prompt processing can use masked multi-query KVarN attention without evicting
+  a tail slot written earlier in the same graph. Qwen3.6 MoE bounded prompt
+  batching is correct through the split multi-query CUDA path; the forced fused
+  multi-query path remains debug-only because packed repeats still diverge.
 - Hybrid recurrent/full-attention models can compose recurrent memory for SSM
   layers with KVarN storage for full-attention layers. This is used by local
   Qwen3.5/Qwen3.6-family validation instead of rejecting the whole model for
@@ -169,9 +168,9 @@ constructed with native slot metadata. Graph construction identifies
 `llama_kv_cache_kvarn_context` before the normal `llama_kv_cache_context` casts.
 The KVarN graph path stores sink/tail tensors, can seal one completed body
 record from pending K/V staging, and can consume KVarN sink/tail/body/scale
-storage through CUDA mixed attention. Non-MoE runtime execution now uses bounded
-prompt ubatches with KQ masks; MoE runtime execution remains one-token until the
-Qwen3.6 prompt-batch scratch divergence is fixed.
+storage through CUDA mixed attention. Runtime execution now uses bounded prompt
+ubatches with KQ masks, including Qwen3.6 MoE through the split multi-query
+CUDA attention path.
 
 Verified local smoke:
 
@@ -338,17 +337,17 @@ Verified local smoke:
   `NMSE = 0.000E+000`.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
-  Latest local result passed with `NMSE = 0.000E+000`; this path stays on
-  one-token MoE KVarN ubatches because bounded MoE prompt batching diverged at
-  `NMSE = 9.983E-004`. Forcing fused bounded MoE prompt batching with
-  `-DebugUbatch 128 -PackedFusedBatch` diverged further at `NMSE = 1.375E-002`.
+  Latest local result passed with `NMSE = 0.000E+000`; this path now uses
+  bounded MoE KVarN prompt ubatches through the split multi-query CUDA kernels.
   The packed-repeat diagnostic
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24 -DebugUbatch 128 -CheckPackedRepeat`
-  showed forced bounded MoE packed-vs-packed determinism at
-  `NMSE = 0.000E+000`, followed by the same packed-vs-scratch failure at
-  `NMSE = 9.983E-004`. That points at KVarN packed/scratch semantic divergence
-  under forced MoE prompt batching rather than general cross-run MoE
-  nondeterminism.
+  also passed with packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
+  `NMSE = 0.000E+000`. The earlier false divergence came from overallocating
+  scratch-reference workspace for inactive body records, perturbing large MoE
+  prompt graphs before the scratch path was actually active.
+  `-DebugUbatch 128 -PackedFusedBatch -CheckPackedRepeat` still fails with
+  packed-repeat `NMSE = 1.048E-002`, so forced fused multi-query attention
+  remains debug-only.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
