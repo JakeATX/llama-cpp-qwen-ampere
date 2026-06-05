@@ -697,8 +697,8 @@ Verified local smoke:
   `KVarN no-kv-offload rejection: PASS`, and
   `KVarN server multi-slot rejection: PASS`. The optional
   `-UnsupportedDimModel` argument is now reserved for truly unsupported head
-  dimensions or non-Gemma SWA/ISWA fixtures; Gemma 4 is a supported KVarN+ISWA
-  path. Latest KVarN+ISWA rerun with
+  dimensions, asymmetric K/V head dimensions, or non-Gemma SWA/ISWA fixtures;
+  Gemma 4 is a supported KVarN+ISWA path. Latest KVarN+ISWA rerun with
   `-SupportedIswaModel C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf`
   also passed `KVarN+ISWA invalid debug ubatch rejection: PASS`, proving the
   Gemma composite path no longer silently ignores malformed
@@ -934,6 +934,6 @@ with `STATUS_CONTROL_C_EXIT`.
 
 Local smoke models may fail KVarN initialization before graph construction if
 they do not match the production constraints. Expected guarded failures include
-K/V head dimensions other than 128, 256, or 512, MLA, non-Gemma SWA/ISWA,
-unsupported backend placement, attention rotations/KQ bias/sinks, and other
-explicit KVarN graph-backend guards.
+K/V head dimensions other than 128, 256, or 512, asymmetric K/V head
+dimensions, MLA, non-Gemma SWA/ISWA, unsupported backend placement, attention
+rotations/KQ bias/sinks, and other explicit KVarN graph-backend guards.
