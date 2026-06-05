@@ -3489,6 +3489,11 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN && !params.offload_kqv) {
+        LLAMA_LOG_ERROR("%s: KVarN currently requires KV cache offload because KVarN backend ops are CUDA-only\n", __func__);
+        return nullptr;
+    }
+
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;

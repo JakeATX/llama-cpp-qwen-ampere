@@ -179,6 +179,9 @@ Current implemented pieces:
   values above `1`. KVarN context initialization also rejects `n_seq_max > 1`
   as a lower-level guard until multi-stream KVarN storage and scheduling are
   implemented.
+- KVarN context initialization rejects `--no-kv-offload` explicitly because
+  current KVarN graph/backend ops are CUDA-only; disabling KV offload would
+  allocate KVarN storage on CPU and fail later through backend op rejection.
 - Unit tests in `tests/test-kvarn-kv.cpp` and a standalone CUDA parity test in
   `tests/test-kvarn-cuda-dequant.cpp`, registered as
   `test-kvarn-cuda-scratch-ref`.

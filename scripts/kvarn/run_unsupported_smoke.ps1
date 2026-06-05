@@ -162,6 +162,13 @@ try {
         "KVarN debug ubatch override must be a positive integer" `
         "KVarN invalid debug ubatch rejection"
 
+    Invoke-ExpectFailure `
+        $results `
+        ($commonKvarn + @("--no-kv-offload")) `
+        @{} `
+        "KVarN currently requires KV cache offload because KVarN backend ops are CUDA-only" `
+        "KVarN no-kv-offload rejection"
+
     Invoke-ExpectProcessFailure `
         $server `
         @(
