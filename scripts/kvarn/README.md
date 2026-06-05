@@ -720,7 +720,7 @@ Verified local smoke:
 - Unsupported runtime-mode rejection check:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest static-build rerun on the Qwen2.5 1.5B regression model passed all
-  twelve current rejection checks:
+  thirteen current rejection checks:
   `KVarN invalid fused-batch env rejection: PASS`,
   `KVarN invalid unsafe fused-batch env rejection: PASS`,
   `KVarN invalid scratch-reference env rejection: PASS`,
@@ -731,7 +731,8 @@ Verified local smoke:
   `KVarN out-of-range CUDA split-kernel env rejection: PASS`,
   `KVarN unsafe debug ubatch rejection: PASS`,
   `KVarN invalid debug ubatch rejection: PASS`,
-  `KVarN no-kv-offload rejection: PASS`, and
+  `KVarN no-kv-offload rejection: PASS`,
+  `KVarN CPU layer placement rejection: PASS`, and
   `KVarN server multi-slot rejection: PASS`. The optional
   `-UnsupportedDimModel` argument is now reserved for truly unsupported head
   dimensions, asymmetric K/V head dimensions, or non-Gemma SWA/ISWA fixtures;

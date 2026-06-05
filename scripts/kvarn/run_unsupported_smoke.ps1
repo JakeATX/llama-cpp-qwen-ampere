@@ -200,6 +200,23 @@ try {
         "KVarN currently requires KV cache offload because KVarN backend ops are CUDA-only" `
         "KVarN no-kv-offload rejection"
 
+    Invoke-ExpectFailure `
+        $results `
+        @(
+            "-fit", "off",
+            "-m", $SupportedModel,
+            "-p", "hello",
+            "-o", $tmpOut,
+            "-c", [string] $Context,
+            "-ngl", "0",
+            "-fa", "off",
+            "--kv-cache-quant", "kvarn",
+            "--kvarn-preset", "kvarn_k4v2_g128"
+        ) `
+        @{} `
+        "KVarN backend currently requires every KV layer to run on a backend with CUDA KVarN op support; layer [0-9]+ has head_dim=[0-9]+ and is assigned to CPU" `
+        "KVarN CPU layer placement rejection"
+
     Invoke-ExpectProcessFailure `
         $server `
         @(
