@@ -199,6 +199,14 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
+        const char * LLAMA_KVARN_ATTN_FUSED_BATCH = getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
+        if (cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN &&
+                LLAMA_KVARN_ATTN_FUSED_BATCH != nullptr &&
+                atoi(LLAMA_KVARN_ATTN_FUSED_BATCH) != 0) {
+            throw std::runtime_error(
+                    "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven");
+        }
+
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }

@@ -41,9 +41,11 @@ Current implemented pieces:
 - The runtime packed mixed-attention path has a fused CUDA kernel for one-query
   decode batches. Multi-query prompt batches currently use the split score/AV
   CUDA kernels because the fused multi-query variants diverge from the
-  scratch-reference path under prompt batching. Set
+  scratch-reference path under prompt batching. Forcing
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1` is rejected at context initialization with
+  an explicit error instead of falling back silently. Set
   `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` or `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for
-  A/B debugging of the packed attention variants.
+  supported A/B debugging of the packed attention variants.
 - CUDA F32 scratch mixed-attention primitive that consumes dequantized body
   scratch tensors and is used as a device-side reference for the packed mixed
   attention primitive.
@@ -61,10 +63,10 @@ Current implemented pieces:
   body tensors. This is a live-runtime correctness oracle for the packed mixed
   attention path.
 - Debug-only prompt-batch controls are available for bring-up:
-  `LLAMA_KVARN_DEBUG_UBATCH=<n>` overrides the bounded KVarN ubatch size, and
-  `LLAMA_KVARN_ATTN_FUSED_BATCH=1` forces the fused multi-query packed
-  attention path. These are not production fallbacks; they are used to
-  reproduce prompt-batch divergence against `LLAMA_KVARN_ATTN_REF_SCRATCH=1`.
+  `LLAMA_KVARN_DEBUG_UBATCH=<n>` overrides the bounded KVarN ubatch size.
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1` is intentionally disabled in llama.cpp
+  runtime contexts because Qwen3.6 prompt-batch logits still diverge; this is
+  an explicit unsupported-mode error, not a fallback to split kernels.
 - KVarN runtime memory/context skeleton with native slot metadata, sequence
   operations, memory estimates, and production-shaped per-layer/per-KV-head
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
@@ -75,7 +77,7 @@ Current implemented pieces:
   prompt processing can use masked multi-query KVarN attention without evicting
   a tail slot written earlier in the same graph. Qwen3.6 MoE bounded prompt
   batching is correct through the split multi-query CUDA path; the forced fused
-  multi-query path remains debug-only because packed repeats still diverge.
+  multi-query path is explicitly rejected because packed repeats still diverge.
 - Hybrid recurrent/full-attention models can compose recurrent memory for SSM
   layers with KVarN storage for full-attention layers. This is used by local
   Qwen3.5/Qwen3.6-family validation instead of rejecting the whole model for
@@ -339,13 +341,17 @@ Verified local smoke:
   `KVarN packed-vs-scratch logits: PASS, NMSE = 0.000E+000`. The
   `-CheckPackedRepeat` diagnostic also passed with packed-repeat
   `NMSE = 0.000E+000`. The harness now parses `NaN`/infinity NMSE values
-  explicitly so debug-only forced fused paths can be reported without script
-  parser failures.
+  explicitly so diagnostic failures can be reported without script parser
+  failures.
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512`.
   Latest local result passed on the bounded prompt-batch path with
   packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
   `NMSE = 0.000E+000`.
+- Forced fused-batch rejection check:
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1 llama-results.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "hello" -o %TEMP%\kvarn-fused-reject.gguf -c 256 -ngl 99 -fa on --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
+  Latest local result failed before graph execution with
+  `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses
@@ -356,9 +362,9 @@ Verified local smoke:
   `NMSE = 0.000E+000`. The earlier false divergence came from overallocating
   scratch-reference workspace for inactive body records, perturbing large MoE
   prompt graphs before the scratch path was actually active.
-  `-DebugUbatch 128 -PackedFusedBatch -CheckPackedRepeat` still fails with
-  packed-repeat `NMSE = 1.048E-002`, so forced fused multi-query attention
-  remains debug-only.
+  `-DebugUbatch 128 -PackedFusedBatch -CheckPackedRepeat` exposed a real
+  forced fused-batch divergence (`NMSE` around `1e-2` to `2.5e-2`), so the
+  runtime now rejects `LLAMA_KVARN_ATTN_FUSED_BATCH=1` explicitly.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
@@ -383,9 +389,9 @@ Required integration path:
    carries an optional KQ/causal mask in `src[10]`, and runtime preparation now
    admits bounded prompt ubatches for dense, hybrid, and MoE models.
    Correctness is currently maintained by using split score/AV CUDA kernels for
-   `n_queries > 1`; the fused multi-query packed-attention path still needs
-   broader evidence before it can replace the split path for all prompt
-   batches.
+   `n_queries > 1`; the fused multi-query packed-attention path is disabled
+   with an explicit unsupported-mode error until it can replace the split path
+   for all prompt batches.
 2. Finish prompt-batch sealing semantics. The graph builder now collects all
    seal records in an ubatch and emits store ops for each record, and the body
    plan has multi-record seal coverage. Bounded production prompt ubatches now
@@ -404,10 +410,12 @@ Required integration path:
   KVarN body record, and a multi-record variant is present and parity-tested
   across several body records. Batched multi-query and mixed sink/body/tail
   variants are also present and parity-tested. The runtime packed
-  mixed-attention path now has a batched fused score/softmax/AV CUDA kernel,
-  but the mixed op is still a custom attention op rather than a
-  flash-attention load-path integration. Until that integration exists, KVarN
-  must not pretend that llama.cpp Flash Attention is required or used.
+  mixed-attention path now has a batched fused score/softmax/AV CUDA kernel
+  that passes synthetic tests, but that forced runtime mode is disabled because
+  Qwen3.6 prompt-batch logits still diverge. The mixed op is still a custom
+  attention op rather than a flash-attention load-path integration. Until that
+  integration exists, KVarN must not pretend that llama.cpp Flash Attention is
+  required or used.
 5. Compare fused output against the reference scratch path with fixed seeds
    and logits-distance thresholds. The current custom packed attention op now
    has a live packed-vs-scratch logits NMSE guard via

@@ -11,6 +11,18 @@
 #include <stdexcept>
 #include <vector>
 
+static void set_env_var(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    if (value[0] == '\0') {
+        unsetenv(name);
+    } else {
+        setenv(name, value, 1);
+    }
+#endif
+}
+
 static void require(bool ok, const char * msg) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", msg);
@@ -684,7 +696,7 @@ static void run_case(uint32_t head_dim) {
     }
     require(multi_probs_max_err < 1.0e-6f, "CUDA multi-record packed-body probabilities match CPU reference");
 
-    constexpr uint32_t n_queries = 3;
+    const uint32_t n_queries = head_dim == 256 ? 128 : 3;
     std::vector<float> q_batch(size_t(n_queries)*head_dim);
     for (uint32_t iq = 0; iq < n_queries; ++iq) {
         for (uint32_t d = 0; d < head_dim; ++d) {
@@ -1026,11 +1038,27 @@ static void run_case(uint32_t head_dim) {
     float * pending_k_mha_d = cuda_upload(pending_k_mha);
     float * pending_v_mha_d = cuda_upload(pending_v_mha);
     float * mha_mixed_out_d = nullptr;
+    float * mha_mixed_fused_out_d = nullptr;
     float * mha_mixed_scores_d = nullptr;
+    float * mha_mixed_fused_scores_d = nullptr;
     const uint32_t n_mha_mixed_tokens = n_sink + n_records*group + n_pending_mha + n_tail;
     const uint32_t tail_start = 1;
     require_cuda(cudaMalloc(&mha_mixed_out_d, size_t(n_queries)*n_head*head_dim*sizeof(float)), "cudaMalloc MHA mixed output");
+    require_cuda(cudaMalloc(&mha_mixed_fused_out_d, size_t(n_queries)*n_head*head_dim*sizeof(float)), "cudaMalloc MHA fused mixed output");
     require_cuda(cudaMalloc(&mha_mixed_scores_d, n_mha_mixed_tokens*sizeof(float)), "cudaMalloc MHA mixed scores");
+    require_cuda(cudaMalloc(&mha_mixed_fused_scores_d, n_mha_mixed_tokens*sizeof(float)), "cudaMalloc MHA fused mixed scores");
+
+    std::vector<uint16_t> mha_mask_f16(size_t(n_queries)*n_mha_mixed_tokens);
+    std::vector<float> mha_mask_ref(size_t(n_queries)*n_mha_mixed_tokens);
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        for (uint32_t t = 0; t < n_mha_mixed_tokens; ++t) {
+            const float bias = t > n_sink + n_records*group + iq ? -25.0f : 0.0f;
+            const size_t off = size_t(iq)*n_mha_mixed_tokens + t;
+            mha_mask_f16[off] = f32_to_f16_bits(bias);
+            mha_mask_ref[off] = f16_bits_to_f32(mha_mask_f16[off]);
+        }
+    }
+    uint16_t * mha_mask_f16_d = cuda_upload(mha_mask_f16);
 
     ggml_cuda_kvarn_attn_mixed_f16_batch(
             q_mha_d,
@@ -1038,7 +1066,7 @@ static void run_case(uint32_t head_dim) {
             mha_k_body_d, mha_v_body_d,
             mha_k_scales_d, mha_v_scales_d,
             pending_k_mha_d, pending_v_mha_d,
-            nullptr,
+            mha_mask_f16_d,
             mha_mixed_out_d, mha_mixed_scores_d,
             n_queries, n_head, n_head_kv,
             n_sink, n_records, n_pending_mha, n_tail, tail_start, head_dim, group,
@@ -1051,15 +1079,45 @@ static void run_case(uint32_t head_dim) {
             size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
             records[0].k_scales.size(), records[0].v_scales.size(),
             size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
-            0, 0, 0,
+            size_t(n_mha_mixed_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
             scale,
             nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA batched F16 mixed attention launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA batched F16 mixed attention sync");
 
+    set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "1");
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            q_mha_d,
+            sink_tail_k_f16_d, sink_tail_v_f16_d,
+            mha_k_body_d, mha_v_body_d,
+            mha_k_scales_d, mha_v_scales_d,
+            pending_k_mha_d, pending_v_mha_d,
+            mha_mask_f16_d,
+            mha_mixed_fused_out_d, mha_mixed_fused_scores_d,
+            n_queries, n_head, n_head_kv,
+            n_sink, n_records, n_pending_mha, n_tail, tail_start, head_dim, group,
+            params.key_bits, params.value_bits,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            records[0].k_body.size(), records[0].v_body.size(),
+            size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+            records[0].k_scales.size(), records[0].v_scales.size(),
+            size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+            size_t(n_mha_mixed_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+            scale,
+            nullptr);
+    set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
+    require_cuda(cudaGetLastError(), "KVarN CUDA forced fused batched F16 mixed attention launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA forced fused batched F16 mixed attention sync");
+
     std::vector<float> mha_mixed_out_gpu(size_t(n_queries)*n_head*head_dim);
+    std::vector<float> mha_mixed_fused_out_gpu(size_t(n_queries)*n_head*head_dim);
     require_cuda(cudaMemcpy(mha_mixed_out_gpu.data(), mha_mixed_out_d, mha_mixed_out_gpu.size()*sizeof(float), cudaMemcpyDeviceToHost),
             "copy MHA mixed attention output");
+    require_cuda(cudaMemcpy(mha_mixed_fused_out_gpu.data(), mha_mixed_fused_out_d, mha_mixed_fused_out_gpu.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy forced fused MHA mixed attention output");
 
     std::vector<float> mha_mixed_out_ref(size_t(n_queries)*n_head*head_dim, 0.0f);
     for (uint32_t iq = 0; iq < n_queries; ++iq) {
@@ -1098,6 +1156,9 @@ static void run_case(uint32_t head_dim) {
                     row_scores[score_i] += q_row[d]*sink_tail_k_ref[(size_t(slot)*n_head_kv + ikh)*head_dim + d];
                 }
                 row_scores[score_i] *= scale;
+            }
+            for (uint32_t t = 0; t < n_mha_mixed_tokens; ++t) {
+                row_scores[t] += mha_mask_ref[size_t(iq)*n_mha_mixed_tokens + t];
             }
 
             float row_max = row_scores[0];
@@ -1150,6 +1211,12 @@ static void run_case(uint32_t head_dim) {
     }
     require(mha_mixed_max_err < 1.0e-5f, "CUDA batched F16 sink/body/tail mixed attention matches CPU reference");
 
+    float mha_mixed_fused_max_err = 0.0f;
+    for (size_t i = 0; i < mha_mixed_out_ref.size(); ++i) {
+        mha_mixed_fused_max_err = std::max(mha_mixed_fused_max_err, std::fabs(mha_mixed_out_ref[i] - mha_mixed_fused_out_gpu[i]));
+    }
+    require(mha_mixed_fused_max_err < 1.0e-5f, "CUDA forced fused batched F16 sink/body/tail mixed attention matches CPU reference");
+
     cudaFree(k_body_d);
     cudaFree(v_body_d);
     cudaFree(k_scales_d);
@@ -1191,7 +1258,10 @@ static void run_case(uint32_t head_dim) {
     cudaFree(pending_k_mha_d);
     cudaFree(pending_v_mha_d);
     cudaFree(mha_mixed_out_d);
+    cudaFree(mha_mixed_fused_out_d);
     cudaFree(mha_mixed_scores_d);
+    cudaFree(mha_mixed_fused_scores_d);
+    cudaFree(mha_mask_f16_d);
 
     cudaFree(k_tile_d);
     cudaFree(v_tile_d);

@@ -647,6 +647,11 @@ static bool kvarn_graph_use_attn_scratch_ref() {
     return env != nullptr && std::atoi(env) != 0;
 }
 
+static bool kvarn_graph_use_attn_fused_batch() {
+    const char * env = getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
 static int64_t kvarn_graph_attn_scratch_floats(
         const kvarn_active_window & window,
         int64_t n_head_kv,
@@ -683,6 +688,10 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
     this->mctx_kvarn = mctx;
 
     if (has_body_store_ops) {
+        return false;
+    }
+
+    if (kvarn_graph_use_attn_fused_batch()) {
         return false;
     }
 
