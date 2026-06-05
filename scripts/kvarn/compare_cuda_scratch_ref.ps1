@@ -7,6 +7,7 @@ param(
     [int] $Seed = 1234,
     [double] $RtnQuantile = 0.95,
     [string] $Prompt = "Hello",
+    [int] $MinKvarnLayerLogs = 1,
     [switch] $DisableGraphReuse
 )
 
@@ -14,6 +15,9 @@ $ErrorActionPreference = "Stop"
 
 if (!($RtnQuantile -gt 0.0 -and $RtnQuantile -le 1.0)) {
     throw "RtnQuantile must be in (0, 1]"
+}
+if ($MinKvarnLayerLogs -lt 1) {
+    throw "MinKvarnLayerLogs must be positive"
 }
 
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
@@ -56,8 +60,8 @@ function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet)
         throw "llama-completion succeeded but logs did not show KVarN cache initialization"
     }
     $kvarnLayerLogs = ([regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer")).Count
-    if ($kvarnLayerLogs -lt 1) {
-        throw "llama-completion succeeded but did not show any KVarN layer allocation lines"
+    if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
+        throw "llama-completion succeeded but showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs"
     }
     Write-Host ("KVarN completion log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
 

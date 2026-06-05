@@ -531,6 +531,10 @@ Verified local smoke:
   was reuse disabled `158.00` eval tok/s with `graphs reused = 0`, reuse enabled
   `167.94` eval tok/s with `graphs reused = 31`, normal-KV baseline `275.04`
   eval tok/s, and 56 KVarN layer log lines in each KVarN run.
+  Latest stricter short rerun with `-MinKvarnLayerLogs 28` passed: reuse
+  disabled `146.45` eval tok/s with `graphs reused = 0`, reuse enabled
+  `153.36` eval tok/s with `graphs reused = 15`, and 56 KVarN layer log lines
+  in each KVarN run.
 - Runtime packed-vs-scratch attention comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_scratch_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs -RtnQuantile 0.95`.
   This runs the same deterministic long decode once with packed KVarN mixed
@@ -542,6 +546,13 @@ Verified local smoke:
   scratch-reference runs logged `KVarN completion log check: PASS, KVarN layer
   lines = 56`; packed attention `167.28` eval tok/s and scratch-reference
   attention `165.99` eval tok/s, both with `graphs reused = 31`.
+  Latest stricter short Qwen2.5 rerun with `-MinKvarnLayerLogs 28` passed:
+  packed attention `83.77` eval tok/s, scratch-reference attention `101.51`
+  eval tok/s, both with `graphs reused = 15` and 56 KVarN layer log lines.
+  Latest strict Gemma 4 12B 512-dim KVarN+ISWA generated-text rerun with
+  `-MinKvarnLayerLogs 8` passed: packed attention `38.44` eval tok/s,
+  scratch-reference attention `37.57` eval tok/s, both with `graphs reused =
+  14` and 16 KVarN layer log lines.
   Historical longer local result with fused packed attention:
   packed attention `78.98` eval tok/s, scratch-reference attention `78.13`
   eval tok/s, both with `graphs reused = 268`. Forcing the old split kernels
@@ -563,6 +574,10 @@ Verified local smoke:
   `KVarN completion log check: PASS, KVarN layer lines = 56`; default
   attention `172.69` eval tok/s, explicit serial fused `98.34` eval tok/s,
   split attention `89.41` eval tok/s, all with `graphs reused = 31`.
+  Latest stricter short rerun with `-MinKvarnLayerLogs 28` passed: default
+  attention `83.77` eval tok/s, explicit serial fused `77.50` eval tok/s,
+  split attention `84.78` eval tok/s, all with `graphs reused = 15` and 56
+  KVarN layer log lines.
   Historical pre-routing result: batched fused
   attention `181.47` eval tok/s, serial fused attention `99.00` eval tok/s,
   split attention `79.92` eval tok/s, all with `graphs reused = 268`.

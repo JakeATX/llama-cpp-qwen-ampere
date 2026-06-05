@@ -7,6 +7,7 @@ param(
     [int] $Seed = 1234,
     [double] $RtnQuantile = 1.0,
     [string] $Prompt = "Hello",
+    [int] $MinKvarnLayerLogs = 1,
     [switch] $SkipNormalBaseline
 )
 
@@ -14,6 +15,9 @@ $ErrorActionPreference = "Stop"
 
 if (!($RtnQuantile -gt 0.0 -and $RtnQuantile -le 1.0)) {
     throw "RtnQuantile must be in (0, 1]"
+}
+if ($MinKvarnLayerLogs -lt 1) {
+    throw "MinKvarnLayerLogs must be positive"
 }
 
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
@@ -59,8 +63,8 @@ function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet,
         }
 
         $layerLines = [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer").Count
-        if ($layerLines -le 0) {
-            throw "Expected KVarN layer logs, but none were found"
+        if ($layerLines -lt $MinKvarnLayerLogs) {
+            throw "Expected at least $MinKvarnLayerLogs KVarN layer logs, got $layerLines"
         }
 
         Write-Host ("KVarN completion log check: PASS, KVarN layer lines = {0}" -f $layerLines)
