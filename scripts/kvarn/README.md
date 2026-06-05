@@ -428,11 +428,14 @@ Verified local smoke:
   Static focused rerun after adding Gemma-shaped 512 primitive coverage:
   `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref" --output-on-failure`.
   Latest local result passed. The test now also includes a Gemma-shaped
+  512-dimensional sink-only forced-fused-vs-split primitive case (`16` query
+  heads, `1` KV head, `14` causal queries, `14` sink tokens, and a
+  `512`-token padded F32 mask row), plus a Gemma-shaped
   512-dimensional forced-fused-vs-split primitive case (`16` query heads,
   `1` KV head, `17` queries, `128` sink tokens, `2` body records, `128` tail
   tokens, and a `512`-token padded F16 mask row), so the basic 512 packed-body
   unpack, softmax, and AV path is covered independently of the Gemma model-level
-  run. The remaining 512 fused gate is model-level fused/serial drift;
+  run. The remaining 512 fused gate is model-level forced fused-batch drift;
   production still routes 512-dimensional heads to split kernels by default.
 - Shared batch-split and focused KVarN CUDA coverage passed after tightening
   `split_equal()` sequence-set limits:
@@ -703,8 +706,8 @@ Verified local smoke:
   After promoting 256-dimensional fused-batch attention, the same Gemma 4 12B
   `-Context 384 -Batch 512 -Repeat 4 -CheckPackedRepeat -CheckPackedSplit`
   validation exposed 512-dimensional drift when fused-batch was used by default
-  (`NMSE = 2.261e-04`) and when serial fused was forced against the scratch
-  reference (`NMSE = 1.506e-04`). The dispatcher now defaults
+  (`NMSE = 2.261e-04`) and in an earlier serial-fused diagnostic
+  (`NMSE = 1.506e-04`). The dispatcher now defaults
   `head_dim >= 512` to split score/AV kernels unless fused or serial is
   explicitly forced for diagnostics. Rebuilt static rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
@@ -720,6 +723,15 @@ Verified local smoke:
   full-attention layer routing, body-record capacity `2`, and
   `NMSE = 0.000E+000`. The model-level active-body-record rerun after the
   Gemma-shaped 512 primitive guard still passed default split at `NMSE = 0`.
+  Current forced serial-fused rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -PackedSerialFused -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
+  Latest local result passed packed-vs-split and packed-vs-scratch at
+  `NMSE = 0.000E+000`, so serial fused is no longer the active 512 gate.
+  Current forced fused-batch diagnostic still fails as expected:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
+  Latest local result failed packed-vs-split with `NMSE = 2.680e-04`; the
+  passing 512 sink-only F32-mask primitive means the fused-batch failure still
+  needs a runtime-shape reproducer beyond basic causal sink-only attention.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
