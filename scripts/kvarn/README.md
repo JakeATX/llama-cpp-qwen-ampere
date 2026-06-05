@@ -504,6 +504,14 @@ Verified local smoke:
   fused-vs-split, and CPU-reference checks. Current evidence points to small
   fused-vs-split attention math drift being amplified by the Qwen3.6 MoE graph;
   the production path remains the split multi-query KVarN kernels.
+  The `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` diagnostic now actually overrides the
+  default multi-query split routing; before this routing fix it was masked by
+  the `n_queries > 1` split guard. After fixing that routing, the traced
+  Qwen3.6 repeat-4 serial-fused run entered CUDA as `mode=serial-fused` and
+  passed both serial-fused-vs-split and serial-fused-vs-scratch at
+  `NMSE = 0.000E+000`. The remaining unsafe correctness issue is specific to
+  the multi-block `LLAMA_KVARN_ATTN_FUSED_BATCH=1` path, not the per-row fused
+  kernel.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.
