@@ -118,8 +118,9 @@ function Get-HttpErrorText([System.Management.Automation.ErrorRecord] $err) {
 $server = Get-ExePath $BuildDir "llama-server.exe"
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
-$stdoutLog = Join-Path $env:TEMP "kvarn-server-smoke.out.log"
-$stderrLog = Join-Path $env:TEMP "kvarn-server-smoke.err.log"
+$logId = [guid]::NewGuid().ToString("N")
+$stdoutLog = Join-Path $env:TEMP ("kvarn-server-smoke-{0}.out.log" -f $logId)
+$stderrLog = Join-Path $env:TEMP ("kvarn-server-smoke-{0}.err.log" -f $logId)
 Remove-Item -LiteralPath $stdoutLog, $stderrLog -ErrorAction SilentlyContinue
 
 $slotSaveDir = $null
