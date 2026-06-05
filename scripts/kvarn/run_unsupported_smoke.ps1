@@ -132,6 +132,13 @@ Invoke-ExpectFailure `
     "KVarN debug ubatch override exceeds tail-ring safety limit" `
     "KVarN unsafe debug ubatch rejection"
 
+Invoke-ExpectFailure `
+    $results `
+    $commonKvarn `
+    @{ "LLAMA_KVARN_DEBUG_UBATCH" = "0" } `
+    "KVarN debug ubatch override must be a positive integer" `
+    "KVarN invalid debug ubatch rejection"
+
 Invoke-ExpectProcessFailure `
     $server `
     @(
