@@ -302,6 +302,14 @@ Verified local smoke:
   FP16 and KVarN smoke paths passed for all three context sizes. Reported
   KVarN cache estimates were `8.64 MiB` at 512 tokens, `11.92 MiB` at 1024
   tokens, and `18.48 MiB` at 2048 tokens.
+  The script now rejects a successful KVarN CLI smoke unless output logs
+  contain `llama_kv_cache_kvarn:` initialization lines, so a successful token
+  response alone cannot hide a normal-KV fallback. Static CUDA rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "256 512" -RtnQuantile 0.95 -MinKvarnLayerLogs 1`.
+  Latest local result passed both contexts with
+  `KVarN CLI log check: PASS, KVarN layer lines = 56`; the `-c 512` KVarN path
+  allocated `2` body records per layer and reported an `8.64 MiB` metadata
+  estimate.
 - `scripts\kvarn\kv_memory_estimate.py` now mirrors the runtime logical memory
   formula and has `--self-test` coverage against `test-kvarn-kv` 128-, 256-,
   and 512-dimensional reference totals. It reports full FP16 KV, ideal
@@ -431,6 +439,11 @@ Verified local smoke:
   passed with two body records per KVarN layer and an `8.87 MiB` CUDA KVarN
   buffer. A larger `-c 2048` smoke with a 1500-token repeated prompt passed
   with 14 body records per KVarN layer and a `14.07 MiB` CUDA KVarN buffer.
+  The strengthened CLI smoke harness also passed Gemma 4 12B at `-c 512`:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "512" -RtnQuantile 0.95 -MinKvarnLayerLogs 8`.
+  Latest local result reported `KVarN CLI log check: PASS, KVarN layer lines =
+  16`, `2` body records per full-attention KVarN layer, and a `4.87 MiB`
+  metadata estimate for the KVarN portion of the KVarN+ISWA composite.
   Gemma 4 12B server smoke passed via
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8152 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95`.
   Latest rebuilt static-server rerun at `-c 512` with
