@@ -1432,9 +1432,10 @@ static void run_case(uint32_t head_dim) {
         cudaFree(q36_scores_d);
         cudaFree(q36_fused_scores_d);
 
-        const uint32_t n_sink_only_queries = 49;
-        const uint32_t n_sink_only = 49;
         const uint32_t sink_only_mask_stride_tokens = 512;
+        const uint32_t sink_only_shapes[] = {2, 49};
+        for (uint32_t n_sink_only : sink_only_shapes) {
+            const uint32_t n_sink_only_queries = n_sink_only;
         std::vector<float> q_sink_only(size_t(n_sink_only_queries)*n_head*head_dim);
         std::vector<float> k_sink_only(size_t(n_sink_only)*n_head_kv*head_dim);
         std::vector<float> v_sink_only(size_t(n_sink_only)*n_head_kv*head_dim);
@@ -1577,12 +1578,15 @@ static void run_case(uint32_t head_dim) {
 
         float sink_only_split_err = 0.0f;
         float sink_only_fused_err = 0.0f;
+        float sink_only_fused_vs_split_err = 0.0f;
         for (size_t i = 0; i < sink_only_ref.size(); ++i) {
             sink_only_split_err = std::max(sink_only_split_err, std::fabs(sink_only_ref[i] - sink_only_split[i]));
             sink_only_fused_err = std::max(sink_only_fused_err, std::fabs(sink_only_ref[i] - sink_only_fused[i]));
+            sink_only_fused_vs_split_err = std::max(sink_only_fused_vs_split_err, std::fabs(sink_only_split[i] - sink_only_fused[i]));
         }
         require(sink_only_split_err < 1.0e-5f, "CUDA split sink-only causal attention matches CPU reference with F16 mask");
         require(sink_only_fused_err < 1.0e-5f, "CUDA fused sink-only causal attention matches CPU reference with F16 mask");
+        require(sink_only_fused_vs_split_err < 1.0e-6f, "CUDA fused sink-only causal attention matches split output with F16 mask");
 
         std::vector<float> sink_only_mask_f32(size_t(n_sink_only_queries)*sink_only_mask_stride_tokens);
         for (size_t i = 0; i < sink_only_mask_f32.size(); ++i) {
@@ -1643,12 +1647,15 @@ static void run_case(uint32_t head_dim) {
 
         float sink_only_f32_mask_split_err = 0.0f;
         float sink_only_f32_mask_fused_err = 0.0f;
+        float sink_only_f32_mask_fused_vs_split_err = 0.0f;
         for (size_t i = 0; i < sink_only_ref.size(); ++i) {
             sink_only_f32_mask_split_err = std::max(sink_only_f32_mask_split_err, std::fabs(sink_only_ref[i] - sink_only_split[i]));
             sink_only_f32_mask_fused_err = std::max(sink_only_f32_mask_fused_err, std::fabs(sink_only_ref[i] - sink_only_fused[i]));
+            sink_only_f32_mask_fused_vs_split_err = std::max(sink_only_f32_mask_fused_vs_split_err, std::fabs(sink_only_split[i] - sink_only_fused[i]));
         }
         require(sink_only_f32_mask_split_err < 1.0e-5f, "CUDA split sink-only causal attention matches CPU reference with F32 mask");
         require(sink_only_f32_mask_fused_err < 1.0e-5f, "CUDA fused sink-only causal attention matches CPU reference with F32 mask");
+        require(sink_only_f32_mask_fused_vs_split_err < 1.0e-6f, "CUDA fused sink-only causal attention matches split output with F32 mask");
 
         cudaFree(q_sink_only_d);
         cudaFree(k_sink_only_d);
@@ -1659,6 +1666,7 @@ static void run_case(uint32_t head_dim) {
         cudaFree(sink_only_fused_d);
         cudaFree(sink_only_scores_d);
         cudaFree(sink_only_fused_scores_d);
+        }
     }
 
     cudaFree(k_body_d);

@@ -92,6 +92,37 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
 
+static bool ggml_cuda_kvarn_attn_trace_enabled() {
+    const char * env = std::getenv("LLAMA_KVARN_ATTN_TRACE");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+static bool ggml_cuda_kvarn_attn_trace_claim() {
+    static std::atomic<int> n_trace{0};
+
+    const char * limit_env = std::getenv("LLAMA_KVARN_ATTN_TRACE_LIMIT");
+    const int limit = limit_env != nullptr ? std::atoi(limit_env) : 64;
+    if (limit <= 0) {
+        return true;
+    }
+
+    return n_trace.fetch_add(1, std::memory_order_relaxed) < limit;
+}
+
+static void ggml_cuda_kvarn_attn_trace_tensor(const char * name, const ggml_tensor * t) {
+    if (t == nullptr) {
+        std::fprintf(stderr, "  %-12s: null\n", name);
+        return;
+    }
+
+    std::fprintf(stderr,
+            "  %-12s: type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] data=%p\n",
+            name, ggml_type_name(t->type),
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t->nb[0], t->nb[1], t->nb[2], t->nb[3],
+            t->data);
+}
+
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
     int id = -1; // in case cudaGetDevice fails
@@ -2877,6 +2908,55 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const uint32_t kq_mask_type = kq_mask == nullptr ? 0u : (kq_mask->type == GGML_TYPE_F32 ? 1u : 2u);
                 const bool use_scratch_ref = getenv("LLAMA_KVARN_ATTN_REF_SCRATCH") != nullptr &&
                     std::atoi(getenv("LLAMA_KVARN_ATTN_REF_SCRATCH")) != 0;
+                if (ggml_cuda_kvarn_attn_trace_enabled() && ggml_cuda_kvarn_attn_trace_claim()) {
+                    const char * fused_batch_env = std::getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
+                    const char * split_env = std::getenv("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
+                    const char * serial_env = std::getenv("LLAMA_KVARN_ATTN_SERIAL_FUSED");
+                    const bool forced_fused_batch = fused_batch_env != nullptr && std::atoi(fused_batch_env) != 0;
+                    const bool forced_split = split_env != nullptr && std::atoi(split_env) != 0;
+                    const bool forced_serial = serial_env != nullptr && std::atoi(serial_env) != 0;
+                    const bool split_runtime = use_scratch_ref || forced_split || (dst->ne[2] > 1 && !forced_fused_batch);
+                    const char * mode = use_scratch_ref ? "scratch-ref" :
+                        (split_runtime ? "split" : (forced_serial ? "serial-fused" : "fused-batch"));
+
+                    std::fprintf(stderr,
+                            "KVarN CUDA mixed-attn trace: mode=%s n_queries=%" PRId64 " n_head=%" PRId64
+                            " n_head_kv=%" PRId64 " n_sink=%d n_records=%d n_pending=%d n_tail=%d"
+                            " tail_start=%d n_kv=%" PRId64 " head_dim=%d group_size=%d k_bits=%d v_bits=%d"
+                            " scale=%.9g mask_type=%u\n",
+                            mode, dst->ne[2], dst->ne[1], sink_tail_k->ne[1],
+                            params.n_sink, params.n_records, params.n_pending, params.n_tail,
+                            params.tail_start, n_kv, params.head_dim, params.group_size,
+                            params.key_bits, params.value_bits, double(params.scale), kq_mask_type);
+                    std::fprintf(stderr,
+                            "  derived    : q_stride_head=%zu q_stride_query=%zu out_stride_head=%zu out_stride_query=%zu"
+                            " sink_tail_stride_head=%zu sink_tail_stride_token=%zu pending_stride_head=%zu pending_stride_token=%zu"
+                            " k_body_stride_record=%zu v_body_stride_record=%zu k_body_stride_head=%zu v_body_stride_head=%zu"
+                            " k_scale_stride_record=%zu v_scale_stride_record=%zu k_scale_stride_head=%zu v_scale_stride_head=%zu"
+                            " mask_stride_query=%zu mask_stride_token=%zu scratch_floats=%" PRId64 "\n",
+                            q->nb[1]/sizeof(float), q->nb[2]/sizeof(float),
+                            dst->nb[1]/sizeof(float), dst->nb[2]/sizeof(float),
+                            sink_tail_k->nb[1]/sizeof(uint16_t), sink_tail_k->nb[2]/sizeof(uint16_t),
+                            pending_k->nb[1]/sizeof(float), pending_k->nb[2]/sizeof(float),
+                            body_k->nb[1], body_v->nb[1], body_k->nb[2], body_v->nb[2],
+                            scales_k->nb[1]/sizeof(float), scales_v->nb[1]/sizeof(float),
+                            scales_k->nb[2]/sizeof(float), scales_v->nb[2]/sizeof(float),
+                            kq_mask ? kq_mask->nb[1] : 0,
+                            kq_mask ? kq_mask->nb[0] : 0,
+                            scratch ? ggml_nelements(scratch) : 0);
+                    ggml_cuda_kvarn_attn_trace_tensor("q", q);
+                    ggml_cuda_kvarn_attn_trace_tensor("sink_tail_k", sink_tail_k);
+                    ggml_cuda_kvarn_attn_trace_tensor("sink_tail_v", sink_tail_v);
+                    ggml_cuda_kvarn_attn_trace_tensor("body_k", body_k);
+                    ggml_cuda_kvarn_attn_trace_tensor("body_v", body_v);
+                    ggml_cuda_kvarn_attn_trace_tensor("scales_k", scales_k);
+                    ggml_cuda_kvarn_attn_trace_tensor("scales_v", scales_v);
+                    ggml_cuda_kvarn_attn_trace_tensor("pending_k", pending_k);
+                    ggml_cuda_kvarn_attn_trace_tensor("pending_v", pending_v);
+                    ggml_cuda_kvarn_attn_trace_tensor("scratch", scratch);
+                    ggml_cuda_kvarn_attn_trace_tensor("kq_mask", kq_mask);
+                    ggml_cuda_kvarn_attn_trace_tensor("out", dst);
+                }
                 if (use_scratch_ref && params.n_records > 0) {
                     const size_t n_head_kv = sink_tail_k->ne[1];
                     const size_t n_per_record = size_t(params.head_dim)*params.group_size;

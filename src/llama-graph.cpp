@@ -15,8 +15,12 @@
 #include "llama-memory-recurrent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -24,6 +28,36 @@
 #include <unordered_set>
 
 // dedup helpers
+
+static bool kvarn_graph_attn_trace_enabled() {
+    const char * env = std::getenv("LLAMA_KVARN_ATTN_TRACE");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+static bool kvarn_graph_attn_trace_claim() {
+    static std::atomic<int> n_trace{0};
+
+    const char * limit_env = std::getenv("LLAMA_KVARN_ATTN_TRACE_LIMIT");
+    const int limit = limit_env != nullptr ? std::atoi(limit_env) : 64;
+    if (limit <= 0) {
+        return true;
+    }
+
+    return n_trace.fetch_add(1, std::memory_order_relaxed) < limit;
+}
+
+static void kvarn_graph_attn_trace_tensor(const char * name, const ggml_tensor * t) {
+    if (t == nullptr) {
+        std::fprintf(stderr, "  %-12s: null\n", name);
+        return;
+    }
+
+    std::fprintf(stderr,
+            "  %-12s: type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu]\n",
+            name, ggml_type_name(t->type),
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+}
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
@@ -640,6 +674,43 @@ static void kvarn_graph_update_mixed_attn_params(ggml_tensor * node, const kvarn
     };
 
     std::memcpy(node->op_params, &params, sizeof(params));
+
+    if (kvarn_graph_attn_trace_enabled() && kvarn_graph_attn_trace_claim()) {
+        const ggml_tensor * q           = node->src[0];
+        const ggml_tensor * sink_tail_k = node->src[1];
+        const ggml_tensor * sink_tail_v = node->src[2];
+        const ggml_tensor * body_k      = node->src[3];
+        const ggml_tensor * body_v      = node->src[4];
+        const ggml_tensor * scales_k    = node->src[5];
+        const ggml_tensor * scales_v    = node->src[6];
+        const ggml_tensor * pending_k   = node->src[7];
+        const ggml_tensor * pending_v   = node->src[8];
+        const ggml_tensor * scratch     = node->src[9];
+        const ggml_tensor * kq_mask     = node->src[10];
+
+        std::fprintf(stderr,
+                "KVarN graph mixed-attn trace: n_queries=%" PRId64 " n_head=%" PRId64
+                " n_head_kv=%" PRId64 " n_sink=%d n_records=%d n_pending=%d n_tail=%d"
+                " tail_start=%d n_kv=%" PRId64 " head_dim=%d group_size=%d k_bits=%d v_bits=%d"
+                " scale=%.9g scratch_elems=%" PRId64 "\n",
+                node->ne[2], node->ne[1], sink_tail_k ? sink_tail_k->ne[1] : 0,
+                params.n_sink, params.n_records, params.n_pending, params.n_tail,
+                params.tail_start, window.n_kv, params.head_dim, params.group_size,
+                params.key_bits, params.value_bits, double(params.scale),
+                scratch ? ggml_nelements(scratch) : 0);
+        kvarn_graph_attn_trace_tensor("q", q);
+        kvarn_graph_attn_trace_tensor("sink_tail_k", sink_tail_k);
+        kvarn_graph_attn_trace_tensor("sink_tail_v", sink_tail_v);
+        kvarn_graph_attn_trace_tensor("body_k", body_k);
+        kvarn_graph_attn_trace_tensor("body_v", body_v);
+        kvarn_graph_attn_trace_tensor("scales_k", scales_k);
+        kvarn_graph_attn_trace_tensor("scales_v", scales_v);
+        kvarn_graph_attn_trace_tensor("pending_k", pending_k);
+        kvarn_graph_attn_trace_tensor("pending_v", pending_v);
+        kvarn_graph_attn_trace_tensor("scratch", scratch);
+        kvarn_graph_attn_trace_tensor("kq_mask", kq_mask);
+        kvarn_graph_attn_trace_tensor("out", node);
+    }
 }
 
 static bool kvarn_graph_use_attn_scratch_ref() {

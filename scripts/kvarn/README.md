@@ -485,6 +485,25 @@ Verified local smoke:
   heads, `2` KV heads) and still passes split, forced fused, and CPU-reference
   comparisons, so the model-level failure is above a direct primitive call and
   remains tied to full graph/runtime integration.
+  `LLAMA_KVARN_ATTN_TRACE=1` with `LLAMA_KVARN_ATTN_TRACE_LIMIT=N` now traces
+  both the graph update and CUDA backend dispatch for `GGML_OP_KVARN_ATTN_MIXED`.
+  On this Windows host, freshly rebuilt shared `llama-results.exe`/DLLs were
+  blocked by Smart App Control / Device Guard (`CodeIntegrity` event 3077:
+  `ggml-base.dll` did not meet Enterprise signing requirements), so traced
+  model diagnostics used a separate static CUDA build:
+  `cmake -S . -B build-kvarn-cuda-static-vs -G "Visual Studio 17 2022" -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_CCACHE=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=ON`.
+  The traced Qwen3.6 repeat-4 unsafe fused-vs-split diagnostic showed the first
+  divergent model path entering CUDA as `mode=fused-batch` versus `mode=split`
+  with identical tensor geometry: `n_queries=2`, `n_head=16`, `n_head_kv=2`,
+  `n_sink=2`, `n_records=0`, `n_pending=0`, `n_tail=0`, `head_dim=256`,
+  F32 mask, and a 512-token mask stride. Disabling CUDA graphs with
+  `GGML_CUDA_DISABLE_GRAPHS=1` still failed (`NMSE = 2.061e-03` in the static
+  traced run), so CUDA graph capture/replay is not the root cause. The direct
+  CUDA primitive test now also covers this two-token sink-only shape plus the
+  earlier 49-token sink-only shape and still passes split, forced fused,
+  fused-vs-split, and CPU-reference checks. Current evidence points to small
+  fused-vs-split attention math drift being amplified by the Qwen3.6 MoE graph;
+  the production path remains the split multi-query KVarN kernels.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.

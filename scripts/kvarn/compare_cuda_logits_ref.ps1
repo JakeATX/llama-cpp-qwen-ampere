@@ -16,6 +16,8 @@ param(
     [switch] $PackedSplitKernels,
     [switch] $CheckPackedRepeat,
     [switch] $CheckPackedSplit,
+    [switch] $TraceAttn,
+    [int] $TraceLimit = 4,
     [switch] $KeepArtifacts
 )
 
@@ -33,9 +35,19 @@ if ($Batch -lt 0) {
 if ($DebugUbatch -lt 0) {
     throw "DebugUbatch must be non-negative"
 }
+if ($TraceLimit -lt 0) {
+    throw "TraceLimit must be non-negative"
+}
 $packedModeCount = (@($PackedFusedBatch.IsPresent, $PackedSerialFused.IsPresent, $PackedSplitKernels.IsPresent) | Where-Object { $_ }).Count
 if ($packedModeCount -gt 1) {
     throw "PackedFusedBatch, PackedSerialFused, and PackedSplitKernels are mutually exclusive"
+}
+
+function Add-TraceEnv([hashtable] $envSet) {
+    if ($TraceAttn) {
+        $envSet["LLAMA_KVARN_ATTN_TRACE"] = "1"
+        $envSet["LLAMA_KVARN_ATTN_TRACE_LIMIT"] = [string] $TraceLimit
+    }
 }
 
 function Get-ExePath([string] $buildDir, [string] $name) {
@@ -135,10 +147,16 @@ if ($PackedFusedBatch) {
 if ($PackedSplitKernels) {
     $packedEnv["LLAMA_KVARN_ATTN_SPLIT_KERNELS"] = "1"
 }
+Add-TraceEnv $packedEnv
+Add-TraceEnv $scratchEnv
+Add-TraceEnv $splitEnv
 
 try {
     Write-Host "== Saving packed KVarN logits"
-    [void] (Invoke-Results $results $commonArgs $packedEnv)
+    $packedText = Invoke-Results $results $commonArgs $packedEnv
+    if ($TraceAttn) {
+        Write-Host $packedText
+    }
 
     if ($CheckPackedRepeat) {
         Write-Host "== Checking packed KVarN repeat determinism"
@@ -150,12 +168,18 @@ try {
     if ($CheckPackedSplit) {
         Write-Host "== Checking split-kernel packed KVarN logits"
         $splitCheck = Invoke-Results $results ($commonArgs + @("--check")) $splitEnv
+        if ($TraceAttn) {
+            Write-Host $splitCheck
+        }
         $splitNmse = Get-Nmse $splitCheck "packed-vs-split"
         Write-Host ("KVarN packed-vs-split logits: PASS, NMSE = {0:E3}" -f $splitNmse)
     }
 
     Write-Host "== Checking scratch-reference KVarN logits"
     $check = Invoke-Results $results ($commonArgs + @("--check")) $scratchEnv
+    if ($TraceAttn) {
+        Write-Host $check
+    }
     $nmse = Get-Nmse $check "packed-vs-scratch"
     Write-Host ("KVarN packed-vs-scratch logits: PASS, NMSE = {0:E3}" -f $nmse)
 } finally {
