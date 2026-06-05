@@ -27,11 +27,22 @@ function Get-ExpectedKvarnLayerIds([string] $layers) {
         if ([string]::IsNullOrWhiteSpace($raw)) {
             continue
         }
-        $id = 0
-        if (-not [int]::TryParse($raw, [ref] $id) -or $id -lt 0) {
-            throw "Invalid KVarN layer id '$raw' in ExpectedKvarnLayers"
+        if ($raw -match '^([0-9]+)-([0-9]+)$') {
+            $start = [int] $Matches[1]
+            $end = [int] $Matches[2]
+            if ($end -lt $start) {
+                throw "Invalid KVarN layer range '$raw' in ExpectedKvarnLayers"
+            }
+            for ($id = $start; $id -le $end; ++$id) {
+                $ids += $id
+            }
+        } else {
+            $id = 0
+            if (-not [int]::TryParse($raw, [ref] $id) -or $id -lt 0) {
+                throw "Invalid KVarN layer id '$raw' in ExpectedKvarnLayers"
+            }
+            $ids += $id
         }
-        $ids += $id
     }
     return $ids
 }
