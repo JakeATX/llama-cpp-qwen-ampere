@@ -504,14 +504,22 @@ Verified local smoke:
   fused-vs-split, and CPU-reference checks. Current evidence points to small
   fused-vs-split attention math drift being amplified by the Qwen3.6 MoE graph;
   the production path remains the split multi-query KVarN kernels.
-  The `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` diagnostic now actually overrides the
-  default multi-query split routing; before this routing fix it was masked by
-  the `n_queries > 1` split guard. After fixing that routing, the traced
-  Qwen3.6 repeat-4 serial-fused run entered CUDA as `mode=serial-fused` and
-  passed both serial-fused-vs-split and serial-fused-vs-scratch at
-  `NMSE = 0.000E+000`. The remaining unsafe correctness issue is specific to
-  the multi-block `LLAMA_KVARN_ATTN_FUSED_BATCH=1` path, not the per-row fused
-  kernel.
+  The per-row serial fused kernel is now the default for multi-query KVarN
+  prompt batches. `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` still forces the previous
+  split score/AV kernels, and `LLAMA_KVARN_ATTN_FUSED_BATCH=1` remains the
+  explicitly rejected unsafe multi-block diagnostic path unless paired with
+  `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`. Before the routing fix,
+  `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` was masked by the `n_queries > 1` split
+  guard; after fixing that routing, the traced Qwen3.6 repeat-4 serial-fused
+  run entered CUDA as `mode=serial-fused` and passed both serial-fused-vs-split
+  and serial-fused-vs-scratch at `NMSE = 0.000E+000`. The remaining unsafe
+  correctness issue is specific to the multi-block
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1` path, not the per-row fused kernel.
+  Static Qwen3.5 0.8B benchmark at `-p 128 -n 64 -r 1 -fa off` measured the
+  old split prompt path at `553.86` pp t/s and `125.18` tg t/s, while serial
+  fused measured `692.75` pp t/s and `111.10` tg t/s. The production routing
+  uses serial fused only for multi-query prompt batches, preserving the
+  existing single-query fused generation path.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.
@@ -539,10 +547,10 @@ Required integration path:
 1. Finish optimization of KVarN prompt batches. `GGML_OP_KVARN_ATTN_MIXED`
    carries an optional KQ/causal mask in `src[10]`, and runtime preparation now
    admits bounded prompt ubatches for dense, hybrid, and MoE models.
-   Correctness is currently maintained by using split score/AV CUDA kernels for
-   `n_queries > 1`; the fused multi-query packed-attention path is disabled
-   with an explicit unsupported-mode error until it can replace the split path
-   for all prompt batches.
+   Correctness is currently maintained by using the per-row serial fused CUDA
+   kernel for `n_queries > 1`; the faster multi-block fused packed-attention
+   path is disabled with an explicit unsupported-mode error until it can replace
+   the serial fused path for all prompt batches.
 2. Finish prompt-batch sealing semantics. The graph builder now collects all
    seal records in an ubatch and emits store ops for each record, and the body
    plan has multi-record seal coverage. Bounded production prompt ubatches now

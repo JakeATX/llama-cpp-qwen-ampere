@@ -2915,9 +2915,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     const bool forced_fused_batch = fused_batch_env != nullptr && std::atoi(fused_batch_env) != 0;
                     const bool forced_split = split_env != nullptr && std::atoi(split_env) != 0;
                     const bool forced_serial = serial_env != nullptr && std::atoi(serial_env) != 0;
-                    const bool split_runtime = use_scratch_ref || forced_split || (dst->ne[2] > 1 && !forced_fused_batch && !forced_serial);
+                    const bool serial_runtime = forced_serial || (dst->ne[2] > 1 && !forced_fused_batch && !forced_split);
+                    const bool split_runtime = use_scratch_ref || forced_split;
                     const char * mode = use_scratch_ref ? "scratch-ref" :
-                        (split_runtime ? "split" : (forced_serial ? "serial-fused" : "fused-batch"));
+                        (split_runtime ? "split" : (serial_runtime ? "serial-fused" : "fused-batch"));
 
                     std::fprintf(stderr,
                             "KVarN CUDA mixed-attn trace: mode=%s n_queries=%" PRId64 " n_head=%" PRId64

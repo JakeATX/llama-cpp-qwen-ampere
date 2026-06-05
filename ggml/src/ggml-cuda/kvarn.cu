@@ -2159,9 +2159,9 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const char * fused_batch_env = std::getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
     const bool allow_fused_batch = fused_batch_env != nullptr && std::atoi(fused_batch_env) != 0;
     const char * serial_env = std::getenv("LLAMA_KVARN_ATTN_SERIAL_FUSED");
-    const bool use_serial_fused = serial_env != nullptr && std::atoi(serial_env) != 0;
-    const bool use_split_kernels = (split_env != nullptr && std::atoi(split_env) != 0) ||
-        (n_queries > 1 && !allow_fused_batch && !use_serial_fused);
+    const bool force_serial_fused = serial_env != nullptr && std::atoi(serial_env) != 0;
+    const bool use_split_kernels = split_env != nullptr && std::atoi(split_env) != 0;
+    const bool use_serial_fused = force_serial_fused || (n_queries > 1 && !allow_fused_batch && !use_split_kernels);
 
     int block = 1;
     while (block < int(n_tokens)) {
