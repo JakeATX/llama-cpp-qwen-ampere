@@ -9,6 +9,7 @@ param(
     [double] $RtnQuantile = 0.95,
     [int] $Repetitions = 1,
     [int] $MinKvarnLayerLogs = 1,
+    [int] $MinKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
     [ValidateSet("csv", "json", "jsonl", "md", "sql")] [string] $OutputFormat = "md",
     [string] $OutputDir = "",
@@ -29,6 +30,9 @@ if ($GpuLayers -lt 0) {
 }
 if ($MinKvarnLayerLogs -lt 1) {
     throw "MinKvarnLayerLogs must be positive"
+}
+if ($MinKvarnBodyRecords -lt 0) {
+    throw "MinKvarnBodyRecords must be non-negative"
 }
 if (-not (Test-Path -LiteralPath $Model)) {
     throw "Model not found at $Model"
@@ -144,6 +148,25 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
     Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
 }
 
+function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    if ($maxRecords -lt $minimum) {
+        throw "$label observed maximum KVarN body records $maxRecords, expected at least $minimum"
+    }
+
+    Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
+}
+
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 $requiresKvarnEvidence = ($KvCacheQuant.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) |
@@ -160,6 +183,7 @@ $manifest = @(
     "kvarn_rtn_quantile=$rtnQuantileArg",
     "repetitions=$Repetitions",
     "min_kvarn_layer_logs=$MinKvarnLayerLogs",
+    "min_kvarn_body_records=$MinKvarnBodyRecords",
     "expected_kvarn_layers=$ExpectedKvarnLayers",
     "output_format=$OutputFormat",
     "warmup=$($Warmup.IsPresent)",
@@ -229,6 +253,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
             throw "llama-bench case '$($case.Name)' output did not include a KVarN benchmark row; see $logPath"
         }
         Assert-ExpectedKvarnLayers $text $expectedKvarnLayerIds "llama-bench case '$($case.Name)'"
+        Assert-MinKvarnBodyRecords $text $MinKvarnBodyRecords "llama-bench case '$($case.Name)'"
         Write-Host ("KVarN bench log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
     }
 }

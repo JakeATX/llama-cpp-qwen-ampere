@@ -5,6 +5,7 @@ param(
     [int] $GpuLayers = 99,
     [double] $RtnQuantile = 1.0,
     [int] $MinKvarnLayerLogs = 1,
+    [int] $MinKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = ""
 )
 
@@ -15,6 +16,9 @@ if (!($RtnQuantile -gt 0.0 -and $RtnQuantile -le 1.0)) {
 }
 if ($MinKvarnLayerLogs -lt 0) {
     throw "MinKvarnLayerLogs must be non-negative"
+}
+if ($MinKvarnBodyRecords -lt 0) {
+    throw "MinKvarnBodyRecords must be non-negative"
 }
 
 function Get-ExpectedKvarnLayerIds([string] $layers) {
@@ -73,6 +77,25 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
     Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
 }
 
+function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    if ($maxRecords -lt $minimum) {
+        throw "$label observed maximum KVarN body records $maxRecords, expected at least $minimum"
+    }
+
+    Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
+}
+
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 
@@ -106,6 +129,7 @@ foreach ($ctx in $CtxList.Split(" ", [System.StringSplitOptions]::RemoveEmptyEnt
             throw "KVarN smoke for ctx=$ctx showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs"
         }
         Assert-ExpectedKvarnLayers $kvarnText $expectedKvarnLayerIds "KVarN smoke for ctx=$ctx"
+        Assert-MinKvarnBodyRecords $kvarnText $MinKvarnBodyRecords "KVarN smoke for ctx=$ctx"
         Write-Host ("KVarN CLI log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
         continue
     }

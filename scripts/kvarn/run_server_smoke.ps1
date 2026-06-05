@@ -8,6 +8,7 @@ param(
     [string] $Prompt = "Hello",
     [int] $Predict = 1,
     [int] $MinKvarnLayerLogs = 1,
+    [int] $MinKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
     [switch] $CheckSlotSaveRejection
 )
@@ -22,6 +23,9 @@ if ($Predict -le 0) {
 }
 if ($MinKvarnLayerLogs -lt 0) {
     throw "MinKvarnLayerLogs must be non-negative"
+}
+if ($MinKvarnBodyRecords -lt 0) {
+    throw "MinKvarnBodyRecords must be non-negative"
 }
 
 function Get-ExpectedKvarnLayerIds([string] $layers) {
@@ -78,6 +82,25 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
         throw "$label missing expected KVarN layer ids: $($missing -join ',')"
     }
     Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
+}
+
+function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    if ($maxRecords -lt $minimum) {
+        throw "$label observed maximum KVarN body records $maxRecords, expected at least $minimum"
+    }
+
+    Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
 }
 
 function Get-ExePath([string] $buildDir, [string] $name) {
@@ -222,6 +245,7 @@ try {
         throw "server log showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs`n$serverLog"
     }
     Assert-ExpectedKvarnLayers $serverLog $expectedKvarnLayerIds "llama-server"
+    Assert-MinKvarnBodyRecords $serverLog $MinKvarnBodyRecords "llama-server"
 
     Write-Host ("KVarN server smoke: PASS, content = '{0}'" -f $response.content)
     Write-Host ("KVarN server log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)

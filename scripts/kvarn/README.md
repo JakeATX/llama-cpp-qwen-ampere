@@ -336,8 +336,12 @@ Verified local smoke:
   0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27`
   and `KVarN CLI log check: PASS, KVarN layer lines = 56`.
   The script also accepts `-ExpectedKvarnLayers` to require exact routed layer
-  IDs; all KVarN exact-layer harnesses accept comma-separated IDs and
-  inclusive ranges such as `0-27`, plus stepped ranges such as `5-47:6`.
+  IDs and `-MinKvarnBodyRecords` to prove the requested context allocated
+  packed body-record capacity instead of only sink/tail storage; all KVarN
+  exact-layer harnesses accept comma-separated IDs and inclusive ranges such as
+  `0-27`, plus stepped ranges such as `5-47:6`. Latest body-record guard rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "512" -RtnQuantile 0.95 -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27"`.
+  It passed with `KVarN body-record check: PASS, max body records = 2`.
   Latest Gemma 4 12B exact-layer rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "256" -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   This passed with `KVarN expected layer check: PASS, layers =
@@ -529,8 +533,10 @@ Verified local smoke:
   `artifacts\kvarn-bench\<timestamp>`. When `kvarn` is included in
   `--kv-cache-quant`, the harness now also requires
   `llama_kv_cache_kvarn:` initialization logs, at least `-MinKvarnLayerLogs`
-  KVarN layer allocation lines, and a KVarN benchmark row, so benchmark
-  artifacts cannot hide a normal-KV fallback or an under-routed KVarN layer set.
+  KVarN layer allocation lines, optional `-MinKvarnBodyRecords` body-record
+  capacity, and a KVarN benchmark row, so benchmark artifacts cannot hide a
+  normal-KV fallback, an under-routed KVarN layer set, or a body-record smoke
+  that only allocated sink/tail storage.
   `-ExpectedKvarnLayers` additionally requires exact routed layer IDs when a
   model family has a known KVarN layer set, and accepts comma-separated IDs
   plus inclusive ranges.
@@ -547,6 +553,12 @@ Verified local smoke:
   Latest stricter rerun with `-MinKvarnLayerLogs 28` passed on build
   `50f2196a0`: normal KV `212.41` tok/s, KVarN `184.42` tok/s, and 28 KVarN
   layer lines.
+  Latest body-record benchmark guard artifact:
+  `artifacts\kvarn-bench\latest-body-record-check-qwen25`, generated with
+  `-CaseList "pp512:512:0" -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2
+  -ExpectedKvarnLayers "0-27"`. Latest local result: normal KV `4224.78`
+  tok/s, KVarN `37.33` tok/s, exact layer check passed, and
+  `KVarN body-record check: PASS, max body records = 2`.
   Latest local 256-dim Qwen3.5 4B artifact directory:
   `artifacts\kvarn-bench\20260605-043201`. Results: `tg64` normal KV
   `139.47` tok/s, KVarN `99.06` tok/s; `pp128` normal KV `758.49` tok/s,
@@ -801,6 +813,10 @@ Verified local smoke:
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
+  Body-record guard rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8147 -Context 512 -Predict 1 -Prompt "Hello" -RtnQuantile 0.95 -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27"`.
+  Latest local result passed exact layer routing and
+  `KVarN body-record check: PASS, max body records = 2`.
 - 256-dim server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8135 -CheckSlotSaveRejection`.
   Latest local result: `KVarN server smoke: PASS, content = ','` and
