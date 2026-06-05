@@ -377,9 +377,11 @@ Verified local smoke:
   packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
   `NMSE = 0.000E+000`.
 - Forced fused-batch rejection check:
-  `LLAMA_KVARN_ATTN_FUSED_BATCH=1 llama-results.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "hello" -o %TEMP%\kvarn-fused-reject.gguf -c 256 -ngl 99 -fa on --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -UnsupportedDimModel C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result failed before graph execution with
-  `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`.
+  `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`
+  and also verified Gemma 4 12B rejects with the expected unsupported K/V
+  dimension guard.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses
