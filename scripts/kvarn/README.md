@@ -442,7 +442,7 @@ Verified local smoke:
   packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
   `NMSE = 0.000E+000`.
 - Unsupported runtime-mode rejection check:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -UnsupportedDimModel C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -UnsupportedDimModel C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result failed forced fused-batch initialization before graph
   execution with
   `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`
