@@ -718,6 +718,11 @@ Verified local smoke:
   The logits script also accepts `-FlashAttn on|off|auto`; with `-FlashAttn off`
   the same Qwen3.6 serial-fused production path passed packed-repeat and
   packed-vs-scratch checks at `NMSE = 0.000E+000`.
+  Latest exact-layer static rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -CheckPackedRepeat -FlashAttn off -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`.
+  Packed save, packed repeat, and scratch-reference checks all logged 20 KVarN
+  layer lines, passed exact layer routing for `3,7,11,15,19,23,27,31,35,39`,
+  and passed packed-repeat and packed-vs-scratch checks at `NMSE = 0.000E+000`.
   The packed-repeat diagnostic
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24 -DebugUbatch 128 -CheckPackedRepeat`
   also passed with packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
