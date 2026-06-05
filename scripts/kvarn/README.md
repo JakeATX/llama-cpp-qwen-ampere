@@ -94,9 +94,11 @@ Current implemented pieces:
   span (`min(n_ubatch, tail_tokens)`) for dense, hybrid, and MoE models, so
   prompt processing can use masked multi-query KVarN attention without evicting
   a tail slot written earlier in the same graph. Qwen3.6 MoE bounded prompt
-  batching is correct through the serial fused multi-query CUDA path; the
-  forced multi-block fused-batch path is explicitly rejected because packed
-  repeats still diverge.
+  batching is correct through the default multi-block fused-batch CUDA path
+  for 256-dimensional heads, with serial-fused and split-kernel modes retained
+  only as explicit A/B diagnostics. Gemma 4 512-dimensional heads remain on the
+  split score/AV path by default until the fused 512 path is fixed against the
+  scratch-reference logits guard.
 - The shared `llama_batch_allocr::split_equal()` path has regression coverage
   ensuring it does not emit more sequence sets than its `n_ubatch` limit. This
   protects KVarN's tail-ring prompt bound and the other memory backends that
@@ -208,8 +210,8 @@ constructed with native slot metadata. Graph construction identifies
 The KVarN graph path stores sink/tail tensors, can seal one completed body
 record from pending K/V staging, and can consume KVarN sink/tail/body/scale
 storage through CUDA mixed attention. Runtime execution now uses bounded prompt
-ubatches with KQ masks, including Qwen3.6 MoE through the serial fused
-multi-query CUDA attention path.
+ubatches with KQ masks, including Qwen3.6 MoE through the default multi-block
+fused-batch CUDA attention path.
 
 Verified local smoke:
 
@@ -725,17 +727,17 @@ Verified local smoke:
   promotes the multi-block fused-batch CUDA path to the default production
   packed attention mode; `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` and
   `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` remain supported diagnostic overrides.
-  A minimized forced fused-batch trace with the same model also passed
-  packed-vs-split and packed-vs-scratch checks at `NMSE = 0.000E+000`; the trace
-  confirmed identical tensor geometry between fused, split, and scratch modes
-  for the warmup/single-query calls.
-  `LLAMA_KVARN_ATTN_TRACE=1` with `LLAMA_KVARN_ATTN_TRACE_LIMIT=N` traces
-  both the graph update and CUDA backend dispatch for `GGML_OP_KVARN_ATTN_MIXED`.
+  Current traced static rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -TraceAttn -TraceLimit 1 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`.
+  It passed the exact layer check, asserted packed CUDA mode `fused-batch`, and
+  passed packed-vs-scratch at `NMSE = 0.000E+000`, so the production Qwen3.6
+  path now has an automated dispatcher-mode guard instead of a manual trace
+  inspection. `LLAMA_KVARN_ATTN_TRACE=1` with
+  `LLAMA_KVARN_ATTN_TRACE_LIMIT=N` traces both the graph update and CUDA backend
+  dispatch for `GGML_OP_KVARN_ATTN_MIXED`.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current
   default-fused model-level logits guard is now the acceptance criterion.
-  `LLAMA_KVARN_ATTN_TRACE=1` with `LLAMA_KVARN_ATTN_TRACE_LIMIT=N` now traces
-  both the graph update and CUDA backend dispatch for `GGML_OP_KVARN_ATTN_MIXED`.
   On this Windows host, freshly rebuilt shared `llama-results.exe`/DLLs were
   blocked by Smart App Control / Device Guard (`CodeIntegrity` event 3077:
   `ggml-base.dll` did not meet Enterprise signing requirements), so traced
