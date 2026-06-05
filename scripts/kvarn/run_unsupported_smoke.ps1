@@ -103,7 +103,6 @@ function Invoke-ExpectProcessFailure([string] $exe, [string[]] $argv, [hashtable
 }
 
 $results = Get-ExePath $BuildDir "llama-results.exe"
-$cli = Get-ExePath $BuildDir "llama-cli.exe"
 $server = Get-ExePath $BuildDir "llama-server.exe"
 $tmpOut = Join-Path $env:TEMP "kvarn-unsupported-smoke.gguf"
 Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue
@@ -153,23 +152,20 @@ if ($UnsupportedDimModel -ne "") {
     $unsupportedArgs = @(
         "-m", $UnsupportedDimModel,
         "-p", "Hello",
-        "-n", "1",
+        "-o", $tmpOut,
         "-c", [string] $Context,
         "-ngl", [string] $GpuLayers,
-        "--no-warmup",
-        "--simple-io",
-        "--single-turn",
         "-fa", "off",
         "--kv-cache-quant", "kvarn",
         "--kvarn-preset", "kvarn_k4v2_g128"
     )
 
     Invoke-ExpectFailure `
-        $cli `
+        $results `
         $unsupportedArgs `
         @{} `
-        "KVarN backend currently supports only 128- or 256-dimensional K/V heads" `
-        "KVarN unsupported K/V dimension rejection"
+        "KVarN backend currently supports only 128- or 256-dimensional K/V heads|KVarN backend does not support SWA/ISWA models yet" `
+        "KVarN unsupported K/V dimension or SWA/ISWA rejection"
 }
 
 Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue

@@ -343,12 +343,12 @@ Verified local smoke:
   48 layers, context `131072`, 16 attention heads, no SSM keys, and K/V head
   length `512`. They are not 256-dimensional despite the original target
   assumption, and they also use SWA/ISWA cache routing. KVarN rejects these
-  files cleanly before graph construction with
-  `KVarN backend currently supports only 128- or 256-dimensional K/V heads`;
+  files cleanly before graph construction with a combined blocker message:
+  `KVarN backend does not support SWA/ISWA models yet; KVarN backend currently supports only 128- or 256-dimensional K/V heads; layer 5 has 512`;
   earlier builds could reach an invalid ISWA graph cast and crash with
   `0xC0000005`. Current-build rejection was rechecked with
-  `llama-cli -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`
-  and passed with the expected 128/256-only validation error.
+  `llama-results -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p Hello -o <tmp.gguf> -c 256 -ngl 99 -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`
+  and passed with the expected SWA/ISWA plus 128/256-only validation error.
 - Fresh `tg64` benchmark gates on the CUDA FA-off build:
   Qwen2.5 1.5B 128-dim normal KV `202.46` tok/s, KVarN `160.37` tok/s;
   Qwen3.5 0.8B 256-dim hybrid normal KV `360.12` tok/s, KVarN
@@ -419,7 +419,7 @@ Verified local smoke:
   `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`
   and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection, server
   `--parallel 2` rejection, plus Gemma 4 12B rejection with the expected
-  unsupported K/V dimension guard.
+  unsupported K/V dimension or SWA/ISWA guard.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses

@@ -2022,6 +2022,7 @@ static void llama_kvarn_validate_memory_support(
         throw std::runtime_error("KVarN backend does not support MLA models yet");
     }
 
+    std::string unsupported_head_dim_msg;
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         if (!hparams.has_kv(il)) {
             continue;
@@ -2037,10 +2038,24 @@ static void llama_kvarn_validate_memory_support(
                     il, head_k, head_v));
         }
         if (!llama_kvarn_supported_head_dim(head_k)) {
-            throw std::runtime_error(format(
+            unsupported_head_dim_msg = format(
                     "KVarN backend currently supports only 128- or 256-dimensional K/V heads; layer %u has %u",
-                    il, head_k));
+                    il, head_k);
+            break;
         }
+    }
+
+    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+        std::string msg = "KVarN backend does not support SWA/ISWA models yet";
+        if (!unsupported_head_dim_msg.empty()) {
+            msg += "; ";
+            msg += unsupported_head_dim_msg;
+        }
+        throw std::runtime_error(msg);
+    }
+
+    if (!unsupported_head_dim_msg.empty()) {
+        throw std::runtime_error(unsupported_head_dim_msg);
     }
 
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
@@ -2067,10 +2082,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
     if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
         llama_kvarn_validate_memory_support(*this, hparams, params, cparams);
-
-        if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-            throw std::runtime_error("KVarN backend does not support SWA/ISWA models yet");
-        }
 
         const bool mtp_on_hybrid_qwen35 =
             params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
