@@ -385,6 +385,9 @@ Verified local smoke:
   Static CUDA focused rerun:
   `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail|test-arg-parser" --output-on-failure`.
   Latest local result on 2026-06-05 passed all four tests.
+  `test-kvarn-kv` also now covers the lower-level cache constructor rejection
+  for asymmetric K/V head dimensions, matching the model-load compatibility
+  guard that rejects such models before runtime allocation.
   The CUDA scratch-reference test now stresses the Qwen3.6 attention topology
   for 256-dimensional heads (`16` query heads, `2` KV heads) and includes a
   sink-only causal, padded-mask case matching the smallest unsafe fused-batch

@@ -858,6 +858,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const uint32_t n_head_kv = hparams.n_head_kv_arr[il];
         const uint32_t head_k = kvarn_hparams_n_embd_head_k(hparams, il);
         const uint32_t head_v = kvarn_hparams_n_embd_head_v(hparams, il);
+        if (head_k != head_v) {
+            throw std::invalid_argument("KVarN cache requires equal K and V head dimensions");
+        }
         const llama_kvarn_layout layout_k = llama_kvarn_make_layout(params, head_k);
         const llama_kvarn_layout layout_v = llama_kvarn_make_layout(params, head_v);
         layer_heads.push_back(n_head_kv);

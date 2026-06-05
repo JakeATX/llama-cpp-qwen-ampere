@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 static void require(bool ok, const char * msg) {
@@ -356,6 +357,17 @@ static void test_runtime_metadata() {
     require(view_reuse1.sink_tail_k == view_reuse0.sink_tail_k, "KVarN reuse layer shares sink K storage");
     require(view_reuse1.body_k == view_reuse0.body_k, "KVarN reuse layer shares body K storage");
     require(cache_reuse.body_store_scratch_floats(1) == 512*128 + 2*512, "KVarN reuse body scratch uses logical layer head dim");
+
+    llama_hparams hparams_asym = make_test_hparams(256);
+    hparams_asym.n_embd_head_v_full = 128;
+    hparams_asym.n_embd_head_v_swa = 128;
+    bool rejected_asym = false;
+    try {
+        llama_kv_cache_kvarn cache_asym(nullptr, hparams_asym, params, false, 16, 4, 1, nullptr);
+    } catch (const std::invalid_argument & e) {
+        rejected_asym = std::strstr(e.what(), "equal K and V head dimensions") != nullptr;
+    }
+    require(rejected_asym, "KVarN rejects asymmetric K/V head dimensions");
 
 }
 
