@@ -13,6 +13,7 @@ param(
     [switch] $PackedFusedBatch,
     [switch] $PackedSerialFused,
     [switch] $PackedSplitKernels,
+    [switch] $CheckPackedRepeat,
     [switch] $KeepArtifacts
 )
 
@@ -109,6 +110,17 @@ if ($PackedSplitKernels) {
 try {
     Write-Host "== Saving packed KVarN logits"
     [void] (Invoke-Results $results $commonArgs $packedEnv)
+
+    if ($CheckPackedRepeat) {
+        Write-Host "== Checking packed KVarN repeat determinism"
+        $repeatCheck = Invoke-Results $results ($commonArgs + @("--check")) $packedEnv
+        $repeatMatch = [regex]::Match($repeatCheck, "NMSE=([0-9.eE+-]+)")
+        if (-not $repeatMatch.Success) {
+            throw "Could not find packed-repeat NMSE in llama-results output"
+        }
+        $repeatNmse = [double]::Parse($repeatMatch.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+        Write-Host ("KVarN packed repeat logits: PASS, NMSE = {0:E3}" -f $repeatNmse)
+    }
 
     Write-Host "== Checking scratch-reference KVarN logits"
     $check = Invoke-Results $results ($commonArgs + @("--check")) $scratchEnv

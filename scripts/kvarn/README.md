@@ -342,6 +342,13 @@ Verified local smoke:
   one-token MoE KVarN ubatches because bounded MoE prompt batching diverged at
   `NMSE = 9.983E-004`. Forcing fused bounded MoE prompt batching with
   `-DebugUbatch 128 -PackedFusedBatch` diverged further at `NMSE = 1.375E-002`.
+  The packed-repeat diagnostic
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24 -DebugUbatch 128 -CheckPackedRepeat`
+  showed forced bounded MoE packed-vs-packed determinism at
+  `NMSE = 0.000E+000`, followed by the same packed-vs-scratch failure at
+  `NMSE = 9.983E-004`. That points at KVarN packed/scratch semantic divergence
+  under forced MoE prompt batching rather than general cross-run MoE
+  nondeterminism.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
