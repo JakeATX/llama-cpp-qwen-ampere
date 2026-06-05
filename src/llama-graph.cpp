@@ -7,6 +7,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-kvarn-iswa.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-memory-hybrid.h"
@@ -845,6 +846,35 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
+    if (mctx_kvarn_iswa != nullptr) {
+        const auto * base_ctx = mctx_kvarn_iswa->get_base();
+        base_ctx->set_input_sink_tail_idxs(base_sink_tail_idxs, ubatch);
+        base_ctx->set_input_body_plan(base_body_plan, ubatch);
+        base_ctx->set_input_body_offsets(base_body_offsets, ubatch);
+        base_ctx->set_input_tail_evict_idxs(base_tail_evict_idxs, ubatch);
+        base_ctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+        const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, *ubatch, base_ctx->get_size());
+        GGML_ASSERT(window.valid);
+        for (ggml_tensor * node : base_mixed_attn_nodes) {
+            kvarn_graph_update_mixed_attn_params(node, window);
+        }
+
+        const auto * swa_ctx = mctx_kvarn_iswa->get_swa();
+        if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
+            swa_ctx->set_input_k_idxs(self_k_idxs_swa, ubatch);
+            swa_ctx->set_input_v_idxs(self_v_idxs_swa, ubatch);
+            swa_ctx->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn);
+        }
+        if (self_k_rot_swa) {
+            swa_ctx->set_input_k_rot(self_k_rot_swa);
+        }
+        if (self_v_rot_swa) {
+            swa_ctx->set_input_v_rot(self_v_rot_swa);
+        }
+        return;
+    }
+
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (self_k_idxs && self_k_idxs->buffer) {
         mctx->get_base()->set_input_k_idxs(self_k_idxs, ubatch);
@@ -879,9 +909,56 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
+    if (const auto * mctx = dynamic_cast<const llama_kv_cache_kvarn_iswa_context *>(params.mctx)) {
+        this->mctx_kvarn_iswa = mctx;
+        this->mctx = nullptr;
+
+        const auto * base_ctx = mctx->get_base();
+        if (base_has_body_store_ops) {
+            return false;
+        }
+        if (kvarn_graph_use_attn_fused_batch()) {
+            return false;
+        }
+
+        const kvarn_active_window window = kvarn_graph_active_window(params.cparams.kvarn, params.ubatch, base_ctx->get_size());
+        if (!window.valid) {
+            return false;
+        }
+        if (!kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch).empty()) {
+            return false;
+        }
+
+        const uint32_t n_tail_evict = kvarn_graph_count_tail_evictions(params.cparams.kvarn, params.ubatch);
+        bool res = true;
+        res &= base_sink_tail_idxs->ne[0] == params.ubatch.n_tokens;
+        res &= base_body_plan->ne[1] == n_tail_evict;
+        res &= base_body_offsets->ne[0] == n_tail_evict;
+        res &= base_tail_evict_idxs->ne[0] == n_tail_evict;
+        res &= can_reuse_kq_mask(self_kq_mask, base_ctx->get_size(), params.ubatch, params.cparams);
+        res &= !base_mixed_attn_nodes.empty();
+
+        for (const ggml_tensor * node : base_mixed_attn_nodes) {
+            res &= node->op == GGML_OP_KVARN_ATTN_MIXED;
+            const int64_t n_head_kv = node->src[1] ? node->src[1]->ne[1] : 0;
+            const int64_t required_scratch = kvarn_graph_attn_scratch_floats(
+                    window, n_head_kv, window.n_records, node->op_params[5], node->op_params[6]);
+            res &= node->src[9] != nullptr && ggml_nelements(node->src[9]) >= required_scratch;
+        }
+
+        const auto * swa_ctx = mctx->get_swa();
+        if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
+            res &= self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
+            res &= can_reuse_kq_mask(self_kq_mask_swa, swa_ctx, params.ubatch, params.cparams);
+        }
+
+        return res;
+    }
+
     const auto * mctx = static_cast<const llama_kv_cache_iswa_context *>(params.mctx);
 
     this->mctx = mctx;
+    this->mctx_kvarn_iswa = nullptr;
 
     bool res = true;
 
@@ -3008,9 +3085,111 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, v_cur);
     }
 
-    const auto * mctx_iswa = inp->mctx;
+    if (!is_swa && inp->mctx_kvarn_iswa != nullptr) {
+        const auto * mctx_kvarn = inp->mctx_kvarn_iswa->get_base();
 
-    const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+        if (inp->self_k_rot || inp->self_v_rot || kq_b || sinks) {
+            throw std::runtime_error(
+                    "KVarN+ISWA graph backend does not yet support attention rotations, KQ bias, or attention sinks on non-SWA layers");
+        }
+        if ((k_cur == nullptr) != (v_cur == nullptr)) {
+            throw std::runtime_error("KVarN+ISWA graph backend requires K and V cache writes to be paired");
+        }
+
+        const bool stores_kv = k_cur != nullptr;
+        const auto & idxs = inp->base_sink_tail_idxs;
+        const llama_kvarn_layer_view layer = mctx_kvarn->get_layer_view(il);
+        GGML_ASSERT(layer.body_k != nullptr);
+        GGML_ASSERT(layer.body_v != nullptr);
+        GGML_ASSERT(layer.scales_k != nullptr);
+        GGML_ASSERT(layer.scales_v != nullptr);
+        GGML_ASSERT(layer.layout_k.key_bits == 4);
+        GGML_ASSERT(layer.layout_v.value_bits == 2);
+
+        if (stores_kv) {
+            ggml_build_forward_expand(gf, inp->base_body_plan);
+            ggml_build_forward_expand(gf, inp->base_body_offsets);
+            ggml_build_forward_expand(gf, inp->base_tail_evict_idxs);
+            if (inp->base_body_offsets->ne[0] > 0) {
+                ggml_build_forward_expand(gf, mctx_kvarn->cpy_tail_evict_pending_k(
+                            ctx0, inp->base_tail_evict_idxs, inp->base_body_offsets, il));
+                ggml_build_forward_expand(gf, mctx_kvarn->cpy_tail_evict_pending_v(
+                            ctx0, inp->base_tail_evict_idxs, inp->base_body_offsets, il));
+            }
+            ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
+            ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
+
+            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
+            if (!seal_records.empty()) {
+                inp->base_has_body_store_ops = true;
+            }
+
+            for (const uint32_t seal_record : seal_records) {
+                if (seal_record >= layer.n_records) {
+                    throw std::runtime_error("KVarN+ISWA graph backend attempted to seal a body record outside cache capacity");
+                }
+
+                for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
+                    ggml_tensor * k_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
+                    ggml_tensor * v_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
+                    ggml_build_forward_expand(gf, mctx_kvarn->store_k_body_record_from_pending(
+                                ctx0, k_scratch, il, ih, seal_record));
+                    ggml_build_forward_expand(gf, mctx_kvarn->store_v_body_record_from_pending(
+                                ctx0, v_scratch, il, ih, seal_record));
+                }
+            }
+        }
+
+        const llama_pos pos = ubatch.pos ? ubatch.pos[0] : llama_pos(0);
+        if (pos < 0) {
+            throw std::runtime_error("KVarN+ISWA graph backend cannot attend to a negative-position decode token");
+        }
+
+        const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, ubatch, mctx_kvarn->get_size());
+        if (!window.valid) {
+            throw std::runtime_error("KVarN+ISWA graph backend cannot build active decode attention window");
+        }
+        if (uint32_t(window.n_records) > layer.n_records) {
+            throw std::runtime_error("KVarN+ISWA graph backend active body record count exceeds allocated cache capacity");
+        }
+
+        const int64_t scores_floats = std::max<int64_t>(
+                kvarn_graph_attn_scratch_floats(
+                    window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size),
+                mctx_kvarn->get_size());
+        ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
+        ggml_set_name(scores, "kvarn_iswa_attn_scores");
+
+        ggml_tensor * cur = ggml_kvarn_attn_mixed(
+                ctx0, q_cur, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
+                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask(),
+                window.n_sink, window.n_records, window.n_pending, window.n_tail, window.tail_start,
+                int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
+                int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);
+        inp->base_mixed_attn_nodes.push_back(cur);
+        cb(cur, "kvarn_iswa_kqv_out", il);
+        cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+
+        if (wo) {
+            cur = build_lora_mm(wo, cur, wo_s);
+        }
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+
+        return cur;
+    }
+
+    const llama_kv_cache_context * mctx_cur = nullptr;
+    if (inp->mctx_kvarn_iswa != nullptr) {
+        if (!is_swa) {
+            throw std::runtime_error("KVarN+ISWA graph backend reached normal KV path for a non-SWA layer");
+        }
+        mctx_cur = inp->mctx_kvarn_iswa->get_swa();
+    } else {
+        const auto * mctx_iswa = inp->mctx;
+        mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
+    }
 
     // optionally store to KV cache
     if (k_cur) {
@@ -3144,6 +3323,28 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
 //       like with the non-sliding window equivalent
 //       once sliding-window hybrid caches are a thing.
 llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const {
+    if (const auto * mctx_kvarn_iswa = dynamic_cast<const llama_kv_cache_kvarn_iswa_context *>(mctx)) {
+        auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_kvarn_iswa);
+
+        const auto * base_ctx = mctx_kvarn_iswa->get_base();
+        inp->base_sink_tail_idxs = base_ctx->build_input_sink_tail_idxs(ctx0, ubatch);
+        inp->base_body_plan = base_ctx->build_input_body_plan(ctx0, ubatch);
+        inp->base_body_offsets = base_ctx->build_input_body_offsets(ctx0, ubatch);
+        inp->base_tail_evict_idxs = base_ctx->build_input_tail_evict_idxs(ctx0, ubatch);
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, base_ctx->get_size(), ubatch, cparams);
+        inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        const auto * swa_ctx = mctx_kvarn_iswa->get_swa();
+        inp->self_k_idxs_swa = swa_ctx->build_input_k_idxs(ctx0, ubatch);
+        inp->self_v_idxs_swa = swa_ctx->build_input_v_idxs(ctx0, ubatch);
+        inp->self_kq_mask_swa = build_attn_inp_kq_mask(ctx0, swa_ctx, ubatch, cparams);
+        inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
+        inp->self_k_rot_swa = swa_ctx->build_input_k_rot(ctx0);
+        inp->self_v_rot_swa = swa_ctx->build_input_v_rot(ctx0);
+
+        return (llm_graph_input_attn_kv_iswa *) res->add_input(std::move(inp));
+    }
+
     const auto * mctx_cur = dynamic_cast<const llama_kv_cache_iswa_context *>(mctx);
     if (!mctx_cur) {
         throw std::runtime_error("ISWA attention graph requested a non-ISWA memory context");

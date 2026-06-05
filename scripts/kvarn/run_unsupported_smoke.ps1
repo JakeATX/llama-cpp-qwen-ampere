@@ -164,8 +164,8 @@ if ($UnsupportedDimModel -ne "") {
         $results `
         $unsupportedArgs `
         @{} `
-        "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads|KVarN backend does not support SWA/ISWA models yet" `
-        "KVarN unsupported K/V dimension or SWA/ISWA rejection"
+        "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads|KVarN backend supports SWA/ISWA only for Gemma 4 models at this stage" `
+        "KVarN unsupported K/V dimension or non-Gemma SWA/ISWA rejection"
 }
 
 Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue

@@ -10,12 +10,12 @@ Current implemented pieces:
 - `kvarn_k4v2_g128` preset defaults: group 128, 4-bit K, 2-bit V, 128 sink
   tokens, 128 tail tokens, 16 Sinkhorn iterations.
 - Runtime K/V head dimensions of 128, 256, and 512 are supported by
-  validation, layout/memory-estimator tests, runtime metadata tests, and CUDA
-  parity tests. Local `llama-cli` smokes currently cover 128- and
-  256-dimensional K/V heads. 256 remains the primary Qwen acceptance path. 512
-  is now admitted for layout/runtime/CUDA primitives, but the local Gemma 4
-  12B/26B files still use SWA/ISWA cache routing and are explicitly rejected
-  until KVarN has a production ISWA cache implementation.
+  validation, layout/memory-estimator tests, runtime metadata tests, CUDA
+  parity tests, and local `llama-cli` smokes. The 256-dimensional Qwen path is
+  the broadest acceptance path. The 512-dimensional Gemma 4 path now runs
+  through the KVarN+ISWA composite: non-SWA layers use KVarN storage, SWA
+  layers use the normal sliding-window KV cache, and Gemma-style physical KV
+  layer reuse is preserved.
 - CPU reference layout, Hadamard rotation, Sinkhorn-style balancing,
   asymmetric RTN, bit packing, body-record dequant, and a sink/body/tail
   reference cache.
@@ -81,17 +81,15 @@ Current implemented pieces:
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
   groups into packed KVarN body records plus scale metadata. It does not
   allocate or use the normal KV cache as a fallback.
-- KVarN cache layer-reuse metadata is now wired for models whose later layers
+- KVarN cache layer-reuse metadata is wired for models whose later layers
   reuse an earlier physical KV layer. Reuse-only graph layers attend from the
   mapped KVarN storage and skip duplicate sink/tail writes, tail-eviction
-  staging, and body-record sealing. This is a prerequisite for Gemma-style
-  K/V reuse, but Gemma still requires a KVarN+ISWA composite before SWA layers
-  can run.
-- A compiled `llama_kv_cache_kvarn_iswa` memory composite now exists. It owns
-  non-SWA layers with KVarN storage and SWA layers with the existing normal
-  sliding-window KV cache, preserving the normal SWA sizing, state, and
-  sequence operations. It is not routed from `create_memory()` yet because the
-  graph input path still needs a KVarN-base/normal-SWA dispatcher.
+  staging, and body-record sealing. This is used by Gemma-style K/V reuse.
+- The `llama_kv_cache_kvarn_iswa` memory composite is routed for Gemma 4. It
+  owns non-SWA layers with KVarN storage and SWA layers with the existing
+  normal sliding-window KV cache, preserving the normal SWA sizing, state, and
+  sequence operations. Non-Gemma SWA/ISWA models still fail explicitly until a
+  model-specific cache/reuse policy is added.
 - KVarN batch preparation now admits bounded prompt ubatches up to one tail-ring
   span (`min(n_ubatch, tail_tokens)`) for dense, hybrid, and MoE models, so
   prompt processing can use masked multi-query KVarN attention without evicting
@@ -372,21 +370,27 @@ Verified local smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "<300 hello tokens>" -n 1 -c 384 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with two KVarN body records per full-attention
   layer and an `11.11 MiB` CUDA KVarN buffer.
-- Gemma 4 12B metadata discovered locally:
+- Gemma 4 12B/26B metadata and KVarN+ISWA runtime validation:
   `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf` and
   `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf` are `gemma4`,
   48 layers, context `131072`, 16 attention heads, no SSM keys, full-attention
   K/V head length `512`, and SWA K/V head length `256`. Gemma 4 26B A4B files
   are also `gemma4`, 30 layers, context `262144`, full-attention K/V head
   length `512`, SWA K/V head length `256`, 128 experts, and 8 active experts.
-  KVarN 512 layout/CUDA support and KVarN physical-layer reuse no longer reject
-  these for head dimension or KV reuse, but KVarN still rejects them cleanly
-  before graph construction because KVarN+ISWA graph routing is not implemented:
-  `KVarN backend does not support SWA/ISWA models yet`. Earlier builds could
-  reach an invalid ISWA graph cast and crash with `0xC0000005`.
-  Current-build rejection was rechecked with
-  `llama-results -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p Hello -o <tmp.gguf> -c 256 -ngl 99 -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`
-  and passed with the expected SWA/ISWA validation error.
+  KVarN+ISWA now routes these Gemma 4 models without falling back to normal KV
+  on full-attention layers.
+  Gemma 4 12B short smoke:
+  `build-kvarn-cuda-static-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p Hello -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 --no-display-prompt`.
+  Latest local result passed with KVarN storage on full-attention layers
+  `5, 11, 17, 23, 29, 35, 41, 47`.
+  Gemma 4 12B body-record smoke at `-c 384` with a 300-token repeated prompt
+  passed with two body records per KVarN layer and an `8.87 MiB` CUDA KVarN
+  buffer. A larger `-c 2048` smoke with a 1500-token repeated prompt passed
+  with 14 body records per KVarN layer and a `14.07 MiB` CUDA KVarN buffer.
+  Gemma 4 12B server smoke passed via
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8152 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95`.
+  Gemma 4 26B A4B short and body-record smokes passed on the local 12 GB RTX
+  5070, with KVarN storage on full-attention layers `5, 11, 17, 23, 29`.
 - Fresh `tg64` benchmark gates on the CUDA FA-off build:
   Qwen2.5 1.5B 128-dim normal KV `202.46` tok/s, KVarN `160.37` tok/s;
   Qwen3.5 0.8B 256-dim hybrid normal KV `360.12` tok/s, KVarN
@@ -398,6 +402,13 @@ Verified local smoke:
   Qwen3.5 4B body-record-crossing `tg384` normal KV `145.27` tok/s, KVarN
   `34.90` tok/s; Qwen3.6 35B A3B MTP IQ3 `tg64` normal KV `9.10` tok/s,
   KVarN `9.81` tok/s.
+- Current-build 512 Gemma 4 KVarN+ISWA benchmark on the static CUDA build:
+  `build-kvarn-cuda-static-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p 512 -n 64 -r 1 -ngl 99 -fa off --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
+  Latest local result: normal KV `pp512 = 1725.04` tok/s and
+  `tg64 = 66.32` tok/s; KVarN `pp512 = 31.80` tok/s and
+  `tg64 = 45.59` tok/s. This confirms the routed Gemma path is benchmarkable,
+  but prompt prefill remains a major optimization target for 512-dimensional
+  KVarN+ISWA.
 - Reusable benchmark matrix harness:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -CaseList "tg64:0:64,pp128:128:0,tg384:0:384" -FlashAttn off -Repetitions 1`.
   The script runs each named `prompt_tokens:generation_tokens` case through
@@ -468,14 +479,22 @@ Verified local smoke:
   Latest local result passed on the bounded prompt-batch path with
   packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
   `NMSE = 0.000E+000`.
+- 512-dim Gemma 4 KVarN+ISWA packed-vs-scratch logits-distance comparisons:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -CheckPackedRepeat`.
+  Latest local 12B result passed with packed-repeat `NMSE = 0.000E+000` and
+  packed-vs-scratch `NMSE = 0.000E+000`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat`.
+  Latest local 26B A4B result also passed with packed-repeat
+  `NMSE = 0.000E+000` and packed-vs-scratch `NMSE = 0.000E+000`.
 - Unsupported runtime-mode rejection check:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -UnsupportedDimModel C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result failed forced fused-batch initialization before graph
   execution with
   `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`
   and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection, server
-  `--parallel 2` rejection, plus Gemma 4 12B rejection with the expected
-  unsupported K/V dimension or SWA/ISWA guard.
+  `--parallel 2` rejection. The optional `-UnsupportedDimModel` argument is
+  now reserved for truly unsupported head dimensions or non-Gemma SWA/ISWA
+  fixtures; Gemma 4 is a supported KVarN+ISWA path.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses
@@ -668,6 +687,6 @@ with `STATUS_CONTROL_C_EXIT`.
 
 Local smoke models may fail KVarN initialization before graph construction if
 they do not match the production constraints. Expected guarded failures include
-K/V head dimensions other than 128, 256, or 512, MLA, SWA/ISWA, unsupported
-backend placement, attention rotations/KQ bias/sinks, and other explicit KVarN
-graph-backend guards.
+K/V head dimensions other than 128, 256, or 512, MLA, non-Gemma SWA/ISWA,
+unsupported backend placement, attention rotations/KQ bias/sinks, and other
+explicit KVarN graph-backend guards.

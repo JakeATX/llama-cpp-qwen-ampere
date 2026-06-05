@@ -10,6 +10,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-kvarn-iswa.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-memory-hybrid.h"
@@ -2022,6 +2023,12 @@ static void llama_kvarn_validate_memory_support(
         throw std::runtime_error("KVarN backend does not support MLA models yet");
     }
 
+    const bool has_swa = hparams.swa_type != LLAMA_SWA_TYPE_NONE;
+    const bool supports_kvarn_iswa = model.arch == LLM_ARCH_GEMMA4;
+    if (has_swa && !supports_kvarn_iswa) {
+        throw std::runtime_error("KVarN backend supports SWA/ISWA only for Gemma 4 models at this stage");
+    }
+
     std::string unsupported_head_dim_msg;
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         if (!hparams.has_kv(il)) {
@@ -2045,15 +2052,6 @@ static void llama_kvarn_validate_memory_support(
         }
     }
 
-    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        std::string msg = "KVarN backend does not support SWA/ISWA models yet";
-        if (!unsupported_head_dim_msg.empty()) {
-            msg += "; ";
-            msg += unsupported_head_dim_msg;
-        }
-        throw std::runtime_error(msg);
-    }
-
     if (!unsupported_head_dim_msg.empty()) {
         throw std::runtime_error(unsupported_head_dim_msg);
     }
@@ -2063,6 +2061,9 @@ static void llama_kvarn_validate_memory_support(
             continue;
         }
         if (hparams.is_recr(il)) {
+            continue;
+        }
+        if (hparams.is_swa(il)) {
             continue;
         }
 
@@ -2086,6 +2087,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         const bool mtp_on_hybrid_qwen35 =
             params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
             (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+
+        if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+            llama_memory_i::layer_reuse_cb reuse = nullptr;
+            llama_kv_cache_kvarn::layer_filter_cb filter = nullptr;
+
+            if (arch == LLM_ARCH_GEMMA4) {
+                reuse = [&](int32_t il) {
+                    if (il >= (int32_t) hparams.n_layer_kv_from_start) {
+                        return (int32_t) hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+                    }
+
+                    return -1;
+                };
+            } else {
+                throw std::runtime_error("KVarN backend supports SWA/ISWA only for Gemma 4 models at this stage");
+            }
+
+            return new llama_kv_cache_kvarn_iswa(
+                    *this,
+                    params.kvarn,
+                    params.type_k,
+                    params.type_v,
+                    !cparams.flash_attn,
+                    cparams.offload_kqv,
+                    params.swa_full,
+                    cparams.kv_unified,
+                    cparams.n_ctx_seq,
+                    cparams.n_seq_max,
+                    cparams.n_ubatch,
+                    1,
+                    filter,
+                    reuse);
+        }
 
         if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen35) {
             llama_memory_i::layer_filter_cb filter_attn = nullptr;

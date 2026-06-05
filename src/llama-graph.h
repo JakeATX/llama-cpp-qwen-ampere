@@ -23,6 +23,7 @@ struct llama_memory_context_i;
 
 class llama_kv_cache_context;
 class llama_kv_cache_kvarn_context;
+class llama_kv_cache_kvarn_iswa_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
@@ -455,6 +456,15 @@ public:
         cparams(cparams),
         mctx(mctx) {
     }
+    llm_graph_input_attn_kv_iswa(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_kvarn_iswa_context * mctx) :
+        hparams(hparams),
+        cparams(cparams),
+        mctx(nullptr),
+        mctx_kvarn_iswa(mctx) {
+    }
     ~llm_graph_input_attn_kv_iswa() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -485,10 +495,18 @@ public:
     ggml_tensor * self_k_rot_swa = nullptr;
     ggml_tensor * self_v_rot_swa = nullptr;
 
+    ggml_tensor * base_sink_tail_idxs = nullptr; // I64 [n_batch]
+    ggml_tensor * base_body_plan = nullptr;      // I64 [record, offset, seal_record; n_tail_evict]
+    ggml_tensor * base_body_offsets = nullptr;   // I64 [n_tail_evict]
+    ggml_tensor * base_tail_evict_idxs = nullptr;// I32 [n_tail_evict]
+    std::vector<ggml_tensor *> base_mixed_attn_nodes;
+    bool base_has_body_store_ops = false;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+    const llama_kv_cache_kvarn_iswa_context * mctx_kvarn_iswa = nullptr;
 };
 
 class llm_graph_input_attn_cross : public llm_graph_input_i {
