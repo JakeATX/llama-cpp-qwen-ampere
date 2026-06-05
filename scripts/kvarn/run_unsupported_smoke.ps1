@@ -130,6 +130,20 @@ try {
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_FUSED_BATCH" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ATTN_FUSED_BATCH=bogus" `
+        "KVarN invalid fused-batch env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=bogus" `
+        "KVarN invalid unsafe fused-batch env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "bogus" } `
         "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=bogus" `
         "KVarN invalid scratch-reference env rejection"
@@ -140,6 +154,13 @@ try {
         @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "2" } `
         "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=2" `
         "KVarN out-of-range scratch-reference env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_SERIAL_FUSED" = "2" } `
+        "invalid KVarN CUDA environment flag LLAMA_KVARN_ATTN_SERIAL_FUSED=2" `
+        "KVarN out-of-range CUDA serial-fused env rejection"
 
     Invoke-ExpectFailure `
         $results `

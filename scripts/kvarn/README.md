@@ -687,10 +687,13 @@ Verified local smoke:
   and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection, invalid
   `LLAMA_KVARN_DEBUG_UBATCH=0` positive-integer rejection, and server
   `--parallel 2` rejection. Latest static-build rerun on the Qwen2.5 1.5B
-  regression model passed all eight checks:
+  regression model passed all eleven checks:
   `KVarN forced fused-batch rejection: PASS`,
+  `KVarN invalid fused-batch env rejection: PASS`,
+  `KVarN invalid unsafe fused-batch env rejection: PASS`,
   `KVarN invalid scratch-reference env rejection: PASS`,
   `KVarN out-of-range scratch-reference env rejection: PASS`,
+  `KVarN out-of-range CUDA serial-fused env rejection: PASS`,
   `KVarN out-of-range CUDA split-kernel env rejection: PASS`,
   `KVarN unsafe debug ubatch rejection: PASS`,
   `KVarN invalid debug ubatch rejection: PASS`,
