@@ -545,6 +545,15 @@ Verified local smoke:
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.
+  CUDA primitive coverage now forces `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for
+  the split baselines before comparing against the diagnostic fused-batch path,
+  so the MHA mixed, Qwen3.6-shaped, and sink-only primitive cases really cover
+  split-vs-fused instead of serial-vs-fused. A row-local score workspace
+  experiment for fused-batch was rejected: the Qwen3.6 repeat-4
+  packed-vs-scratch run still failed, worsening from the previous
+  `NMSE = 7.686e-04` to `NMSE = 1.495e-03`. The production guard remains the
+  correct behavior until a different multi-block fused implementation passes
+  Qwen3.6 model-level logits.
 - 128-dim Qwen2.5 regression on the corrected static CUDA build:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs -Batch 512 -Repeat 4 -CheckPackedSplit -FlashAttn off`.
   Latest local result passed with packed-vs-split `NMSE = 0.000E+000` and
