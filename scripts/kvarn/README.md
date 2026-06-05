@@ -195,8 +195,9 @@ Verified local smoke:
   `hf download Qwen/Qwen2.5-1.5B-Instruct-GGUF qwen2.5-1.5b-instruct-q4_k_m.gguf --local-dir C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF`.
 - Reproducible local model metadata discovery:
   `python scripts\kvarn\discover_models.py C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`.
-  Latest local result reports both Gemma4 12B files as unsupported
-  512-dimensional K/V plus `swa/iswa-likely`, Qwen2.5 1.5B as
+  Latest local result reports both Gemma4 12B files as full-attention
+  512-dimensional K/V with separate SWA 256-dimensional K/V
+  (`unsupported-kv-dim,swa/iswa-likely,swa-256`), Qwen2.5 1.5B as
   `regression-128,dim-inferred`, Qwen3.5 0.8B as `primary-256,hybrid-ssm`,
   and Qwen3.6 35B A3B MTP IQ3 as `primary-256,hybrid-ssm,moe`.
 - Additional local 256 metadata discovery:

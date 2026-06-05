@@ -74,6 +74,14 @@ def metadata_for(path: Path) -> dict[str, str]:
         f"{prefix}.attention.value_length",
         f"{prefix}.attention.value_length.full",
     ])
+    key_len_swa = first_value(reader, [
+        f"{prefix}.attention.key_length_swa",
+        f"{prefix}.attention.key_length.swa",
+    ])
+    value_len_swa = first_value(reader, [
+        f"{prefix}.attention.value_length_swa",
+        f"{prefix}.attention.value_length.swa",
+    ])
     inferred_dim = False
     if key_len is None and value_len is None:
         embedding_len = first_value(reader, [f"{prefix}.embedding_length", "general.embedding_length"])
@@ -110,6 +118,20 @@ def metadata_for(path: Path) -> dict[str, str]:
 
     if arch in {"gemma2", "gemma3", "gemma3n", "gemma4", "exaone4", "openai_moe", "mimo2"} or sliding_keys:
         notes.append("swa/iswa-likely")
+    try:
+        key_len_swa_int = int(key_len_swa) if key_len_swa is not None else None
+        value_len_swa_int = int(value_len_swa) if value_len_swa is not None else None
+        if key_len_swa_int is not None or value_len_swa_int is not None:
+            if key_len_swa_int != value_len_swa_int:
+                notes.append("swa-k/v-dim-mismatch")
+            elif key_len_swa_int == 256:
+                notes.append("swa-256")
+            elif key_len_swa_int == 128:
+                notes.append("swa-128")
+            else:
+                notes.append("swa-unsupported-kv-dim")
+    except (TypeError, ValueError):
+        pass
     if ssm_keys:
         notes.append("hybrid-ssm")
     if mla_keys:
@@ -127,6 +149,8 @@ def metadata_for(path: Path) -> dict[str, str]:
         "kv_heads": scalar(first_value(reader, [f"{prefix}.attention.head_count_kv"])),
         "key_dim": scalar(key_len),
         "value_dim": scalar(value_len),
+        "key_dim_swa": scalar(key_len_swa),
+        "value_dim_swa": scalar(value_len_swa),
         "experts": scalar(expert_count),
         "experts_used": scalar(expert_used),
         "ssm_keys": str(len(ssm_keys)),
@@ -179,6 +203,8 @@ def main() -> int:
                 "kv_heads": "",
                 "key_dim": "",
                 "value_dim": "",
+                "key_dim_swa": "",
+                "value_dim_swa": "",
                 "experts": "",
                 "experts_used": "",
                 "ssm_keys": "",
@@ -198,6 +224,8 @@ def main() -> int:
         "kv_heads",
         "key_dim",
         "value_dim",
+        "key_dim_swa",
+        "value_dim_swa",
         "experts",
         "experts_used",
         "ssm_keys",
