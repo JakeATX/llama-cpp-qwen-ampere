@@ -3,6 +3,10 @@ import argparse
 import math
 
 
+def fmt_bytes(n: int) -> str:
+    return f"{n} ({n / (1024 ** 2):.2f} MiB)"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Estimate FP16, simple low-bit, and KVarN KV cache memory.")
     parser.add_argument("--layers", type=int, required=True)
@@ -24,9 +28,9 @@ def main() -> None:
     lowbit_total = args.layers * args.kv_heads * args.ctx * args.head_dim * (args.key_bits + args.value_bits) // 8
     kvarn_total = args.layers * args.kv_heads * records * kvarn_record
 
-    print(f"FP16 total: {fp16_total}")
-    print(f"approximate {args.key_bits}-bit K / {args.value_bits}-bit V body-only total: {lowbit_total}")
-    print(f"KVarN total: {kvarn_total}")
+    print(f"FP16 total: {fmt_bytes(fp16_total)}")
+    print(f"approximate {args.key_bits}-bit K / {args.value_bits}-bit V body-only total: {fmt_bytes(lowbit_total)}")
+    print(f"KVarN total: {fmt_bytes(kvarn_total)}")
     print(f"KVarN amortized bytes/token/layer/head: {kvarn_total / args.ctx / args.layers / args.kv_heads:.6f}")
 
 

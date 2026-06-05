@@ -228,6 +228,14 @@ Verified local smoke:
   `110,100,480` bytes at 16K context, or `120` amortized bytes/token/layer/KV
   head. These estimator numbers are body-record estimates and do not include
   every runtime allocation reported by llama.cpp logs.
+- Memory estimator for 256-dim hybrid Qwen3.5 full-attention geometry (`6`
+  layers, `2` KV heads, `256` head dim, K4/V2/group128) reports KVarN totals
+  of `10.69 MiB` at 4K context and `21.38 MiB` at 8K context. The same geometry
+  in FP16 KV would be `48.00 MiB` and `96.00 MiB`.
+- Memory estimator for 256-dim hybrid Qwen3.6 35B A3B MTP full-attention
+  geometry (`10` layers, `2` KV heads, `256` head dim, K4/V2/group128) reports
+  KVarN totals of `17.81 MiB` at 4K context and `35.62 MiB` at 8K context. The
+  same geometry in FP16 KV would be `80.00 MiB` and `160.00 MiB`.
 - Explicit multi-slot startup now fails cleanly before model load with:
   `KVarN currently supports only --parallel 1`.
 - Focused tests passed:
@@ -314,9 +322,15 @@ Verified local smoke:
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result also passed with `NMSE = 0.000E+000`.
+- 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Repeat 24`.
+  Latest local result passed with `NMSE = 0.000E+000`.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
+- 256-dim server smoke passed:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Port 8135`.
+  Latest local result: `KVarN server smoke: PASS, content = ','`.
 - Long-context smoke observed with `llama-cli` at `-c 4096`, `-n 768`,
   `--kv-cache-quant kvarn`, and `--kvarn-rtn-quantile 0.95`. The run
   allocated `30` KVarN body records per layer and reported generation
