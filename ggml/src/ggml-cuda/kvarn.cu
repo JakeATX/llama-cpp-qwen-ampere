@@ -2066,9 +2066,6 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_kernel(
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
         probs[t] *= inv_denom;
-        if (row == 0) {
-            scores[t] = probs[t];
-        }
     }
     __syncthreads();
 

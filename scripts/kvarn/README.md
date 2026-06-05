@@ -70,6 +70,11 @@ Current implemented pieces:
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1` is intentionally disabled in llama.cpp
   runtime contexts because Qwen3.6 prompt-batch logits still diverge; this is
   an explicit unsupported-mode error, not a fallback to split kernels.
+  For diagnostics only, pair it with
+  `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` to bypass the context guard and
+  reproduce the unsafe fused-batch path. Do not use this combination as a
+  production mode until Qwen3.6 packed-repeat logits pass at the normal
+  `llama-results` threshold.
 - KVarN runtime memory/context skeleton with native slot metadata, sequence
   operations, memory estimates, and production-shaped per-layer/per-KV-head
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
@@ -290,6 +295,11 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
   Latest local result on 2026-06-05 passed after adding F32/F16 KQ-mask graph
   input coverage to `test-kvarn-kv`.
+  A later local rerun on 2026-06-05 passed `test-kvarn-kv` and
+  `test-kvarn-cuda-scratch-ref`; `test-kvarn-cuda-mixed-tail.exe` was blocked
+  at process launch by Windows Application Control, matching the same local
+  policy limitation seen with unsigned shared server binaries. This was an
+  environment launch failure, not a CUDA assertion failure.
 - Shared batch-split and focused KVarN CUDA coverage passed after tightening
   `split_equal()` sequence-set limits:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
@@ -418,6 +428,10 @@ Verified local smoke:
   `-DebugUbatch 128 -PackedFusedBatch -CheckPackedRepeat` exposed a real
   forced fused-batch divergence (`NMSE` around `1e-2` to `2.5e-2`), so the
   runtime now rejects `LLAMA_KVARN_ATTN_FUSED_BATCH=1` explicitly.
+  With the unsafe diagnostic override enabled after removing an unnecessary
+  scratch/probability write from the fused-batch kernel, Qwen3.6 still failed
+  packed repeat at `NMSE = 1.569e-02`. Disabling graph reuse still failed at
+  `NMSE = 1.269e-02`, so the remaining issue is not stale graph reuse state.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.

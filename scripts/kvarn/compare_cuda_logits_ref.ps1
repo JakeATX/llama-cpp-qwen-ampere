@@ -122,6 +122,7 @@ if ($PackedSerialFused) {
 }
 if ($PackedFusedBatch) {
     $packedEnv["LLAMA_KVARN_ATTN_FUSED_BATCH"] = "1"
+    $packedEnv["LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH"] = "1"
 }
 if ($PackedSplitKernels) {
     $packedEnv["LLAMA_KVARN_ATTN_SPLIT_KERNELS"] = "1"
