@@ -86,6 +86,17 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
     ssm_keys = [key for key in fields if ".ssm." in key or key.endswith(".ssm_conv_kernel")]
     sliding_keys = [key for key in fields if "sliding" in key or key.endswith(".attention.window_size")]
     mla_keys = [key for key in fields if "lora_rank" in key or "kv_lora" in key or "mla" in key]
+    attn_sink_tensors = [tensor_name(tensor) for tensor in reader.tensors if tensor_name(tensor).endswith(".attn_sinks.weight")]
+
+    alibi_bias = first_value(reader, [
+        f"{prefix}.attention.max_alibi_bias",
+    ])
+    attn_logit_softcap = first_value(reader, [
+        f"{prefix}.attn_logit_softcapping",
+    ])
+    attn_output_scale = first_value(reader, [
+        f"{prefix}.attention.output_scale",
+    ])
 
     expert_count = first_value(reader, [
         f"{prefix}.expert_count",
@@ -170,6 +181,20 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
         notes.append("hybrid-ssm")
     if mla_keys:
         notes.append("mla-likely")
+    try:
+        if alibi_bias is not None and float(alibi_bias) > 0.0:
+            notes.append("kvarn-unsupported-alibi")
+    except (TypeError, ValueError):
+        notes.append("kvarn-unsupported-alibi")
+    if attn_logit_softcap is not None:
+        notes.append("kvarn-unsupported-attn-softcap")
+    try:
+        if attn_output_scale is not None and float(attn_output_scale) != 0.0:
+            notes.append("kvarn-unsupported-attn-output-scale")
+    except (TypeError, ValueError):
+        notes.append("kvarn-unsupported-attn-output-scale")
+    if attn_sink_tensors:
+        notes.append("kvarn-unsupported-attn-sinks")
     if expert_count not in (None, 0, "0"):
         notes.append("moe")
 
@@ -214,6 +239,10 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
         "value_dim_swa": scalar(value_len_swa),
         "experts": scalar(expert_count),
         "experts_used": scalar(expert_used),
+        "alibi_bias": scalar(alibi_bias),
+        "attn_softcap": scalar(attn_logit_softcap),
+        "attn_output_scale": scalar(attn_output_scale),
+        "attn_sink_tensors": str(len(attn_sink_tensors)),
         "ssm_keys": str(len(ssm_keys)),
         "sliding_keys": str(len(sliding_keys)),
         "notes": ",".join(notes),
@@ -277,6 +306,10 @@ def main() -> int:
                 "value_dim_swa": "",
                 "experts": "",
                 "experts_used": "",
+                "alibi_bias": "",
+                "attn_softcap": "",
+                "attn_output_scale": "",
+                "attn_sink_tensors": "",
                 "ssm_keys": "",
                 "sliding_keys": "",
                 "notes": f"error:{exc}",
@@ -305,6 +338,10 @@ def main() -> int:
         "value_dim_swa",
         "experts",
         "experts_used",
+        "alibi_bias",
+        "attn_softcap",
+        "attn_output_scale",
+        "attn_sink_tensors",
         "ssm_keys",
         "sliding_keys",
         "notes",

@@ -223,7 +223,9 @@ Verified local smoke:
 - Reproducible local model metadata discovery:
   `python scripts\kvarn\discover_models.py --gpu-vram-gib 12 --vram-reserve-gib 1.5 C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf"`.
   The script now reports GGUF tensor GiB, expert/non-expert tensor split,
-  expert share, usable VRAM, and full-offload fit. Latest local result with a
+  expert share, usable VRAM, full-offload fit, and KVarN-unsupported
+  attention metadata for ALiBi/max-bias, attention softcap, attention output
+  scale, and learned attention-sink tensors. Latest local result with a
   10.50 GiB usable VRAM budget reports Gemma4 12B dense Q3 as `5.59` tensor
   GiB and full-offload fit `yes` with `4.91` GiB margin
   (`design-512,swa/iswa-likely,swa-256`); Gemma4 26B A4B Q3 as `12.01`
@@ -235,7 +237,10 @@ Verified local smoke:
   GiB with `13.30` expert GiB (`84.8%`) and full-offload fit `no` with
   `-5.18` GiB margin (`primary-256,hybrid-ssm,moe`). These margins are model
   tensor bytes only; runtime KV, graph, and workspace allocations require
-  additional headroom.
+  additional headroom. The same scan reported blank ALiBi/softcap/output-scale
+  fields and `0` attention-sink tensors for the current local Qwen/Gemma target
+  files, so none of the newly surfaced unsupported-attention notes apply to
+  those files.
 - Additional local 256 metadata discovery:
   `python scripts\kvarn\discover_models.py C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-UD-Q4_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`.
   Latest local result reports both Qwen3.5 4B files as 256-dim hybrid SSM
