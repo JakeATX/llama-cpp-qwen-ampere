@@ -158,6 +158,23 @@ try {
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_TRACE" = "2" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ATTN_TRACE=2" `
+        "KVarN out-of-range trace env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{
+            "LLAMA_KVARN_ATTN_TRACE" = "1"
+            "LLAMA_KVARN_ATTN_TRACE_LIMIT" = "bogus"
+        } `
+        "invalid KVarN environment integer LLAMA_KVARN_ATTN_TRACE_LIMIT=bogus" `
+        "KVarN invalid trace-limit env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_SERIAL_FUSED" = "2" } `
         "invalid KVarN CUDA environment flag LLAMA_KVARN_ATTN_SERIAL_FUSED=2" `
         "KVarN out-of-range CUDA serial-fused env rejection"

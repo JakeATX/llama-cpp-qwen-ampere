@@ -51,6 +51,23 @@ static bool llama_kvarn_parse_env_flag(const char * name) {
     return value != 0;
 }
 
+static int llama_kvarn_parse_env_int(const char * name, int default_value) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(std::string("invalid KVarN environment integer ") + name +
+                "=" + env);
+    }
+    return int(value);
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -221,6 +238,10 @@ llama_context::llama_context(
         const bool is_kvarn = cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN;
         const bool kvarn_forced_fused_batch = is_kvarn && llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
         const bool kvarn_unsafe_fused_batch = is_kvarn && llama_kvarn_parse_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
+        if (is_kvarn) {
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_TRACE");
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
+        }
         if (kvarn_forced_fused_batch && !kvarn_unsafe_fused_batch) {
             throw std::runtime_error(
                     "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven");
