@@ -87,6 +87,11 @@ Current implemented pieces:
   staging, and body-record sealing. This is a prerequisite for Gemma-style
   K/V reuse, but Gemma still requires a KVarN+ISWA composite before SWA layers
   can run.
+- A compiled `llama_kv_cache_kvarn_iswa` memory composite now exists. It owns
+  non-SWA layers with KVarN storage and SWA layers with the existing normal
+  sliding-window KV cache, preserving the normal SWA sizing, state, and
+  sequence operations. It is not routed from `create_memory()` yet because the
+  graph input path still needs a KVarN-base/normal-SWA dispatcher.
 - KVarN batch preparation now admits bounded prompt ubatches up to one tail-ring
   span (`min(n_ubatch, tail_tokens)`) for dense, hybrid, and MoE models, so
   prompt processing can use masked multi-query KVarN attention without evicting
@@ -374,9 +379,9 @@ Verified local smoke:
   K/V head length `512`, and SWA K/V head length `256`. Gemma 4 26B A4B files
   are also `gemma4`, 30 layers, context `262144`, full-attention K/V head
   length `512`, SWA K/V head length `256`, 128 experts, and 8 active experts.
-  KVarN 512 layout/CUDA support no longer rejects these for head dimension, but
-  KVarN still rejects them cleanly before graph construction because SWA/ISWA
-  cache routing is not implemented:
+  KVarN 512 layout/CUDA support and KVarN physical-layer reuse no longer reject
+  these for head dimension or KV reuse, but KVarN still rejects them cleanly
+  before graph construction because KVarN+ISWA graph routing is not implemented:
   `KVarN backend does not support SWA/ISWA models yet`. Earlier builds could
   reach an invalid ISWA graph cast and crash with `0xC0000005`.
   Current-build rejection was rechecked with
