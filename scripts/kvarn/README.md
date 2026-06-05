@@ -492,6 +492,12 @@ Verified local smoke:
   `ggml-base.dll` did not meet Enterprise signing requirements), so traced
   model diagnostics used a separate static CUDA build:
   `cmake -S . -B build-kvarn-cuda-static-vs -G "Visual Studio 17 2022" -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DGGML_CUDA_FA=OFF -DCMAKE_CUDA_ARCHITECTURES=120a-real -DGGML_CCACHE=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=ON`.
+  Static llama builds must compile the `llama` target with `LLAMA_BUILD`;
+  otherwise KVarN runtime storage falls back to CPU buffers and body-store
+  graph execution can fail with
+  `pre-allocated tensor ... in a buffer (CPU) that cannot run the operation (KVARN_STORE_BODY)`.
+  After fixing the static target definition, traced static runs report KVarN
+  storage dev `CUDA0`.
   The traced Qwen3.6 repeat-4 unsafe fused-vs-split diagnostic showed the first
   divergent model path entering CUDA as `mode=fused-batch` versus `mode=split`
   with identical tensor geometry: `n_queries=2`, `n_head=16`, `n_head_kv=2`,
@@ -516,13 +522,18 @@ Verified local smoke:
   correctness issue is specific to the multi-block
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1` path, not the per-row fused kernel.
   Static Qwen3.5 0.8B benchmark at `-p 128 -n 64 -r 1 -fa off` measured the
-  old split prompt path at `553.86` pp t/s and `125.18` tg t/s, while serial
-  fused measured `692.75` pp t/s and `111.10` tg t/s. The production routing
-  uses serial fused only for multi-query prompt batches, preserving the
-  existing single-query fused generation path.
+  old split prompt path at `553.86` pp t/s and `125.18` tg t/s before the static
+  build fix; after the static build fix and serial-fused default routing, the
+  same command measured `592.08` pp t/s and `154.04` tg t/s with KVarN storage
+  on `CUDA0`. The production routing uses serial fused only for multi-query
+  prompt batches, preserving the existing single-query fused generation path.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.
+- 128-dim Qwen2.5 regression on the corrected static CUDA build:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs -Batch 512 -Repeat 4 -CheckPackedSplit -FlashAttn off`.
+  Latest local result passed with packed-vs-split `NMSE = 0.000E+000` and
+  packed-vs-scratch `NMSE = 0.000E+000`.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
