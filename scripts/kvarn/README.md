@@ -819,6 +819,11 @@ Verified local smoke:
   same command measured `592.08` pp t/s and `154.04` tg t/s with KVarN storage
   on `CUDA0`. The production routing uses serial fused only for multi-query
   prompt batches, preserving the existing single-query fused generation path.
+  Static Qwen3.6 35B A3B MTP exact-layer benchmark smoke:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp64:64:0" -RtnQuantile 0.95 -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`.
+  Latest local result passed with normal KV `pp64 = 63.68` tok/s, KVarN
+  `pp64 = 8.20` tok/s, exact KVarN layers `3,7,11,15,19,23,27,31,35,39`,
+  10 KVarN layer log lines, and no body records at this short prompt length.
   Static normal-vs-KVarN 256-dim benchmark on Qwen3.5 0.8B with active body
   records:
   `build-kvarn-cuda-static-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p 512 -n 128 -r 1 -ngl 99 -fa off --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
