@@ -8,6 +8,7 @@ param(
     [double] $RtnQuantile = 0.95,
     [string] $Prompt = "Hello",
     [int] $MinKvarnLayerLogs = 1,
+    [int] $MinKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
     [switch] $IncludeForcedFusedBatch,
     [switch] $IncludeUnsafeFusedBatch
@@ -20,6 +21,9 @@ if (!($RtnQuantile -gt 0.0 -and $RtnQuantile -le 1.0)) {
 }
 if ($MinKvarnLayerLogs -lt 1) {
     throw "MinKvarnLayerLogs must be positive"
+}
+if ($MinKvarnBodyRecords -lt 0) {
+    throw "MinKvarnBodyRecords must be non-negative"
 }
 
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
@@ -80,6 +84,25 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
     Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
 }
 
+function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    if ($maxRecords -lt $minimum) {
+        throw "$label observed maximum KVarN body records $maxRecords, expected at least $minimum"
+    }
+
+    Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
+}
+
 function Get-ExePath([string] $buildDir, [string] $name) {
     $path = Join-Path $buildDir "bin/Release/$name"
     if (-not (Test-Path -LiteralPath $path)) {
@@ -122,6 +145,7 @@ function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet)
         throw "llama-completion succeeded but showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs"
     }
     Assert-ExpectedKvarnLayers $text $expectedKvarnLayerIds "llama-completion"
+    Assert-MinKvarnBodyRecords $text $MinKvarnBodyRecords "llama-completion"
     Write-Host ("KVarN completion log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
 
     return $text

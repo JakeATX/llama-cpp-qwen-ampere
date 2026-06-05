@@ -650,9 +650,10 @@ Verified local smoke:
   divergence from packed-vs-scratch divergence. The harness now rejects any
   successful `llama-results` invocation whose output lacks
   `llama_kv_cache_kvarn:` initialization logs, so logits NMSE passes cannot
-  hide a normal-KV fallback. It also accepts `-MinKvarnLayerLogs` and
-  range-aware `-ExpectedKvarnLayers` to require the expected KVarN
-  layer-routing count and exact layer IDs for a model family. Static CUDA
+  hide a normal-KV fallback. It also accepts `-MinKvarnLayerLogs`,
+  `-MinKvarnBodyRecords`, and range-aware `-ExpectedKvarnLayers` to require
+  the expected KVarN layer-routing count, packed body-record capacity, and
+  exact layer IDs for a model family. Static CUDA
   rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 16 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off`.
   Latest local result logged `KVarN llama-results log check: PASS, KVarN layer
@@ -667,6 +668,11 @@ Verified local smoke:
   Range-parser rerun with `-Repeat 1` also passed packed-repeat,
   packed-vs-split, and packed-vs-scratch checks at `NMSE = 0.000E+000`, with
   exact layer checks passing for `0-27` on all four `llama-results` runs.
+  Latest active-body-record guard rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27"`.
+  Packed save, repeat, split, and scratch-reference checks all passed exact
+  layer routing, `KVarN body-record check: PASS, max body records = 2`, and
+  `NMSE = 0.000E+000`.
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512`.
   Latest local result passed on the bounded prompt-batch path with
@@ -699,6 +705,11 @@ Verified local smoke:
   512 path uses the validated split kernels. Rebuilt Gemma 4 12B server smoke
   also passed with exact KVarN full-attention layers `5,11,17,23,29,35,41,47`
   and 16 KVarN layer log lines.
+  Latest active-body-record 512 rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6"`.
+  Packed save, split-kernel check, and scratch-reference check all passed exact
+  full-attention layer routing, body-record capacity `2`, and
+  `NMSE = 0.000E+000`.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
@@ -747,6 +758,11 @@ Verified local smoke:
   inspection. `LLAMA_KVARN_ATTN_TRACE=1` with
   `LLAMA_KVARN_ATTN_TRACE_LIMIT=N` traces both the graph update and CUDA backend
   dispatch for `GGML_OP_KVARN_ATTN_MIXED`.
+  Latest Qwen3.6 active-body-record logits rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4"`.
+  Packed save, split-kernel check, and scratch-reference check all passed exact
+  Qwen3.6 layer routing, body-record capacity `2`, and
+  `NMSE = 0.000E+000`.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current
   default-fused model-level logits guard is now the acceptance criterion.
@@ -794,17 +810,25 @@ Verified local smoke:
   Latest local result passed exact layer routing for `0..27`, packed-repeat,
   packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 - Exact KVarN layer-routing evidence is now available in all runtime smoke and
-  comparison harnesses through range-aware `-ExpectedKvarnLayers`. Latest local
-  Qwen2.5 exact fused/split dispatch parity:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_fused_split.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Predict 16 -RtnQuantile 0.95 -Prompt Hello -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0-27"`.
-  Latest local result passed with exact layers `0..27`, 56 KVarN layer log
-  lines per run, graph reuse `15`, and eval rates: default `154.94` tok/s,
-  serial fused `93.16` tok/s, split `85.58` tok/s.
+  comparison harnesses through range-aware `-ExpectedKvarnLayers`. The
+  comparison harnesses also accept `-MinKvarnBodyRecords` for active
+  body-record allocation evidence. Latest local Qwen2.5 exact fused/split
+  dispatch parity:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_fused_split.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Predict 16 -RtnQuantile 0.95 -Prompt Hello -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27" -IncludeForcedFusedBatch`.
+  Latest local result passed with exact layers `0..27`, body-record capacity
+  `2`, 56 KVarN layer log lines per run, graph reuse `15`, and eval rates:
+  default `150.00` tok/s, serial fused `96.20` tok/s, split `84.52` tok/s,
+  forced fused-batch `156.76` tok/s.
 - Latest local Qwen2.5 exact graph-reuse parity:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_reuse.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Predict 16 -RtnQuantile 0.95 -Prompt Hello -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0-27" -SkipNormalBaseline`.
-  Latest local result passed with exact layers `0..27`, reuse-disabled
-  `graphs reused = 0` at `141.05` eval tok/s, and reuse-enabled
-  `graphs reused = 15` at `156.85` eval tok/s.
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_reuse.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Predict 16 -RtnQuantile 0.95 -Prompt Hello -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27" -SkipNormalBaseline`.
+  Latest local result passed with exact layers `0..27`, body-record capacity
+  `2`, reuse-disabled `graphs reused = 0` at `142.25` eval tok/s, and
+  reuse-enabled `graphs reused = 15` at `151.95` eval tok/s.
+  Latest generated-text packed-vs-scratch body-record rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_scratch_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Predict 16 -RtnQuantile 0.95 -Prompt Hello -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27"`.
+  Latest local result passed deterministic text parity with body-record
+  capacity `2`; packed attention ran at `158.61` eval tok/s and scratch
+  reference at `153.23` eval tok/s.
 - Latest local Gemma 4 12B exact server smoke:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8164 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   Latest local result passed with exact KVarN full-attention layers
@@ -898,7 +922,9 @@ corresponding logits-distance guard. For traced dispatcher checks,
 `compare_cuda_logits_ref.ps1 -TraceAttn -ExpectedPackedTraceMode <mode>` now
 also fails if the packed CUDA path does not emit the expected mode, such as
 `fused-batch` for the default validated 128/256-dimensional path or
-`split-512-default` for the current Gemma 4 512-dimensional path.
+`split-512-default` for the current Gemma 4 512-dimensional path. Use
+`-MinKvarnBodyRecords` on these comparison harnesses when a test is meant to
+exercise packed body storage instead of only sink/tail capacity.
 
 For `llama-cli` smoke runs, use `--single-turn`; default conversation mode can
 stay interactive after generation and causes external harnesses to terminate it

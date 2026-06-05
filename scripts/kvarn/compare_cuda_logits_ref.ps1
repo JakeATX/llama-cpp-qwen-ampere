@@ -12,6 +12,7 @@ param(
     [string] $PromptFile = (Join-Path $env:TEMP "kvarn-logits-prompt.txt"),
     [int] $DebugUbatch = 0,
     [int] $MinKvarnLayerLogs = 1,
+    [int] $MinKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
     [switch] $PackedFusedBatch,
     [switch] $PackedSerialFused,
@@ -40,6 +41,9 @@ if ($DebugUbatch -lt 0) {
 }
 if ($MinKvarnLayerLogs -lt 1) {
     throw "MinKvarnLayerLogs must be positive"
+}
+if ($MinKvarnBodyRecords -lt 0) {
+    throw "MinKvarnBodyRecords must be non-negative"
 }
 if ($TraceLimit -lt 0) {
     throw "TraceLimit must be non-negative"
@@ -142,6 +146,25 @@ function Assert-ExpectedPackedTraceMode([string] $text, [string] $expected, [str
     Write-Host ("KVarN packed trace mode check: PASS, mode = {0}" -f $expected)
 }
 
+function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    if ($maxRecords -lt $minimum) {
+        throw "$label observed maximum KVarN body records $maxRecords, expected at least $minimum"
+    }
+
+    Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
+}
+
 function Invoke-Results([string] $exe, [string[]] $argv, [hashtable] $envSet) {
     $oldEnv = @{}
     foreach ($key in $envSet.Keys) {
@@ -176,6 +199,7 @@ function Invoke-Results([string] $exe, [string[]] $argv, [hashtable] $envSet) {
         throw "llama-results succeeded but showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs"
     }
     Assert-ExpectedKvarnLayers $text $expectedKvarnLayerIds "llama-results"
+    Assert-MinKvarnBodyRecords $text $MinKvarnBodyRecords "llama-results"
     Write-Host ("KVarN llama-results log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
 
     return $text
