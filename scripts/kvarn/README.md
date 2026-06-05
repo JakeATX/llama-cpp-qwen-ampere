@@ -171,7 +171,8 @@ Current implemented pieces:
   inputs for both F32 and F16 masks.
   The standalone CUDA test covers store/dequant, packed body attention,
   sink/body/tail mixed attention, pending tokens, batched F16 mixed attention,
-  wrapped-tail decode order, multi-record scratch dequant, and packed
+  wrapped-tail decode order, padded full-attention KQ-mask strides for the
+  256-dimensional forced-fused path, multi-record scratch dequant, and packed
   mixed-attention versus scratch-dequant mixed-attention parity without linking
   the full llama runtime.
 - `tests/test-kvarn-server-load-failure.cpp` covers the server-backed loader
@@ -464,6 +465,13 @@ Verified local smoke:
   or CUDA graph capture. Running the repeat-4 unsafe fused-vs-scratch check
   with `-FlashAttn off` still failed at `NMSE = 8.676e-04`, so F16 KQ-mask
   storage is not the root cause even though it affects the error magnitude.
+  After expanding the standalone CUDA test to cover padded 1024-token full
+  mixed-attention KQ-mask strides, the primitive still passed but the same
+  Qwen3.6 repeat-4 unsafe fused-vs-scratch diagnostic with `-FlashAttn off`
+  failed at `NMSE = 3.998e-04`. The supported split-kernel path under the same
+  short setup passed packed-repeat and packed-vs-scratch checks at
+  `NMSE = 0.000E+000`, keeping the production path intact while narrowing the
+  fused issue to graph/model integration rather than isolated mask stride.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.

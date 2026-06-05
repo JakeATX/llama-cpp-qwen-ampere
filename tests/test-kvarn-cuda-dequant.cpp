@@ -1048,12 +1048,13 @@ static void run_case(uint32_t head_dim) {
     require_cuda(cudaMalloc(&mha_mixed_scores_d, n_mha_mixed_tokens*sizeof(float)), "cudaMalloc MHA mixed scores");
     require_cuda(cudaMalloc(&mha_mixed_fused_scores_d, n_mha_mixed_tokens*sizeof(float)), "cudaMalloc MHA fused mixed scores");
 
-    std::vector<uint16_t> mha_mask_f16(size_t(n_queries)*n_mha_mixed_tokens);
-    std::vector<float> mha_mask_ref(size_t(n_queries)*n_mha_mixed_tokens);
+    const uint32_t mha_mask_stride_tokens = head_dim == 256 ? 1024 : n_mha_mixed_tokens;
+    std::vector<uint16_t> mha_mask_f16(size_t(n_queries)*mha_mask_stride_tokens, f32_to_f16_bits(-1.0e30f));
+    std::vector<float> mha_mask_ref(size_t(n_queries)*mha_mask_stride_tokens, -1.0e30f);
     for (uint32_t iq = 0; iq < n_queries; ++iq) {
-        for (uint32_t t = 0; t < n_mha_mixed_tokens; ++t) {
+        for (uint32_t t = 0; t < mha_mask_stride_tokens; ++t) {
             const float bias = t > n_sink + n_records*group + iq ? -25.0f : 0.0f;
-            const size_t off = size_t(iq)*n_mha_mixed_tokens + t;
+            const size_t off = size_t(iq)*mha_mask_stride_tokens + t;
             mha_mask_f16[off] = f32_to_f16_bits(bias);
             mha_mask_ref[off] = f16_bits_to_f32(mha_mask_f16[off]);
         }
@@ -1079,7 +1080,7 @@ static void run_case(uint32_t head_dim) {
             size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
             records[0].k_scales.size(), records[0].v_scales.size(),
             size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
-            size_t(n_mha_mixed_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+            size_t(mha_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
             scale,
             nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA batched F16 mixed attention launch");
@@ -1105,7 +1106,7 @@ static void run_case(uint32_t head_dim) {
             size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
             records[0].k_scales.size(), records[0].v_scales.size(),
             size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
-            size_t(n_mha_mixed_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+            size_t(mha_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
             scale,
             nullptr);
     set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
@@ -1158,7 +1159,7 @@ static void run_case(uint32_t head_dim) {
                 row_scores[score_i] *= scale;
             }
             for (uint32_t t = 0; t < n_mha_mixed_tokens; ++t) {
-                row_scores[t] += mha_mask_ref[size_t(iq)*n_mha_mixed_tokens + t];
+                row_scores[t] += mha_mask_ref[size_t(iq)*mha_mask_stride_tokens + t];
             }
 
             float row_max = row_scores[0];
