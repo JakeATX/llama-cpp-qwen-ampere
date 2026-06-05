@@ -859,7 +859,7 @@ Verified local smoke:
   `graphs reused = 0` at `141.05` eval tok/s, and reuse-enabled
   `graphs reused = 15` at `156.85` eval tok/s.
 - Latest local Gemma 4 12B exact server smoke:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8164 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5,11,17,23,29,35,41,47"`.
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8164 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   Latest local result passed with exact KVarN full-attention layers
   `5,11,17,23,29,35,41,47`, 16 KVarN layer log lines, and completion content
   `" and"`.
