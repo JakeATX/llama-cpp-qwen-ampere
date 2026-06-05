@@ -416,6 +416,8 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure`.
   This passed `test-kvarn-kv`, `test-download-model`,
   `test-kvarn-server-load-failure`, and `test-arg-parser`.
+  Latest rerun after KVarN trace environment validation also passed all four
+  tests.
   `test-kvarn-kv` also now covers the lower-level cache constructor rejection
   for asymmetric K/V head dimensions, matching the model-load compatibility
   guard that rejects such models before runtime allocation.
