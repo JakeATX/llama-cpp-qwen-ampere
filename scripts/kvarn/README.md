@@ -260,26 +260,31 @@ Verified local smoke:
   FP16 and KVarN smoke paths passed for all three context sizes. Reported
   KVarN cache estimates were `8.64 MiB` at 512 tokens, `11.92 MiB` at 1024
   tokens, and `18.48 MiB` at 2048 tokens.
+- `scripts\kvarn\kv_memory_estimate.py` now mirrors the runtime logical memory
+  formula and has `--self-test` coverage against `test-kvarn-kv` 128- and
+  256-dimensional reference totals. It reports full FP16 KV, ideal full-context
+  low-bit KV, and KVarN's FP16 sink/tail, packed body, and scale breakdown.
 - Memory estimator for Qwen2.5 1.5B geometry (`28` layers, `2` KV heads,
-  `128` head dim, K4/V2/group128) reports KVarN body-record totals of
-  `27,525,120` bytes at 4K context, `55,050,240` bytes at 8K context, and
-  `110,100,480` bytes at 16K context, or `120` amortized bytes/token/layer/KV
-  head. These estimator numbers are body-record estimates and do not include
-  every runtime allocation reported by llama.cpp logs.
+  `128` head dim, K4/V2/group128, 128 sink + 128 tail) reports KVarN totals of
+  `31.61 MiB` at 4K context, `57.86 MiB` at 8K context, and `110.36 MiB` at
+  16K context. The same selected KV geometry in FP16 would be `112.00 MiB`,
+  `224.00 MiB`, and `448.00 MiB`.
 - Memory estimator for 256-dim hybrid Qwen3.5 full-attention geometry (`6`
-  layers, `2` KV heads, `256` head dim, K4/V2/group128) reports KVarN totals
-  of `10.69 MiB` at 4K context and `21.38 MiB` at 8K context. The same geometry
-  in FP16 KV would be `48.00 MiB` and `96.00 MiB`.
+  layers, `2` KV heads, `256` head dim, K4/V2/group128, 128 sink + 128 tail)
+  reports KVarN totals of `13.02 MiB` at 4K context and `23.71 MiB` at 8K
+  context. The same geometry in FP16 KV would be `48.00 MiB` and `96.00 MiB`.
 - Memory estimator for 256-dim hybrid Qwen3.5 4B full-attention geometry (`8`
-  layers, `4` KV heads, `256` head dim, K4/V2/group128) reports KVarN totals
-  of `28.50 MiB` at 4K context, `57.00 MiB` at 8K context, and `114.00 MiB`
-  at 16K context. The same geometry in FP16 KV would be `128.00 MiB`,
-  `256.00 MiB`, and `512.00 MiB`.
+  layers, `4` KV heads, `256` head dim, K4/V2/group128, 128 sink + 128 tail)
+  reports KVarN totals of `34.72 MiB` at 4K context, `63.22 MiB` at 8K
+  context, and `120.22 MiB` at 16K context. The same geometry in FP16 KV would
+  be `128.00 MiB`, `256.00 MiB`, and `512.00 MiB`. At the default 512-cell
+  `llama-bench` allocation, the estimator reports `9.78 MiB`, matching the
+  runtime `KVarN metadata cache` log for the Qwen3.5 4B `tg384` benchmark.
 - Memory estimator for 256-dim hybrid Qwen3.6 35B A3B MTP full-attention
-  geometry (`10` layers, `2` KV heads, `256` head dim, K4/V2/group128) reports
-  KVarN totals of `17.81 MiB` at 4K context, `35.62 MiB` at 8K context, and
-  `71.25 MiB` at 16K context. The same geometry in FP16 KV would be
-  `80.00 MiB`, `160.00 MiB`, and `320.00 MiB`.
+  geometry (`10` layers, `2` KV heads, `256` head dim, K4/V2/group128, 128
+  sink + 128 tail) reports KVarN totals of `21.70 MiB` at 4K context,
+  `39.51 MiB` at 8K context, and `75.14 MiB` at 16K context. The same geometry
+  in FP16 KV would be `80.00 MiB`, `160.00 MiB`, and `320.00 MiB`.
 - Explicit multi-slot startup now fails cleanly before model load with:
   `KVarN currently supports only --parallel 1`.
 - Focused tests passed:
