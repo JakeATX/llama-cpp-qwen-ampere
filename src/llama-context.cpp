@@ -201,13 +201,25 @@ llama_context::llama_context(
 
         const char * LLAMA_KVARN_ATTN_FUSED_BATCH = getenv("LLAMA_KVARN_ATTN_FUSED_BATCH");
         const char * LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH = getenv("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
+        const bool kvarn_forced_fused_batch =
+            LLAMA_KVARN_ATTN_FUSED_BATCH != nullptr &&
+            atoi(LLAMA_KVARN_ATTN_FUSED_BATCH) != 0;
+        const bool kvarn_unsafe_fused_batch =
+            LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH != nullptr &&
+            atoi(LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH) != 0;
         if (cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN &&
-                LLAMA_KVARN_ATTN_FUSED_BATCH != nullptr &&
-                atoi(LLAMA_KVARN_ATTN_FUSED_BATCH) != 0 &&
-                !(LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH != nullptr &&
-                    atoi(LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH) != 0)) {
+                kvarn_forced_fused_batch &&
+                !kvarn_unsafe_fused_batch) {
             throw std::runtime_error(
                     "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven");
+        }
+        if (cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN &&
+                kvarn_forced_fused_batch &&
+                kvarn_unsafe_fused_batch) {
+            LLAMA_LOG_WARN(
+                    "%s: KVarN forced fused-batch attention is running in an unsafe diagnostic mode; "
+                    "Qwen3.6 prompt-batch correctness is not proven\n",
+                    __func__);
         }
 
         if (graph_reuse_disable) {

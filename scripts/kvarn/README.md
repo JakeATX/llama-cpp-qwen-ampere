@@ -527,11 +527,13 @@ Verified local smoke:
   `-c 384 -Repeat 4`. Qwen3.6 still fails at
   `-c 384 -Repeat 4 -DebugUbatch 128` with packed-repeat
   `NMSE = 4.865e-03`; disabling CUDA graph capture still fails at
-  `NMSE = 7.621e-03`. The standalone CUDA primitive test now matches the real
+  `NMSE = 7.621e-03`, and disabling graph reuse still fails at
+  `NMSE = 1.237e-03`. The standalone CUDA primitive test now matches the real
   failing prompt-batch shape more closely with a 49-query Qwen3.6-shaped
   body-record case, and that primitive test passes, so the remaining issue is
   above the primitive arithmetic or depends on full-runtime graph/state
-  interaction.
+  interaction. Using the diagnostic unsafe override now emits an explicit
+  runtime warning before allowing the path.
   With the unsafe diagnostic override enabled after removing an unnecessary
   scratch/probability write from the fused-batch kernel, Qwen3.6 still failed
   packed repeat at `NMSE = 1.569e-02`. Disabling graph reuse still failed at
