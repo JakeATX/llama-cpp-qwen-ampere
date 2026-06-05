@@ -84,6 +84,8 @@ function Get-BenchCases([string] $caseList) {
 }
 
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+$requiresKvarnEvidence = ($KvCacheQuant.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) |
+    ForEach-Object { $_.Trim().ToLowerInvariant() }) -contains "kvarn"
 $manifest = @(
     "model=$modelPath",
     "bench=$bench",
@@ -150,6 +152,19 @@ foreach ($case in (Get-BenchCases $CaseList)) {
     $text | Write-Host
     if ($exit -ne 0) {
         throw "llama-bench failed for case '$($case.Name)' with exit code $exit; see $logPath"
+    }
+    if ($requiresKvarnEvidence) {
+        if ($text -notmatch "llama_kv_cache_kvarn:") {
+            throw "llama-bench case '$($case.Name)' succeeded but logs did not show KVarN cache initialization; see $logPath"
+        }
+        $kvarnLayerLogs = ([regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer")).Count
+        if ($kvarnLayerLogs -lt 1) {
+            throw "llama-bench case '$($case.Name)' succeeded but did not show any KVarN layer allocation lines; see $logPath"
+        }
+        if ($text -notmatch "(?i)\bkvarn\b") {
+            throw "llama-bench case '$($case.Name)' output did not include a KVarN benchmark row; see $logPath"
+        }
+        Write-Host ("KVarN bench log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
     }
 }
 
