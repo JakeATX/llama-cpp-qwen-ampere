@@ -543,6 +543,11 @@ Verified local smoke:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "tg16:0:16" -FlashAttn off -Repetitions 1 -OutputDir artifacts\kvarn-bench\latest-log-check-qwen25`.
   Latest local result: normal KV `217.13` tok/s, KVarN `181.42` tok/s, and
   `KVarN bench log check: PASS, KVarN layer lines = 28`.
+  Range-parser validation artifact:
+  `artifacts\kvarn-bench\latest-range-check-qwen25`, generated with
+  `-ExpectedKvarnLayers "0-27"`. Latest local result: normal KV `186.83`
+  tok/s, KVarN `160.68` tok/s, `KVarN expected layer check: PASS`, and
+  `KVarN bench log check: PASS, KVarN layer lines = 28`.
   Latest stricter rerun with `-MinKvarnLayerLogs 28` passed on build
   `50f2196a0`: normal KV `212.41` tok/s, KVarN `184.42` tok/s, and 28 KVarN
   layer lines.
@@ -650,6 +655,9 @@ Verified local smoke:
   Packed save, packed repeat, split-kernel, and scratch-reference checks all
   logged 56 KVarN layer lines, passed the exact layer-ID check for layers
   `0..27`, and passed with `NMSE = 0.000E+000`.
+  Range-parser rerun with `-Repeat 1` also passed packed-repeat,
+  packed-vs-split, and packed-vs-scratch checks at `NMSE = 0.000E+000`, with
+  exact layer checks passing for `0-27` on all four `llama-results` runs.
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512`.
   Latest local result passed on the bounded prompt-batch path with
