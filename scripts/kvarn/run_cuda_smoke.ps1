@@ -4,7 +4,8 @@ param(
     [string] $CtxList = "256 512 1024",
     [int] $GpuLayers = 99,
     [double] $RtnQuantile = 1.0,
-    [int] $MinKvarnLayerLogs = 1
+    [int] $MinKvarnLayerLogs = 1,
+    [string] $ExpectedKvarnLayers = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +17,49 @@ if ($MinKvarnLayerLogs -lt 0) {
     throw "MinKvarnLayerLogs must be non-negative"
 }
 
+function Get-ExpectedKvarnLayerIds([string] $layers) {
+    if ([string]::IsNullOrWhiteSpace($layers)) {
+        return @()
+    }
+
+    $ids = @()
+    foreach ($raw in ($layers -split "[,\s]+")) {
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            continue
+        }
+        $id = 0
+        if (-not [int]::TryParse($raw, [ref] $id) -or $id -lt 0) {
+            throw "Invalid KVarN layer id '$raw' in ExpectedKvarnLayers"
+        }
+        $ids += $id
+    }
+    return $ids
+}
+
+function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] $label) {
+    if ($expected.Count -eq 0) {
+        return
+    }
+
+    $actual = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($m in [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer\s+([0-9]+)")) {
+        [void] $actual.Add([int] $m.Groups[1].Value)
+    }
+
+    $missing = @()
+    foreach ($id in $expected) {
+        if (-not $actual.Contains($id)) {
+            $missing += $id
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw "$label missing expected KVarN layer ids: $($missing -join ',')"
+    }
+    Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
+}
+
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+$expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 
 $cli = Join-Path $BuildDir "bin/Release/llama-cli.exe"
 if (-not (Test-Path -LiteralPath $cli)) {
@@ -47,6 +90,7 @@ foreach ($ctx in $CtxList.Split(" ", [System.StringSplitOptions]::RemoveEmptyEnt
         if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
             throw "KVarN smoke for ctx=$ctx showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs"
         }
+        Assert-ExpectedKvarnLayers $kvarnText $expectedKvarnLayerIds "KVarN smoke for ctx=$ctx"
         Write-Host ("KVarN CLI log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
         continue
     }

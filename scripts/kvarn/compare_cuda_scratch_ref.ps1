@@ -8,6 +8,7 @@ param(
     [double] $RtnQuantile = 0.95,
     [string] $Prompt = "Hello",
     [int] $MinKvarnLayerLogs = 1,
+    [string] $ExpectedKvarnLayers = "",
     [switch] $DisableGraphReuse
 )
 
@@ -28,6 +29,47 @@ function Get-ExePath([string] $buildDir, [string] $name) {
         throw "$name not found at $path"
     }
     return (Resolve-Path -LiteralPath $path).Path
+}
+
+function Get-ExpectedKvarnLayerIds([string] $layers) {
+    if ([string]::IsNullOrWhiteSpace($layers)) {
+        return @()
+    }
+
+    $ids = @()
+    foreach ($raw in ($layers -split "[,\s]+")) {
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            continue
+        }
+        $id = 0
+        if (-not [int]::TryParse($raw, [ref] $id) -or $id -lt 0) {
+            throw "Invalid KVarN layer id '$raw' in ExpectedKvarnLayers"
+        }
+        $ids += $id
+    }
+    return $ids
+}
+
+function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] $label) {
+    if ($expected.Count -eq 0) {
+        return
+    }
+
+    $actual = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($m in [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer\s+([0-9]+)")) {
+        [void] $actual.Add([int] $m.Groups[1].Value)
+    }
+
+    $missing = @()
+    foreach ($id in $expected) {
+        if (-not $actual.Contains($id)) {
+            $missing += $id
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw "$label missing expected KVarN layer ids: $($missing -join ',')"
+    }
+    Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
 }
 
 function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet) {
@@ -63,6 +105,7 @@ function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet)
     if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
         throw "llama-completion succeeded but showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs"
     }
+    Assert-ExpectedKvarnLayers $text $expectedKvarnLayerIds "llama-completion"
     Write-Host ("KVarN completion log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
 
     return $text
@@ -117,6 +160,7 @@ function Get-EvalTokensPerSecond([string] $output) {
 }
 
 $completion = Get-ExePath $BuildDir "llama-completion.exe"
+$expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 $args = @(
     "-m", $Model,
     "-p", $Prompt,

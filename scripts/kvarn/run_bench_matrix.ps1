@@ -9,6 +9,7 @@ param(
     [double] $RtnQuantile = 0.95,
     [int] $Repetitions = 1,
     [int] $MinKvarnLayerLogs = 1,
+    [string] $ExpectedKvarnLayers = "",
     [ValidateSet("csv", "json", "jsonl", "md", "sql")] [string] $OutputFormat = "md",
     [string] $OutputDir = "",
     [switch] $Warmup,
@@ -87,7 +88,49 @@ function Get-BenchCases([string] $caseList) {
     return $cases
 }
 
+function Get-ExpectedKvarnLayerIds([string] $layers) {
+    if ([string]::IsNullOrWhiteSpace($layers)) {
+        return @()
+    }
+
+    $ids = @()
+    foreach ($raw in ($layers -split "[,\s]+")) {
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            continue
+        }
+        $id = 0
+        if (-not [int]::TryParse($raw, [ref] $id) -or $id -lt 0) {
+            throw "Invalid KVarN layer id '$raw' in ExpectedKvarnLayers"
+        }
+        $ids += $id
+    }
+    return $ids
+}
+
+function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] $label) {
+    if ($expected.Count -eq 0) {
+        return
+    }
+
+    $actual = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($m in [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer\s+([0-9]+)")) {
+        [void] $actual.Add([int] $m.Groups[1].Value)
+    }
+
+    $missing = @()
+    foreach ($id in $expected) {
+        if (-not $actual.Contains($id)) {
+            $missing += $id
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw "$label missing expected KVarN layer ids: $($missing -join ',')"
+    }
+    Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
+}
+
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+$expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 $requiresKvarnEvidence = ($KvCacheQuant.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) |
     ForEach-Object { $_.Trim().ToLowerInvariant() }) -contains "kvarn"
 $manifest = @(
@@ -102,6 +145,7 @@ $manifest = @(
     "kvarn_rtn_quantile=$rtnQuantileArg",
     "repetitions=$Repetitions",
     "min_kvarn_layer_logs=$MinKvarnLayerLogs",
+    "expected_kvarn_layers=$ExpectedKvarnLayers",
     "output_format=$OutputFormat",
     "warmup=$($Warmup.IsPresent)",
     "extra_args=$($ExtraArgs -join ' ')"
@@ -169,6 +213,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         if ($text -notmatch "(?i)\bkvarn\b") {
             throw "llama-bench case '$($case.Name)' output did not include a KVarN benchmark row; see $logPath"
         }
+        Assert-ExpectedKvarnLayers $text $expectedKvarnLayerIds "llama-bench case '$($case.Name)'"
         Write-Host ("KVarN bench log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
     }
 }
