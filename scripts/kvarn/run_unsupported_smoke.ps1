@@ -164,7 +164,7 @@ if ($UnsupportedDimModel -ne "") {
         $results `
         $unsupportedArgs `
         @{} `
-        "KVarN backend currently supports only 128- or 256-dimensional K/V heads|KVarN backend does not support SWA/ISWA models yet" `
+        "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads|KVarN backend does not support SWA/ISWA models yet" `
         "KVarN unsupported K/V dimension or SWA/ISWA rejection"
 }
 

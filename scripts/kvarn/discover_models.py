@@ -111,6 +111,8 @@ def metadata_for(path: Path) -> dict[str, str]:
             notes.append("primary-256")
         elif key_len_int == 128:
             notes.append("regression-128")
+        elif key_len_int == 512:
+            notes.append("design-512")
         else:
             notes.append("unsupported-kv-dim")
         if inferred_dim:

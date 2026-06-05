@@ -9,12 +9,13 @@ Current implemented pieces:
 - Public API and common CLI flags for `--kv-cache-quant none|kvarn`.
 - `kvarn_k4v2_g128` preset defaults: group 128, 4-bit K, 2-bit V, 128 sink
   tokens, 128 tail tokens, 16 Sinkhorn iterations.
-- Runtime K/V head dimensions of 128 and 256 are supported by validation,
-  layout tests, and CUDA parity tests. Local `llama-cli` smokes currently cover
-  128- and 256-dimensional K/V heads. 256 remains the primary Qwen acceptance
-  path. The local Gemma 4 12B files report 512-dimensional K/V heads and
-  SWA/ISWA cache routing, so they are explicitly rejected until KVarN has a
-  production ISWA cache implementation and a 512-dimensional support decision.
+- Runtime K/V head dimensions of 128, 256, and 512 are supported by
+  validation, layout/memory-estimator tests, runtime metadata tests, and CUDA
+  parity tests. Local `llama-cli` smokes currently cover 128- and
+  256-dimensional K/V heads. 256 remains the primary Qwen acceptance path. 512
+  is now admitted for layout/runtime/CUDA primitives, but the local Gemma 4
+  12B/26B files still use SWA/ISWA cache routing and are explicitly rejected
+  until KVarN has a production ISWA cache implementation.
 - CPU reference layout, Hadamard rotation, Sinkhorn-style balancing,
   asymmetric RTN, bit packing, body-record dequant, and a sink/body/tail
   reference cache.
@@ -198,12 +199,13 @@ Verified local smoke:
 - Compatible model downloaded with
   `hf download Qwen/Qwen2.5-1.5B-Instruct-GGUF qwen2.5-1.5b-instruct-q4_k_m.gguf --local-dir C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF`.
 - Reproducible local model metadata discovery:
-  `python scripts\kvarn\discover_models.py C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf`.
-  Latest local result reports both Gemma4 12B files as full-attention
-  512-dimensional K/V with separate SWA 256-dimensional K/V
-  (`unsupported-kv-dim,swa/iswa-likely,swa-256`), Qwen2.5 1.5B as
-  `regression-128,dim-inferred`, Qwen3.5 0.8B as `primary-256,hybrid-ssm`,
-  and Qwen3.6 35B A3B MTP IQ3 as `primary-256,hybrid-ssm,moe`.
+  `python scripts\kvarn\discover_models.py C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q4_K_M.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf`.
+  Latest local result reports Gemma4 12B dense files as `design-512`
+  full-attention K/V with separate 256-dimensional SWA K/V
+  (`design-512,swa/iswa-likely,swa-256`), Gemma4 26B A4B files as
+  `design-512,swa/iswa-likely,swa-256,moe`, Qwen3.6 35B A3B MTP IQ3 as
+  `primary-256,hybrid-ssm,moe`, and Qwen3.6 35B A3B Q3 as
+  `primary-256,hybrid-ssm,moe`.
 - Additional local 256 metadata discovery:
   `python scripts\kvarn\discover_models.py C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-UD-Q4_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q3_K_XL.gguf C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-GGUF\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`.
   Latest local result reports both Qwen3.5 4B files as 256-dim hybrid SSM
@@ -265,9 +267,10 @@ Verified local smoke:
   KVarN cache estimates were `8.64 MiB` at 512 tokens, `11.92 MiB` at 1024
   tokens, and `18.48 MiB` at 2048 tokens.
 - `scripts\kvarn\kv_memory_estimate.py` now mirrors the runtime logical memory
-  formula and has `--self-test` coverage against `test-kvarn-kv` 128- and
-  256-dimensional reference totals. It reports full FP16 KV, ideal full-context
-  low-bit KV, and KVarN's FP16 sink/tail, packed body, and scale breakdown.
+  formula and has `--self-test` coverage against `test-kvarn-kv` 128-, 256-,
+  and 512-dimensional reference totals. It reports full FP16 KV, ideal
+  full-context low-bit KV, and KVarN's FP16 sink/tail, packed body, and scale
+  breakdown.
 - Memory estimator for Qwen2.5 1.5B geometry (`28` layers, `2` KV heads,
   `128` head dim, K4/V2/group128, 128 sink + 128 tail) reports KVarN totals of
   `31.61 MiB` at 4K context, `57.86 MiB` at 8K context, and `110.36 MiB` at
@@ -292,9 +295,14 @@ Verified local smoke:
 - Explicit multi-slot startup now fails cleanly before model load with:
   `KVarN currently supports only --parallel 1`.
 - Focused tests passed:
-  `ctest --test-dir build-kvarn-cpu -C Release -R "test-kvarn-kv|test-kvarn-server-load-failure" --output-on-failure`
+  `ctest --test-dir build-kvarn-cpu -C Release -R "test-kvarn-kv|test-arg-parser|test-kvarn-server-load-failure" --output-on-failure`
   and
-  `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R test-kvarn-cuda-scratch-ref --output-on-failure`.
+  `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure`.
+  Latest local result on 2026-06-05 passed. `test-kvarn-kv` now asserts 512
+  memory estimates, runtime layer-view shapes, scale/body tensor sizing, and
+  body-store graph op shapes. `test-kvarn-cuda-scratch-ref` now runs 128, 256,
+  and 512 head-dimension cases through the CUDA packed/scratch reference
+  coverage.
 - CUDA KVarN coverage now includes the wrapped-tail mixed-attention runtime
   test:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-cuda" --output-on-failure`.
@@ -351,15 +359,18 @@ Verified local smoke:
 - Gemma 4 12B metadata discovered locally:
   `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf` and
   `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf` are `gemma4`,
-  48 layers, context `131072`, 16 attention heads, no SSM keys, and K/V head
-  length `512`. They are not 256-dimensional despite the original target
-  assumption, and they also use SWA/ISWA cache routing. KVarN rejects these
-  files cleanly before graph construction with a combined blocker message:
-  `KVarN backend does not support SWA/ISWA models yet; KVarN backend currently supports only 128- or 256-dimensional K/V heads; layer 5 has 512`;
-  earlier builds could reach an invalid ISWA graph cast and crash with
-  `0xC0000005`. Current-build rejection was rechecked with
+  48 layers, context `131072`, 16 attention heads, no SSM keys, full-attention
+  K/V head length `512`, and SWA K/V head length `256`. Gemma 4 26B A4B files
+  are also `gemma4`, 30 layers, context `262144`, full-attention K/V head
+  length `512`, SWA K/V head length `256`, 128 experts, and 8 active experts.
+  KVarN 512 layout/CUDA support no longer rejects these for head dimension, but
+  KVarN still rejects them cleanly before graph construction because SWA/ISWA
+  cache routing is not implemented:
+  `KVarN backend does not support SWA/ISWA models yet`. Earlier builds could
+  reach an invalid ISWA graph cast and crash with `0xC0000005`.
+  Current-build rejection was rechecked with
   `llama-results -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p Hello -o <tmp.gguf> -c 256 -ngl 99 -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`
-  and passed with the expected SWA/ISWA plus 128/256-only validation error.
+  and passed with the expected SWA/ISWA validation error.
 - Fresh `tg64` benchmark gates on the CUDA FA-off build:
   Qwen2.5 1.5B 128-dim normal KV `202.46` tok/s, KVarN `160.37` tok/s;
   Qwen3.5 0.8B 256-dim hybrid normal KV `360.12` tok/s, KVarN
@@ -641,6 +652,6 @@ with `STATUS_CONTROL_C_EXIT`.
 
 Local smoke models may fail KVarN initialization before graph construction if
 they do not match the production constraints. Expected guarded failures include
-K/V head dimensions other than 128 or 256, MLA, SWA/ISWA, unsupported backend
-placement, attention rotations/KQ bias/sinks, and other explicit KVarN
+K/V head dimensions other than 128, 256, or 512, MLA, SWA/ISWA, unsupported
+backend placement, attention rotations/KQ bias/sinks, and other explicit KVarN
 graph-backend guards.

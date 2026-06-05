@@ -1971,7 +1971,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 static bool llama_kvarn_supported_head_dim(uint32_t head_dim) {
-    return head_dim == 128 || head_dim == 256;
+    return head_dim == 128 || head_dim == 256 || head_dim == 512;
 }
 
 static bool llama_kvarn_device_supports_ops(ggml_backend_dev_t dev, const llama_kvarn_params & params, uint32_t head_dim) {
@@ -2039,7 +2039,7 @@ static void llama_kvarn_validate_memory_support(
         }
         if (!llama_kvarn_supported_head_dim(head_k)) {
             unsupported_head_dim_msg = format(
-                    "KVarN backend currently supports only 128- or 256-dimensional K/V heads; layer %u has %u",
+                    "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads; layer %u has %u",
                     il, head_k);
             break;
         }

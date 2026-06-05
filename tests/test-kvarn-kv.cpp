@@ -244,6 +244,13 @@ static void test_memory_estimate() {
     require(est256.scale_bytes == 73728, "256-dim KVarN scale estimate");
     require(est256.total_bytes == 2564096, "256-dim KVarN total estimate");
 
+    llama_hparams hparams512 = make_test_hparams(512);
+    const llama_kvarn_memory_estimate est512 = llama_kvarn_estimate_memory(params, hparams512, 512);
+    require(est512.fp16_sink_tail_bytes == 4194304, "512-dim KVarN sink/tail estimate");
+    require(est512.body_packed_bytes == 786432, "512-dim KVarN body estimate");
+    require(est512.scale_bytes == 122880, "512-dim KVarN scale estimate");
+    require(est512.total_bytes == 5103616, "512-dim KVarN total estimate");
+
 }
 
 static void test_runtime_metadata() {
@@ -318,6 +325,17 @@ static void test_runtime_metadata() {
     require(view256.scales_k->ne[0] == 640, "256-dim KVarN layer view scale K shape");
     require(view256.scales_v->ne[0] == 512, "256-dim KVarN layer view scale V shape");
     require(cache256.body_store_scratch_floats(0) == 256*128 + 2*256, "256-dim KVarN body store scratch floats");
+
+    llama_hparams hparams512 = make_test_hparams(512);
+    llama_kv_cache_kvarn cache512(nullptr, hparams512, params, false, 16, 4, 1, nullptr);
+    const llama_kvarn_layer_view view512 = cache512.get_layer_view(0);
+    require(view512.head_dim_k == 512, "512-dim KVarN layer view K head dim");
+    require(view512.head_dim_v == 512, "512-dim KVarN layer view V head dim");
+    require(view512.layout_k.k_body_bytes == 32768, "512-dim KVarN layer view K body bytes");
+    require(view512.layout_v.v_body_bytes == 16384, "512-dim KVarN layer view V body bytes");
+    require(view512.scales_k->ne[0] == 1152, "512-dim KVarN layer view scale K shape");
+    require(view512.scales_v->ne[0] == 768, "512-dim KVarN layer view scale V shape");
+    require(cache512.body_store_scratch_floats(0) == 512*128 + 2*512, "512-dim KVarN body store scratch floats");
 
 }
 
@@ -739,47 +757,47 @@ static void test_kvarn_store_body_ggml_ops() {
     };
     ggml_context_ptr ctx { ggml_init(init_params) };
 
-    for (const int32_t head_dim : { 128, 256 }) {
-    llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+    for (const int32_t head_dim : { 128, 256, 512 }) {
+        llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
 
-    ggml_tensor * k_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, params.group_size, head_dim);
-    ggml_tensor * v_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, head_dim, params.group_size);
-    ggml_tensor * k_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.k_body_bytes);
-    ggml_tensor * v_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.v_body_bytes);
-    ggml_tensor * k_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.k_scale_floats);
-    ggml_tensor * v_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.v_scale_floats);
-    ggml_tensor * scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, head_dim*params.group_size + 2*std::max<int32_t>(head_dim, params.group_size));
+        ggml_tensor * k_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, params.group_size, head_dim);
+        ggml_tensor * v_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, head_dim, params.group_size);
+        ggml_tensor * k_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.k_body_bytes);
+        ggml_tensor * v_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.v_body_bytes);
+        ggml_tensor * k_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.k_scale_floats);
+        ggml_tensor * v_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.v_scale_floats);
+        ggml_tensor * scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, head_dim*params.group_size + 2*std::max<int32_t>(head_dim, params.group_size));
 
-    ggml_tensor * k_store = ggml_kvarn_store_k_body(
-            ctx.get(), k_tile, k_body, k_scales, scratch,
-            head_dim, params.group_size, params.key_bits, params.sinkhorn_iters, params.rtn_quantile);
-    ggml_tensor * v_store = ggml_kvarn_store_v_body(
-            ctx.get(), v_tile, v_body, v_scales, scratch,
-            head_dim, params.group_size, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+        ggml_tensor * k_store = ggml_kvarn_store_k_body(
+                ctx.get(), k_tile, k_body, k_scales, scratch,
+                head_dim, params.group_size, params.key_bits, params.sinkhorn_iters, params.rtn_quantile);
+        ggml_tensor * v_store = ggml_kvarn_store_v_body(
+                ctx.get(), v_tile, v_body, v_scales, scratch,
+                head_dim, params.group_size, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
 
-    require(k_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN K body store op");
-    require(v_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN V body store op");
-    require(k_store->type == GGML_TYPE_I8, "KVarN K body store result type");
-    require(v_store->type == GGML_TYPE_I8, "KVarN V body store result type");
-    require(k_store->view_src == k_body, "KVarN K body store returns body view");
-    require(v_store->view_src == v_body, "KVarN V body store returns body view");
-    require(k_store->src[0] == k_tile && k_store->src[1] == k_scales && k_store->src[2] == scratch && k_store->src[3] == k_body,
-            "KVarN K body store sources");
-    require(v_store->src[0] == v_tile && v_store->src[1] == v_scales && v_store->src[2] == scratch && v_store->src[3] == v_body,
-            "KVarN V body store sources");
-    require(k_store->op_params[0] == 0, "KVarN K body store mode");
-    require(v_store->op_params[0] == 1, "KVarN V body store mode");
-    require(k_store->op_params[1] == head_dim && k_store->op_params[2] == (int32_t) params.group_size,
-            "KVarN K body store geometry");
-    require(v_store->op_params[3] == (int32_t) params.value_bits && v_store->op_params[4] == (int32_t) params.sinkhorn_iters,
-            "KVarN V body store params");
-    float k_quantile = 0.0f;
-    float v_quantile = 0.0f;
-    std::memcpy(&k_quantile, &k_store->op_params[5], sizeof(float));
-    std::memcpy(&v_quantile, &v_store->op_params[5], sizeof(float));
-    require(std::fabs(k_quantile - params.rtn_quantile) < 1.0e-6f &&
-            std::fabs(v_quantile - params.rtn_quantile) < 1.0e-6f,
-            "KVarN body store quantile params");
+        require(k_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN K body store op");
+        require(v_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN V body store op");
+        require(k_store->type == GGML_TYPE_I8, "KVarN K body store result type");
+        require(v_store->type == GGML_TYPE_I8, "KVarN V body store result type");
+        require(k_store->view_src == k_body, "KVarN K body store returns body view");
+        require(v_store->view_src == v_body, "KVarN V body store returns body view");
+        require(k_store->src[0] == k_tile && k_store->src[1] == k_scales && k_store->src[2] == scratch && k_store->src[3] == k_body,
+                "KVarN K body store sources");
+        require(v_store->src[0] == v_tile && v_store->src[1] == v_scales && v_store->src[2] == scratch && v_store->src[3] == v_body,
+                "KVarN V body store sources");
+        require(k_store->op_params[0] == 0, "KVarN K body store mode");
+        require(v_store->op_params[0] == 1, "KVarN V body store mode");
+        require(k_store->op_params[1] == head_dim && k_store->op_params[2] == (int32_t) params.group_size,
+                "KVarN K body store geometry");
+        require(v_store->op_params[3] == (int32_t) params.value_bits && v_store->op_params[4] == (int32_t) params.sinkhorn_iters,
+                "KVarN V body store params");
+        float k_quantile = 0.0f;
+        float v_quantile = 0.0f;
+        std::memcpy(&k_quantile, &k_store->op_params[5], sizeof(float));
+        std::memcpy(&v_quantile, &v_store->op_params[5], sizeof(float));
+        require(std::fabs(k_quantile - params.rtn_quantile) < 1.0e-6f &&
+                std::fabs(v_quantile - params.rtn_quantile) < 1.0e-6f,
+                "KVarN body store quantile params");
     }
 }
 

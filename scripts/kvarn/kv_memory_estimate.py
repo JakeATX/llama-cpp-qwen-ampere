@@ -83,6 +83,22 @@ def run_self_test() -> None:
     assert est256.scales == 73728
     assert est256.total == 2564096
 
+    est512 = estimate(
+        layers=2,
+        kv_heads=4,
+        head_dim=512,
+        ctx=512,
+        group=128,
+        key_bits=4,
+        value_bits=2,
+        sink_tokens=128,
+        tail_tokens=128,
+    )
+    assert est512.fp16_sink_tail == 4194304
+    assert est512.body_packed == 786432
+    assert est512.scales == 122880
+    assert est512.total == 5103616
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Estimate logical KVarN KV cache memory using the runtime formula.")
