@@ -16,6 +16,7 @@ from gguf import GGUFReader  # noqa: E402
 
 
 ALIBI_DEFAULT_ARCHES = {"bloom", "jina-bert-v2", "refact"}
+ATTN_SOFTCAP_ARCHES = {"gemma2"}
 
 
 def field_value(reader: GGUFReader, key: str) -> Any:
@@ -76,6 +77,18 @@ def arch_default_alibi_bias(arch: str, block_count: Any) -> str | None:
     return None
 
 
+def arch_default_attn_softcap(arch: str) -> str | None:
+    if arch in ATTN_SOFTCAP_ARCHES:
+        return "arch-default:50.0"
+    return None
+
+
+def arch_default_attn_output_scale(arch: str) -> str | None:
+    if arch == "grok":
+        return "arch-default:0.08838834764831845"
+    return None
+
+
 def is_expert_tensor(name: str) -> bool:
     lower = name.lower()
     return "_exps" in lower or ".experts" in lower or "expert" in lower
@@ -113,9 +126,17 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
     attn_logit_softcap = first_value(reader, [
         f"{prefix}.attn_logit_softcapping",
     ])
+    default_attn_softcap = arch_default_attn_softcap(arch)
+    arch_attn_softcap = default_attn_softcap is not None
+    if attn_logit_softcap is None and arch_attn_softcap:
+        attn_logit_softcap = default_attn_softcap
     attn_output_scale = first_value(reader, [
         f"{prefix}.attention.output_scale",
     ])
+    default_attn_output_scale = arch_default_attn_output_scale(arch)
+    arch_attn_output_scale = default_attn_output_scale is not None
+    if attn_output_scale is None and arch_attn_output_scale:
+        attn_output_scale = default_attn_output_scale
 
     expert_count = first_value(reader, [
         f"{prefix}.expert_count",
@@ -208,13 +229,16 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
                 notes.append("kvarn-unsupported-alibi")
         except (TypeError, ValueError):
             notes.append("kvarn-unsupported-alibi")
-    if attn_logit_softcap is not None:
+    if arch_attn_softcap:
         notes.append("kvarn-unsupported-attn-softcap")
-    try:
-        if attn_output_scale is not None and float(attn_output_scale) != 0.0:
-            notes.append("kvarn-unsupported-attn-output-scale")
-    except (TypeError, ValueError):
+    if arch_attn_output_scale:
         notes.append("kvarn-unsupported-attn-output-scale")
+    else:
+        try:
+            if attn_output_scale is not None and float(attn_output_scale) != 0.0:
+                notes.append("kvarn-unsupported-attn-output-scale")
+        except (TypeError, ValueError):
+            notes.append("kvarn-unsupported-attn-output-scale")
     if attn_sink_tensors:
         notes.append("kvarn-unsupported-attn-sinks")
     if expert_count not in (None, 0, "0"):
