@@ -685,9 +685,13 @@ Verified local smoke:
   512 path uses the validated split kernels. Rebuilt Gemma 4 12B server smoke
   also passed with exact KVarN full-attention layers `5,11,17,23,29,35,41,47`
   and 16 KVarN layer log lines.
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat`.
-  Latest local 26B A4B result also passed with packed-repeat
-  `NMSE = 0.000E+000` and packed-vs-scratch `NMSE = 0.000E+000`.
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
+  Latest local 26B A4B rerun passed exact full-attention layer checks for
+  `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
+  packed-repeat, packed-vs-split, and packed-vs-scratch at
+  `NMSE = 0.000E+000`. A traced short rerun also reported
+  `KVarN CUDA mixed-attn trace: mode=split-512-default`, confirming Gemma 4
+  26B uses the same validated default 512 split-kernel path.
 - Unsupported runtime-mode rejection check:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest static-build rerun on the Qwen2.5 1.5B regression model passed all
