@@ -245,6 +245,19 @@ Verified local smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-completion.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -p "Hello" -n 270 -c 512 -ngl 99 --no-warmup --simple-io -no-cnv --no-display-prompt --ignore-eos -fa off --kv-cache-quant none -s 1234 --temp 0`.
   This completed at 222.63 tokens/s eval with `graphs reused = 268`, so the current KVarN path is
   correctness-oriented and not yet performance-competitive.
+- Gemma 4 12B 512-dimensional KVarN+ISWA body-record smoke on the static CUDA
+  build:
+  `build-kvarn-cuda-static-vs\bin\Release\llama-completion.exe -fit off -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p "Hello" -n 270 -c 512 -ngl 99 --no-warmup --simple-io -no-cnv --no-display-prompt --ignore-eos -fa on --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 -s 1234 --temp 0`.
+  Latest local result passes after rebuilding stale static CLI tools at commit
+  `1fc9833ff`: KVarN owns Gemma full-attention layers `5, 11, 17, 23, 29, 35,
+  41, 47`, allocates `2` body records per KVarN layer at `-c 512`, reports
+  `8.87 MiB` CUDA KVarN buffer, `4.87 MiB` estimated KVarN metadata cache, and
+  runs at `32.21` eval tok/s with `graphs reused = 267`.
+- Matching Gemma 4 12B normal-KV baseline:
+  `build-kvarn-cuda-static-vs\bin\Release\llama-completion.exe -fit off -m C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -p "Hello" -n 270 -c 512 -ngl 99 --no-warmup --simple-io -no-cnv --no-display-prompt --ignore-eos -fa off --kv-cache-quant none -s 1234 --temp 0`.
+  Latest local result: `67.79` eval tok/s with `graphs reused = 267`, so the
+  Gemma KVarN+ISWA path is functionally up but still roughly half normal-KV
+  decode speed on this short smoke.
 - Standard benchmark smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -p 0 -n 64 -r 1 -ngl 99 -fa on --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
   This verifies the `llama-bench` KVarN option plumbing. Latest local result:
