@@ -425,6 +425,15 @@ Verified local smoke:
   fused-batch model diagnostic shape (`49` queries, `49` sink tokens, `1024`-byte mask row
   stride). That sink-only fused-batch coverage now runs both F16 and F32 KQ
   masks, matching `-fa on` and `-fa off` runtime graph mask storage.
+  Static focused rerun after adding Gemma-shaped 512 primitive coverage:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref" --output-on-failure`.
+  Latest local result passed. The test now also includes a Gemma-shaped
+  512-dimensional forced-fused-vs-split primitive case (`16` query heads,
+  `1` KV head, `17` queries, `128` sink tokens, `2` body records, `128` tail
+  tokens, and a `512`-token padded F16 mask row), so the basic 512 packed-body
+  unpack, softmax, and AV path is covered independently of the Gemma model-level
+  run. The remaining 512 fused gate is model-level fused/serial drift;
+  production still routes 512-dimensional heads to split kernels by default.
 - Shared batch-split and focused KVarN CUDA coverage passed after tightening
   `split_equal()` sequence-set limits:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
@@ -709,7 +718,8 @@ Verified local smoke:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6"`.
   Packed save, split-kernel check, and scratch-reference check all passed exact
   full-attention layer routing, body-record capacity `2`, and
-  `NMSE = 0.000E+000`.
+  `NMSE = 0.000E+000`. The model-level active-body-record rerun after the
+  Gemma-shaped 512 primitive guard still passed default split at `NMSE = 0`.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus

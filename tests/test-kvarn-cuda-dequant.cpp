@@ -1678,6 +1678,223 @@ static void run_case(uint32_t head_dim) {
         }
     }
 
+    if (head_dim == 512) {
+        const uint32_t n_gemma_sink = 128;
+        const uint32_t n_gemma_records = 2;
+        const uint32_t n_gemma_pending = 0;
+        const uint32_t n_gemma_tail = 128;
+        const uint32_t gemma_tail_start = 0;
+        const uint32_t n_gemma_tokens = n_gemma_sink + n_gemma_records*group + n_gemma_pending + n_gemma_tail;
+        const uint32_t gemma_n_queries = 17;
+        const uint32_t gemma_n_head = 16;
+        const uint32_t gemma_n_head_kv = 1;
+        const uint32_t gemma_mask_stride_tokens = 512;
+
+        std::vector<uint16_t> gemma_sink_tail_k(size_t(n_gemma_sink + n_gemma_tail)*gemma_n_head_kv*head_dim);
+        std::vector<uint16_t> gemma_sink_tail_v(gemma_sink_tail_k.size());
+        std::vector<float> gemma_sink_tail_k_ref(gemma_sink_tail_k.size());
+        std::vector<float> gemma_sink_tail_v_ref(gemma_sink_tail_v.size());
+        for (uint32_t t = 0; t < n_gemma_sink + n_gemma_tail; ++t) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t off = size_t(t)*head_dim + d;
+                const float k = 0.073f*std::sin(float(d + 11*t)*0.011f) -
+                                0.039f*std::cos(float(3*d + 17*t)*0.007f);
+                const float v = 0.067f*std::cos(float(5*d + 13*t)*0.009f) +
+                                0.041f*std::sin(float(d + 23*t)*0.013f);
+                gemma_sink_tail_k[off] = f32_to_f16_bits(k);
+                gemma_sink_tail_v[off] = f32_to_f16_bits(v);
+                gemma_sink_tail_k_ref[off] = f16_bits_to_f32(gemma_sink_tail_k[off]);
+                gemma_sink_tail_v_ref[off] = f16_bits_to_f32(gemma_sink_tail_v[off]);
+            }
+        }
+
+        std::vector<float> gemma_queries(size_t(gemma_n_queries)*gemma_n_head*head_dim);
+        for (uint32_t iq = 0; iq < gemma_n_queries; ++iq) {
+            for (uint32_t ih = 0; ih < gemma_n_head; ++ih) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    gemma_queries[(size_t(iq)*gemma_n_head + ih)*head_dim + d] =
+                        0.101f*std::sin(float(d + 5*ih + 19*iq)*0.017f) -
+                        0.063f*std::cos(float(2*d + 7*ih + 11*iq)*0.013f);
+                }
+            }
+        }
+
+        std::vector<uint16_t> gemma_mask(size_t(gemma_n_queries)*gemma_mask_stride_tokens, f32_to_f16_bits(-1.0e30f));
+        std::vector<float> gemma_mask_ref(size_t(gemma_n_queries)*gemma_mask_stride_tokens, -1.0e30f);
+        for (uint32_t iq = 0; iq < gemma_n_queries; ++iq) {
+            for (uint32_t t = 0; t < gemma_mask_stride_tokens; ++t) {
+                const float bias = t <= n_gemma_sink + n_gemma_records*group + iq ? 0.0f : -1.0e30f;
+                const size_t off = size_t(iq)*gemma_mask_stride_tokens + t;
+                gemma_mask[off] = f32_to_f16_bits(bias);
+                gemma_mask_ref[off] = f16_bits_to_f32(gemma_mask[off]);
+            }
+        }
+
+        std::vector<float> gemma_pending(size_t(gemma_n_head_kv)*head_dim, 0.0f);
+        float * gemma_queries_d = cuda_upload(gemma_queries);
+        uint16_t * gemma_sink_tail_k_d = cuda_upload(gemma_sink_tail_k);
+        uint16_t * gemma_sink_tail_v_d = cuda_upload(gemma_sink_tail_v);
+        float * gemma_pending_d = cuda_upload(gemma_pending);
+        uint16_t * gemma_mask_d = cuda_upload(gemma_mask);
+        float * gemma_split_d = nullptr;
+        float * gemma_fused_d = nullptr;
+        float * gemma_scores_d = nullptr;
+        float * gemma_fused_scores_d = nullptr;
+        require_cuda(cudaMalloc(&gemma_split_d, gemma_queries.size()*sizeof(float)), "cudaMalloc Gemma-shaped split output");
+        require_cuda(cudaMalloc(&gemma_fused_d, gemma_queries.size()*sizeof(float)), "cudaMalloc Gemma-shaped fused output");
+        require_cuda(cudaMalloc(&gemma_scores_d, n_gemma_tokens*sizeof(float)), "cudaMalloc Gemma-shaped split scores");
+        require_cuda(cudaMalloc(&gemma_fused_scores_d, n_gemma_tokens*sizeof(float)), "cudaMalloc Gemma-shaped fused scores");
+
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                gemma_queries_d, gemma_sink_tail_k_d, gemma_sink_tail_v_d,
+                multi_k_body_d, multi_v_body_d, multi_k_scales_d, multi_v_scales_d,
+                gemma_pending_d, gemma_pending_d, gemma_mask_d,
+                gemma_split_d, gemma_scores_d,
+                gemma_n_queries, gemma_n_head, gemma_n_head_kv,
+                n_gemma_sink, n_gemma_records, n_gemma_pending, n_gemma_tail, gemma_tail_start, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(gemma_n_head)*head_dim,
+                head_dim, size_t(gemma_n_head)*head_dim,
+                head_dim, size_t(gemma_n_head_kv)*head_dim,
+                head_dim, size_t(gemma_n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(gemma_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA Gemma-shaped split launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA Gemma-shaped split sync");
+
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                gemma_queries_d, gemma_sink_tail_k_d, gemma_sink_tail_v_d,
+                multi_k_body_d, multi_v_body_d, multi_k_scales_d, multi_v_scales_d,
+                gemma_pending_d, gemma_pending_d, gemma_mask_d,
+                gemma_fused_d, gemma_fused_scores_d,
+                gemma_n_queries, gemma_n_head, gemma_n_head_kv,
+                n_gemma_sink, n_gemma_records, n_gemma_pending, n_gemma_tail, gemma_tail_start, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(gemma_n_head)*head_dim,
+                head_dim, size_t(gemma_n_head)*head_dim,
+                head_dim, size_t(gemma_n_head_kv)*head_dim,
+                head_dim, size_t(gemma_n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(gemma_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA Gemma-shaped forced fused launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA Gemma-shaped forced fused sync");
+
+        std::vector<float> gemma_split(gemma_queries.size());
+        std::vector<float> gemma_fused(gemma_queries.size());
+        require_cuda(cudaMemcpy(gemma_split.data(), gemma_split_d, gemma_split.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy Gemma-shaped split output");
+        require_cuda(cudaMemcpy(gemma_fused.data(), gemma_fused_d, gemma_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy Gemma-shaped fused output");
+
+        std::vector<float> gemma_ref(gemma_queries.size(), 0.0f);
+        for (uint32_t iq = 0; iq < gemma_n_queries; ++iq) {
+            for (uint32_t ih = 0; ih < gemma_n_head; ++ih) {
+                const float * q_row = gemma_queries.data() + (size_t(iq)*gemma_n_head + ih)*head_dim;
+                std::vector<float> row_scores(n_gemma_tokens, 0.0f);
+
+                for (uint32_t t = 0; t < n_gemma_sink; ++t) {
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        row_scores[t] += q_row[d]*gemma_sink_tail_k_ref[size_t(t)*head_dim + d];
+                    }
+                    row_scores[t] *= scale;
+                }
+                for (uint32_t r = 0; r < n_gemma_records; ++r) {
+                    const size_t rec_off = size_t(r)*n;
+                    for (uint32_t g = 0; g < group; ++g) {
+                        float s = 0.0f;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            s += q_row[d]*multi_k_ref[rec_off + d*group + g];
+                        }
+                        row_scores[size_t(n_gemma_sink) + size_t(r)*group + g] = s*scale;
+                    }
+                }
+                for (uint32_t t = 0; t < n_gemma_tail; ++t) {
+                    const size_t score_i = size_t(n_gemma_sink) + n_gemma_records*group + t;
+                    const uint32_t slot = n_gemma_sink + (gemma_tail_start + t)%n_gemma_tail;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        row_scores[score_i] += q_row[d]*gemma_sink_tail_k_ref[size_t(slot)*head_dim + d];
+                    }
+                    row_scores[score_i] *= scale;
+                }
+                for (uint32_t t = 0; t < n_gemma_tokens; ++t) {
+                    row_scores[t] += gemma_mask_ref[size_t(iq)*gemma_mask_stride_tokens + t];
+                }
+
+                float row_max = row_scores[0];
+                for (float s : row_scores) {
+                    row_max = std::max(row_max, s);
+                }
+                std::vector<float> row_probs(n_gemma_tokens);
+                float row_denom = 0.0f;
+                for (uint32_t t = 0; t < n_gemma_tokens; ++t) {
+                    row_probs[t] = std::exp(row_scores[t] - row_max);
+                    row_denom += row_probs[t];
+                }
+
+                float * out_row = gemma_ref.data() + (size_t(iq)*gemma_n_head + ih)*head_dim;
+                for (uint32_t t = 0; t < n_gemma_sink; ++t) {
+                    const float p = row_probs[t]/row_denom;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        out_row[d] += p*gemma_sink_tail_v_ref[size_t(t)*head_dim + d];
+                    }
+                }
+                for (uint32_t r = 0; r < n_gemma_records; ++r) {
+                    const size_t rec_off = size_t(r)*n;
+                    for (uint32_t g = 0; g < group; ++g) {
+                        const float p = row_probs[size_t(n_gemma_sink) + size_t(r)*group + g]/row_denom;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            out_row[d] += p*multi_v_ref[rec_off + g*head_dim + d];
+                        }
+                    }
+                }
+                for (uint32_t t = 0; t < n_gemma_tail; ++t) {
+                    const size_t prob_i = size_t(n_gemma_sink) + n_gemma_records*group + t;
+                    const float p = row_probs[prob_i]/row_denom;
+                    const uint32_t slot = n_gemma_sink + (gemma_tail_start + t)%n_gemma_tail;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        out_row[d] += p*gemma_sink_tail_v_ref[size_t(slot)*head_dim + d];
+                    }
+                }
+            }
+        }
+
+        float gemma_split_err = 0.0f;
+        float gemma_fused_err = 0.0f;
+        float gemma_fused_vs_split_err = 0.0f;
+        for (size_t i = 0; i < gemma_ref.size(); ++i) {
+            gemma_split_err = std::max(gemma_split_err, std::fabs(gemma_ref[i] - gemma_split[i]));
+            gemma_fused_err = std::max(gemma_fused_err, std::fabs(gemma_ref[i] - gemma_fused[i]));
+            gemma_fused_vs_split_err = std::max(gemma_fused_vs_split_err, std::fabs(gemma_split[i] - gemma_fused[i]));
+        }
+        require(gemma_split_err < 1.0e-5f, "CUDA Gemma-shaped 17-query split mixed attention matches CPU reference");
+        require(gemma_fused_err < 1.0e-5f, "CUDA Gemma-shaped 17-query forced fused mixed attention matches CPU reference");
+        require(gemma_fused_vs_split_err < 1.0e-6f, "CUDA Gemma-shaped 17-query forced fused mixed attention matches split output");
+
+        cudaFree(gemma_queries_d);
+        cudaFree(gemma_sink_tail_k_d);
+        cudaFree(gemma_sink_tail_v_d);
+        cudaFree(gemma_pending_d);
+        cudaFree(gemma_mask_d);
+        cudaFree(gemma_split_d);
+        cudaFree(gemma_fused_d);
+        cudaFree(gemma_scores_d);
+        cudaFree(gemma_fused_scores_d);
+    }
+
     cudaFree(k_body_d);
     cudaFree(v_body_d);
     cudaFree(k_scales_d);
