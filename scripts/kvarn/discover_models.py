@@ -15,6 +15,9 @@ if str(GGUF_PY) not in sys.path:
 from gguf import GGUFReader  # noqa: E402
 
 
+ALIBI_DEFAULT_ARCHES = {"bloom", "jina-bert-v2", "refact"}
+
+
 def field_value(reader: GGUFReader, key: str) -> Any:
     field = reader.fields.get(key)
     if field is None:
@@ -62,6 +65,17 @@ def tensor_nbytes(tensor: Any) -> int:
     return 0
 
 
+def arch_default_alibi_bias(arch: str, block_count: Any) -> str | None:
+    if arch in ALIBI_DEFAULT_ARCHES:
+        return "arch-default:8.0"
+    if arch == "baichuan":
+        try:
+            return "arch-default:8.0" if int(block_count) == 40 else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def is_expert_tensor(name: str) -> bool:
     lower = name.lower()
     return "_exps" in lower or ".experts" in lower or "expert" in lower
@@ -81,6 +95,7 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
     reader = GGUFReader(path)
     arch = scalar(field_value(reader, "general.architecture"))
     prefix = arch if arch else "<unknown>"
+    block_count = first_value(reader, [f"{prefix}.block_count", "general.block_count"])
 
     fields = reader.fields.keys()
     ssm_keys = [key for key in fields if ".ssm." in key or key.endswith(".ssm_conv_kernel")]
@@ -91,6 +106,10 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
     alibi_bias = first_value(reader, [
         f"{prefix}.attention.max_alibi_bias",
     ])
+    default_alibi = arch_default_alibi_bias(arch, block_count)
+    arch_default_alibi = default_alibi is not None
+    if alibi_bias is None and arch_default_alibi:
+        alibi_bias = default_alibi
     attn_logit_softcap = first_value(reader, [
         f"{prefix}.attn_logit_softcapping",
     ])
@@ -181,11 +200,14 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
         notes.append("hybrid-ssm")
     if mla_keys:
         notes.append("mla-likely")
-    try:
-        if alibi_bias is not None and float(alibi_bias) > 0.0:
-            notes.append("kvarn-unsupported-alibi")
-    except (TypeError, ValueError):
+    if arch_default_alibi:
         notes.append("kvarn-unsupported-alibi")
+    else:
+        try:
+            if alibi_bias is not None and float(alibi_bias) > 0.0:
+                notes.append("kvarn-unsupported-alibi")
+        except (TypeError, ValueError):
+            notes.append("kvarn-unsupported-alibi")
     if attn_logit_softcap is not None:
         notes.append("kvarn-unsupported-attn-softcap")
     try:
@@ -229,7 +251,7 @@ def metadata_for(path: Path, gpu_vram_gib: float | None, vram_reserve_gib: float
         "full_offload_fit": full_offload_fit,
         "vram_margin_gib": fmt_gib(vram_margin_gib),
         "arch": arch,
-        "layers": scalar(first_value(reader, [f"{prefix}.block_count", "general.block_count"])),
+        "layers": scalar(block_count),
         "ctx": scalar(first_value(reader, [f"{prefix}.context_length", "general.context_length"])),
         "heads": scalar(first_value(reader, [f"{prefix}.attention.head_count"])),
         "kv_heads": scalar(first_value(reader, [f"{prefix}.attention.head_count_kv"])),

@@ -225,7 +225,10 @@ Verified local smoke:
   The script now reports GGUF tensor GiB, expert/non-expert tensor split,
   expert share, usable VRAM, full-offload fit, and KVarN-unsupported
   attention metadata for ALiBi/max-bias, attention softcap, attention output
-  scale, and learned attention-sink tensors. Latest local result with a
+  scale, and learned attention-sink tensors. ALiBi discovery includes
+  llama.cpp architecture defaults that are not always stored as GGUF metadata,
+  so Bloom, Jina BERT v2, Refact, and 40-layer Baichuan models can report
+  `arch-default:8.0` and `kvarn-unsupported-alibi`. Latest local result with a
   10.50 GiB usable VRAM budget reports Gemma4 12B dense Q3 as `5.59` tensor
   GiB and full-offload fit `yes` with `4.91` GiB margin
   (`design-512,swa/iswa-likely,swa-256`); Gemma4 26B A4B Q3 as `12.01`
