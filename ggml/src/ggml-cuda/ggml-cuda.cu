@@ -27,6 +27,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/kvarn.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2810,6 +2811,189 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
             break;
+        case GGML_OP_KVARN_STORE_BODY:
+            {
+                struct kvarn_store_body_params {
+                    int32_t is_v;
+                    int32_t head_dim;
+                    int32_t group_size;
+                    int32_t bits;
+                    int32_t sinkhorn_iters;
+                    float   rtn_quantile;
+                } params;
+                memcpy(&params, dst->op_params, sizeof(params));
+
+                const ggml_tensor * tile    = dst->src[0];
+                const ggml_tensor * scales  = dst->src[1];
+                const ggml_tensor * scratch = dst->src[2];
+
+                if (params.is_v) {
+                    ggml_cuda_kvarn_store_v_body_reference_minmax(
+                            (const float *) tile->data,
+                            (uint8_t *) dst->data,
+                            (float *) scales->data,
+                            (float *) scratch->data,
+                            params.head_dim, params.group_size, params.bits, params.sinkhorn_iters, params.rtn_quantile,
+                            ctx.stream());
+                } else {
+                    ggml_cuda_kvarn_store_k_body_reference_minmax(
+                            (const float *) tile->data,
+                            (uint8_t *) dst->data,
+                            (float *) scales->data,
+                            (float *) scratch->data,
+                            params.head_dim, params.group_size, params.bits, params.sinkhorn_iters, params.rtn_quantile,
+                            ctx.stream());
+                }
+            } break;
+        case GGML_OP_KVARN_ATTN_MIXED:
+            {
+                struct kvarn_attn_params {
+                    int32_t n_sink;
+                    int32_t n_records;
+                    int32_t n_pending;
+                    int32_t n_tail;
+                    int32_t tail_start;
+                    int32_t head_dim;
+                    int32_t group_size;
+                    int32_t key_bits;
+                    int32_t value_bits;
+                    float   scale;
+                } params;
+                memcpy(&params, dst->op_params, sizeof(params));
+
+                const ggml_tensor * q           = dst->src[0];
+                const ggml_tensor * sink_tail_k = dst->src[1];
+                const ggml_tensor * sink_tail_v = dst->src[2];
+                const ggml_tensor * body_k      = dst->src[3];
+                const ggml_tensor * body_v      = dst->src[4];
+                const ggml_tensor * scales_k    = dst->src[5];
+                const ggml_tensor * scales_v    = dst->src[6];
+                const ggml_tensor * pending_k   = dst->src[7];
+                const ggml_tensor * pending_v   = dst->src[8];
+                const ggml_tensor * scratch     = dst->src[9];
+                const ggml_tensor * kq_mask     = nullptr;
+
+                const int64_t n_kv = int64_t(params.n_sink) + int64_t(params.n_records)*params.group_size + params.n_pending + params.n_tail;
+                const uint32_t kq_mask_type = 0u;
+                const bool use_scratch_ref = getenv("LLAMA_KVARN_ATTN_REF_SCRATCH") != nullptr &&
+                    std::atoi(getenv("LLAMA_KVARN_ATTN_REF_SCRATCH")) != 0;
+                if (use_scratch_ref && params.n_records > 0) {
+                    const size_t n_head_kv = sink_tail_k->ne[1];
+                    const size_t n_per_record = size_t(params.head_dim)*params.group_size;
+                    const size_t body_scratch_floats = n_head_kv*size_t(params.n_records)*n_per_record;
+                    float * scores = (float *) scratch->data;
+                    float * k_scratch = scores + n_kv;
+                    float * v_scratch = k_scratch + body_scratch_floats;
+
+                    for (int64_t ikh = 0; ikh < sink_tail_k->ne[1]; ++ikh) {
+                        ggml_cuda_kvarn_dequant_body_n(
+                                (const uint8_t *) body_k->data + size_t(ikh)*body_k->nb[2],
+                                (const uint8_t *) body_v->data + size_t(ikh)*body_v->nb[2],
+                                (const float *) scales_k->data + size_t(ikh)*scales_k->nb[2]/sizeof(float),
+                                (const float *) scales_v->data + size_t(ikh)*scales_v->nb[2]/sizeof(float),
+                                k_scratch + size_t(ikh)*params.n_records*n_per_record,
+                                v_scratch + size_t(ikh)*params.n_records*n_per_record,
+                                params.n_records,
+                                params.head_dim,
+                                params.group_size,
+                                params.key_bits,
+                                params.value_bits,
+                                body_k->nb[1],
+                                body_v->nb[1],
+                                scales_k->nb[1]/sizeof(float),
+                                scales_v->nb[1]/sizeof(float),
+                                n_per_record,
+                                n_per_record,
+                                ctx.stream());
+                    }
+
+                    ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
+                            (const float *) q->data,
+                            (const uint16_t *) sink_tail_k->data,
+                            (const uint16_t *) sink_tail_v->data,
+                            k_scratch,
+                            v_scratch,
+                            (const float *) pending_k->data,
+                            (const float *) pending_v->data,
+                            kq_mask ? kq_mask->data : nullptr,
+                            (float *) dst->data,
+                            scores,
+                            dst->ne[2],
+                            dst->ne[1],
+                            sink_tail_k->ne[1],
+                            params.n_sink,
+                            params.n_records,
+                            params.n_pending,
+                            params.n_tail,
+                            params.tail_start,
+                            params.head_dim,
+                            params.group_size,
+                            q->nb[1]/sizeof(float),
+                            q->nb[2]/sizeof(float),
+                            dst->nb[1]/sizeof(float),
+                            dst->nb[2]/sizeof(float),
+                            sink_tail_k->nb[1]/sizeof(uint16_t),
+                            sink_tail_k->nb[2]/sizeof(uint16_t),
+                            pending_k->nb[1]/sizeof(float),
+                            pending_k->nb[2]/sizeof(float),
+                            n_per_record,
+                            n_per_record,
+                            size_t(params.n_records)*n_per_record,
+                            size_t(params.n_records)*n_per_record,
+                            kq_mask ? kq_mask->nb[1] : 0,
+                            kq_mask ? kq_mask->nb[0] : 0,
+                            kq_mask_type,
+                            params.scale,
+                            ctx.stream());
+                } else {
+                    ggml_cuda_kvarn_attn_mixed_f16_batch(
+                            (const float *) q->data,
+                            (const uint16_t *) sink_tail_k->data,
+                            (const uint16_t *) sink_tail_v->data,
+                            (const uint8_t *) body_k->data,
+                            (const uint8_t *) body_v->data,
+                            (const float *) scales_k->data,
+                            (const float *) scales_v->data,
+                            (const float *) pending_k->data,
+                            (const float *) pending_v->data,
+                            kq_mask ? kq_mask->data : nullptr,
+                            (float *) dst->data,
+                            (float *) scratch->data,
+                            dst->ne[2],
+                            dst->ne[1],
+                            sink_tail_k->ne[1],
+                            params.n_sink,
+                            params.n_records,
+                            params.n_pending,
+                            params.n_tail,
+                            params.tail_start,
+                            params.head_dim,
+                            params.group_size,
+                            params.key_bits,
+                            params.value_bits,
+                            q->nb[1]/sizeof(float),
+                            q->nb[2]/sizeof(float),
+                            dst->nb[1]/sizeof(float),
+                            dst->nb[2]/sizeof(float),
+                            sink_tail_k->nb[1]/sizeof(uint16_t),
+                            sink_tail_k->nb[2]/sizeof(uint16_t),
+                            pending_k->nb[1]/sizeof(float),
+                            pending_k->nb[2]/sizeof(float),
+                            body_k->nb[1],
+                            body_v->nb[1],
+                            body_k->nb[2],
+                            body_v->nb[2],
+                            scales_k->nb[1]/sizeof(float),
+                            scales_v->nb[1]/sizeof(float),
+                            scales_k->nb[2]/sizeof(float),
+                            scales_v->nb[2]/sizeof(float),
+                            kq_mask ? kq_mask->nb[1] : 0,
+                            kq_mask ? kq_mask->nb[0] : 0,
+                            kq_mask_type,
+                            params.scale,
+                            ctx.stream());
+                }
+            } break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
             break;
@@ -3280,6 +3464,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        if (node->op == GGML_OP_KVARN_ATTN_MIXED) {
+            // KVarN decode reuses the llama graph while updating the active KV window
+            // through op_params. CUDA graph replay would keep stale kernel arguments.
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to dynamic KVarN attention params\n", __func__);
+#endif
         }
 
         if (!use_cuda_graph) {
@@ -5212,6 +5405,120 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_IQ4_NL) &&
                        op->src[0]->type == GGML_TYPE_F32 &&
                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+            } break;
+        case GGML_OP_KVARN_STORE_BODY:
+            {
+                struct kvarn_store_body_params {
+                    int32_t is_v;
+                    int32_t head_dim;
+                    int32_t group_size;
+                    int32_t bits;
+                    int32_t sinkhorn_iters;
+                    float   rtn_quantile;
+                } params;
+                memcpy(&params, op->op_params, sizeof(params));
+
+                if (op->type != GGML_TYPE_I8 || op->src[0]->type != GGML_TYPE_F32 ||
+                        op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (params.is_v != 0 && params.is_v != 1) {
+                    return false;
+                }
+                if (params.head_dim <= 0 || params.group_size <= 0 ||
+                        params.bits <= 0 || params.bits > 8 || params.sinkhorn_iters <= 0 ||
+                        !(params.rtn_quantile > 0.0f && params.rtn_quantile <= 1.0f)) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op) ||
+                        !ggml_is_contiguous(op->src[1]) || !ggml_is_contiguous(op->src[2])) {
+                    return false;
+                }
+
+                const int64_t n = int64_t(params.head_dim)*params.group_size;
+                const int64_t body_bytes = (n*params.bits + 7)/8;
+                const int64_t scale_floats = params.is_v ? params.head_dim + 2*params.group_size : 2*params.head_dim + params.group_size;
+                const int64_t scratch_floats = n + 2*std::max(params.head_dim, params.group_size);
+                return ggml_nelements(op->src[0]) == n &&
+                       op->ne[0] >= body_bytes &&
+                       op->src[1]->ne[0] >= scale_floats &&
+                       ggml_nelements(op->src[2]) >= scratch_floats;
+            } break;
+        case GGML_OP_KVARN_ATTN_MIXED:
+            {
+                struct kvarn_attn_params {
+                    int32_t n_sink;
+                    int32_t n_records;
+                    int32_t n_pending;
+                    int32_t n_tail;
+                    int32_t tail_start;
+                    int32_t head_dim;
+                    int32_t group_size;
+                    int32_t key_bits;
+                    int32_t value_bits;
+                    float   scale;
+                } params;
+                memcpy(&params, op->op_params, sizeof(params));
+
+                if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32 ||
+                        op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16 ||
+                        op->src[3]->type != GGML_TYPE_I8 || op->src[4]->type != GGML_TYPE_I8 ||
+                        op->src[5]->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_F32 ||
+                        op->src[7]->type != GGML_TYPE_F32 || op->src[8]->type != GGML_TYPE_F32 ||
+                        op->src[9]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (params.n_sink < 0 || params.n_records < 0 || params.n_pending < 0 || params.n_tail < 0 ||
+                        params.tail_start < 0 ||
+                        params.head_dim <= 0 || params.group_size <= 0 ||
+                        params.key_bits <= 0 || params.key_bits > 8 ||
+                        params.value_bits <= 0 || params.value_bits > 8) {
+                    return false;
+                }
+                if (op->ne[0] != params.head_dim || op->src[0]->ne[0] != params.head_dim ||
+                        op->ne[1] != op->src[0]->ne[1] || op->ne[2] != op->src[0]->ne[2]) {
+                    return false;
+                }
+                if (op->src[1]->ne[0] != params.head_dim || op->src[2]->ne[0] != params.head_dim ||
+                        op->src[1]->ne[1] != op->src[2]->ne[1] ||
+                        op->src[1]->ne[1] <= 0 || op->src[0]->ne[1]%op->src[1]->ne[1] != 0) {
+                    return false;
+                }
+                if (op->src[7]->ne[0] != params.head_dim || op->src[8]->ne[0] != params.head_dim ||
+                        op->src[7]->ne[1] != op->src[1]->ne[1] ||
+                        op->src[8]->ne[1] != op->src[2]->ne[1] ||
+                        op->src[7]->ne[2] < params.n_pending ||
+                        op->src[8]->ne[2] < params.n_pending) {
+                    return false;
+                }
+
+                const int64_t n_kv = int64_t(params.n_sink) + int64_t(params.n_records)*params.group_size + params.n_pending + params.n_tail;
+                int64_t scratch_floats = n_kv;
+                if (getenv("LLAMA_KVARN_ATTN_REF_SCRATCH") != nullptr &&
+                        std::atoi(getenv("LLAMA_KVARN_ATTN_REF_SCRATCH")) != 0 &&
+                        params.n_records > 0) {
+                    scratch_floats += 2*op->src[1]->ne[1]*int64_t(params.n_records)*params.head_dim*params.group_size;
+                }
+                const int64_t k_body_bytes = (int64_t)(((size_t) params.head_dim*params.group_size*params.key_bits + 7)/8);
+                const int64_t v_body_bytes = (int64_t)(((size_t) params.head_dim*params.group_size*params.value_bits + 7)/8);
+                const int64_t k_scale_floats = 2*params.head_dim + params.group_size;
+                const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
+                return op->src[1]->ne[2] >= params.n_sink + params.n_tail &&
+                       op->src[2]->ne[2] >= params.n_sink + params.n_tail &&
+                       (params.n_tail == 0 || params.tail_start < params.n_tail) &&
+                       op->src[3]->ne[0] >= k_body_bytes &&
+                       op->src[4]->ne[0] >= v_body_bytes &&
+                       op->src[3]->ne[1] >= params.n_records &&
+                       op->src[4]->ne[1] >= params.n_records &&
+                       op->src[3]->ne[2] == op->src[1]->ne[1] &&
+                       op->src[4]->ne[2] == op->src[2]->ne[1] &&
+                       op->src[5]->ne[0] >= k_scale_floats &&
+                       op->src[6]->ne[0] >= v_scale_floats &&
+                       op->src[5]->ne[1] >= params.n_records &&
+                       op->src[6]->ne[1] >= params.n_records &&
+                       op->src[5]->ne[2] == op->src[1]->ne[1] &&
+                       op->src[6]->ne[2] == op->src[2]->ne[1] &&
+                       ggml_nelements(op->src[9]) >= scratch_floats;
             } break;
         case GGML_OP_SET:
             {

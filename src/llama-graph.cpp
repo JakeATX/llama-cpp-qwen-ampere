@@ -6,27 +6,30 @@
 #include "llama-cparams.h"
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-kvarn.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <unordered_set>
 
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
-        const llama_kv_cache_context * mctx,
+        uint32_t n_kv,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -40,12 +43,19 @@ static ggml_tensor * build_attn_inp_kq_mask(
     return res;
 }
 
-static bool can_reuse_kq_mask(
-        ggml_tensor * kq_mask,
+static ggml_tensor * build_attn_inp_kq_mask(
+        ggml_context * ctx,
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams) {
-    const auto n_kv     = mctx->get_n_kv();
+    return build_attn_inp_kq_mask(ctx, mctx->get_n_kv(), ubatch, cparams);
+}
+
+static bool can_reuse_kq_mask(
+        ggml_tensor * kq_mask,
+        uint32_t n_kv,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams) {
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
@@ -57,6 +67,14 @@ static bool can_reuse_kq_mask(
     res &= (kq_mask->ne[3] == n_stream);
 
     return res;
+}
+
+static bool can_reuse_kq_mask(
+        ggml_tensor * kq_mask,
+        const llama_kv_cache_context * mctx,
+        const llama_ubatch & ubatch,
+        const llama_cparams & cparams) {
+    return can_reuse_kq_mask(kq_mask, mctx->get_n_kv(), ubatch, cparams);
 }
 
 // impl
@@ -512,6 +530,190 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+struct kvarn_active_window {
+    int32_t n_sink = 0;
+    int32_t n_records = 0;
+    int32_t n_pending = 0;
+    int32_t n_tail = 0;
+    int32_t tail_start = 0;
+    int64_t n_kv = 0;
+    bool valid = false;
+};
+
+static uint32_t kvarn_graph_count_tail_evictions(const llama_kvarn_params & params, const llama_ubatch & ubatch) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_pos pos = ubatch.pos ? ubatch.pos[i] : llama_pos(i);
+        if (pos >= 0 && uint32_t(pos) >= params.sink_tokens + params.tail_tokens) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+static std::vector<uint32_t> kvarn_graph_seal_records(const llama_kvarn_params & params, const llama_ubatch & ubatch) {
+    std::vector<uint32_t> records;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_pos pos = ubatch.pos ? ubatch.pos[i] : llama_pos(i);
+        if (pos < 0 || uint32_t(pos) < params.sink_tokens + params.tail_tokens) {
+            continue;
+        }
+
+        const uint32_t evicted_pos = uint32_t(pos) - params.tail_tokens;
+        const uint32_t body_pos = evicted_pos - params.sink_tokens;
+        const uint32_t offset = body_pos%params.group_size;
+        if (offset + 1 != params.group_size) {
+            continue;
+        }
+
+        const uint32_t record = body_pos/params.group_size;
+        if (std::find(records.begin(), records.end(), record) == records.end()) {
+            records.push_back(record);
+        }
+    }
+    return records;
+}
+
+static kvarn_active_window kvarn_graph_active_window(const llama_kvarn_params & params, const llama_ubatch & ubatch, uint32_t kv_size) {
+    kvarn_active_window result;
+    if (ubatch.n_tokens == 0) {
+        return result;
+    }
+
+    const uint32_t i_last = ubatch.n_tokens - 1;
+    const llama_pos pos = ubatch.pos ? ubatch.pos[i_last] : llama_pos(i_last);
+    if (pos < 0) {
+        return result;
+    }
+
+    const uint32_t n_seen = uint32_t(pos) + 1;
+    if (kv_size != 0 && n_seen > kv_size) {
+        return result;
+    }
+
+    const uint32_t n_sink = std::min<uint32_t>(n_seen, params.sink_tokens);
+    const uint32_t n_after_sink = n_seen - n_sink;
+    const uint32_t n_tail = std::min<uint32_t>(n_after_sink, params.tail_tokens);
+    const uint32_t n_body_pending = n_after_sink - n_tail;
+    const uint32_t n_records = n_body_pending/params.group_size;
+    const uint32_t n_pending = n_body_pending%params.group_size;
+    const uint32_t tail_start = n_tail == 0 ? 0 : (n_body_pending%params.tail_tokens);
+
+    result.n_sink = int32_t(n_sink);
+    result.n_records = int32_t(n_records);
+    result.n_pending = int32_t(n_pending);
+    result.n_tail = int32_t(n_tail);
+    result.tail_start = int32_t(tail_start);
+    result.n_kv = int64_t(n_sink) + int64_t(n_records)*params.group_size + n_pending + n_tail;
+    result.valid = true;
+    return result;
+}
+
+static void kvarn_graph_update_mixed_attn_params(ggml_tensor * node, const kvarn_active_window & window) {
+    GGML_ASSERT(node->op == GGML_OP_KVARN_ATTN_MIXED);
+
+    float scale = 0.0f;
+    std::memcpy(&scale, &node->op_params[9], sizeof(scale));
+
+    struct {
+        int32_t n_sink;
+        int32_t n_records;
+        int32_t n_pending;
+        int32_t n_tail;
+        int32_t tail_start;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        float   scale;
+    } params = {
+        window.n_sink,
+        window.n_records,
+        window.n_pending,
+        window.n_tail,
+        window.tail_start,
+        node->op_params[5],
+        node->op_params[6],
+        node->op_params[7],
+        node->op_params[8],
+        scale,
+    };
+
+    std::memcpy(node->op_params, &params, sizeof(params));
+}
+
+static bool kvarn_graph_use_attn_scratch_ref() {
+    const char * env = getenv("LLAMA_KVARN_ATTN_REF_SCRATCH");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+static int64_t kvarn_graph_attn_scratch_floats(
+        const kvarn_active_window & window,
+        int64_t n_head_kv,
+        int64_t n_records_scratch,
+        int64_t head_dim,
+        int64_t group_size) {
+    int64_t result = window.n_kv;
+    if (kvarn_graph_use_attn_scratch_ref() && n_records_scratch > 0) {
+        result += 2*n_head_kv*n_records_scratch*head_dim*group_size;
+    }
+    return result;
+}
+
+void llm_graph_input_attn_kvarn::set_input(const llama_ubatch * ubatch) {
+    mctx_kvarn->set_input_sink_tail_idxs(sink_tail_idxs, ubatch);
+    mctx_kvarn->set_input_body_plan(body_plan, ubatch);
+    mctx_kvarn->set_input_body_offsets(body_offsets, ubatch);
+    mctx_kvarn->set_input_tail_evict_idxs(tail_evict_idxs, ubatch);
+
+    const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, *ubatch, mctx_kvarn->get_size());
+    GGML_ASSERT(window.valid);
+    for (ggml_tensor * node : mixed_attn_nodes) {
+        kvarn_graph_update_mixed_attn_params(node, window);
+    }
+}
+
+bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(params.mctx);
+    if (mctx == nullptr) {
+        return false;
+    }
+
+    this->mctx_kvarn = mctx;
+
+    if (has_body_store_ops) {
+        return false;
+    }
+
+    const kvarn_active_window window = kvarn_graph_active_window(params.cparams.kvarn, params.ubatch, mctx->get_size());
+    if (!window.valid) {
+        return false;
+    }
+
+    if (!kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch).empty()) {
+        return false;
+    }
+
+    const uint32_t n_tail_evict = kvarn_graph_count_tail_evictions(params.cparams.kvarn, params.ubatch);
+
+    bool res = true;
+    res &= sink_tail_idxs->ne[0] == params.ubatch.n_tokens;
+    res &= body_plan->ne[1] == n_tail_evict;
+    res &= body_offsets->ne[0] == n_tail_evict;
+    res &= tail_evict_idxs->ne[0] == n_tail_evict;
+    res &= !mixed_attn_nodes.empty();
+
+    for (const ggml_tensor * node : mixed_attn_nodes) {
+        res &= node->op == GGML_OP_KVARN_ATTN_MIXED;
+        const int64_t n_head_kv = node->src[1] ? node->src[1]->ne[1] : 0;
+        const int64_t required_scratch = kvarn_graph_attn_scratch_floats(
+                window, n_head_kv, window.n_records, node->op_params[5], node->op_params[6]);
+        res &= node->src[9] != nullptr && ggml_nelements(node->src[9]) >= required_scratch;
+    }
+
+    return res;
+}
+
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
@@ -737,6 +939,47 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
+
+    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= inp_rs->head == mctx->get_recr()->get_head();
+    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    return res;
+}
+
+void llm_graph_input_mem_hybrid_kvarn::set_input(const llama_ubatch * ubatch) {
+    inp_attn->set_input(ubatch);
+
+    const int64_t n_rs = mctx_kvarn->get_recr()->get_n_rs();
+
+    if (inp_rs->s_copy) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+        int32_t * data = (int32_t *) inp_rs->s_copy->data;
+
+        for (uint32_t i = 0; i < n_rs; ++i) {
+            data[i] = mctx_kvarn->get_recr()->s_copy(i);
+        }
+    }
+}
+
+bool llm_graph_input_mem_hybrid_kvarn::can_reuse(const llm_graph_params & params) {
+    const auto * mctx = dynamic_cast<const llama_memory_hybrid_kvarn_context *>(params.mctx);
+    if (mctx == nullptr) {
+        return false;
+    }
+
+    this->mctx_kvarn = mctx;
+
+    llm_graph_params params_attn = params;
+    params_attn.mctx = mctx->get_attn();
+
+    bool res = true;
+
+    res &= inp_attn->can_reuse(params_attn);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2231,8 +2474,8 @@ ggml_tensor * llm_graph_context::build_attn(
 }
 
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
-           ggml_context * ctx0,
-     const llama_ubatch & ubatch,
+    ggml_context * ctx0,
+    const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
     const llama_kv_cache_context * mctx_cur) {
@@ -2255,7 +2498,28 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
+static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kvarn_impl(
+    ggml_context * ctx0,
+    const llama_ubatch & ubatch,
+    const llama_hparams & hparams,
+    const llama_cparams & cparams,
+    const llama_kv_cache_kvarn_context * mctx_kvarn) {
+    auto inp = std::make_unique<llm_graph_input_attn_kvarn>(hparams, cparams, mctx_kvarn);
+    inp->sink_tail_idxs = mctx_kvarn->build_input_sink_tail_idxs(ctx0, ubatch);
+    inp->body_plan = mctx_kvarn->build_input_body_plan(ctx0, ubatch);
+    inp->body_offsets = mctx_kvarn->build_input_body_offsets(ctx0, ubatch);
+    inp->tail_evict_idxs = mctx_kvarn->build_input_tail_evict_idxs(ctx0, ubatch);
+    inp->self_kq_mask = nullptr;
+    inp->self_kq_mask_cnv = nullptr;
+    return inp;
+}
+
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+    if (const auto * mctx_kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx)) {
+        auto inp = build_attn_inp_kvarn_impl(ctx0, ubatch, hparams, cparams, mctx_kvarn);
+        return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+    }
+
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
@@ -2277,6 +2541,110 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
+
+    if (auto * inp_kvarn = dynamic_cast<llm_graph_input_attn_kvarn *>(inp)) {
+        ggml_build_forward_expand(gf, q_cur);
+        ggml_build_forward_expand(gf, v_cur);
+        ggml_build_forward_expand(gf, k_cur);
+
+        // Runtime KVarN memory splits work into one-token ubatches. Context
+        // initialization can still reserve a larger worst-case graph; building
+        // that graph is safe because it is not executed for prompt chunks.
+        if (inp->self_k_rot || inp->self_v_rot || kq_b || sinks) {
+            throw std::runtime_error(
+                    "KVarN graph backend does not yet support attention rotations, KQ bias, or attention sinks");
+        }
+
+        const auto & idxs = inp_kvarn->get_sink_tail_idxs();
+        const llama_kvarn_layer_view layer = inp_kvarn->mctx_kvarn->get_layer_view(il);
+        GGML_ASSERT(layer.body_k != nullptr);
+        GGML_ASSERT(layer.body_v != nullptr);
+        GGML_ASSERT(layer.scales_k != nullptr);
+        GGML_ASSERT(layer.scales_v != nullptr);
+        GGML_ASSERT(layer.layout_k.key_bits == 4);
+        GGML_ASSERT(layer.layout_v.value_bits == 2);
+        GGML_ASSERT(inp_kvarn->mctx_kvarn->body_store_scratch_floats(il) > 0);
+        ggml_build_forward_expand(gf, inp_kvarn->get_body_plan());
+        ggml_build_forward_expand(gf, inp_kvarn->get_body_offsets());
+        ggml_build_forward_expand(gf, inp_kvarn->get_tail_evict_idxs());
+        if (inp_kvarn->get_body_offsets()->ne[0] > 0) {
+            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_k(
+                        ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
+            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_v(
+                        ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
+        }
+        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
+        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
+
+        const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
+        if (!seal_records.empty()) {
+            inp_kvarn->has_body_store_ops = true;
+        }
+
+        for (const uint32_t seal_record : seal_records) {
+            if (seal_record >= layer.n_records) {
+                throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
+            }
+
+            for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
+                ggml_tensor * k_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
+                ggml_tensor * v_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
+                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_k_body_record_from_pending(
+                            ctx0, k_scratch, il, ih, seal_record));
+                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_v_body_record_from_pending(
+                            ctx0, v_scratch, il, ih, seal_record));
+            }
+        }
+
+        const llama_pos pos = ubatch.pos ? ubatch.pos[0] : llama_pos(0);
+        if (pos < 0) {
+            throw std::runtime_error("KVarN graph backend cannot attend to a negative-position decode token");
+        }
+
+        const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size());
+        if (!window.valid) {
+            throw std::runtime_error("KVarN graph backend cannot build active decode attention window");
+        }
+
+        if (uint32_t(window.n_records) > layer.n_records) {
+            throw std::runtime_error("KVarN graph backend active body record count exceeds allocated cache capacity");
+        }
+
+        const int64_t scores_floats = std::max<int64_t>(
+                kvarn_graph_attn_scratch_floats(
+                    window, layer.n_head_kv, layer.n_records, layer.head_dim_k, cparams.kvarn.group_size),
+                inp_kvarn->mctx_kvarn->get_size());
+        ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
+        ggml_set_name(scores, "kvarn_attn_scores");
+
+        ggml_tensor * cur = ggml_kvarn_attn_mixed(
+                ctx0, q_cur, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
+                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, nullptr,
+                window.n_sink, window.n_records, window.n_pending, window.n_tail, window.tail_start,
+                int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
+                int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);
+        inp_kvarn->mixed_attn_nodes.push_back(cur);
+        cb(cur, "kvarn_kqv_out", il);
+        cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+
+        if (wo) {
+            if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+                cur = build_lora_mm(wo, cur);
+                ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                if (wo_s) {
+                    cur = ggml_mul(ctx0, cur, wo_s);
+                }
+            } else {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+        }
+
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+
+        return cur;
+    }
 
     if (inp->self_k_rot) {
         q_cur = ggml_mul_mat_aux(ctx0, q_cur, inp->self_k_rot);
@@ -2360,6 +2728,12 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 }
 
 llm_graph_input_attn_k * llm_graph_context::build_attn_inp_k() const {
+    if (dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx) != nullptr) {
+        throw std::runtime_error(
+                "KVarN graph backend is not wired yet: K-only attention graph needs KVarN sink/tail/body/scale inputs "
+                "instead of llama_kv_cache_context tensors");
+    }
+
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
@@ -2831,6 +3205,16 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 }
 
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+    if (const auto * mctx_kvarn = dynamic_cast<const llama_memory_hybrid_kvarn_context *>(mctx)) {
+        auto inp_rs   = build_rs_inp_impl(ctx0, ubatch, mctx_kvarn->get_recr());
+        auto inp_attn = build_attn_inp_kvarn_impl(ctx0, ubatch, hparams, cparams, mctx_kvarn->get_attn());
+
+        auto inp = std::make_unique<llm_graph_input_mem_hybrid_kvarn>(
+                cparams, std::move(inp_attn), std::move(inp_rs), mctx_kvarn);
+
+        return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
+    }
+
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());

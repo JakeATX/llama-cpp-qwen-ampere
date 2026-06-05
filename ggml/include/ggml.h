@@ -523,6 +523,8 @@ extern "C" {
         GGML_OP_GET_ROWS,
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
+        GGML_OP_KVARN_STORE_BODY,
+        GGML_OP_KVARN_ATTN_MIXED,
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
         GGML_OP_DIAG_MASK_ZERO,
@@ -1684,6 +1686,56 @@ extern "C" {
             struct ggml_tensor  * a,  // destination
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
+
+    // KVarN body-store cache write ops. These return view(body) and write the
+    // matching packed body tensor plus FP32 scale tensor.
+    GGML_API struct ggml_tensor * ggml_kvarn_store_k_body(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * tile,
+            struct ggml_tensor  * body,
+            struct ggml_tensor  * scales,
+            struct ggml_tensor  * scratch,
+                   int32_t        head_dim,
+                   int32_t        group_size,
+                   int32_t        key_bits,
+                   int32_t        sinkhorn_iters,
+                   float          rtn_quantile);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_store_v_body(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * tile,
+            struct ggml_tensor  * body,
+            struct ggml_tensor  * scales,
+            struct ggml_tensor  * scratch,
+                   int32_t        head_dim,
+                   int32_t        group_size,
+                   int32_t        value_bits,
+                   int32_t        sinkhorn_iters,
+                   float          rtn_quantile);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_attn_mixed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * sink_tail_k,
+            struct ggml_tensor  * sink_tail_v,
+            struct ggml_tensor  * body_k,
+            struct ggml_tensor  * body_v,
+            struct ggml_tensor  * scales_k,
+            struct ggml_tensor  * scales_v,
+            struct ggml_tensor  * pending_k,
+            struct ggml_tensor  * pending_v,
+            struct ggml_tensor  * scratch,
+            struct ggml_tensor  * kq_mask,
+                   int32_t        n_sink,
+                   int32_t        n_records,
+                   int32_t        n_pending,
+                   int32_t        n_tail,
+                   int32_t        tail_start,
+                   int32_t        head_dim,
+                   int32_t        group_size,
+                   int32_t        key_bits,
+                   int32_t        value_bits,
+                   float          scale);
 
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,

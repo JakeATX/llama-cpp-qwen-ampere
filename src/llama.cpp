@@ -46,6 +46,30 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_kv_cache_quant_type_name(enum llama_kv_cache_quant_type kv_cache_quant_type) {
+    switch (kv_cache_quant_type) {
+        case LLAMA_KV_CACHE_QUANT_TYPE_NONE:
+            return "none";
+        case LLAMA_KV_CACHE_QUANT_TYPE_KVARN:
+            return "kvarn";
+    }
+    GGML_ABORT("fatal error");
+}
+
+struct llama_kvarn_params llama_kvarn_default_params(void) {
+    struct llama_kvarn_params result = {
+        /*.group_size    =*/ 128,
+        /*.key_bits      =*/ 4,
+        /*.value_bits    =*/ 2,
+        /*.sink_tokens   =*/ 128,
+        /*.tail_tokens   =*/ 128,
+        /*.sinkhorn_iters=*/ 16,
+        /*.rtn_quantile  =*/ 1.0f,
+    };
+
+    return result;
+}
+
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
     struct llama_sampler_chain_params result = {
         /*.no_perf =*/ true,

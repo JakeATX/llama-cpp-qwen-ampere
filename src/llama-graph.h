@@ -22,10 +22,12 @@ struct llama_layer;
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
+class llama_kv_cache_kvarn_context;
 class llama_kv_cache_dsa_context;
 class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
+class llama_memory_hybrid_kvarn_context;
 class llama_memory_hybrid_iswa_context;
 
 // certain models (typically multi-modal) can produce different types of graphs
@@ -342,6 +344,36 @@ public:
     const llama_kv_cache_context * mctx;
 };
 
+class llm_graph_input_attn_kvarn : public llm_graph_input_attn_kv {
+public:
+    llm_graph_input_attn_kvarn(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_kvarn_context * mctx) :
+        llm_graph_input_attn_kv(hparams, cparams, nullptr),
+        mctx_kvarn(mctx) {
+    }
+    ~llm_graph_input_attn_kvarn() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * get_sink_tail_idxs() const { return sink_tail_idxs; }
+    ggml_tensor * get_body_plan() const { return body_plan; }
+    ggml_tensor * get_body_offsets() const { return body_offsets; }
+    ggml_tensor * get_tail_evict_idxs() const { return tail_evict_idxs; }
+
+    ggml_tensor * sink_tail_idxs = nullptr; // I64 [n_batch]
+    ggml_tensor * body_plan = nullptr;      // I64 [record, offset, seal_record; n_tail_evict]
+    ggml_tensor * body_offsets = nullptr;   // I64 [n_tail_evict]
+    ggml_tensor * tail_evict_idxs = nullptr;// I32 [n_tail_evict]
+
+    const llama_kv_cache_kvarn_context * mctx_kvarn;
+    std::vector<ggml_tensor *> mixed_attn_nodes;
+    bool has_body_store_ops = false;
+};
+
 // V-less input for the KV cache
 // ref: https://github.com/ggml-org/llama.cpp/pull/19067
 class llm_graph_input_attn_k : public llm_graph_input_i {
@@ -528,6 +560,24 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_context * mctx;
+};
+
+class llm_graph_input_mem_hybrid_kvarn : public llm_graph_input_mem_hybrid {
+public:
+    llm_graph_input_mem_hybrid_kvarn(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv> inp_attn,
+            std::unique_ptr<llm_graph_input_rs>      inp_rs,
+            const llama_memory_hybrid_kvarn_context * mctx) :
+        llm_graph_input_mem_hybrid(cparams, std::move(inp_attn), std::move(inp_rs), nullptr),
+        mctx_kvarn(mctx) { }
+    ~llm_graph_input_mem_hybrid_kvarn() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    const llama_memory_hybrid_kvarn_context * mctx_kvarn;
 };
 
 class llm_graph_input_mem_hybrid_iswa : public llm_graph_input_i {

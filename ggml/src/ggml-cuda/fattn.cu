@@ -6,6 +6,28 @@
 #include "fattn-wmma-f16.cuh"
 #include "fattn.cuh"
 
+#ifdef GGML_CUDA_NO_FA
+
+size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return 0;
+}
+
+void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("CUDA Flash Attention was disabled at build time");
+}
+
+bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+}
+
+#else
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -595,3 +617,5 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
+
+#endif

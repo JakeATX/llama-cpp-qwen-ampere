@@ -23,6 +23,9 @@ struct llama_memory_params {
     bool swa_full;
 
     llama_context_type ctx_type;
+
+    llama_kv_cache_quant_type kv_cache_quant_type;
+    llama_kvarn_params        kvarn;
 };
 
 enum llama_memory_status {

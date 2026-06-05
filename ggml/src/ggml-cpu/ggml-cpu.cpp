@@ -439,6 +439,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_KVARN_STORE_BODY:
+        case GGML_OP_KVARN_ATTN_MIXED:
+            return false;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

@@ -1019,6 +1019,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GET_ROWS",
     "GET_ROWS_BACK",
     "SET_ROWS",
+    "KVARN_STORE_BODY",
+    "KVARN_ATTN_MIXED",
     "DIAG",
     "DIAG_MASK_INF",
     "DIAG_MASK_ZERO",
@@ -1080,7 +1082,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1129,6 +1131,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "get_rows(x)",
     "get_rows_back(x)",
     "set_rows(x)",
+    "kvarn_store_body(x)",
+    "kvarn_attn_mixed(q)",
     "diag(x)",
     "diag_mask_inf(x)",
     "diag_mask_zero(x)",
@@ -1190,7 +1194,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3920,6 +3924,212 @@ struct ggml_tensor * ggml_set_rows(
     result->src[0] = b;
     result->src[1] = c;
     result->src[2] = a; // note: order is weird due to legacy reasons (https://github.com/ggml-org/llama.cpp/pull/16063#discussion_r2385795931)
+
+    return result;
+}
+
+static struct ggml_tensor * ggml_kvarn_store_body_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tile,
+        struct ggml_tensor  * body,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * scratch,
+               int32_t        is_v,
+               int32_t        head_dim,
+               int32_t        group_size,
+               int32_t        bits,
+               int32_t        sinkhorn_iters,
+               float          rtn_quantile) {
+    GGML_ASSERT(tile->type == GGML_TYPE_F32);
+    GGML_ASSERT(body->type == GGML_TYPE_I8);
+    GGML_ASSERT(scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(scratch->type == GGML_TYPE_F32);
+    GGML_ASSERT(head_dim > 0);
+    GGML_ASSERT(group_size > 0);
+    GGML_ASSERT(bits > 0 && bits <= 8);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(rtn_quantile > 0.0f && rtn_quantile <= 1.0f);
+    GGML_ASSERT(ggml_is_contiguous(tile));
+    GGML_ASSERT(ggml_is_contiguous(body));
+    GGML_ASSERT(ggml_is_contiguous(scales));
+    GGML_ASSERT(ggml_is_contiguous(scratch));
+    GGML_ASSERT(ggml_nelements(tile) == (int64_t) head_dim*group_size);
+    GGML_ASSERT(ggml_nelements(scratch) >= (int64_t) head_dim*group_size + 2*MAX(head_dim, group_size));
+
+    const int64_t body_bytes = (int64_t)(((size_t) head_dim*group_size*bits + 7)/8);
+    const int64_t scale_floats = is_v ? head_dim + 2*group_size : 2*head_dim + group_size;
+    GGML_ASSERT(body->ne[0] >= body_bytes);
+    GGML_ASSERT(scales->ne[0] >= scale_floats);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, body);
+
+    struct kvarn_store_body_params {
+        int32_t is_v;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t bits;
+        int32_t sinkhorn_iters;
+        float   rtn_quantile;
+    } params = {
+        is_v,
+        head_dim,
+        group_size,
+        bits,
+        sinkhorn_iters,
+        rtn_quantile,
+    };
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_KVARN_STORE_BODY;
+    result->src[0] = tile;
+    result->src[1] = scales;
+    result->src[2] = scratch;
+    result->src[3] = body;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvarn_store_k_body(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tile,
+        struct ggml_tensor  * body,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * scratch,
+               int32_t        head_dim,
+               int32_t        group_size,
+               int32_t        key_bits,
+               int32_t        sinkhorn_iters,
+               float          rtn_quantile) {
+    return ggml_kvarn_store_body_impl(ctx, tile, body, scales, scratch, 0, head_dim, group_size, key_bits, sinkhorn_iters, rtn_quantile);
+}
+
+struct ggml_tensor * ggml_kvarn_store_v_body(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * tile,
+        struct ggml_tensor  * body,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * scratch,
+               int32_t        head_dim,
+               int32_t        group_size,
+               int32_t        value_bits,
+               int32_t        sinkhorn_iters,
+               float          rtn_quantile) {
+    return ggml_kvarn_store_body_impl(ctx, tile, body, scales, scratch, 1, head_dim, group_size, value_bits, sinkhorn_iters, rtn_quantile);
+}
+
+struct ggml_tensor * ggml_kvarn_attn_mixed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * sink_tail_k,
+        struct ggml_tensor  * sink_tail_v,
+        struct ggml_tensor  * body_k,
+        struct ggml_tensor  * body_v,
+        struct ggml_tensor  * scales_k,
+        struct ggml_tensor  * scales_v,
+        struct ggml_tensor  * pending_k,
+        struct ggml_tensor  * pending_v,
+        struct ggml_tensor  * scratch,
+        struct ggml_tensor  * kq_mask,
+               int32_t        n_sink,
+               int32_t        n_records,
+               int32_t        n_pending,
+               int32_t        n_tail,
+               int32_t        tail_start,
+               int32_t        head_dim,
+               int32_t        group_size,
+               int32_t        key_bits,
+               int32_t        value_bits,
+               float          scale) {
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(sink_tail_k->type == GGML_TYPE_F16);
+    GGML_ASSERT(sink_tail_v->type == GGML_TYPE_F16);
+    GGML_ASSERT(body_k->type == GGML_TYPE_I8);
+    GGML_ASSERT(body_v->type == GGML_TYPE_I8);
+    GGML_ASSERT(scales_k->type == GGML_TYPE_F32);
+    GGML_ASSERT(scales_v->type == GGML_TYPE_F32);
+    GGML_ASSERT(pending_k->type == GGML_TYPE_F32);
+    GGML_ASSERT(pending_v->type == GGML_TYPE_F32);
+    GGML_ASSERT(scratch->type == GGML_TYPE_F32);
+    GGML_ASSERT(kq_mask == NULL || kq_mask->type == GGML_TYPE_F32 || kq_mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(head_dim > 0 && group_size > 0);
+    GGML_ASSERT(n_sink >= 0 && n_records >= 0 && n_pending >= 0 && n_tail >= 0);
+    GGML_ASSERT(tail_start >= 0);
+    GGML_ASSERT(n_tail == 0 || tail_start < n_tail);
+    GGML_ASSERT(key_bits > 0 && key_bits <= 8);
+    GGML_ASSERT(value_bits > 0 && value_bits <= 8);
+    GGML_ASSERT(q->ne[0] == head_dim);
+    GGML_ASSERT(sink_tail_k->ne[0] == head_dim);
+    GGML_ASSERT(sink_tail_v->ne[0] == head_dim);
+    GGML_ASSERT(sink_tail_k->ne[1] == sink_tail_v->ne[1]);
+    GGML_ASSERT(sink_tail_k->ne[2] >= n_sink + n_tail);
+    GGML_ASSERT(sink_tail_v->ne[2] >= n_sink + n_tail);
+    GGML_ASSERT(q->ne[1] % sink_tail_k->ne[1] == 0);
+    GGML_ASSERT(body_k->ne[1] >= n_records);
+    GGML_ASSERT(body_v->ne[1] >= n_records);
+    GGML_ASSERT(body_k->ne[2] == sink_tail_k->ne[1]);
+    GGML_ASSERT(body_v->ne[2] == sink_tail_v->ne[1]);
+    GGML_ASSERT(scales_k->ne[1] >= n_records);
+    GGML_ASSERT(scales_v->ne[1] >= n_records);
+    GGML_ASSERT(scales_k->ne[2] == sink_tail_k->ne[1]);
+    GGML_ASSERT(scales_v->ne[2] == sink_tail_v->ne[1]);
+    GGML_ASSERT(pending_k->ne[0] == head_dim);
+    GGML_ASSERT(pending_v->ne[0] == head_dim);
+    GGML_ASSERT(pending_k->ne[1] == sink_tail_k->ne[1]);
+    GGML_ASSERT(pending_v->ne[1] == sink_tail_v->ne[1]);
+    GGML_ASSERT(pending_k->ne[2] >= n_pending);
+    GGML_ASSERT(pending_v->ne[2] >= n_pending);
+
+    const int64_t n_kv = (int64_t) n_sink + (int64_t) n_records*group_size + n_pending + n_tail;
+    GGML_ASSERT(ggml_nelements(scratch) >= n_kv);
+    GGML_ASSERT(kq_mask == NULL || (kq_mask->ne[0] >= n_kv && kq_mask->ne[1] >= q->ne[2]));
+
+    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits + 7)/8);
+    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int64_t k_scale_floats = 2*head_dim + group_size;
+    const int64_t v_scale_floats = head_dim + 2*group_size;
+    GGML_ASSERT(body_k->ne[0] >= k_body_bytes);
+    GGML_ASSERT(body_v->ne[0] >= v_body_bytes);
+    GGML_ASSERT(scales_k->ne[0] >= k_scale_floats);
+    GGML_ASSERT(scales_v->ne[0] >= v_scale_floats);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, q->ne[1], q->ne[2]);
+
+    struct {
+        int32_t n_sink;
+        int32_t n_records;
+        int32_t n_pending;
+        int32_t n_tail;
+        int32_t tail_start;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        float   scale;
+    } params = {
+        n_sink,
+        n_records,
+        n_pending,
+        n_tail,
+        tail_start,
+        head_dim,
+        group_size,
+        key_bits,
+        value_bits,
+        scale,
+    };
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_KVARN_ATTN_MIXED;
+    result->src[0] = q;
+    result->src[1] = sink_tail_k;
+    result->src[2] = sink_tail_v;
+    result->src[3] = body_k;
+    result->src[4] = body_v;
+    result->src[5] = scales_k;
+    result->src[6] = scales_v;
+    result->src[7] = pending_k;
+    result->src[8] = pending_v;
+    result->src[9] = scratch;
 
     return result;
 }

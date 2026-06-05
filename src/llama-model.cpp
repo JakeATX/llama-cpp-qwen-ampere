@@ -9,9 +9,11 @@
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-kvarn.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -1968,8 +1970,160 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+static bool llama_kvarn_supported_head_dim(uint32_t head_dim) {
+    return head_dim == 128 || head_dim == 256;
+}
+
+static bool llama_kvarn_device_supports_ops(ggml_backend_dev_t dev, const llama_kvarn_params & params, uint32_t head_dim) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return false;
+    }
+
+    ggml_init_params ggml_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(ggml_params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create KVarN backend capability probe context");
+    }
+
+    const int64_t group    = params.group_size;
+    const int64_t n        = int64_t(head_dim)*group;
+    const int64_t body     = (n*params.key_bits + 7)/8;
+    const int64_t scales   = 2*int64_t(head_dim) + group;
+    const int64_t scratch  = n + 2*std::max<int64_t>(head_dim, group);
+
+    ggml_tensor * tile      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, group, head_dim);
+    ggml_tensor * body_k    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8,  body);
+    ggml_tensor * scales_k  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, scales);
+    ggml_tensor * scratch_k = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, scratch);
+    ggml_tensor * op = ggml_kvarn_store_k_body(
+            ctx.get(), tile, body_k, scales_k, scratch_k,
+            int32_t(head_dim), int32_t(group), int32_t(params.key_bits), int32_t(params.sinkhorn_iters),
+            params.rtn_quantile);
+
+    return ggml_backend_dev_supports_op(dev, op);
+}
+
+static void llama_kvarn_validate_memory_support(
+        const llama_model & model,
+        const llama_hparams & hparams,
+        const llama_memory_params & params,
+        const llama_cparams & cparams) {
+    if (params.kvarn.group_size != 128 || params.kvarn.key_bits != 4 || params.kvarn.value_bits != 2) {
+        throw std::runtime_error("KVarN backend currently supports only kvarn_k4v2_g128");
+    }
+
+    if (hparams.is_mla()) {
+        throw std::runtime_error("KVarN backend does not support MLA models yet");
+    }
+
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (!hparams.has_kv(il)) {
+            continue;
+        }
+        if (hparams.is_recr(il)) {
+            continue;
+        }
+        const uint32_t head_k = hparams.n_embd_head_k(il);
+        const uint32_t head_v = hparams.n_embd_head_v(il);
+        if (head_k != head_v) {
+            throw std::runtime_error(format(
+                    "KVarN backend requires equal K and V head dimensions; layer %u has K=%u and V=%u",
+                    il, head_k, head_v));
+        }
+        if (!llama_kvarn_supported_head_dim(head_k)) {
+            throw std::runtime_error(format(
+                    "KVarN backend currently supports only 128- or 256-dimensional K/V heads; layer %u has %u",
+                    il, head_k));
+        }
+    }
+
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (!hparams.has_kv(il)) {
+            continue;
+        }
+        if (hparams.is_recr(il)) {
+            continue;
+        }
+
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        const uint32_t head_dim = hparams.n_embd_head_k(il);
+        if (!llama_kvarn_device_supports_ops(dev, params.kvarn, head_dim)) {
+            throw std::runtime_error(format(
+                    "KVarN backend currently requires every KV layer to run on a backend with CUDA KVarN op support; "
+                    "layer %u has head_dim=%u and is assigned to %s",
+                    il, head_dim, ggml_backend_dev_name(dev)));
+        }
+    }
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+
+    if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+        llama_kvarn_validate_memory_support(*this, hparams, params, cparams);
+
+        const bool mtp_on_hybrid_qwen35 =
+            params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+
+        if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen35) {
+            if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                throw std::runtime_error("KVarN backend does not support hybrid SWA models yet");
+            }
+
+            llama_memory_i::layer_filter_cb filter_attn = nullptr;
+            llama_memory_i::layer_filter_cb filter_recr = nullptr;
+            if (arch == LLM_ARCH_FALCON_H1) {
+                filter_attn = [&](int32_t) { return true; };
+                filter_recr = [&](int32_t) { return true; };
+            } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+                filter_attn = [&](int32_t il) {
+                    return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
+                };
+                filter_recr = [&](int32_t il) {
+                    return hparams.is_recr(il) && hparams.n_ff(il) == 0;
+                };
+            } else if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+                const uint32_t n_main = hparams.n_layer - hparams.nextn_predict_layers;
+                filter_attn = [&, n_main](int32_t il) {
+                    return (uint32_t)il < n_main && !hparams.is_recr(il);
+                };
+                filter_recr = [&, n_main](int32_t il) {
+                    return (uint32_t)il < n_main && hparams.is_recr(il);
+                };
+            }
+
+            return new llama_memory_hybrid_kvarn(
+                    /* model             */ *this,
+                    /* params            */ params.kvarn,
+                    /* attn_kv_size      */ cparams.n_ctx_seq,
+                    /* attn_n_pad        */ 1,
+                    /* recurrent_type_r  */ GGML_TYPE_F32,
+                    /* recurrent_type_s  */ GGML_TYPE_F32,
+                    /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                    /* n_seq_max         */ cparams.n_seq_max,
+                    /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* offload           */ cparams.offload_kqv,
+                    /* filter_attn       */ std::move(filter_attn),
+                    /* filter_recr       */ std::move(filter_recr));
+        }
+
+        return new llama_kv_cache_kvarn(
+                this,
+                hparams,
+                params.kvarn,
+                cparams.offload_kqv,
+                cparams.n_ctx_seq,
+                cparams.n_seq_max,
+                1,
+                nullptr);
+    }
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the

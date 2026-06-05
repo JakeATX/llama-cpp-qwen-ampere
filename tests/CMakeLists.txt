@@ -214,6 +214,37 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
+llama_build_and_test(test-kvarn-kv.cpp ../src/llama-kv-cache-kvarn.cpp)
+target_include_directories(test-kvarn-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+if (TARGET ggml-cuda)
+    find_package(CUDAToolkit REQUIRED)
+
+    add_library(test-kvarn-cuda-kernels STATIC
+        test-kvarn-cuda-kernels.cpp
+        ../ggml/src/ggml-cuda/kvarn.cu)
+    target_include_directories(test-kvarn-cuda-kernels PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    target_link_libraries(test-kvarn-cuda-kernels PRIVATE CUDA::cudart)
+
+    add_executable(test-kvarn-cuda-scratch-ref
+        test-kvarn-cuda-dequant.cpp)
+    target_compile_features(test-kvarn-cuda-scratch-ref PRIVATE cxx_std_17)
+    target_include_directories(test-kvarn-cuda-scratch-ref PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    target_link_libraries(test-kvarn-cuda-scratch-ref PRIVATE test-kvarn-cuda-kernels CUDA::cudart)
+    llama_test(test-kvarn-cuda-scratch-ref)
+
+    add_executable(test-kvarn-cuda-mixed-tail
+        test-kvarn-cuda-mixed-tail.cpp)
+    target_compile_features(test-kvarn-cuda-mixed-tail PRIVATE cxx_std_17)
+    target_include_directories(test-kvarn-cuda-mixed-tail PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+    target_link_libraries(test-kvarn-cuda-mixed-tail PRIVATE test-kvarn-cuda-kernels CUDA::cudart)
+    llama_test(test-kvarn-cuda-mixed-tail)
+
+endif()
+
 if (NOT ${CMAKE_SYSTEM_PROCESSOR} MATCHES "s390x")
     set(MODEL_NAME "tinyllamas/stories15M-q4_0.gguf")
     set(MODEL_HASH "SHA256=66967fbece6dbe97886593fdbb73589584927e29119ec31f08090732d1861739")
@@ -230,6 +261,11 @@ add_test(NAME test-download-model COMMAND ${CMAKE_COMMAND}
     -P ${CMAKE_SOURCE_DIR}/cmake/download-models.cmake
 )
 set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download-model)
+
+llama_build_and_test(test-kvarn-server-load-failure.cpp LABEL "model" ARGS "${MODEL_DEST}")
+target_include_directories(test-kvarn-server-load-failure PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+target_link_libraries(test-kvarn-server-load-failure PRIVATE server-context)
+set_tests_properties(test-kvarn-server-load-failure PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)

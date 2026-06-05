@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -14,6 +15,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -187,6 +189,8 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_cache_quant_type = params.kv_cache_quant_type;
+    cparams.kvarn = params.kvarn;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -226,6 +230,18 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
+    LLAMA_LOG_INFO("%s: kv_cache_quant= %s\n",   __func__, llama_kv_cache_quant_type_name(params.kv_cache_quant_type));
+    if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+        LLAMA_LOG_INFO("%s: kvarn         = preset k%uv%u_g%u, sink %u, tail %u, sinkhorn %u, rtn %.6g\n",
+                __func__,
+                params.kvarn.key_bits,
+                params.kvarn.value_bits,
+                params.kvarn.group_size,
+                params.kvarn.sink_tokens,
+                params.kvarn.tail_tokens,
+                params.kvarn.sinkhorn_iters,
+                params.kvarn.rtn_quantile);
+    }
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
@@ -300,10 +316,12 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
-            /*.ctx_type= */ cparams.ctx_type,
+            /*.type_k             =*/ params.type_k,
+            /*.type_v             =*/ params.type_v,
+            /*.swa_full           =*/ params.swa_full,
+            /*.ctx_type           =*/ cparams.ctx_type,
+            /*.kv_cache_quant_type=*/ params.kv_cache_quant_type,
+            /*.kvarn              =*/ params.kvarn,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1287,7 +1305,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to build graph: %s\n", __func__, err.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2234,6 +2258,15 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
+    const auto * mctx_kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx);
+    if (mctx_kvarn != nullptr) {
+        n_tokens = 1;
+        n_seqs = 1;
+        n_outputs = std::min(n_outputs, n_tokens);
+        LLAMA_LOG_DEBUG("%s: KVarN reserve graph capped to single decode shape - n_tokens = %u, n_seqs = %u, n_outputs = %u\n",
+                __func__, n_tokens, n_seqs, n_outputs);
+    }
+
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -2262,13 +2295,31 @@ ggml_cgraph * llama_context::graph_reserve(
         ubatch.output[i] = true;
     }
 
+    if (mctx_kvarn != nullptr && ubatch.pos != nullptr) {
+        const uint32_t reserve_size = std::max<uint32_t>(mctx_kvarn->get_size(), 1);
+        const llama_pos reserve_pos = llama_pos(reserve_size - 1);
+
+        for (uint32_t p = 0; p < ubatch.n_pos; ++p) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                ubatch.pos[p*ubatch.n_tokens + i] = reserve_pos;
+            }
+        }
+    }
+
     auto * res = gf_res_reserve.get();
 
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
 
     res->reset();
 
-    auto * gf = model.build_graph(gparams);
+    ggml_cgraph * gf = nullptr;
+    try {
+        gf = model.build_graph(gparams);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to build graph: %s\n", __func__, err.what());
+        this->n_outputs = save_n_outputs;
+        return nullptr;
+    }
 
     this->n_outputs = save_n_outputs;
 
@@ -3365,6 +3416,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kv_cache_quant_type         =*/ LLAMA_KV_CACHE_QUANT_TYPE_NONE,
+        /*.kvarn                       =*/ llama_kvarn_default_params(),
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -3395,6 +3448,11 @@ llama_context * llama_init_from_model(
 
     if (params.n_ctx == 0 && model->hparams.n_ctx_train == 0) {
         LLAMA_LOG_ERROR("%s: n_ctx and model->hparams.n_ctx_train cannot both be zero\n", __func__);
+        return nullptr;
+    }
+
+    if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN && std::max(1u, params.n_seq_max) > 1) {
+        LLAMA_LOG_ERROR("%s: KVarN currently supports only n_seq_max = 1\n", __func__);
         return nullptr;
     }
 

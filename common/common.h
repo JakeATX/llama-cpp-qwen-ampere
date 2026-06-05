@@ -564,6 +564,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    enum llama_kv_cache_quant_type kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_NONE;
+    struct llama_kvarn_params      kvarn              = llama_kvarn_default_params();
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

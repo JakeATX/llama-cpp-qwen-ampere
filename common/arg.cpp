@@ -416,6 +416,57 @@ static std::string get_all_kv_cache_types() {
     return msg.str();
 }
 
+static llama_kv_cache_quant_type kv_cache_quant_type_from_str(const std::string & s) {
+    if (s == "none") {
+        return LLAMA_KV_CACHE_QUANT_TYPE_NONE;
+    }
+    if (s == "kvarn") {
+        return LLAMA_KV_CACHE_QUANT_TYPE_KVARN;
+    }
+    throw std::runtime_error("Unsupported KV cache quantization mode: " + s);
+}
+
+static void common_kvarn_apply_preset(common_params & params, const std::string & preset) {
+    if (preset != "kvarn_k4v2_g128") {
+        throw std::runtime_error("Unsupported KVarN preset: " + preset + " (supported: kvarn_k4v2_g128)");
+    }
+
+    params.kvarn = llama_kvarn_default_params();
+}
+
+static void common_kvarn_validate(const llama_kvarn_params & params) {
+    if (params.group_size != 128) {
+        throw std::runtime_error("KVarN currently requires group size 128");
+    }
+    if (params.key_bits != 4 || params.value_bits != 2) {
+        throw std::runtime_error("KVarN currently supports only 4-bit K and 2-bit V");
+    }
+    if (params.sink_tokens == 0 || params.tail_tokens == 0) {
+        throw std::runtime_error("KVarN sink and tail token counts must be positive");
+    }
+    if (params.sinkhorn_iters == 0) {
+        throw std::runtime_error("KVarN Sinkhorn iteration count must be positive");
+    }
+    if (!(params.rtn_quantile > 0.0f && params.rtn_quantile <= 1.0f)) {
+        throw std::runtime_error("KVarN RTN quantile must be in (0, 1]");
+    }
+}
+
+static void common_kvarn_validate_runtime_params(common_params & params) {
+    if (params.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+        return;
+    }
+
+    common_kvarn_validate(params.kvarn);
+
+    if (params.n_parallel < 0) {
+        params.n_parallel = 1;
+    }
+    if (params.n_parallel > 1) {
+        throw std::invalid_argument("KVarN currently supports only --parallel 1");
+    }
+}
+
 static bool parse_bool_value(const std::string & value) {
     if (is_truthy(value)) {
         return true;
@@ -630,6 +681,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+
+    common_kvarn_validate_runtime_params(params);
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -2074,6 +2127,68 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"--kv-cache-quant"}, "none|kvarn",
+        string_format(
+            "KV cache backend quantization mode (default: %s)",
+            llama_kv_cache_quant_type_name(params.kv_cache_quant_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.kv_cache_quant_type = kv_cache_quant_type_from_str(value);
+            if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+                common_kvarn_validate(params.kvarn);
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_QUANT"));
+    add_opt(common_arg(
+        {"--kvarn-preset"}, "PRESET",
+        "KVarN preset to use with --kv-cache-quant kvarn (supported: kvarn_k4v2_g128)",
+        [](common_params & params, const std::string & value) {
+            common_kvarn_apply_preset(params, value);
+            common_kvarn_validate(params.kvarn);
+        }
+    ).set_env("LLAMA_ARG_KVARN_PRESET"));
+    add_opt(common_arg(
+        {"--kvarn-sink-tokens"}, "N",
+        string_format("KVarN FP16 sink tokens (default: %u)", params.kvarn.sink_tokens),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::runtime_error("KVarN sink token count must be positive");
+            }
+            params.kvarn.sink_tokens = (uint32_t) value;
+            common_kvarn_validate(params.kvarn);
+        }
+    ).set_env("LLAMA_ARG_KVARN_SINK_TOKENS"));
+    add_opt(common_arg(
+        {"--kvarn-tail-tokens"}, "N",
+        string_format("KVarN FP16 tail tokens (default: %u)", params.kvarn.tail_tokens),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::runtime_error("KVarN tail token count must be positive");
+            }
+            params.kvarn.tail_tokens = (uint32_t) value;
+            common_kvarn_validate(params.kvarn);
+        }
+    ).set_env("LLAMA_ARG_KVARN_TAIL_TOKENS"));
+    add_opt(common_arg(
+        {"--kvarn-iters"}, "N",
+        string_format("KVarN Sinkhorn-style variance normalization iterations (default: %u)", params.kvarn.sinkhorn_iters),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::runtime_error("KVarN iteration count must be positive");
+            }
+            params.kvarn.sinkhorn_iters = (uint32_t) value;
+            common_kvarn_validate(params.kvarn);
+        }
+    ).set_env("LLAMA_ARG_KVARN_ITERS"));
+    add_opt(common_arg(
+        {"--kvarn-rtn-quantile"}, "F",
+        string_format("KVarN asymmetric RTN scale quantile in (0, 1] (default: %.6g)", params.kvarn.rtn_quantile),
+        [](common_params & params, const std::string & value) {
+            params.kvarn.rtn_quantile = std::stof(value);
+            common_kvarn_validate(params.kvarn);
+        }
+    ).set_env("LLAMA_ARG_KVARN_RTN_QUANTILE"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

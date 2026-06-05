@@ -44,6 +44,9 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    enum llama_kv_cache_quant_type kv_cache_quant_type;
+    struct llama_kvarn_params      kvarn;
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 

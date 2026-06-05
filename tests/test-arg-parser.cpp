@@ -141,6 +141,20 @@ int main(void) {
     assert(params.lora_adapters[2].path == "file3\"3\".gguf");
     assert(params.lora_adapters[3].path == "file4\".gguf");
 
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN);
+    assert(params.n_parallel == 1);
+
+    params = {};
+    argv = {"binary_name", "--parallel", "2", "--kv-cache-quant", "kvarn"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--parallel", "2"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
 // skip this part on windows, because setenv is not supported
 #ifdef _WIN32
     printf("test-arg-parser: skip on windows build\n");
