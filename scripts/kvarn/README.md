@@ -39,9 +39,9 @@ Current implemented pieces:
 - CUDA mixed sink/body/tail attention primitive that attends over FP16
   sink/tail tokens and packed KVarN body records in one stable softmax.
 - The runtime packed mixed-attention path has a fused CUDA kernel for one-query
-  decode batches. Multi-query prompt batches currently use the split score/AV
-  CUDA kernels because the fused multi-query variants diverge from the
-  scratch-reference path under prompt batching. Forcing
+  decode batches. Multi-query prompt batches use the per-row serial fused CUDA
+  kernel by default; the faster multi-block fused-batch variant still diverges
+  from the scratch-reference path under Qwen3.6 prompt batching. Forcing
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1` is rejected at context initialization with
   an explicit error instead of falling back silently. Set
   `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` or `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for
@@ -84,8 +84,9 @@ Current implemented pieces:
   span (`min(n_ubatch, tail_tokens)`) for dense, hybrid, and MoE models, so
   prompt processing can use masked multi-query KVarN attention without evicting
   a tail slot written earlier in the same graph. Qwen3.6 MoE bounded prompt
-  batching is correct through the split multi-query CUDA path; the forced fused
-  multi-query path is explicitly rejected because packed repeats still diverge.
+  batching is correct through the serial fused multi-query CUDA path; the
+  forced multi-block fused-batch path is explicitly rejected because packed
+  repeats still diverge.
 - The shared `llama_batch_allocr::split_equal()` path has regression coverage
   ensuring it does not emit more sequence sets than its `n_ubatch` limit. This
   protects KVarN's tail-ring prompt bound and the other memory backends that
@@ -189,8 +190,8 @@ constructed with native slot metadata. Graph construction identifies
 The KVarN graph path stores sink/tail tensors, can seal one completed body
 record from pending K/V staging, and can consume KVarN sink/tail/body/scale
 storage through CUDA mixed attention. Runtime execution now uses bounded prompt
-ubatches with KQ masks, including Qwen3.6 MoE through the split multi-query
-CUDA attention path.
+ubatches with KQ masks, including Qwen3.6 MoE through the serial fused
+multi-query CUDA attention path.
 
 Verified local smoke:
 
@@ -412,13 +413,17 @@ Verified local smoke:
   `graphs reused = 268`.
 - Runtime fused-vs-split packed attention comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_fused_split.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs -RtnQuantile 0.95`.
-  This runs default batched fused packed attention, forces serial fused
-  attention with `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, and then forces the
-  previous split score/AV kernels with `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`,
-  asserting deterministic generated-text parity. Latest local result: batched
-  fused attention `181.47` eval tok/s, serial fused attention `99.00` eval
-  tok/s, split attention `79.92` eval tok/s, all with
-  `graphs reused = 268`.
+  This runs the production default packed attention path, explicitly forces
+  serial fused attention with `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, and then
+  forces the previous split score/AV kernels with
+  `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`, asserting deterministic generated-text
+  parity. Pass `-IncludeUnsafeFusedBatch` only for the explicitly unsafe
+  multi-block fused-batch diagnostic. Latest static 128-dim regression result
+  with `-Predict 32 -Context 256`: default attention `166.47` eval tok/s,
+  explicit serial fused `94.8` eval tok/s, split attention `82.97` eval tok/s,
+  all with `graphs reused = 31`. Historical pre-routing result: batched fused
+  attention `181.47` eval tok/s, serial fused attention `99.00` eval tok/s,
+  split attention `79.92` eval tok/s, all with `graphs reused = 268`.
 - Runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
   This saves logits from the packed KVarN path with `llama-results`, reruns
@@ -447,9 +452,10 @@ Verified local smoke:
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses
-  bounded MoE KVarN prompt ubatches through the split multi-query CUDA kernels.
+  bounded MoE KVarN prompt ubatches through the serial fused multi-query CUDA
+  kernel.
   The logits script also accepts `-FlashAttn on|off|auto`; with `-FlashAttn off`
-  the same Qwen3.6 split-kernel production path passed packed-repeat and
+  the same Qwen3.6 serial-fused production path passed packed-repeat and
   packed-vs-scratch checks at `NMSE = 0.000E+000`.
   The packed-repeat diagnostic
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24 -DebugUbatch 128 -CheckPackedRepeat`
@@ -472,10 +478,11 @@ Verified local smoke:
   After expanding the standalone CUDA test to cover padded 1024-token full
   mixed-attention KQ-mask strides, the primitive still passed but the same
   Qwen3.6 repeat-4 unsafe fused-vs-scratch diagnostic with `-FlashAttn off`
-  failed at `NMSE = 3.998e-04`. The supported split-kernel path under the same
-  short setup passed packed-repeat and packed-vs-scratch checks at
-  `NMSE = 0.000E+000`, keeping the production path intact while narrowing the
-  fused issue to graph/model integration rather than isolated mask stride.
+  failed at `NMSE = 3.998e-04`. The supported split-kernel diagnostic under
+  the same short setup passed packed-repeat and packed-vs-scratch checks at
+  `NMSE = 0.000E+000`, keeping a reference comparison path intact while
+  narrowing the fused issue to graph/model integration rather than isolated
+  mask stride.
   The direct `-PackedFusedBatch -CheckPackedSplit` logits diagnostic on the
   same Qwen3.6 repeat-4 setup failed forced fused-vs-forced split at
   `NMSE = 7.774e-03`, so the remaining unsafe path is now isolated to fused
@@ -509,7 +516,7 @@ Verified local smoke:
   earlier 49-token sink-only shape and still passes split, forced fused,
   fused-vs-split, and CPU-reference checks. Current evidence points to small
   fused-vs-split attention math drift being amplified by the Qwen3.6 MoE graph;
-  the production path remains the split multi-query KVarN kernels.
+  the production path uses the per-row serial fused multi-query KVarN kernel.
   The per-row serial fused kernel is now the default for multi-query KVarN
   prompt batches. `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` still forces the previous
   split score/AV kernels, and `LLAMA_KVARN_ATTN_FUSED_BATCH=1` remains the

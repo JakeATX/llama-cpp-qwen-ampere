@@ -6,7 +6,8 @@ param(
     [int] $GpuLayers = 99,
     [int] $Seed = 1234,
     [double] $RtnQuantile = 0.95,
-    [string] $Prompt = "Hello"
+    [string] $Prompt = "Hello",
+    [switch] $IncludeUnsafeFusedBatch
 )
 
 $ErrorActionPreference = "Stop"
@@ -123,11 +124,11 @@ $args = @(
     "--temp", "0"
 )
 
-Write-Host "== KVarN batched fused packed attention"
-$batched = Invoke-Completion $completion $args @{}
-$batchedText = Get-GeneratedText $batched
-$batchedGraphs = Get-GraphsReused $batched
-$batchedTps = Get-EvalTokensPerSecond $batched
+Write-Host "== KVarN default packed attention"
+$default = Invoke-Completion $completion $args @{}
+$defaultText = Get-GeneratedText $default
+$defaultGraphs = Get-GraphsReused $default
+$defaultTps = Get-EvalTokensPerSecond $default
 
 Write-Host "== KVarN serial fused packed attention"
 $serial = Invoke-Completion $completion $args @{ "LLAMA_KVARN_ATTN_SERIAL_FUSED" = "1" }
@@ -141,9 +142,9 @@ $splitText = Get-GeneratedText $split
 $splitGraphs = Get-GraphsReused $split
 $splitTps = Get-EvalTokensPerSecond $split
 
-if ($batchedText -ne $serialText -or $batchedText -ne $splitText) {
-    Write-Host "== batched fused generated text =="
-    Write-Host $batchedText
+if ($defaultText -ne $serialText -or $defaultText -ne $splitText) {
+    Write-Host "== default generated text =="
+    Write-Host $defaultText
     Write-Host "== serial fused generated text =="
     Write-Host $serialText
     Write-Host "== split generated text =="
@@ -151,7 +152,28 @@ if ($batchedText -ne $serialText -or $batchedText -ne $splitText) {
     throw "KVarN packed mixed attention dispatch mode changed deterministic generated text"
 }
 
+if ($IncludeUnsafeFusedBatch) {
+    Write-Host "== KVarN unsafe multi-block fused-batch packed attention"
+    $unsafe = Invoke-Completion $completion $args @{
+        "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1"
+        "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH" = "1"
+    }
+    $unsafeText = Get-GeneratedText $unsafe
+    $unsafeGraphs = Get-GraphsReused $unsafe
+    $unsafeTps = Get-EvalTokensPerSecond $unsafe
+
+    if ($defaultText -ne $unsafeText) {
+        Write-Host "== default generated text =="
+        Write-Host $defaultText
+        Write-Host "== unsafe fused-batch generated text =="
+        Write-Host $unsafeText
+        throw "KVarN unsafe fused-batch attention changed deterministic generated text"
+    }
+
+    Write-Host ("KVarN unsafe fused-batch attention: graphs reused = {0}, eval tok/s = {1}" -f $unsafeGraphs, $unsafeTps)
+}
+
 Write-Host "KVarN packed attention dispatch parity: PASS"
-Write-Host ("KVarN batched fused attention: graphs reused = {0}, eval tok/s = {1}" -f $batchedGraphs, $batchedTps)
+Write-Host ("KVarN default attention     : graphs reused = {0}, eval tok/s = {1}" -f $defaultGraphs, $defaultTps)
 Write-Host ("KVarN serial fused attention : graphs reused = {0}, eval tok/s = {1}" -f $serialGraphs, $serialTps)
 Write-Host ("KVarN split attention        : graphs reused = {0}, eval tok/s = {1}" -f $splitGraphs, $splitTps)
