@@ -521,6 +521,17 @@ Verified local smoke:
   fails for forced fused-batch Qwen3.6 at packed-repeat `NMSE = 2.443e-03`, so
   the production guard remains in place until the remaining correctness issue
   is fixed.
+  Follow-up narrowing: forced fused-batch Qwen3.6 passes packed-repeat and
+  packed-vs-scratch at `-c 256 -Repeat 1` and `-c 256 -Repeat 4`, and
+  Qwen3.5 0.8B passes the same forced fused-batch body-record logits guard at
+  `-c 384 -Repeat 4`. Qwen3.6 still fails at
+  `-c 384 -Repeat 4 -DebugUbatch 128` with packed-repeat
+  `NMSE = 4.865e-03`; disabling CUDA graph capture still fails at
+  `NMSE = 7.621e-03`. The standalone CUDA primitive test now matches the real
+  failing prompt-batch shape more closely with a 49-query Qwen3.6-shaped
+  body-record case, and that primitive test passes, so the remaining issue is
+  above the primitive arithmetic or depends on full-runtime graph/state
+  interaction.
   With the unsafe diagnostic override enabled after removing an unnecessary
   scratch/probability write from the fused-batch kernel, Qwen3.6 still failed
   packed repeat at `NMSE = 1.569e-02`. Disabling graph reuse still failed at
