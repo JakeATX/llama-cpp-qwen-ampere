@@ -221,7 +221,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            10
+#define GGML_MAX_SRC            11
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -696,7 +696,7 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        char padding[16];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

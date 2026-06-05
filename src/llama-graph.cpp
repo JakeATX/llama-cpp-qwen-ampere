@@ -665,6 +665,7 @@ void llm_graph_input_attn_kvarn::set_input(const llama_ubatch * ubatch) {
     mctx_kvarn->set_input_body_plan(body_plan, ubatch);
     mctx_kvarn->set_input_body_offsets(body_offsets, ubatch);
     mctx_kvarn->set_input_tail_evict_idxs(tail_evict_idxs, ubatch);
+    mctx_kvarn->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, *ubatch, mctx_kvarn->get_size());
     GGML_ASSERT(window.valid);
@@ -701,6 +702,7 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
     res &= body_plan->ne[1] == n_tail_evict;
     res &= body_offsets->ne[0] == n_tail_evict;
     res &= tail_evict_idxs->ne[0] == n_tail_evict;
+    res &= can_reuse_kq_mask(self_kq_mask, mctx->get_size(), params.ubatch, params.cparams);
     res &= !mixed_attn_nodes.empty();
 
     for (const ggml_tensor * node : mixed_attn_nodes) {
@@ -2509,8 +2511,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kvarn_impl(
     inp->body_plan = mctx_kvarn->build_input_body_plan(ctx0, ubatch);
     inp->body_offsets = mctx_kvarn->build_input_body_offsets(ctx0, ubatch);
     inp->tail_evict_idxs = mctx_kvarn->build_input_tail_evict_idxs(ctx0, ubatch);
-    inp->self_kq_mask = nullptr;
-    inp->self_kq_mask_cnv = nullptr;
+    inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_kvarn->get_size(), ubatch, cparams);
+    inp->self_kq_mask_cnv = inp->self_kq_mask;
     return inp;
 }
 
@@ -2619,7 +2621,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
                 ctx0, q_cur, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
-                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, nullptr,
+                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask(),
                 window.n_sink, window.n_records, window.n_pending, window.n_tail, window.tail_start,
                 int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
                 int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);

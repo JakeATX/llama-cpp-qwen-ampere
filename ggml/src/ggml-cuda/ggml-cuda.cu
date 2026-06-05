@@ -2871,10 +2871,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * pending_k   = dst->src[7];
                 const ggml_tensor * pending_v   = dst->src[8];
                 const ggml_tensor * scratch     = dst->src[9];
-                const ggml_tensor * kq_mask     = nullptr;
+                const ggml_tensor * kq_mask     = dst->src[10];
 
                 const int64_t n_kv = int64_t(params.n_sink) + int64_t(params.n_records)*params.group_size + params.n_pending + params.n_tail;
-                const uint32_t kq_mask_type = 0u;
+                const uint32_t kq_mask_type = kq_mask == nullptr ? 0u : (kq_mask->type == GGML_TYPE_F32 ? 1u : 2u);
                 const bool use_scratch_ref = getenv("LLAMA_KVARN_ATTN_REF_SCRATCH") != nullptr &&
                     std::atoi(getenv("LLAMA_KVARN_ATTN_REF_SCRATCH")) != 0;
                 if (use_scratch_ref && params.n_records > 0) {
@@ -5465,7 +5465,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         op->src[3]->type != GGML_TYPE_I8 || op->src[4]->type != GGML_TYPE_I8 ||
                         op->src[5]->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_F32 ||
                         op->src[7]->type != GGML_TYPE_F32 || op->src[8]->type != GGML_TYPE_F32 ||
-                        op->src[9]->type != GGML_TYPE_F32) {
+                        op->src[9]->type != GGML_TYPE_F32 ||
+                        (op->src[10] != nullptr && op->src[10]->type != GGML_TYPE_F32 && op->src[10]->type != GGML_TYPE_F16)) {
                     return false;
                 }
                 if (params.n_sink < 0 || params.n_records < 0 || params.n_pending < 0 || params.n_tail < 0 ||
@@ -5493,6 +5494,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
 
                 const int64_t n_kv = int64_t(params.n_sink) + int64_t(params.n_records)*params.group_size + params.n_pending + params.n_tail;
+                if (op->src[10] != nullptr &&
+                        (op->src[10]->ne[0] < n_kv || op->src[10]->ne[1] < op->src[0]->ne[2])) {
+                    return false;
+                }
                 int64_t scratch_floats = n_kv;
                 if (getenv("LLAMA_KVARN_ATTN_REF_SCRATCH") != nullptr &&
                         std::atoi(getenv("LLAMA_KVARN_ATTN_REF_SCRATCH")) != 0 &&

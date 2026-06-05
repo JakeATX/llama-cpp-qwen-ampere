@@ -769,10 +769,12 @@ static void test_kvarn_mixed_attention_ggml_op() {
     ggml_tensor * pending_k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, head_dim, n_head_kv, params.group_size);
     ggml_tensor * pending_v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, head_dim, n_head_kv, params.group_size);
     ggml_tensor * scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, params.sink_tokens + n_records*params.group_size + n_pending + params.tail_tokens);
+    ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32,
+            params.sink_tokens + n_records*params.group_size + n_pending + params.tail_tokens, n_tokens);
 
     ggml_tensor * out = ggml_kvarn_attn_mixed(
             ctx.get(), q, sink_tail_k, sink_tail_v, body_k, body_v, scales_k, scales_v, pending_k, pending_v, scratch,
-            nullptr,
+            kq_mask,
             params.sink_tokens, n_records, n_pending, params.tail_tokens, 1, head_dim, params.group_size,
             params.key_bits, params.value_bits, 1.0f/std::sqrt(float(head_dim)));
 
@@ -786,6 +788,7 @@ static void test_kvarn_mixed_attention_ggml_op() {
             out->src[6] == scales_v && out->src[7] == pending_k && out->src[8] == pending_v &&
             out->src[9] == scratch,
             "KVarN mixed attention cache sources");
+    require(out->src[10] == kq_mask, "KVarN mixed attention mask source");
     require(out->op_params[0] == (int32_t) params.sink_tokens &&
             out->op_params[1] == n_records &&
             out->op_params[2] == n_pending &&

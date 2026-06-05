@@ -4130,6 +4130,7 @@ struct ggml_tensor * ggml_kvarn_attn_mixed(
     result->src[7] = pending_k;
     result->src[8] = pending_v;
     result->src[9] = scratch;
+    result->src[10] = kq_mask;
 
     return result;
 }

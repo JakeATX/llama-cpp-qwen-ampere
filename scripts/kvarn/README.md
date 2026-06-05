@@ -66,8 +66,8 @@ Current implemented pieces:
   groups into packed KVarN body records plus scale metadata. It does not
   allocate or use the normal KV cache as a fallback.
 - KVarN batch preparation splits caller batches into one-token ubatches. This
-  keeps prompt processing on the decode-shaped graph path until masked
-  multi-token prompt attention is implemented.
+  keeps prompt processing on the decode-shaped graph path until unsplit
+  multi-token prompt storage/sealing is safely enabled and tested.
 - Hybrid recurrent/full-attention models can compose recurrent memory for SSM
   layers with KVarN storage for full-attention layers. This is used by local
   Qwen3.5/Qwen3.6-family validation instead of rejecting the whole model for
@@ -106,13 +106,14 @@ Current implemented pieces:
 - `GGML_OP_KVARN_ATTN_MIXED` plus `ggml_kvarn_attn_mixed()` constructor. The
   op produces the normal `[head_dim, n_head, n_tokens]` F32 attention output
   shape from F32 Q, F16 sink/tail tensors, packed body tensors, FP32 scales,
-  FP32 pending-body tensors, and a scratch score buffer. CUDA dispatch is wired
-  to the batched F16 sink/body/pending/tail wrapper. The llama graph calls this
-  op for one-token decode batches, where all previous tokens are visible and no
-  causal prompt mask is needed. The graph computes active sink/body/pending/tail
-  counts and the wrapped-tail start slot for each decode token. Context reserve
-  graphs may be built for larger synthetic ubatches, but runtime KVarN memory
-  preparation still splits actual work into one-token ubatches.
+  FP32 pending-body tensors, a scratch score buffer, and an optional KQ/causal
+  mask in `src[10]`. CUDA dispatch passes F32/F16 masks through to the batched
+  F16 sink/body/pending/tail wrapper. The llama graph now builds and fills the
+  KQ mask for KVarN graph inputs, but production runtime preparation still
+  splits actual work into one-token ubatches until unsplit prompt storage and
+  sealing are validated. The graph computes active sink/body/pending/tail counts
+  and the wrapped-tail start slot for each decode token. Context reserve graphs
+  may be built for larger synthetic ubatches.
 - Graph construction writes FP16 sink/tail, stages evicted FP16 tail rows into
   FP32 pending body slots, emits packed K/V body-store nodes when a graph
   completes one body record, and uses KVarN mixed attention for one-token
@@ -345,14 +346,15 @@ Verified local smoke:
 
 Required integration path:
 
-1. Extend `GGML_OP_KVARN_ATTN_MIXED` with the causal/KQ mask semantics needed
-   for prompt batches. Without this, graph attention would compute unmasked
-   prefill attention.
+1. Enable unsplit KVarN prompt batches now that `GGML_OP_KVARN_ATTN_MIXED`
+   carries an optional KQ/causal mask in `src[10]` and the CUDA packed and
+   scratch-reference mixed-attention paths consume it. Runtime batch
+   preparation still splits to one-token ubatches until prompt storage order,
+   active-window construction, and body-record sealing are validated together.
 2. Finish prompt-batch sealing semantics. The graph builder now collects all
    seal records in an ubatch and emits store ops for each record, and the body
    plan has multi-record seal coverage. Prompt ubatches are still split to one
-   token until causal prompt masking is wired, so this path is not yet exercised
-   by production prefill batches.
+   token, so this path is not yet exercised by production prefill batches.
 3. Promote the device scratch-reference primitives into a graph path that
    materializes body records into scratch K/V tensors before
    `ggml_flash_attn_ext`. The standalone CUDA scratch-dequant primitives and
