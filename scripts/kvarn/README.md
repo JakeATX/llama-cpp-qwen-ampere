@@ -411,7 +411,16 @@ Verified local smoke:
   Gemma 4 12B server smoke passed via
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8152 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95`.
   Gemma 4 26B A4B short and body-record smokes passed on the local 12 GB RTX
-  5070, with KVarN storage on full-attention layers `5, 11, 17, 23, 29`.
+  5070, with KVarN storage on full-attention layers `5, 11, 17, 23, 29`. The
+  conservative tensor-budget report marks the Q3 file as exceeding a 10.50 GiB
+  usable-VRAM budget by `1.51` GiB, but a forced `-ngl 99` run is accepted by
+  the current local driver state. Current-build body-record smoke:
+  `build-kvarn-cuda-static-vs\bin\Release\llama-completion.exe -fit off -m "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -p "Hello" -n 270 -c 512 -ngl 99 --no-warmup --simple-io -no-cnv --no-display-prompt --ignore-eos -fa on --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 -s 1234 --temp 0`.
+  Latest local result: KVarN allocated `2` body records per KVarN layer,
+  reported an `11.08 MiB` CUDA KVarN buffer and `6.08 MiB` metadata estimate,
+  and ran at `14.14` eval tok/s with `graphs reused = 267`. Matching normal KV
+  with `--kv-cache-quant none -fa off` ran at `9.12` eval tok/s with
+  `graphs reused = 267`.
 - Fresh `tg64` benchmark gates on the CUDA FA-off build:
   Qwen2.5 1.5B 128-dim normal KV `202.46` tok/s, KVarN `160.37` tok/s;
   Qwen3.5 0.8B 256-dim hybrid normal KV `360.12` tok/s, KVarN
