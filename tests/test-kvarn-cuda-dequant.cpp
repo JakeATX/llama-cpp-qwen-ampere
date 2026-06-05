@@ -1205,5 +1205,6 @@ static void run_case(uint32_t head_dim) {
 int main() {
     run_case(128);
     run_case(256);
+    run_case(512);
     return 0;
 }

@@ -9,8 +9,12 @@ Current implemented pieces:
 - Public API and common CLI flags for `--kv-cache-quant none|kvarn`.
 - `kvarn_k4v2_g128` preset defaults: group 128, 4-bit K, 2-bit V, 128 sink
   tokens, 128 tail tokens, 16 Sinkhorn iterations.
-- Runtime K/V head dimensions of 128 and 256 are supported by validation,
-  layout tests, CUDA parity tests, and local `llama-cli` smokes.
+- Runtime K/V head dimensions of 128, 256, and 512 are supported by
+  validation, layout tests, and CUDA parity tests. Local `llama-cli` smokes
+  currently cover 128- and 256-dimensional K/V heads. 256 remains the primary
+  Qwen acceptance path; 512 is included because the local Gemma 4 12B files
+  report 512-dimensional K/V heads, but Gemma4 uses SWA/ISWA cache routing and
+  is explicitly rejected until KVarN has an ISWA cache implementation.
 - CPU reference layout, Hadamard rotation, Sinkhorn-style balancing,
   asymmetric RTN, bit packing, body-record dequant, and a sink/body/tail
   reference cache.
@@ -238,10 +242,27 @@ Verified local smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "<300 hello tokens>" -n 1 -c 384 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with two KVarN body records per full-attention
   layer and a `6.67 MiB` CUDA KVarN buffer.
+- 256-dim hybrid Qwen3.6 35B A3B MTP smoke:
+  `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
+  Latest local result passed on the RTX 5070 with KVarN allocated on
+  full-attention layers `3, 7, 11, 15, 19, 23, 27, 31, 35, 39`.
+- 256-dim hybrid Qwen3.6 35B A3B MTP body-record smoke:
+  `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -p "<300 hello tokens>" -n 1 -c 384 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
+  Latest local result passed with two KVarN body records per full-attention
+  layer and an `11.11 MiB` CUDA KVarN buffer.
+- Gemma 4 12B dense metadata discovered locally:
+  `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf` and
+  `C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q4_K_XL.gguf` are `gemma4`,
+  48 layers, context `131072`, 16 attention heads, no SSM keys, and K/V head
+  length `512`. They are not 256-dimensional despite the original target
+  assumption. KVarN now rejects these files cleanly with
+  `KVarN backend does not support SWA/ISWA models yet`; earlier builds could
+  reach an invalid ISWA graph cast and crash with `0xC0000005`.
 - Fresh `tg64` benchmark gates on the CUDA FA-off build:
   Qwen2.5 1.5B 128-dim normal KV `202.46` tok/s, KVarN `160.37` tok/s;
   Qwen3.5 0.8B 256-dim hybrid normal KV `360.12` tok/s, KVarN
-  `148.25` tok/s.
+  `148.25` tok/s; Qwen3.6 35B A3B MTP IQ3 256-dim hybrid normal KV
+  `13.51` tok/s, KVarN `13.76` tok/s.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
@@ -355,6 +376,6 @@ with `STATUS_CONTROL_C_EXIT`.
 
 Local smoke models may fail KVarN initialization before graph construction if
 they do not match the production constraints. Expected guarded failures include
-K/V head dimensions other than 128 or 256, MLA, hybrid SWA, unsupported backend
-placement, attention rotations/KQ bias/sinks, and other explicit KVarN
-graph-backend guards.
+K/V head dimensions other than 128, 256, or 512, MLA, SWA/ISWA, unsupported
+backend placement, attention rotations/KQ bias/sinks, and other explicit
+KVarN graph-backend guards.

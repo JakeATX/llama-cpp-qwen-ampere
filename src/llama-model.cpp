@@ -1971,7 +1971,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 static bool llama_kvarn_supported_head_dim(uint32_t head_dim) {
-    return head_dim == 128 || head_dim == 256;
+    return head_dim == 128 || head_dim == 256 || head_dim == 512;
 }
 
 static bool llama_kvarn_device_supports_ops(ggml_backend_dev_t dev, const llama_kvarn_params & params, uint32_t head_dim) {
@@ -2038,7 +2038,7 @@ static void llama_kvarn_validate_memory_support(
         }
         if (!llama_kvarn_supported_head_dim(head_k)) {
             throw std::runtime_error(format(
-                    "KVarN backend currently supports only 128- or 256-dimensional K/V heads; layer %u has %u",
+                    "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads; layer %u has %u",
                     il, head_k));
         }
     }
@@ -2068,15 +2068,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
         llama_kvarn_validate_memory_support(*this, hparams, params, cparams);
 
+        if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+            throw std::runtime_error("KVarN backend does not support SWA/ISWA models yet");
+        }
+
         const bool mtp_on_hybrid_qwen35 =
             params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
             (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
 
         if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen35) {
-            if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-                throw std::runtime_error("KVarN backend does not support hybrid SWA models yet");
-            }
-
             llama_memory_i::layer_filter_cb filter_attn = nullptr;
             llama_memory_i::layer_filter_cb filter_recr = nullptr;
             if (arch == LLM_ARCH_FALCON_H1) {

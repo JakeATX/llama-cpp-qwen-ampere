@@ -3053,7 +3053,10 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
 //       like with the non-sliding window equivalent
 //       once sliding-window hybrid caches are a thing.
 llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const {
-    const auto * mctx_cur = static_cast<const llama_kv_cache_iswa_context *>(mctx);
+    const auto * mctx_cur = dynamic_cast<const llama_kv_cache_iswa_context *>(mctx);
+    if (!mctx_cur) {
+        throw std::runtime_error("ISWA attention graph requested a non-ISWA memory context");
+    }
 
     auto inp = std::make_unique<llm_graph_input_attn_kv_iswa>(hparams, cparams, mctx_cur);
 
