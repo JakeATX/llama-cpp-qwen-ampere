@@ -785,6 +785,23 @@ Verified local smoke:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs -Batch 512 -Repeat 4 -CheckPackedSplit -FlashAttn off`.
   Latest local result passed with packed-vs-split `NMSE = 0.000E+000` and
   packed-vs-scratch `NMSE = 0.000E+000`.
+- Exact KVarN layer-routing evidence is now available in all runtime smoke and
+  comparison harnesses through `-ExpectedKvarnLayers`. Latest local Qwen2.5
+  exact fused/split dispatch parity:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_fused_split.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Predict 16 -RtnQuantile 0.95 -Prompt Hello -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27"`.
+  Latest local result passed with exact layers `0..27`, 56 KVarN layer log
+  lines per run, graph reuse `15`, and eval rates: default `154.94` tok/s,
+  serial fused `93.16` tok/s, split `85.58` tok/s.
+- Latest local Qwen2.5 exact graph-reuse parity:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_reuse.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Predict 16 -RtnQuantile 0.95 -Prompt Hello -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27" -SkipNormalBaseline`.
+  Latest local result passed with exact layers `0..27`, reuse-disabled
+  `graphs reused = 0` at `141.05` eval tok/s, and reuse-enabled
+  `graphs reused = 15` at `156.85` eval tok/s.
+- Latest local Gemma 4 12B exact server smoke:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8164 -Context 256 -Predict 1 -Prompt Hello -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5,11,17,23,29,35,41,47"`.
+  Latest local result passed with exact KVarN full-attention layers
+  `5,11,17,23,29,35,41,47`, 16 KVarN layer log lines, and completion content
+  `" and"`.
 - Server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
