@@ -46,6 +46,7 @@
 /build*
 /release
 /debug
+/artifacts/
 /libllama.so
 /llama-*
 /vulkan-shaders-gen

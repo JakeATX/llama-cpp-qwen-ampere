@@ -362,6 +362,18 @@ Verified local smoke:
   Qwen3.5 4B body-record-crossing `tg384` normal KV `145.27` tok/s, KVarN
   `34.90` tok/s; Qwen3.6 35B A3B MTP IQ3 `tg64` normal KV `9.10` tok/s,
   KVarN `9.81` tok/s.
+- Reusable benchmark matrix harness:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model C:\Users\sjake\.cache\huggingface\hub\models--unsloth--Qwen3.5-4B-GGUF\snapshots\e87f176479d0855a907a41277aca2f8ee7a09523\Qwen3.5-4B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -CaseList "tg64:0:64,pp128:128:0,tg384:0:384" -FlashAttn off -Repetitions 1`.
+  The script runs each named `prompt_tokens:generation_tokens` case through
+  `llama-bench`, compares `--kv-cache-quant none,kvarn`, fails on any nonzero
+  benchmark exit, and writes per-case command/output logs under
+  `artifacts\kvarn-bench\<timestamp>`.
+  Latest local 256-dim Qwen3.5 4B artifact directory:
+  `artifacts\kvarn-bench\20260605-043201`. Results: `tg64` normal KV
+  `139.47` tok/s, KVarN `99.06` tok/s; `pp128` normal KV `758.49` tok/s,
+  KVarN `281.34` tok/s; body-record-crossing `tg384` normal KV `149.29`
+  tok/s, KVarN `35.00` tok/s with two KVarN body records per full-attention
+  layer.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
