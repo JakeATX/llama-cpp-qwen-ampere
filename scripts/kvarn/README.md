@@ -674,10 +674,10 @@ Verified local smoke:
   scratch-reference check, proving the KVarN+ISWA logits comparison used the
   KVarN full-attention layer storage rather than normal KV.
   Latest strict short rerun:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -CheckPackedRepeat -FlashAttn off -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5,11,17,23,29,35,41,47"`.
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -CheckPackedRepeat -FlashAttn off -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   Packed save, packed repeat, and scratch-reference checks all logged 16 KVarN
-  layer lines, passed the exact full-attention layer-ID check, and passed with
-  `NMSE = 0.000E+000`.
+  layer lines, passed the exact full-attention layer-ID check for
+  `5,11,17,23,29,35,41,47`, and passed with `NMSE = 0.000E+000`.
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat`.
   Latest local 26B A4B result also passed with packed-repeat
   `NMSE = 0.000E+000` and packed-vs-scratch `NMSE = 0.000E+000`.
