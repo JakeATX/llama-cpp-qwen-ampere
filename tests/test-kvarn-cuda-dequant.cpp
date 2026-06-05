@@ -1228,8 +1228,8 @@ static void run_case(uint32_t head_dim) {
             for (uint32_t ih = 0; ih < n_head; ++ih) {
                 for (uint32_t d = 0; d < head_dim; ++d) {
                     q_sink_only[(size_t(iq)*n_head + ih)*head_dim + d] =
-                        0.018f*std::sin(float(d + 3*ih + 7*iq)*0.019f) -
-                        0.011f*std::cos(float(5*d + ih + 11*iq)*0.013f);
+                        0.180f*std::sin(float(d + 3*ih + 7*iq)*0.019f) -
+                        0.110f*std::cos(float(5*d + ih + 11*iq)*0.013f);
                 }
             }
         }
@@ -1237,8 +1237,8 @@ static void run_case(uint32_t head_dim) {
             for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
                 for (uint32_t d = 0; d < head_dim; ++d) {
                     const size_t off = (size_t(t)*n_head_kv + ikh)*head_dim + d;
-                    k_sink_only[off] = 0.012f*std::sin(float(d + 13*t + 5*ikh)*0.021f);
-                    v_sink_only[off] = 0.014f*std::cos(float(3*d + 17*t + 7*ikh)*0.017f);
+                    k_sink_only[off] = 0.120f*std::sin(float(d + 13*t + 5*ikh)*0.021f);
+                    v_sink_only[off] = 0.140f*std::cos(float(3*d + 17*t + 7*ikh)*0.017f);
                 }
             }
         }
