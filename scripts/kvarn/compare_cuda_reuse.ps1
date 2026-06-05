@@ -26,7 +26,7 @@ function Get-ExePath([string] $buildDir, [string] $name) {
     return (Resolve-Path -LiteralPath $path).Path
 }
 
-function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet) {
+function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet, [bool] $ExpectKvarn = $true) {
     $oldEnv = @{}
     foreach ($key in $envSet.Keys) {
         $oldEnv[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
@@ -51,6 +51,19 @@ function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet)
     $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
     if ($exit -ne 0) {
         throw "llama-completion failed with exit code $exit`n$text"
+    }
+
+    if ($ExpectKvarn) {
+        if ($text -notmatch "llama_kv_cache_kvarn:") {
+            throw "Expected KVarN runtime logs, but none were found"
+        }
+
+        $layerLines = [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer").Count
+        if ($layerLines -le 0) {
+            throw "Expected KVarN layer logs, but none were found"
+        }
+
+        Write-Host ("KVarN completion log check: PASS, KVarN layer lines = {0}" -f $layerLines)
     }
 
     return $text
@@ -165,7 +178,7 @@ if (-not $SkipNormalBaseline) {
         "-fa", "off",
         "--kv-cache-quant", "none"
     )
-    $normal = Invoke-Completion $completion $normalArgs @{}
+    $normal = Invoke-Completion $completion $normalArgs @{} $false
     $normalGraphs = Get-GraphsReused $normal
     $normalTps = Get-EvalTokensPerSecond $normal
     Write-Host ("Normal KV baseline: graphs reused = {0}, eval tok/s = {1}" -f $normalGraphs, $normalTps)

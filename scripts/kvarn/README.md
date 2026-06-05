@@ -511,13 +511,15 @@ Verified local smoke:
   This runs KVarN twice with the same seed and temperature, first with
   `LLAMA_GRAPH_REUSE_DISABLE=1`, then with graph reuse enabled. It asserts
   identical generated text, requires `graphs reused = 0` in the reference run,
-  and requires positive graph reuse in the optimized run. Latest local result:
-  reuse disabled `76.46` eval tok/s, reuse enabled `79.61` eval tok/s with
-  `graphs reused = 268`, normal-KV baseline `355.53` eval tok/s.
+  requires positive graph reuse in the optimized run, and rejects any KVarN run
+  whose output lacks `llama_kv_cache_kvarn:` initialization and per-layer logs.
+  Latest local result: reuse disabled `76.46` eval tok/s, reuse enabled `79.61`
+  eval tok/s with `graphs reused = 268`, normal-KV baseline `355.53` eval tok/s.
   The script accepts `-RtnQuantile 0.95` to run the same deterministic reuse
-  check with clipped RTN scaling; latest quantile result was reuse disabled
-  `71.43` eval tok/s, reuse enabled `74.67` eval tok/s with
-  `graphs reused = 268`.
+  check with clipped RTN scaling; latest static short-context quantile result
+  was reuse disabled `158.00` eval tok/s with `graphs reused = 0`, reuse enabled
+  `167.94` eval tok/s with `graphs reused = 31`, normal-KV baseline `275.04`
+  eval tok/s, and 56 KVarN layer log lines in each KVarN run.
 - Runtime packed-vs-scratch attention comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_scratch_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs -RtnQuantile 0.95`.
   This runs the same deterministic long decode once with packed KVarN mixed
