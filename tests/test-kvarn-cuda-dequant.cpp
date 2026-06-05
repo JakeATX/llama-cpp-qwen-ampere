@@ -1061,6 +1061,7 @@ static void run_case(uint32_t head_dim) {
     }
     uint16_t * mha_mask_f16_d = cuda_upload(mha_mask_f16);
 
+    set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
     ggml_cuda_kvarn_attn_mixed_f16_batch(
             q_mha_d,
             sink_tail_k_f16_d, sink_tail_v_f16_d,
@@ -1083,6 +1084,7 @@ static void run_case(uint32_t head_dim) {
             size_t(mha_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
             scale,
             nullptr);
+    set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
     require_cuda(cudaGetLastError(), "KVarN CUDA batched F16 mixed attention launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA batched F16 mixed attention sync");
 
@@ -1284,6 +1286,7 @@ static void run_case(uint32_t head_dim) {
         require_cuda(cudaMalloc(&q36_scores_d, n_q36_tokens*sizeof(float)), "cudaMalloc Qwen3.6-shaped split scores");
         require_cuda(cudaMalloc(&q36_fused_scores_d, n_q36_tokens*sizeof(float)), "cudaMalloc Qwen3.6-shaped fused scores");
 
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
         ggml_cuda_kvarn_attn_mixed_f16_batch(
                 q36_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
                 mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
@@ -1303,6 +1306,7 @@ static void run_case(uint32_t head_dim) {
                 size_t(q36_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
                 scale,
                 nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
         require_cuda(cudaGetLastError(), "KVarN CUDA Qwen3.6-shaped split launch");
         require_cuda(cudaDeviceSynchronize(), "KVarN CUDA Qwen3.6-shaped split sync");
 
@@ -1491,6 +1495,7 @@ static void run_case(uint32_t head_dim) {
         require_cuda(cudaMalloc(&sink_only_scores_d, n_sink_only*sizeof(float)), "cudaMalloc sink-only scores");
         require_cuda(cudaMalloc(&sink_only_fused_scores_d, n_sink_only*sizeof(float)), "cudaMalloc sink-only fused scores");
 
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
         ggml_cuda_kvarn_attn_mixed_f16_batch(
                 q_sink_only_d, k_sink_only_d, v_sink_only_d,
                 mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d, pending_k_mha_d, pending_v_mha_d,
@@ -1510,6 +1515,7 @@ static void run_case(uint32_t head_dim) {
                 size_t(sink_only_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
                 scale,
                 nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
         require_cuda(cudaGetLastError(), "KVarN CUDA split sink-only launch");
         require_cuda(cudaDeviceSynchronize(), "KVarN CUDA split sink-only sync");
 
@@ -1594,6 +1600,7 @@ static void run_case(uint32_t head_dim) {
         }
         float * sink_only_mask_f32_d = cuda_upload(sink_only_mask_f32);
 
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
         ggml_cuda_kvarn_attn_mixed_f16_batch(
                 q_sink_only_d, k_sink_only_d, v_sink_only_d,
                 mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d, pending_k_mha_d, pending_v_mha_d,
@@ -1613,6 +1620,7 @@ static void run_case(uint32_t head_dim) {
                 size_t(sink_only_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
                 scale,
                 nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
         require_cuda(cudaGetLastError(), "KVarN CUDA split sink-only F32 mask launch");
         require_cuda(cudaDeviceSynchronize(), "KVarN CUDA split sink-only F32 mask sync");
 
