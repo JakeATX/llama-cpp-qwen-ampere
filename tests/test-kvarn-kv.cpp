@@ -568,6 +568,72 @@ static void test_runtime_body_plan_multi_record_seals() {
     }
 }
 
+static float read_kq_mask_value(const ggml_tensor * mask, int64_t t, int64_t q) {
+    const char * p = (const char *) mask->data + size_t(q)*mask->nb[1] + size_t(t)*mask->nb[0];
+    if (mask->type == GGML_TYPE_F16) {
+        return ggml_fp16_to_fp32(*(const ggml_fp16_t *) p);
+    }
+    return *(const float *) p;
+}
+
+static void require_mask_keep(float v, const char * msg) {
+    require(std::fabs(v) < 1.0e-6f, msg);
+}
+
+static void require_mask_drop(float v, const char * msg) {
+    require(std::isinf(v) && v < 0.0f, msg);
+}
+
+static void test_runtime_kq_mask_graph_api() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = 4;
+    params.sink_tokens = 2;
+    params.tail_tokens = 2;
+
+    llama_hparams hparams = make_small_storage_hparams();
+    llama_kv_cache_kvarn cache(nullptr, hparams, params, false, 12, 4, 1, nullptr);
+
+    llama_ubatch ubatch = make_test_ubatch(5, 0);
+    ubatch.data->pos = { 0, 1, 2, 5, 6 };
+    ubatch.pos = ubatch.data->pos.data();
+
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ 8*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(init_params) };
+
+    ggml_tensor * causal_mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, cache.get_size(), ubatch.n_tokens);
+    ggml_tensor * noncausal_mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, cache.get_size(), ubatch.n_tokens);
+    ggml_tensor * causal_mask_f16 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, cache.get_size(), ubatch.n_tokens);
+
+    ggml_backend_buffer_ptr buf {
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type())
+    };
+    require(buf != nullptr, "KVarN KQ mask graph test buffer");
+
+    cache.set_input_kq_mask(causal_mask, &ubatch, true);
+    cache.set_input_kq_mask(noncausal_mask, &ubatch, false);
+    cache.set_input_kq_mask(causal_mask_f16, &ubatch, true);
+
+    const llama_pos expected_pos[] = { 0, 1, 2, 5, 6 };
+    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
+        const int64_t visible = std::min<int64_t>(cache.get_size(), int64_t(expected_pos[q]) + 1);
+        for (int64_t t = 0; t < int64_t(cache.get_size()); ++t) {
+            const bool keep = t < visible;
+            if (keep) {
+                require_mask_keep(read_kq_mask_value(causal_mask, t, q), "KVarN causal KQ mask keeps visible slot");
+                require_mask_keep(read_kq_mask_value(causal_mask_f16, t, q), "KVarN causal F16 KQ mask keeps visible slot");
+            } else {
+                require_mask_drop(read_kq_mask_value(causal_mask, t, q), "KVarN causal KQ mask drops future slot");
+                require_mask_drop(read_kq_mask_value(causal_mask_f16, t, q), "KVarN causal F16 KQ mask drops future slot");
+            }
+            require_mask_keep(read_kq_mask_value(noncausal_mask, t, q), "KVarN non-causal KQ mask keeps all slots");
+        }
+    }
+}
+
 static void test_runtime_body_record_graph_api() {
     llama_kvarn_params params = llama_kvarn_default_params();
     params.group_size = 4;
@@ -843,6 +909,7 @@ int main() {
     test_runtime_sink_tail_graph_api();
     test_runtime_body_plan_graph_api();
     test_runtime_body_plan_multi_record_seals();
+    test_runtime_kq_mask_graph_api();
     test_runtime_body_record_graph_api();
     test_kvarn_store_body_ggml_ops();
     test_kvarn_mixed_attention_ggml_op();

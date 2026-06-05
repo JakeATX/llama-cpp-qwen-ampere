@@ -154,6 +154,9 @@ Current implemented pieces:
 - Unit tests in `tests/test-kvarn-kv.cpp` and a standalone CUDA parity test in
   `tests/test-kvarn-cuda-dequant.cpp`, registered as
   `test-kvarn-cuda-scratch-ref`.
+  The runtime unit test covers layout/packing, cache sealing, graph-visible
+  sink/tail/body-plan/body-record inputs, and causal/non-causal KQ-mask graph
+  inputs for both F32 and F16 masks.
   The standalone CUDA test covers store/dequant, packed body attention,
   sink/body/tail mixed attention, pending tokens, batched F16 mixed attention,
   wrapped-tail decode order, multi-record scratch dequant, and packed
@@ -272,6 +275,8 @@ Verified local smoke:
   Focused CUDA and layout coverage also passed after tightening production
   support to 128- and 256-dimensional K/V heads only:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
+  Latest local result on 2026-06-05 passed after adding F32/F16 KQ-mask graph
+  input coverage to `test-kvarn-kv`.
 - 256-dim hybrid Qwen3.5 smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with KVarN allocated on full-attention layers
