@@ -49,8 +49,62 @@ function Invoke-ExpectFailure([string] $exe, [string[]] $argv, [hashtable] $envS
     Write-Host "${label}: PASS"
 }
 
+function Join-ProcessArgs([string[]] $argv) {
+    return ($argv | ForEach-Object {
+        if ($_ -match '[\s"]') {
+            '"' + ($_ -replace '"','\"') + '"'
+        } else {
+            $_
+        }
+    }) -join ' '
+}
+
+function Invoke-ExpectProcessFailure([string] $exe, [string[]] $argv, [hashtable] $envSet, [string] $pattern, [string] $label) {
+    $oldEnv = @{}
+    foreach ($key in $envSet.Keys) {
+        $oldEnv[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+        [Environment]::SetEnvironmentVariable($key, $envSet[$key], "Process")
+    }
+
+    $stdoutLog = Join-Path $env:TEMP ("kvarn-unsupported-{0}.out.log" -f ([guid]::NewGuid().ToString("N")))
+    $stderrLog = Join-Path $env:TEMP ("kvarn-unsupported-{0}.err.log" -f ([guid]::NewGuid().ToString("N")))
+
+    try {
+        $process = Start-Process `
+            -FilePath $exe `
+            -ArgumentList (Join-ProcessArgs $argv) `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
+            -PassThru `
+            -WindowStyle Hidden
+
+        if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "$label did not exit within timeout"
+        }
+
+        $out = Get-Content -Raw -LiteralPath $stdoutLog -ErrorAction SilentlyContinue
+        $err = Get-Content -Raw -LiteralPath $stderrLog -ErrorAction SilentlyContinue
+        $text = "$out`n$err"
+        if ($process.ExitCode -eq 0) {
+            throw "$label unexpectedly succeeded"
+        }
+        if ($text -notmatch $pattern) {
+            Write-Host $text
+            throw "$label did not report expected failure"
+        }
+        Write-Host "${label}: PASS"
+    } finally {
+        foreach ($key in $envSet.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $oldEnv[$key], "Process")
+        }
+        Remove-Item -LiteralPath $stdoutLog, $stderrLog -ErrorAction SilentlyContinue
+    }
+}
+
 $results = Get-ExePath $BuildDir "llama-results.exe"
 $cli = Get-ExePath $BuildDir "llama-cli.exe"
+$server = Get-ExePath $BuildDir "llama-server.exe"
 $tmpOut = Join-Path $env:TEMP "kvarn-unsupported-smoke.gguf"
 Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue
 
@@ -78,6 +132,22 @@ Invoke-ExpectFailure `
     @{ "LLAMA_KVARN_DEBUG_UBATCH" = "129" } `
     "KVarN debug ubatch override exceeds tail-ring safety limit" `
     "KVarN unsafe debug ubatch rejection"
+
+Invoke-ExpectProcessFailure `
+    $server `
+    @(
+        "-m", $SupportedModel,
+        "--host", "127.0.0.1",
+        "--port", "8139",
+        "--parallel", "2",
+        "-c", [string] $Context,
+        "-ngl", [string] $GpuLayers,
+        "--kv-cache-quant", "kvarn",
+        "--kvarn-preset", "kvarn_k4v2_g128"
+    ) `
+    @{} `
+    "KVarN currently supports only --parallel 1" `
+    "KVarN server multi-slot rejection"
 
 if ($UnsupportedDimModel -ne "") {
     $unsupportedArgs = @(

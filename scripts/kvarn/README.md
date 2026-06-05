@@ -396,8 +396,9 @@ Verified local smoke:
   Latest local result failed forced fused-batch initialization before graph
   execution with
   `KVarN forced fused-batch attention is disabled because multi-query correctness is not proven`
-  and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection plus Gemma
-  4 12B rejection with the expected unsupported K/V dimension guard.
+  and also verified unsafe `LLAMA_KVARN_DEBUG_UBATCH=129` rejection, server
+  `--parallel 2` rejection, plus Gemma 4 12B rejection with the expected
+  unsupported K/V dimension guard.
 - 256-dim Qwen3.6 runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses
