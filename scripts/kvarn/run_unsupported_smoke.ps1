@@ -104,7 +104,7 @@ function Invoke-ExpectProcessFailure([string] $exe, [string[]] $argv, [hashtable
 
 $results = Get-ExePath $BuildDir "llama-results.exe"
 $server = Get-ExePath $BuildDir "llama-server.exe"
-$tmpOut = Join-Path $env:TEMP "kvarn-unsupported-smoke.gguf"
+$tmpOut = Join-Path $env:TEMP ("kvarn-unsupported-smoke-{0}.gguf" -f ([guid]::NewGuid().ToString("N")))
 Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue
 
 $commonKvarn = @(
@@ -118,68 +118,70 @@ $commonKvarn = @(
     "--kvarn-preset", "kvarn_k4v2_g128"
 )
 
-Invoke-ExpectFailure `
-    $results `
-    $commonKvarn `
-    @{ "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1" } `
-    "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven" `
-    "KVarN forced fused-batch rejection"
-
-Invoke-ExpectFailure `
-    $results `
-    $commonKvarn `
-    @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "bogus" } `
-    "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=bogus" `
-    "KVarN invalid scratch-reference env rejection"
-
-Invoke-ExpectFailure `
-    $results `
-    $commonKvarn `
-    @{ "LLAMA_KVARN_DEBUG_UBATCH" = "129" } `
-    "KVarN debug ubatch override exceeds tail-ring safety limit" `
-    "KVarN unsafe debug ubatch rejection"
-
-Invoke-ExpectFailure `
-    $results `
-    $commonKvarn `
-    @{ "LLAMA_KVARN_DEBUG_UBATCH" = "0" } `
-    "KVarN debug ubatch override must be a positive integer" `
-    "KVarN invalid debug ubatch rejection"
-
-Invoke-ExpectProcessFailure `
-    $server `
-    @(
-        "-m", $SupportedModel,
-        "--host", "127.0.0.1",
-        "--port", "8139",
-        "--parallel", "2",
-        "-c", [string] $Context,
-        "-ngl", [string] $GpuLayers,
-        "--kv-cache-quant", "kvarn",
-        "--kvarn-preset", "kvarn_k4v2_g128"
-    ) `
-    @{} `
-    "KVarN currently supports only --parallel 1" `
-    "KVarN server multi-slot rejection"
-
-if ($UnsupportedDimModel -ne "") {
-    $unsupportedArgs = @(
-        "-m", $UnsupportedDimModel,
-        "-p", "Hello",
-        "-o", $tmpOut,
-        "-c", [string] $Context,
-        "-ngl", [string] $GpuLayers,
-        "-fa", "off",
-        "--kv-cache-quant", "kvarn",
-        "--kvarn-preset", "kvarn_k4v2_g128"
-    )
+try {
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1" } `
+        "KVarN forced fused-batch attention is disabled because multi-query correctness is not proven" `
+        "KVarN forced fused-batch rejection"
 
     Invoke-ExpectFailure `
         $results `
-        $unsupportedArgs `
-        @{} `
-        "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads|KVarN backend supports SWA/ISWA only for Gemma 4 models at this stage" `
-        "KVarN unsupported K/V dimension or non-Gemma SWA/ISWA rejection"
-}
+        $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=bogus" `
+        "KVarN invalid scratch-reference env rejection"
 
-Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_DEBUG_UBATCH" = "129" } `
+        "KVarN debug ubatch override exceeds tail-ring safety limit" `
+        "KVarN unsafe debug ubatch rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_DEBUG_UBATCH" = "0" } `
+        "KVarN debug ubatch override must be a positive integer" `
+        "KVarN invalid debug ubatch rejection"
+
+    Invoke-ExpectProcessFailure `
+        $server `
+        @(
+            "-m", $SupportedModel,
+            "--host", "127.0.0.1",
+            "--port", "8139",
+            "--parallel", "2",
+            "-c", [string] $Context,
+            "-ngl", [string] $GpuLayers,
+            "--kv-cache-quant", "kvarn",
+            "--kvarn-preset", "kvarn_k4v2_g128"
+        ) `
+        @{} `
+        "KVarN currently supports only --parallel 1" `
+        "KVarN server multi-slot rejection"
+
+    if ($UnsupportedDimModel -ne "") {
+        $unsupportedArgs = @(
+            "-m", $UnsupportedDimModel,
+            "-p", "Hello",
+            "-o", $tmpOut,
+            "-c", [string] $Context,
+            "-ngl", [string] $GpuLayers,
+            "-fa", "off",
+            "--kv-cache-quant", "kvarn",
+            "--kvarn-preset", "kvarn_k4v2_g128"
+        )
+
+        Invoke-ExpectFailure `
+            $results `
+            $unsupportedArgs `
+            @{} `
+            "KVarN backend currently supports only 128-, 256-, or 512-dimensional K/V heads|KVarN backend supports SWA/ISWA only for Gemma 4 models at this stage" `
+            "KVarN unsupported K/V dimension or non-Gemma SWA/ISWA rejection"
+    }
+} finally {
+    Remove-Item -LiteralPath $tmpOut -ErrorAction SilentlyContinue
+}
