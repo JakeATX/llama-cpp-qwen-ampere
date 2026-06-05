@@ -76,9 +76,11 @@ Current implemented pieces:
   reproduce the unsafe fused-batch path. Do not use this combination as a
   production mode until Qwen3.6 packed-repeat logits pass at the normal
   `llama-results` threshold.
-  KVarN diagnostic environment flags are parsed strictly: malformed values such
-  as `LLAMA_KVARN_ATTN_REF_SCRATCH=bogus` now fail with an explicit invalid
-  environment-flag error instead of being silently treated as disabled.
+  KVarN diagnostic environment flags are parsed strictly as boolean `0` or
+  `1`: malformed values such as `LLAMA_KVARN_ATTN_REF_SCRATCH=bogus` and
+  out-of-range values such as `LLAMA_KVARN_ATTN_REF_SCRATCH=2` now fail with an
+  explicit invalid environment-flag error instead of being silently treated as
+  disabled or enabled.
 - KVarN runtime memory/context skeleton with native slot metadata, sequence
   operations, memory estimates, and production-shaped per-layer/per-KV-head
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body

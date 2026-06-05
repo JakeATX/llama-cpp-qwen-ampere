@@ -21,7 +21,8 @@ static bool kvarn_env_flag(const char * name) {
     char * end = nullptr;
     errno = 0;
     const long value = std::strtol(env, &end, 10);
-    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            (value != 0 && value != 1)) {
         std::fprintf(stderr, "invalid KVarN CUDA environment flag %s=%s; expected integer 0 or 1\n", name, env);
         std::abort();
     }

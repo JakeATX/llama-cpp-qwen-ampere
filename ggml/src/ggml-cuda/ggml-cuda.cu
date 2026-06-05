@@ -102,7 +102,8 @@ static bool ggml_cuda_kvarn_attn_trace_enabled() {
     char * end = nullptr;
     errno = 0;
     const long value = std::strtol(env, &end, 10);
-    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            (value != 0 && value != 1)) {
         GGML_ABORT("invalid KVarN CUDA environment flag %s=%s; expected integer 0 or 1", "LLAMA_KVARN_ATTN_TRACE", env);
     }
     return value != 0;
@@ -117,7 +118,8 @@ static bool ggml_cuda_kvarn_env_flag(const char * name) {
     char * end = nullptr;
     errno = 0;
     const long value = std::strtol(env, &end, 10);
-    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE) {
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            (value != 0 && value != 1)) {
         GGML_ABORT("invalid KVarN CUDA environment flag %s=%s; expected integer 0 or 1", name, env);
     }
     return value != 0;

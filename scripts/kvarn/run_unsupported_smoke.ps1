@@ -137,6 +137,20 @@ try {
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "2" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=2" `
+        "KVarN out-of-range scratch-reference env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_SPLIT_KERNELS" = "2" } `
+        "invalid KVarN CUDA environment flag LLAMA_KVARN_ATTN_SPLIT_KERNELS=2" `
+        "KVarN out-of-range CUDA split-kernel env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
         @{ "LLAMA_KVARN_DEBUG_UBATCH" = "129" } `
         "KVarN debug ubatch override exceeds tail-ring safety limit" `
         "KVarN unsafe debug ubatch rejection"
