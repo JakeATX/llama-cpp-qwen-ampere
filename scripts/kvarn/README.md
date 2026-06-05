@@ -580,12 +580,17 @@ Verified local smoke:
   divergence from packed-vs-scratch divergence. The harness now rejects any
   successful `llama-results` invocation whose output lacks
   `llama_kv_cache_kvarn:` initialization logs, so logits NMSE passes cannot
-  hide a normal-KV fallback. Static CUDA rerun:
+  hide a normal-KV fallback. It also accepts `-MinKvarnLayerLogs` to require
+  the expected KVarN layer-routing count for a model family. Static CUDA rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 16 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off`.
   Latest local result logged `KVarN llama-results log check: PASS, KVarN layer
   lines = 56` for packed save, packed repeat, split-kernel check, and
   scratch-reference check; packed-repeat, packed-vs-split, and
   packed-vs-scratch all passed with `NMSE = 0.000E+000`.
+  Latest strict short rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 2 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off -MinKvarnLayerLogs 28`.
+  Packed save, packed repeat, split-kernel, and scratch-reference checks all
+  logged 56 KVarN layer lines and passed with `NMSE = 0.000E+000`.
 - 256-dim runtime packed-vs-scratch logits-distance comparison:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Batch 512`.
   Latest local result passed on the bounded prompt-batch path with
@@ -599,6 +604,11 @@ Verified local smoke:
   KVarN layer lines = 16` for packed save, packed repeat, and
   scratch-reference check, proving the KVarN+ISWA logits comparison used the
   KVarN full-attention layer storage rather than normal KV.
+  Latest strict short rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -CheckPackedRepeat -FlashAttn off -MinKvarnLayerLogs 8`.
+  Packed save, packed repeat, and scratch-reference checks all logged 16 KVarN
+  layer lines and passed with `NMSE = 0.000E+000`, exceeding the expected eight
+  Gemma full-attention KVarN layers.
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat`.
   Latest local 26B A4B result also passed with packed-repeat
   `NMSE = 0.000E+000` and packed-vs-scratch `NMSE = 0.000E+000`.

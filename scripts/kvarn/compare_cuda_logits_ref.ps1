@@ -11,6 +11,7 @@ param(
     [string] $OutputFile = (Join-Path $env:TEMP "kvarn-packed-logits.gguf"),
     [string] $PromptFile = (Join-Path $env:TEMP "kvarn-logits-prompt.txt"),
     [int] $DebugUbatch = 0,
+    [int] $MinKvarnLayerLogs = 1,
     [switch] $PackedFusedBatch,
     [switch] $PackedSerialFused,
     [switch] $PackedSplitKernels,
@@ -34,6 +35,9 @@ if ($Batch -lt 0) {
 }
 if ($DebugUbatch -lt 0) {
     throw "DebugUbatch must be non-negative"
+}
+if ($MinKvarnLayerLogs -lt 1) {
+    throw "MinKvarnLayerLogs must be positive"
 }
 if ($TraceLimit -lt 0) {
     throw "TraceLimit must be non-negative"
@@ -88,8 +92,8 @@ function Invoke-Results([string] $exe, [string[]] $argv, [hashtable] $envSet) {
         throw "llama-results succeeded but logs did not show KVarN cache initialization"
     }
     $kvarnLayerLogs = ([regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer")).Count
-    if ($kvarnLayerLogs -lt 1) {
-        throw "llama-results succeeded but did not show any KVarN layer allocation lines"
+    if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
+        throw "llama-results succeeded but showed only $kvarnLayerLogs KVarN layer allocation lines, expected at least $MinKvarnLayerLogs"
     }
     Write-Host ("KVarN llama-results log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
 
