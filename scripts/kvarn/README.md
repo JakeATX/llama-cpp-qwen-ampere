@@ -78,6 +78,10 @@ Current implemented pieces:
   a tail slot written earlier in the same graph. Qwen3.6 MoE bounded prompt
   batching is correct through the split multi-query CUDA path; the forced fused
   multi-query path is explicitly rejected because packed repeats still diverge.
+- The shared `llama_batch_allocr::split_equal()` path has regression coverage
+  ensuring it does not emit more sequence sets than its `n_ubatch` limit. This
+  protects KVarN's tail-ring prompt bound and the other memory backends that
+  rely on equal-sequence ubatches.
 - Hybrid recurrent/full-attention models can compose recurrent memory for SSM
   layers with KVarN storage for full-attention layers. This is used by local
   Qwen3.5/Qwen3.6-family validation instead of rejecting the whole model for
@@ -277,6 +281,9 @@ Verified local smoke:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
   Latest local result on 2026-06-05 passed after adding F32/F16 KQ-mask graph
   input coverage to `test-kvarn-kv`.
+- Shared batch-split and focused KVarN CUDA coverage passed after tightening
+  `split_equal()` sequence-set limits:
+  `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
 - 256-dim hybrid Qwen3.5 smoke:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-cli.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p "Hello" -n 1 -c 256 -ngl 99 --no-warmup --simple-io --single-turn -fa off --kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128`.
   Latest local result passed with KVarN allocated on full-attention layers
