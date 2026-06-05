@@ -305,7 +305,8 @@ Verified local smoke:
   for 256-dimensional heads (`16` query heads, `2` KV heads) and includes a
   sink-only causal, padded-mask case matching the smallest unsafe fused-batch
   model failure shape (`49` queries, `49` sink tokens, `1024`-byte mask row
-  stride).
+  stride). That sink-only fused-batch coverage now runs both F16 and F32 KQ
+  masks, matching `-fa on` and `-fa off` runtime graph mask storage.
 - Shared batch-split and focused KVarN CUDA coverage passed after tightening
   `split_equal()` sequence-set limits:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.
@@ -425,6 +426,9 @@ Verified local smoke:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24`.
   Latest local result passed with `NMSE = 0.000E+000`; this path now uses
   bounded MoE KVarN prompt ubatches through the split multi-query CUDA kernels.
+  The logits script also accepts `-FlashAttn on|off|auto`; with `-FlashAttn off`
+  the same Qwen3.6 split-kernel production path passed packed-repeat and
+  packed-vs-scratch checks at `NMSE = 0.000E+000`.
   The packed-repeat diagnostic
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf -BuildDir build-kvarn-cuda-nofa-vs -Context 384 -Batch 512 -Repeat 24 -DebugUbatch 128 -CheckPackedRepeat`
   also passed with packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
@@ -440,7 +444,9 @@ Verified local smoke:
   `NMSE = 1.269e-02`, and disabling CUDA graphs with
   `GGML_CUDA_DISABLE_GRAPHS=1` still failed a shorter repeat-4 fused-vs-scratch
   check at `NMSE = 1.556e-03`, so the remaining issue is not stale graph reuse
-  or CUDA graph capture.
+  or CUDA graph capture. Running the repeat-4 unsafe fused-vs-scratch check
+  with `-FlashAttn off` still failed at `NMSE = 8.676e-04`, so F16 KQ-mask
+  storage is not the root cause even though it affects the error magnitude.
   The same unsafe fused-batch path passed Qwen3.5 0.8B repeats 4 through 32
   after the scratch/probability write removal, with the worst observed
   `NMSE = 4.735e-07`, so Qwen3.6 remains the active reproducer.

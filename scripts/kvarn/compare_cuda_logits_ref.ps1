@@ -4,6 +4,7 @@ param(
     [int] $Context = 512,
     [int] $GpuLayers = 99,
     [int] $Batch = 0,
+    [ValidateSet("on", "off", "auto")] [string] $FlashAttn = "on",
     [double] $RtnQuantile = 0.95,
     [int] $Repeat = 32,
     [string] $PromptPhrase = "The quick brown fox studies attention kernels and cache layouts carefully. ",
@@ -102,7 +103,7 @@ $commonArgs = @(
     "-o", $OutputFile,
     "-c", [string] $Context,
     "-ngl", [string] $GpuLayers,
-    "-fa", "on",
+    "-fa", $FlashAttn,
     "--kv-cache-quant", "kvarn",
     "--kvarn-preset", "kvarn_k4v2_g128",
     "--kvarn-rtn-quantile", $rtnQuantileArg

@@ -1367,13 +1367,80 @@ static void run_case(uint32_t head_dim) {
             sink_only_split_err = std::max(sink_only_split_err, std::fabs(sink_only_ref[i] - sink_only_split[i]));
             sink_only_fused_err = std::max(sink_only_fused_err, std::fabs(sink_only_ref[i] - sink_only_fused[i]));
         }
-        require(sink_only_split_err < 1.0e-5f, "CUDA split sink-only causal attention matches CPU reference");
-        require(sink_only_fused_err < 1.0e-5f, "CUDA fused sink-only causal attention matches CPU reference");
+        require(sink_only_split_err < 1.0e-5f, "CUDA split sink-only causal attention matches CPU reference with F16 mask");
+        require(sink_only_fused_err < 1.0e-5f, "CUDA fused sink-only causal attention matches CPU reference with F16 mask");
+
+        std::vector<float> sink_only_mask_f32(size_t(n_sink_only_queries)*sink_only_mask_stride_tokens);
+        for (size_t i = 0; i < sink_only_mask_f32.size(); ++i) {
+            sink_only_mask_f32[i] = sink_only_mask_ref[i];
+        }
+        float * sink_only_mask_f32_d = cuda_upload(sink_only_mask_f32);
+
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_sink_only_d, k_sink_only_d, v_sink_only_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d, pending_k_mha_d, pending_v_mha_d,
+                sink_only_mask_f32_d,
+                sink_only_split_d, sink_only_scores_d,
+                n_sink_only_queries, n_head, n_head_kv,
+                n_sink_only, 0, 0, 0, 0, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(sink_only_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
+                scale,
+                nullptr);
+        require_cuda(cudaGetLastError(), "KVarN CUDA split sink-only F32 mask launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA split sink-only F32 mask sync");
+
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_sink_only_d, k_sink_only_d, v_sink_only_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d, pending_k_mha_d, pending_v_mha_d,
+                sink_only_mask_f32_d,
+                sink_only_fused_d, sink_only_fused_scores_d,
+                n_sink_only_queries, n_head, n_head_kv,
+                n_sink_only, 0, 0, 0, 0, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(sink_only_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA fused sink-only F32 mask launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA fused sink-only F32 mask sync");
+
+        require_cuda(cudaMemcpy(sink_only_split.data(), sink_only_split_d, sink_only_split.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy split sink-only F32 mask output");
+        require_cuda(cudaMemcpy(sink_only_fused.data(), sink_only_fused_d, sink_only_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy fused sink-only F32 mask output");
+
+        float sink_only_f32_mask_split_err = 0.0f;
+        float sink_only_f32_mask_fused_err = 0.0f;
+        for (size_t i = 0; i < sink_only_ref.size(); ++i) {
+            sink_only_f32_mask_split_err = std::max(sink_only_f32_mask_split_err, std::fabs(sink_only_ref[i] - sink_only_split[i]));
+            sink_only_f32_mask_fused_err = std::max(sink_only_f32_mask_fused_err, std::fabs(sink_only_ref[i] - sink_only_fused[i]));
+        }
+        require(sink_only_f32_mask_split_err < 1.0e-5f, "CUDA split sink-only causal attention matches CPU reference with F32 mask");
+        require(sink_only_f32_mask_fused_err < 1.0e-5f, "CUDA fused sink-only causal attention matches CPU reference with F32 mask");
 
         cudaFree(q_sink_only_d);
         cudaFree(k_sink_only_d);
         cudaFree(v_sink_only_d);
         cudaFree(sink_only_mask_d);
+        cudaFree(sink_only_mask_f32_d);
         cudaFree(sink_only_split_d);
         cudaFree(sink_only_fused_d);
         cudaFree(sink_only_scores_d);
