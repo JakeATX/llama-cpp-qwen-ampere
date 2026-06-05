@@ -333,6 +333,11 @@ Verified local smoke:
   `KVarN CLI log check: PASS, KVarN layer lines = 56`; the `-c 512` KVarN path
   allocated `2` body records per layer and reported an `8.64 MiB` metadata
   estimate.
+  Latest exact-layer Qwen2.5 static rerun:
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "256" -GpuLayers 99 -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27"`.
+  This passed with `KVarN expected layer check: PASS, layers =
+  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27`
+  and `KVarN CLI log check: PASS, KVarN layer lines = 56`.
   The script also accepts `-ExpectedKvarnLayers` to require exact routed layer
   IDs. Latest Gemma 4 12B exact-layer rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -CtxList "256" -RtnQuantile 0.95 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5,11,17,23,29,35,41,47"`.
@@ -405,6 +410,10 @@ Verified local smoke:
   Static CUDA focused rerun:
   `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail|test-arg-parser" --output-on-failure`.
   Latest local result on 2026-06-05 passed all four tests.
+  Latest static CUDA non-standalone rerun:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure`.
+  This passed `test-kvarn-kv`, `test-download-model`,
+  `test-kvarn-server-load-failure`, and `test-arg-parser`.
   `test-kvarn-kv` also now covers the lower-level cache constructor rejection
   for asymmetric K/V head dimensions, matching the model-load compatibility
   guard that rejects such models before runtime allocation.
