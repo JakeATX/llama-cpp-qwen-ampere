@@ -522,7 +522,14 @@ Verified local smoke:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_scratch_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs -RtnQuantile 0.95`.
   This runs the same deterministic long decode once with packed KVarN mixed
   attention and once with `LLAMA_KVARN_ATTN_REF_SCRATCH=1`, then asserts
-  identical generated text. Latest local result with fused packed attention:
+  identical generated text. The harness now rejects any successful completion
+  whose output lacks `llama_kv_cache_kvarn:` initialization logs, so
+  packed-vs-scratch parity cannot pass on a normal-KV fallback. Latest static
+  128-dim regression result with `-Predict 32 -Context 256`: both packed and
+  scratch-reference runs logged `KVarN completion log check: PASS, KVarN layer
+  lines = 56`; packed attention `167.28` eval tok/s and scratch-reference
+  attention `165.99` eval tok/s, both with `graphs reused = 31`.
+  Historical longer local result with fused packed attention:
   packed attention `78.98` eval tok/s, scratch-reference attention `78.13`
   eval tok/s, both with `graphs reused = 268`. Forcing the old split kernels
   with `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` also passed, with packed attention

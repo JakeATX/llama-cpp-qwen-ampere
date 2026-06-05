@@ -52,6 +52,14 @@ function Invoke-Completion([string] $exe, [string[]] $argv, [hashtable] $envSet)
     if ($exit -ne 0) {
         throw "llama-completion failed with exit code $exit`n$text"
     }
+    if ($text -notmatch "llama_kv_cache_kvarn:") {
+        throw "llama-completion succeeded but logs did not show KVarN cache initialization"
+    }
+    $kvarnLayerLogs = ([regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer")).Count
+    if ($kvarnLayerLogs -lt 1) {
+        throw "llama-completion succeeded but did not show any KVarN layer allocation lines"
+    }
+    Write-Host ("KVarN completion log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
 
     return $text
 }
