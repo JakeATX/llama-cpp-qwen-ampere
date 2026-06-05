@@ -1189,6 +1189,9 @@ private:
             } else if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
+            } else if (params_base.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+                SRV_WRN("%s", "KVarN state serialization is not implemented; disabling --cache-idle-slots\n");
+                params_base.cache_idle_slots = false;
             } else {
                 SRV_INF("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
                 SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
@@ -2234,6 +2237,10 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+                    if (params_base.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+                        send_error(task, "KVarN state serialization is not implemented yet", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
 
                     const size_t token_count = slot->prompt.tokens.size();
                     const int64_t t_start = ggml_time_us();
@@ -2270,6 +2277,10 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    if (params_base.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+                        send_error(task, "KVarN state deserialization is not implemented yet", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 

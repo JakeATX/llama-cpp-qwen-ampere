@@ -6,7 +6,8 @@ param(
     [int] $GpuLayers = 99,
     [double] $RtnQuantile = 0.95,
     [string] $Prompt = "Hello",
-    [int] $Predict = 1
+    [int] $Predict = 1,
+    [switch] $CheckSlotSaveRejection
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,11 +37,49 @@ function Join-ProcessArgs([string[]] $argv) {
     }) -join ' '
 }
 
+function Get-HttpErrorText([System.Management.Automation.ErrorRecord] $err) {
+    $parts = @()
+    if ($err.ErrorDetails -ne $null -and -not [string]::IsNullOrWhiteSpace($err.ErrorDetails.Message)) {
+        $parts += $err.ErrorDetails.Message
+    }
+
+    $response = $err.Exception.Response
+    if ($response -eq $null) {
+        $parts += $err.ToString()
+        return ($parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+    }
+
+    try {
+        $stream = $response.GetResponseStream()
+        if ($stream -eq $null) {
+            $parts += $err.ToString()
+            return ($parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+        }
+        $reader = [System.IO.StreamReader]::new($stream)
+        try {
+            $parts += $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } catch {
+        $parts += $err.ToString()
+    }
+
+    $parts += $err.ToString()
+    return ($parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+}
+
 $server = Get-ExePath $BuildDir "llama-server.exe"
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $stdoutLog = Join-Path $env:TEMP "kvarn-server-smoke.out.log"
 $stderrLog = Join-Path $env:TEMP "kvarn-server-smoke.err.log"
 Remove-Item -LiteralPath $stdoutLog, $stderrLog -ErrorAction SilentlyContinue
+
+$slotSaveDir = $null
+if ($CheckSlotSaveRejection) {
+    $slotSaveDir = Join-Path $env:TEMP ("kvarn-slot-save-{0}" -f ([guid]::NewGuid().ToString("N")))
+    New-Item -ItemType Directory -Path $slotSaveDir | Out-Null
+}
 
 $argv = @(
     "-m", $Model,
@@ -54,6 +93,9 @@ $argv = @(
     "--kvarn-preset", "kvarn_k4v2_g128",
     "--kvarn-rtn-quantile", $rtnQuantileArg
 )
+if ($CheckSlotSaveRejection) {
+    $argv += @("--slot-save-path", $slotSaveDir)
+}
 
 $process = Start-Process `
     -FilePath $server `
@@ -107,8 +149,38 @@ try {
     }
 
     Write-Host ("KVarN server smoke: PASS, content = '{0}'" -f $response.content)
+
+    if ($CheckSlotSaveRejection) {
+        $slotBody = @{
+            filename = "kvarn-slot.bin"
+        } | ConvertTo-Json -Compress
+
+        try {
+            [void] (Invoke-RestMethod `
+                -Uri "http://127.0.0.1:$Port/slots/0?action=save" `
+                -Method Post `
+                -Body $slotBody `
+                -ContentType "application/json" `
+                -TimeoutSec 60)
+            throw "KVarN slot save unexpectedly succeeded"
+        } catch {
+            $text = Get-HttpErrorText $_
+            if ($text -notmatch "KVarN state serialization is not implemented yet") {
+                $out = Get-Content -Raw -LiteralPath $stdoutLog -ErrorAction SilentlyContinue
+                $err = Get-Content -Raw -LiteralPath $stderrLog -ErrorAction SilentlyContinue
+                $text = "$text`n$out`n$err"
+            }
+            if ($text -notmatch "KVarN state serialization is not implemented yet") {
+                throw "KVarN slot save rejection did not report expected error: $text"
+            }
+            Write-Host "KVarN slot save rejection: PASS"
+        }
+    }
 } finally {
     if ($process -and -not $process.HasExited) {
         Stop-Process -Id $process.Id -Force
+    }
+    if ($slotSaveDir -ne $null) {
+        Remove-Item -LiteralPath $slotSaveDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

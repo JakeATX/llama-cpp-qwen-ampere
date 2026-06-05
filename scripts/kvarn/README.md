@@ -239,9 +239,15 @@ Verified local smoke:
   `/completion` with `{"prompt":"Hello","n_predict":1,"temperature":0}`
   returned `"."` and reported `graphs reused = 1`.
 - Reusable single-slot server smoke:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs`.
   This starts `llama-server` on localhost, waits for `/health`, posts one
-  deterministic `/completion` request, and always stops the child process.
+  deterministic `/completion` request, and always stops the child process. Add
+  `-CheckSlotSaveRejection` to start the server with a temporary
+  `--slot-save-path` and verify `/slots/0?action=save` rejects KVarN state
+  serialization cleanly instead of writing an empty state.
+  The static server build is used on this Windows machine because Smart App
+  Control blocks the unsigned shared `llama-server-impl.dll` from
+  `build-kvarn-cuda-nofa-vs` with Code Integrity error `4551`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
 - Larger context allocation/decode smoke:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_cuda_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs -CtxList "512 1024 2048" -RtnQuantile 0.95`.
@@ -413,11 +419,12 @@ Verified local smoke:
   forced fused-batch divergence (`NMSE` around `1e-2` to `2.5e-2`), so the
   runtime now rejects `LLAMA_KVARN_ATTN_FUSED_BATCH=1` explicitly.
 - Server smoke passed:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-nofa-vs`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -BuildDir build-kvarn-cuda-static-vs`.
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
 - 256-dim server smoke passed:
-  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-nofa-vs -Port 8135`.
-  Latest local result: `KVarN server smoke: PASS, content = ','`.
+  `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8135 -CheckSlotSaveRejection`.
+  Latest local result: `KVarN server smoke: PASS, content = ','` and
+  `KVarN slot save rejection: PASS`.
 - Long-context smoke observed with `llama-cli` at `-c 4096`, `-n 768`,
   `--kv-cache-quant kvarn`, and `--kvarn-rtn-quantile 0.95`. The run
   allocated `30` KVarN body records per layer and reported generation
