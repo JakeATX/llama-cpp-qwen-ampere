@@ -300,6 +300,11 @@ Verified local smoke:
   at process launch by Windows Application Control, matching the same local
   policy limitation seen with unsigned shared server binaries. This was an
   environment launch failure, not a CUDA assertion failure.
+  The CUDA scratch-reference test now stresses the Qwen3.6 attention topology
+  for 256-dimensional heads (`16` query heads, `2` KV heads) and includes a
+  sink-only causal, padded-mask case matching the smallest unsafe fused-batch
+  model failure shape (`49` queries, `49` sink tokens, `1024`-byte mask row
+  stride).
 - Shared batch-split and focused KVarN CUDA coverage passed after tightening
   `split_equal()` sequence-set limits:
   `ctest --test-dir build-kvarn-cuda-nofa-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda" --output-on-failure`.

@@ -968,7 +968,7 @@ static void run_case(uint32_t head_dim) {
     require(mixed_scratch_probs_max_err < 1.0e-6f, "CUDA packed mixed probabilities match scratch-dequant probabilities");
 
     const uint32_t n_head_kv = 2;
-    const uint32_t n_head = 4;
+    const uint32_t n_head = head_dim == 256 ? 16 : 4;
     const uint32_t n_pending_mha = 3;
     std::vector<float> q_mha(size_t(n_queries)*n_head*head_dim);
     for (uint32_t iq = 0; iq < n_queries; ++iq) {
@@ -1216,6 +1216,169 @@ static void run_case(uint32_t head_dim) {
         mha_mixed_fused_max_err = std::max(mha_mixed_fused_max_err, std::fabs(mha_mixed_out_ref[i] - mha_mixed_fused_out_gpu[i]));
     }
     require(mha_mixed_fused_max_err < 1.0e-5f, "CUDA forced fused batched F16 sink/body/tail mixed attention matches CPU reference");
+
+    if (head_dim == 256) {
+        const uint32_t n_sink_only_queries = 49;
+        const uint32_t n_sink_only = 49;
+        const uint32_t sink_only_mask_stride_tokens = 512;
+        std::vector<float> q_sink_only(size_t(n_sink_only_queries)*n_head*head_dim);
+        std::vector<float> k_sink_only(size_t(n_sink_only)*n_head_kv*head_dim);
+        std::vector<float> v_sink_only(size_t(n_sink_only)*n_head_kv*head_dim);
+        for (uint32_t iq = 0; iq < n_sink_only_queries; ++iq) {
+            for (uint32_t ih = 0; ih < n_head; ++ih) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    q_sink_only[(size_t(iq)*n_head + ih)*head_dim + d] =
+                        0.018f*std::sin(float(d + 3*ih + 7*iq)*0.019f) -
+                        0.011f*std::cos(float(5*d + ih + 11*iq)*0.013f);
+                }
+            }
+        }
+        for (uint32_t t = 0; t < n_sink_only; ++t) {
+            for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t off = (size_t(t)*n_head_kv + ikh)*head_dim + d;
+                    k_sink_only[off] = 0.012f*std::sin(float(d + 13*t + 5*ikh)*0.021f);
+                    v_sink_only[off] = 0.014f*std::cos(float(3*d + 17*t + 7*ikh)*0.017f);
+                }
+            }
+        }
+
+        std::vector<uint16_t> k_sink_only_f16(k_sink_only.size());
+        std::vector<uint16_t> v_sink_only_f16(v_sink_only.size());
+        for (size_t i = 0; i < k_sink_only.size(); ++i) {
+            k_sink_only_f16[i] = f32_to_f16_bits(k_sink_only[i]);
+            v_sink_only_f16[i] = f32_to_f16_bits(v_sink_only[i]);
+            k_sink_only[i] = f16_bits_to_f32(k_sink_only_f16[i]);
+            v_sink_only[i] = f16_bits_to_f32(v_sink_only_f16[i]);
+        }
+
+        std::vector<uint16_t> sink_only_mask(size_t(n_sink_only_queries)*sink_only_mask_stride_tokens, f32_to_f16_bits(-1.0e30f));
+        std::vector<float> sink_only_mask_ref(size_t(n_sink_only_queries)*sink_only_mask_stride_tokens);
+        for (uint32_t iq = 0; iq < n_sink_only_queries; ++iq) {
+            for (uint32_t t = 0; t < sink_only_mask_stride_tokens; ++t) {
+                const float bias = t <= iq ? 0.0f : -1.0e30f;
+                const size_t off = size_t(iq)*sink_only_mask_stride_tokens + t;
+                sink_only_mask[off] = f32_to_f16_bits(bias);
+                sink_only_mask_ref[off] = f16_bits_to_f32(sink_only_mask[off]);
+            }
+        }
+
+        float * q_sink_only_d = cuda_upload(q_sink_only);
+        uint16_t * k_sink_only_d = cuda_upload(k_sink_only_f16);
+        uint16_t * v_sink_only_d = cuda_upload(v_sink_only_f16);
+        uint16_t * sink_only_mask_d = cuda_upload(sink_only_mask);
+        float * sink_only_split_d = nullptr;
+        float * sink_only_fused_d = nullptr;
+        float * sink_only_scores_d = nullptr;
+        float * sink_only_fused_scores_d = nullptr;
+        require_cuda(cudaMalloc(&sink_only_split_d, q_sink_only.size()*sizeof(float)), "cudaMalloc sink-only split output");
+        require_cuda(cudaMalloc(&sink_only_fused_d, q_sink_only.size()*sizeof(float)), "cudaMalloc sink-only fused output");
+        require_cuda(cudaMalloc(&sink_only_scores_d, n_sink_only*sizeof(float)), "cudaMalloc sink-only scores");
+        require_cuda(cudaMalloc(&sink_only_fused_scores_d, n_sink_only*sizeof(float)), "cudaMalloc sink-only fused scores");
+
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_sink_only_d, k_sink_only_d, v_sink_only_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d, pending_k_mha_d, pending_v_mha_d,
+                sink_only_mask_d,
+                sink_only_split_d, sink_only_scores_d,
+                n_sink_only_queries, n_head, n_head_kv,
+                n_sink_only, 0, 0, 0, 0, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(sink_only_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        require_cuda(cudaGetLastError(), "KVarN CUDA split sink-only launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA split sink-only sync");
+
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_sink_only_d, k_sink_only_d, v_sink_only_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d, pending_k_mha_d, pending_v_mha_d,
+                sink_only_mask_d,
+                sink_only_fused_d, sink_only_fused_scores_d,
+                n_sink_only_queries, n_head, n_head_kv,
+                n_sink_only, 0, 0, 0, 0, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(sink_only_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA fused sink-only launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA fused sink-only sync");
+
+        std::vector<float> sink_only_split(q_sink_only.size());
+        std::vector<float> sink_only_fused(q_sink_only.size());
+        require_cuda(cudaMemcpy(sink_only_split.data(), sink_only_split_d, sink_only_split.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy split sink-only output");
+        require_cuda(cudaMemcpy(sink_only_fused.data(), sink_only_fused_d, sink_only_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy fused sink-only output");
+
+        std::vector<float> sink_only_ref(q_sink_only.size(), 0.0f);
+        for (uint32_t iq = 0; iq < n_sink_only_queries; ++iq) {
+            for (uint32_t ih = 0; ih < n_head; ++ih) {
+                const uint32_t ikh = ih/(n_head/n_head_kv);
+                const float * q_row = q_sink_only.data() + (size_t(iq)*n_head + ih)*head_dim;
+                std::vector<float> row_scores(n_sink_only, 0.0f);
+                for (uint32_t t = 0; t < n_sink_only; ++t) {
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        row_scores[t] += q_row[d]*k_sink_only[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                    }
+                    row_scores[t] = row_scores[t]*scale + sink_only_mask_ref[size_t(iq)*sink_only_mask_stride_tokens + t];
+                }
+                float row_max = row_scores[0];
+                for (float s : row_scores) {
+                    row_max = std::max(row_max, s);
+                }
+                std::vector<float> row_probs(n_sink_only);
+                float row_denom = 0.0f;
+                for (uint32_t t = 0; t < n_sink_only; ++t) {
+                    row_probs[t] = std::exp(row_scores[t] - row_max);
+                    row_denom += row_probs[t];
+                }
+                float * out_row = sink_only_ref.data() + (size_t(iq)*n_head + ih)*head_dim;
+                for (uint32_t t = 0; t < n_sink_only; ++t) {
+                    const float p = row_probs[t]/row_denom;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        out_row[d] += p*v_sink_only[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                    }
+                }
+            }
+        }
+
+        float sink_only_split_err = 0.0f;
+        float sink_only_fused_err = 0.0f;
+        for (size_t i = 0; i < sink_only_ref.size(); ++i) {
+            sink_only_split_err = std::max(sink_only_split_err, std::fabs(sink_only_ref[i] - sink_only_split[i]));
+            sink_only_fused_err = std::max(sink_only_fused_err, std::fabs(sink_only_ref[i] - sink_only_fused[i]));
+        }
+        require(sink_only_split_err < 1.0e-5f, "CUDA split sink-only causal attention matches CPU reference");
+        require(sink_only_fused_err < 1.0e-5f, "CUDA fused sink-only causal attention matches CPU reference");
+
+        cudaFree(q_sink_only_d);
+        cudaFree(k_sink_only_d);
+        cudaFree(v_sink_only_d);
+        cudaFree(sink_only_mask_d);
+        cudaFree(sink_only_split_d);
+        cudaFree(sink_only_fused_d);
+        cudaFree(sink_only_scores_d);
+        cudaFree(sink_only_fused_scores_d);
+    }
 
     cudaFree(k_body_d);
     cudaFree(v_body_d);
