@@ -39,11 +39,12 @@ Current implemented pieces:
   primitive, with explicit query/output/probability strides.
 - CUDA mixed sink/body/tail attention primitive that attends over FP16
   sink/tail tokens and packed KVarN body records in one stable softmax.
-- The runtime packed mixed-attention path now uses the multi-block fused-batch
-  CUDA kernel by default for both one-query decode and multi-query prompt
-  batches. Set `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` or
-  `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for A/B debugging against the per-row
-  serial fused or split score/AV variants.
+- The runtime packed mixed-attention path uses the multi-block fused-batch CUDA
+  kernel by default for validated 128/256-dimensional heads. The 512-dimensional
+  Gemma path defaults to the split score/AV kernels after the fused and serial
+  variants showed Gemma 4 12B scratch-reference drift. Set
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1`, `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, or
+  `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for explicit A/B diagnostics.
 - CUDA F32 scratch mixed-attention primitive that consumes dequantized body
   scratch tensors and is used as a device-side reference for the packed mixed
   attention primitive.
@@ -670,6 +671,20 @@ Verified local smoke:
   Packed save, packed repeat, and scratch-reference checks all logged 16 KVarN
   layer lines, passed the exact full-attention layer-ID check for
   `5,11,17,23,29,35,41,47`, and passed with `NMSE = 0.000E+000`.
+  After promoting 256-dimensional fused-batch attention, the same Gemma 4 12B
+  `-Context 384 -Batch 512 -Repeat 4 -CheckPackedRepeat -CheckPackedSplit`
+  validation exposed 512-dimensional drift when fused-batch was used by default
+  (`NMSE = 2.261e-04`) and when serial fused was forced against the scratch
+  reference (`NMSE = 1.506e-04`). The dispatcher now defaults
+  `head_dim >= 512` to split score/AV kernels unless fused or serial is
+  explicitly forced for diagnostics. Rebuilt static rerun:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
+  Latest local result passed packed-repeat, packed-vs-split, and
+  packed-vs-scratch at `NMSE = 0.000E+000`. A traced short rerun reported
+  `KVarN CUDA mixed-attn trace: mode=split-512-default`, confirming the default
+  512 path uses the validated split kernels. Rebuilt Gemma 4 12B server smoke
+  also passed with exact KVarN full-attention layers `5,11,17,23,29,35,41,47`
+  and 16 KVarN layer log lines.
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat`.
   Latest local 26B A4B result also passed with packed-repeat
   `NMSE = 0.000E+000` and packed-vs-scratch `NMSE = 0.000E+000`.
@@ -806,10 +821,11 @@ Required integration path:
 1. Finish optimization of KVarN prompt batches. `GGML_OP_KVARN_ATTN_MIXED`
    carries an optional KQ/causal mask in `src[10]`, and runtime preparation now
    admits bounded prompt ubatches for dense, hybrid, and MoE models.
-   Correctness is currently maintained by using the per-row serial fused CUDA
-   kernel for `n_queries > 1`; the faster multi-block fused packed-attention
-   path is disabled with an explicit unsupported-mode error until it can replace
-   the serial fused path for all prompt batches.
+   The 128/256-dimensional prompt path now uses the faster multi-block fused
+   CUDA score/softmax/AV kernel by default and is guarded by Qwen3.6
+   packed-repeat, split-kernel, and scratch-reference logits checks. The
+   512-dimensional Gemma path defaults to split score/AV kernels until fused or
+   serial fused 512 attention passes the same scratch-reference logits guard.
 2. Finish prompt-batch sealing semantics. The graph builder now collects all
    seal records in an ubatch and emits store ops for each record, and the body
    plan has multi-record seal coverage. Bounded production prompt ubatches now
@@ -829,9 +845,11 @@ Required integration path:
   across several body records. Batched multi-query and mixed sink/body/tail
   variants are also present and parity-tested. The runtime packed
   mixed-attention path now has a batched fused score/softmax/AV CUDA kernel
-  that is the default runtime path and passes the Qwen3.6 model-level
-  packed-repeat, split-kernel, and scratch-reference logits guards. The mixed
-  op is still a custom attention op rather than a flash-attention load-path
+  that is the default runtime path for validated 128/256-dimensional heads and
+  passes the Qwen3.6 model-level packed-repeat, split-kernel, and
+  scratch-reference logits guards. The 512-dimensional Gemma runtime defaults
+  to split score/AV kernels pending a fused 512 logits fix. The mixed op is
+  still a custom attention op rather than a flash-attention load-path
   integration. Until that integration exists, KVarN must not pretend that
   llama.cpp Flash Attention is required or used.
 5. Compare fused output against the reference scratch path with fixed seeds
