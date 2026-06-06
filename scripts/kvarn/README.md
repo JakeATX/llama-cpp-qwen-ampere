@@ -608,7 +608,10 @@ Verified local smoke:
   KVarN `14.99` tok/s (`94.6%` of normal); `pp128` normal KV `88.43` tok/s,
   KVarN `10.25` tok/s (`11.6%` of normal). Short decode is close to normal KV
   on the large 256 target, while prompt processing remains the current
-  production-performance bottleneck.
+  production-performance bottleneck. A follow-up `pp128` mode check on the same
+  build showed default fused-batch `10.22` tok/s, split kernels `9.73` tok/s,
+  and serial fused `9.83` tok/s, so the prompt bottleneck is common to the
+  current custom KVarN attention paths rather than a bad runtime mode default.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
