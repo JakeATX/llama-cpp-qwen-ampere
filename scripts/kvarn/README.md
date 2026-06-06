@@ -1049,10 +1049,14 @@ Verified local smoke:
   `NMSE = 0.000E+000`.
 - Fresh Qwen3.6 35B A3B MTP benchmark after rebuilding `llama-bench` and after
   the parallel body-store change:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp128:128:0,pp512:512:0,tg64:0:64" -KvCacheQuant "none,kvarn" -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4" -OutputDir artifacts\kvarn-bench\qwen36-256-parallel-store-matrix`.
-  Latest local result: `pp128` normal KV `88.39` tok/s, KVarN `109.34` tok/s
-  (`123.7%`); `pp512` normal KV `125.06` tok/s, KVarN `91.42` tok/s
-  (`73.1%`); `tg64` normal KV `9.97` tok/s, KVarN `10.20` tok/s (`102.3%`).
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp128:128:0,pp512:512:0,tg64:0:64" -KvCacheQuant "none,kvarn" -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4" -OutputDir artifacts\kvarn-bench\qwen36-256-parallel-store-matrix-f2da449d6`.
+  Latest local result on build `f2da449d6`: `pp128` normal KV `98.75` tok/s,
+  KVarN `108.19` tok/s (`109.6%`); `pp512` normal KV `123.11` tok/s, KVarN
+  `92.53` tok/s (`75.2%`); `tg64` normal KV `9.97` tok/s, KVarN `10.17`
+  tok/s (`102.0%`). Forced split attention after the same body-store change
+  measured KVarN `pp512 = 43.78` tok/s in
+  `artifacts\kvarn-bench\qwen36-256-parallel-store-forced-split-pp512`, so the
+  fused-batch default remains the correct production route.
   Before this store-kernel change, the rebuilt fused-batch default measured
   `pp512` KVarN `32.54` tok/s (`26.1%` of normal KV) in
   `artifacts\kvarn-bench\qwen36-256-default-fused-prod-matrix-bef5ab9f4`.
