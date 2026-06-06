@@ -621,7 +621,12 @@ Verified local smoke:
   KVarN with `NMSE=2.289e-03`, and the active-window plus contiguous mask-slice
   variant still failed with `NMSE=1.883e-03`. The next performance pass needs a
   real prompt attention design, not a scalar-dot micro-optimization or naive MHA
-  graph substitution.
+  graph substitution. A follow-up sink-only row-batched fused kernel preserved
+  the existing serial dot-product and softmax order and passed Qwen3.5 and
+  Qwen3.6 packed-vs-split/scratch logits at `NMSE=0.000E+000`, but the Qwen3.6
+  35B A3B MTP `pp128` benchmark remained flat at `10.24` tok/s (`12.3%` of
+  normal KV in `artifacts\kvarn-bench\qwen36-35b-256-sink-rows-batch`), so the
+  source change was reverted.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
