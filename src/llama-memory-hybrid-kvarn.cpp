@@ -10,22 +10,6 @@
 #include <cstdlib>
 #include <limits>
 
-static bool kvarn_batch_within_no_body_window(const llama_batch_allocr & balloc, uint32_t n_sink_tail_tokens) {
-    const llama_batch & batch = balloc.get_batch();
-    if (batch.pos == nullptr) {
-        return false;
-    }
-
-    for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        const llama_pos pos = batch.pos[i];
-        if (pos < 0 || uint32_t(pos) >= n_sink_tail_tokens) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_override) {
     invalid_debug_override = false;
     const char * env = std::getenv("LLAMA_KVARN_DEBUG_UBATCH");
@@ -42,6 +26,62 @@ static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_
     }
 
     return std::max<uint32_t>(1, default_limit);
+}
+
+static uint32_t kvarn_moe_safe_ubatch_limit(
+        const llama_batch_allocr & balloc,
+        uint32_t default_limit,
+        uint32_t n_sink_tokens,
+        uint32_t n_tail_tokens,
+        uint32_t group_size) {
+    const llama_batch & batch = balloc.get_batch();
+    const uint32_t i0 = balloc.get_n_used();
+    if (default_limit == 0 || i0 >= uint32_t(batch.n_tokens)) {
+        return 0;
+    }
+    if (batch.pos == nullptr || group_size == 0) {
+        return 1;
+    }
+
+    const uint32_t n_sink_tail_tokens = n_sink_tokens + n_tail_tokens;
+    const llama_pos first_pos = batch.pos[i0];
+    if (first_pos < 0) {
+        return 1;
+    }
+
+    const bool starts_in_no_body = uint32_t(first_pos) < n_sink_tail_tokens;
+    uint32_t n_safe = 0;
+    llama_pos expected_pos = first_pos;
+
+    for (uint32_t i = i0; i < uint32_t(batch.n_tokens) && n_safe < default_limit; ++i) {
+        const llama_pos pos = batch.pos[i];
+        if (pos < 0 || pos != expected_pos) {
+            break;
+        }
+
+        const uint32_t upos = uint32_t(pos);
+        if (starts_in_no_body) {
+            if (upos >= n_sink_tail_tokens) {
+                break;
+            }
+        } else {
+            if (upos < n_sink_tail_tokens) {
+                break;
+            }
+
+            const uint32_t evicted_pos = upos - n_tail_tokens;
+            const uint32_t body_pos = evicted_pos - n_sink_tokens;
+            const uint32_t offset = body_pos%group_size;
+            if (offset + 1 == group_size) {
+                return n_safe == 0 ? 1 : n_safe;
+            }
+        }
+
+        ++n_safe;
+        ++expected_pos;
+    }
+
+    return std::max<uint32_t>(1, n_safe);
 }
 
 llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
@@ -95,24 +135,24 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
     bool invalid_debug_ubatch = false;
     const uint32_t n_sink_tokens = mem_attn->get_sink_tokens();
     const uint32_t n_tail_tokens = mem_attn->get_tail_tokens();
-    const uint32_t n_sink_tail_tokens = n_sink_tokens + n_tail_tokens;
-    const bool no_body_batch = kvarn_batch_within_no_body_window(balloc, n_sink_tail_tokens);
+    const uint32_t n_group_tokens = mem_attn->get_group_size();
     const uint32_t default_kvarn_ubatch = std::min<uint32_t>(n_ubatch, n_tail_tokens);
-    const uint32_t n_kvarn_ubatch =
-        hparams.n_expert > 0 && !no_body_batch ?
-            1 : kvarn_ubatch_limit(default_kvarn_ubatch, invalid_debug_ubatch);
+    const uint32_t max_kvarn_ubatch = kvarn_ubatch_limit(default_kvarn_ubatch, invalid_debug_ubatch);
     if (invalid_debug_ubatch) {
         LLAMA_LOG_ERROR("%s: KVarN debug ubatch override must be a positive integer: LLAMA_KVARN_DEBUG_UBATCH=%s\n",
                 __func__, std::getenv("LLAMA_KVARN_DEBUG_UBATCH"));
         return std::make_unique<llama_memory_hybrid_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
-    if (n_kvarn_ubatch > n_tail_tokens) {
+    if (max_kvarn_ubatch > n_tail_tokens) {
         LLAMA_LOG_ERROR("%s: KVarN debug ubatch override exceeds tail-ring safety limit: %u > %u\n",
-                __func__, n_kvarn_ubatch, n_tail_tokens);
+                __func__, max_kvarn_ubatch, n_tail_tokens);
         return std::make_unique<llama_memory_hybrid_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
     while (true) {
+        const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 ?
+            kvarn_moe_safe_ubatch_limit(balloc, max_kvarn_ubatch, n_sink_tokens, n_tail_tokens, n_group_tokens) :
+            max_kvarn_ubatch;
         auto ubatch = balloc.split_equal(n_kvarn_ubatch, true);
         if (ubatch.n_tokens == 0) {
             break;

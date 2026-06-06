@@ -934,27 +934,29 @@ Verified local smoke:
   inspection. `LLAMA_KVARN_ATTN_TRACE=1` with
   `LLAMA_KVARN_ATTN_TRACE_LIMIT=N` traces both the graph update and CUDA backend
   dispatch for `GGML_OP_KVARN_ATTN_MIXED`.
-  Active-body MoE multi-token prompt batching remains blocked. Removing the
-  MoE singleton guard entirely made Qwen3.6 `-Context 512 -Batch 512 -Repeat
-  24` fail packed-vs-split at `NMSE = 1.546e-02`; forcing split kernels for the
-  same multi-token active-body shape still failed packed-vs-scratch at
-  `NMSE = 1.034e-02`. The committed policy therefore keeps Qwen3.6 MoE
-  singleton ubatches once the batch length exceeds the tail-ring span. Latest
-  active-body-record logits rerun with that policy:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 24 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4"`.
+  Active-body MoE prompt batching now allows only seal-safe chunks. For Qwen3.6
+  the hybrid splitter batches the non-sealing body-pending spans, keeps the
+  body-record seal token as a singleton graph, and preserves the tail-ring cap
+  as a hard maximum. This avoids the previous unsafe tail-span active-body
+  experiment, where packed fused and split agreed but scratch-reference failed
+  at `NMSE = 1.952e-04`.
+  Multi-query active-body windows that include both packed body records and
+  pending-body tokens now default to split score/AV kernels; forcing the fused
+  batch kernel for that shape failed packed-vs-split at `NMSE = 2.019e-05`.
+  The validated active-body logits command is:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 8 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4"`.
   Packed save, split-kernel check, and scratch-reference check all passed exact
   Qwen3.6 layer routing, body-record capacity `2`, and
   `NMSE = 0.000E+000`.
-  Current committed-policy active-body `-Repeat 8` rerun also passed exact
-  routing, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`. The
-  remaining performance gap is severe: `pp512` benchmark artifact
-  `artifacts\kvarn-bench\qwen36-256-active-body-current-committed` measured
-  normal KV `123.25` tok/s and KVarN `8.39` tok/s (`6.8%`) with two body
-  records per KVarN layer. A current-build experiment that allowed tail-span
-  active-body MoE ubatches made packed fused and split agree, but failed the
-  scratch-reference comparison at `NMSE = 1.952e-04`; this narrows the blocker
-  to multi-token active-body graph/storage/reference semantics rather than the
-  fused attention dispatcher alone.
+  The active-body `pp512` benchmark artifact
+  `artifacts\kvarn-bench\qwen36-256-active-body-safe-pending-split` measured
+  normal KV `129.34` tok/s and KVarN `28.30` tok/s (`21.9%`) with two body
+  records per KVarN layer. This is a 3.4x improvement over the prior committed
+  singleton active-body artifact
+  `artifacts\kvarn-bench\qwen36-256-active-body-current-committed`, which
+  measured KVarN at `8.39` tok/s (`6.8%`), but active-body remains below
+  production performance targets until the fused pending-body multi-query path
+  is fixed.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current
   default-fused model-level logits guard is now the acceptance criterion.
@@ -993,12 +995,12 @@ Verified local smoke:
   batch larger than `tail_tokens`, even when all positions were still inside the
   no-body `sink + tail` window. A too-aggressive full-window diagnostic
   (`pp255`/`pp256` as one `sink + tail` graph) failed decode, so the committed
-  fix only keeps MoE no-body prompts on the validated tail-span chunk size and
-  keeps active-body MoE singleton. Current matrix:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp64:64:0,tg64:0:64,pp256:256:0" -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4" -OutputDir artifacts\kvarn-bench\qwen36-256-tailspan-nobody-matrix`.
-  Latest result: `pp64` normal KV `77.01` tok/s, KVarN `97.40` tok/s
-  (`126.5%`); `tg64` normal KV `9.89` tok/s, KVarN `10.12` tok/s (`102.3%`);
-  `pp256` normal KV `118.66` tok/s, KVarN `111.69` tok/s (`94.1%`), with exact
+  fix keeps MoE no-body prompts on the validated tail-span chunk size. Current
+  no-body matrix:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp64:64:0,tg64:0:64,pp256:256:0" -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4" -OutputDir artifacts\kvarn-bench\qwen36-256-safe-pending-split-nobody-matrix`.
+  Latest result: `pp64` normal KV `80.11` tok/s, KVarN `98.07` tok/s
+  (`122.4%`); `tg64` normal KV `9.84` tok/s, KVarN `10.07` tok/s (`102.3%`);
+  `pp256` normal KV `119.68` tok/s, KVarN `112.63` tok/s (`94.1%`), with exact
   KVarN layers `3,7,11,15,19,23,27,31,35,39` and no body records. Matching
   logits gate:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"` passed fused-batch mode, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
@@ -1086,15 +1088,17 @@ Required integration path:
    carries an optional KQ/causal mask in `src[10]`, and runtime preparation now
    admits bounded prompt ubatches for dense and non-MoE hybrid models.
    MoE hybrid models use tail-span bounded ubatches while all tokens remain
-   inside the sink/tail no-body window; active-body MoE prompt chunks still use
-   singleton ubatches because Qwen3.6 multi-token active-body batching failed
-   the model-level scratch-reference logits guard.
+   inside the sink/tail no-body window. Active-body MoE prompt chunks now batch
+   only non-sealing pending-body spans and keep body-record seal tokens
+   singleton, which passes the Qwen3.6 model-level split-kernel and
+   scratch-reference logits guards.
    The 128/256-dimensional prompt path now uses the faster multi-block fused
-   CUDA score/softmax/AV kernel by default for validated no-body windows and is
-   guarded by Qwen3.6 split-kernel and scratch-reference logits checks. The
-   512-dimensional Gemma path defaults to split score/AV kernels for active
-   body records until fused 512 attention has broader coverage and benchmark
-   evidence.
+   CUDA score/softmax/AV kernel by default for validated no-body windows.
+   Multi-query active-body windows with both packed body records and pending
+   body tokens default to split score/AV kernels until the fused pending-body
+   path is fixed. The 512-dimensional Gemma path defaults to split score/AV
+   kernels for active body records until fused 512 attention has broader
+   coverage and benchmark evidence.
 2. Finish prompt-batch sealing semantics. The graph builder now collects all
    seal records in an ubatch and emits store ops for each record, and the body
    plan has multi-record seal coverage. Bounded production prompt ubatches now
@@ -1116,8 +1120,10 @@ Required integration path:
   mixed-attention path now has a batched fused score/softmax/AV CUDA kernel
   that is the default runtime path for validated 128/256-dimensional heads and
   passes the Qwen3.6 model-level packed-repeat, split-kernel, and
-  scratch-reference logits guards. The 512-dimensional Gemma runtime defaults
-  to split score/AV kernels pending a fused 512 logits fix. The mixed op is
+  scratch-reference logits guards for no-body windows. Active-body pending
+  windows with multiple queries currently default to split score/AV kernels
+  after a fused-batch mismatch was isolated. The 512-dimensional Gemma runtime
+  defaults to split score/AV kernels pending a fused 512 logits fix. The mixed op is
   still a custom attention op rather than a flash-attention load-path
   integration. Until that integration exists, KVarN must not pretend that
   llama.cpp Flash Attention is required or used.
