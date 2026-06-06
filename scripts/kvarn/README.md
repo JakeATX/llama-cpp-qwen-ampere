@@ -793,6 +793,11 @@ Verified local smoke:
   diagnostics. Without the unsafe diagnostic flag, forced fused-batch is
   rejected before executing 512-dimensional CUDA attention:
   `KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads requires LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`.
+  Latest clean-branch rerun at build `42da04dba`:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -TraceAttn -TraceLimit 8 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode fused-batch-forced`
+  passed exact KVarN layer checks, active body-record capacity `2`, packed
+  mode `fused-batch-forced`, packed-vs-split, and packed-vs-scratch with
+  `NMSE = 0.000E+000`.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
