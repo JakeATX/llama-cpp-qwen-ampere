@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)] [string] $SupportedModel,
     [string] $SupportedIswaModel = "",
+    [string] $Supported512Model = "",
     [string] $UnsupportedDimModel = "",
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-nofa-vs"),
     [int] $Context = 256,
@@ -133,6 +134,27 @@ try {
         @{ "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH" = "bogus" } `
         "invalid KVarN environment flag LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=bogus" `
         "KVarN invalid unsafe fused-batch env rejection"
+
+    if ($Supported512Model -ne "") {
+        Invoke-ExpectFailure `
+            $results `
+            @(
+                "-m", $Supported512Model,
+                "-p", "hello",
+                "-o", $tmpOut,
+                "-c", [string] $Context,
+                "-ngl", [string] $GpuLayers,
+                "-fa", "off",
+                "--kv-cache-quant", "kvarn",
+                "--kvarn-preset", "kvarn_k4v2_g128"
+            ) `
+            @{
+                "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1"
+                "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH" = "1"
+            } `
+            "KVarN forced fused-batch CUDA attention is not supported for 512-dimensional K/V heads" `
+            "KVarN 512 forced fused-batch rejection"
+    }
 
     Invoke-ExpectFailure `
         $results `
