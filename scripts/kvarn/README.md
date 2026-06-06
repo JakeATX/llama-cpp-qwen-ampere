@@ -612,6 +612,16 @@ Verified local smoke:
   build showed default fused-batch `10.22` tok/s, split kernels `9.73` tok/s,
   and serial fused `9.83` tok/s, so the prompt bottleneck is common to the
   current custom KVarN attention paths rather than a bad runtime mode default.
+  Rejected follow-up diagnostics: a sink-only warp-dot score fast path in
+  `kvarn_attn_mixed_f16_fused_batch_kernel` passed CUDA unit coverage and
+  Qwen3.5 packed-vs-split/scratch logits, but moved Qwen3.6 `pp128` only from
+  `10.25` to `10.32` tok/s (`11.7%` of normal), so it was not kept. A
+  sink-only graph reroute that fed KVarN FP16 sink tensors into `build_attn_mha`
+  was also rejected: the full-cache mask-compatible view failed against normal
+  KVarN with `NMSE=2.289e-03`, and the active-window plus contiguous mask-slice
+  variant still failed with `NMSE=1.883e-03`. The next performance pass needs a
+  real prompt attention design, not a scalar-dot micro-optimization or naive MHA
+  graph substitution.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
