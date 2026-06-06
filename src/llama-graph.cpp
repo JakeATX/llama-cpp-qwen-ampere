@@ -753,10 +753,12 @@ static bool kvarn_graph_use_attn_scratch_ref() {
     return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
 }
 
-static bool kvarn_graph_reuse_unsafe_forced_512_fused_body(
+static bool kvarn_graph_reuse_unsafe_forced_512_fused(
         const kvarn_active_window & window,
         const ggml_tensor * node) {
-    if (window.n_records <= 0 || node == nullptr || node->op != GGML_OP_KVARN_ATTN_MIXED) {
+    GGML_UNUSED(window);
+
+    if (node == nullptr || node->op != GGML_OP_KVARN_ATTN_MIXED) {
         return false;
     }
 
@@ -829,7 +831,7 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
 
     for (const ggml_tensor * node : mixed_attn_nodes) {
         res &= node->op == GGML_OP_KVARN_ATTN_MIXED;
-        if (kvarn_graph_reuse_unsafe_forced_512_fused_body(window, node)) {
+        if (kvarn_graph_reuse_unsafe_forced_512_fused(window, node)) {
             return false;
         }
         const int64_t n_head_kv = node->src[1] ? node->src[1]->ne[1] : 0;
@@ -980,7 +982,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
 
         for (const ggml_tensor * node : base_mixed_attn_nodes) {
             res &= node->op == GGML_OP_KVARN_ATTN_MIXED;
-            if (kvarn_graph_reuse_unsafe_forced_512_fused_body(window, node)) {
+            if (kvarn_graph_reuse_unsafe_forced_512_fused(window, node)) {
                 return false;
             }
             const int64_t n_head_kv = node->src[1] ? node->src[1]->ne[1] : 0;

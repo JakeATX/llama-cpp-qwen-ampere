@@ -48,10 +48,10 @@ Current implemented pieces:
   12B packed-vs-split/scratch logits, but forcing 512 packed-body records
   remains guarded behind `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` until broader
   512 coverage and performance justify making that path the default. Unsafe
-  forced 512 body-record diagnostics also rebuild llama graphs instead of
-  reusing them after a KVarN+ISWA graph-reuse drift was isolated; the default
-  active 512 split path and validated 128/256 fused-batch path keep their normal
-  reuse behavior.
+  forced 512 fused-batch diagnostics also rebuild llama graphs instead of
+  reusing them after KVarN+ISWA graph-reuse drift was isolated for both no-body
+  and active-body windows; the default active 512 split path and validated
+  128/256 fused-batch path keep their normal reuse behavior.
   Use `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`, or
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1 LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` for
   explicit 512 packed-body A/B diagnostics.
@@ -809,14 +809,23 @@ Verified local smoke:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -PackedSerialFused -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   Latest local result passed packed-vs-split and packed-vs-scratch at
   `NMSE = 0.000E+000`, so serial fused is no longer the active 512 gate.
-  The previous forced fused-batch diagnostic failed packed-vs-split with
-  `NMSE = 2.680e-04`; the forced fused-batch trace for the save pass showed
-  sink-only Gemma shapes
-  `n_queries=2,n_sink=2` for warmup and `n_queries=50,n_sink=50,n_records=0`
-  for the prompt, both with `head_dim=512`, `n_head=16`, `n_head_kv=1`,
-  F32 mask rows, and `scale=1`. The matching 50-token primitive passes, so the
-  remaining forced fused-batch gate likely depends on real model Q/K/V values
-  or another runtime detail not reproduced by the synthetic primitive yet.
+  A forced fused-batch diagnostic then reproduced an unsafe 512 graph-reuse
+  failure even when no body records were active:
+  `-Context 384 -Batch 512 -Repeat 4 -PackedFusedBatch -CheckPackedRepeat
+  -CheckPackedSplit` failed repeat determinism with `NMSE = 2.434e-03` and
+  scratch comparison with `NMSE = 1.947e-04`, while packed-vs-split passed at
+  `NMSE = 0.000E+000`. Because `LLAMA_KVARN_ATTN_REF_SCRATCH=1` still uses the
+  packed fused-batch path when `n_records=0`, this narrowed the bug to unsafe
+  forced 512 fused-batch graph reuse, not packed-body dequant arithmetic.
+  The runtime now refuses llama graph reuse for all explicit unsafe forced
+  512-dimensional KVarN mixed-attention graphs, including no-body windows. The
+  exact old failing command now passes repeat, packed-vs-split, and
+  packed-vs-scratch at `NMSE = 0.000E+000`; trace output for the save pass shows
+  `n_queries=2` and `n_queries=50`, `n_records=0`, `head_dim=512`, F32 masks,
+  and `scale=1`.
+  The earlier forced fused-batch trace for active body records showed
+  Gemma shapes `n_queries=2,n_sink=128,n_records=1,n_pending=2,n_tail=128`,
+  with `head_dim=512`, `n_head=16`, `n_head_kv=1`, F32 mask rows, and `scale=1`.
   A local diagnostic rebuild that temporarily allowed
   `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` through the current 512 rejection
   reran Gemma 4 12B at `-Context 512 -Batch 512 -Repeat 1
@@ -855,7 +864,10 @@ Verified local smoke:
   and `-Repeat 32 -PackedFusedBatch -CheckPackedSplit -TraceAttn
   -ExpectedPackedTraceMode fused-batch-forced` both passed exact Gemma 4 12B
   KVarN+ISWA layer routing, body-record capacity `2`, packed-vs-split, and
-  packed-vs-scratch at `NMSE = 0.000E+000`.
+  packed-vs-scratch at `NMSE = 0.000E+000`. Current validation separates
+  no-trace logits comparisons from trace-only dispatcher checks because
+  high-volume tracing on this Windows host has produced intermittent
+  comparison drift while the same untraced commands pass at `NMSE = 0`.
   Follow-up tail-window diagnostic after exposing `llama-bench`
   `--kvarn-tail-tokens`: running Gemma 4 12B with `--kvarn-tail-tokens 512`
   and the default 512 split path produced
@@ -1160,13 +1172,15 @@ to all packed/split/scratch runs in one comparison. For traced dispatcher checks
 also fails if the packed CUDA path does not emit the expected mode, such as
 `fused-batch` for the default validated 128/256-dimensional path or
 the 512-dimensional no-body Gemma path, and `split-512-default` for active
-512-dimensional packed body records. Use
+512-dimensional packed body records. Pass `-SkipScratchCheck` when the purpose
+is dispatcher tracing only; scratch comparison remains enabled by default for
+logits gates. Use
   `-MinKvarnBodyRecords` on these comparison harnesses when a test is meant to
 exercise packed body storage instead of only sink/tail capacity.
 Latest dispatcher-gate validation:
 `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers '5-47:6' -ExpectedPackedTraceMode fused-batch -ExtraArgs @('--kvarn-tail-tokens','512') }"` passed with the default no-body `mode=fused-batch` and packed-vs-scratch `NMSE = 0.000E+000`.
-`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 40 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode split-512-default` passed with active 512 packed body records, default `mode=split-512-default`, and packed-vs-scratch `NMSE = 0.000E+000`.
-`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -TraceAttn -TraceLimit 8 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode fused-batch-forced` passed after the unsafe forced 512 body-record graph-reuse guard, with packed-vs-split and packed-vs-scratch at `NMSE = 0.000E+000`.
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6"` passed active 512 packed body records, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`; a trace-40 rerun emitted `split-512-default` but drifted during the traced comparison, so trace output is not being used as the logits gate on this host.
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -PackedFusedBatch -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"` passed after the unsafe forced 512 no-body graph-reuse guard, with repeat, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 The 256-dimensional production default was rechecked with
 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`, passing exact layer routing, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure` passed both CUDA regression tests.

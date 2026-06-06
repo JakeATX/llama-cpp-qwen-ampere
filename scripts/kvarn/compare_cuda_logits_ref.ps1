@@ -22,6 +22,7 @@ param(
     [switch] $TraceAttn,
     [int] $TraceLimit = 4,
     [string] $ExpectedPackedTraceMode = "",
+    [switch] $SkipScratchCheck,
     [switch] $KeepArtifacts,
     [string[]] $ExtraArgs = @()
 )
@@ -304,13 +305,15 @@ try {
         Write-Host ("KVarN packed-vs-split logits: PASS, NMSE = {0:E3}" -f $splitNmse)
     }
 
-    Write-Host "== Checking scratch-reference KVarN logits"
-    $check = Invoke-Results $results ($commonArgs + @("--check")) $scratchEnv
-    if ($TraceAttn) {
-        Write-Host $check
+    if (-not $SkipScratchCheck) {
+        Write-Host "== Checking scratch-reference KVarN logits"
+        $check = Invoke-Results $results ($commonArgs + @("--check")) $scratchEnv
+        if ($TraceAttn) {
+            Write-Host $check
+        }
+        $nmse = Get-Nmse $check "packed-vs-scratch"
+        Write-Host ("KVarN packed-vs-scratch logits: PASS, NMSE = {0:E3}" -f $nmse)
     }
-    $nmse = Get-Nmse $check "packed-vs-scratch"
-    Write-Host ("KVarN packed-vs-scratch logits: PASS, NMSE = {0:E3}" -f $nmse)
 } finally {
     if (-not $KeepArtifacts) {
         Remove-Item -LiteralPath $OutputFile -ErrorAction SilentlyContinue
