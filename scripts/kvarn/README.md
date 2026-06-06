@@ -770,12 +770,12 @@ Verified local smoke:
   times with packed-vs-split and packed-vs-scratch `NMSE = 0.000E+000`. One
   apparent failure during this investigation was traced to two comparison
   harnesses racing on the same default temp GGUF output path, not to a stable
-  CUDA mismatch. The committed runtime still rejects 512 forced fused-batch
-  until the unsafe diagnostic gate, Gemma 26B check, and performance decision
-  are made explicit.
-  Current runtime behavior still rejects forced fused-batch mode before
-  executing 512-dimensional CUDA attention:
-  `KVarN forced fused-batch CUDA attention is not supported for 512-dimensional K/V heads`.
+  CUDA mismatch. The committed runtime now keeps the default 512-dimensional
+  guard but allows this path only when both `LLAMA_KVARN_ATTN_FUSED_BATCH=1`
+  and `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` are set for explicit
+  diagnostics. Without the unsafe diagnostic flag, forced fused-batch is
+  rejected before executing 512-dimensional CUDA attention:
+  `KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads requires LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
@@ -788,7 +788,7 @@ Verified local smoke:
   Latest static-build rerun passed all fourteen current rejection checks:
   `KVarN invalid fused-batch env rejection: PASS`,
   `KVarN invalid unsafe fused-batch env rejection: PASS`,
-  `KVarN 512 forced fused-batch rejection: PASS`,
+  `KVarN 512 forced fused-batch unsafe-gate rejection: PASS`,
   `KVarN invalid scratch-reference env rejection: PASS`,
   `KVarN out-of-range scratch-reference env rejection: PASS`,
   `KVarN out-of-range trace env rejection: PASS`,
@@ -1006,8 +1006,13 @@ when a stable artifact path is intentionally required. For traced dispatcher che
 also fails if the packed CUDA path does not emit the expected mode, such as
 `fused-batch` for the default validated 128/256-dimensional path or
 `split-512-default` for the current Gemma 4 512-dimensional path. Use
-`-MinKvarnBodyRecords` on these comparison harnesses when a test is meant to
+  `-MinKvarnBodyRecords` on these comparison harnesses when a test is meant to
 exercise packed body storage instead of only sink/tail capacity.
+Latest dispatcher-gate validation:
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -TraceAttn -TraceLimit 8 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode fused-batch-forced` passed with `mode=fused-batch-forced`, active body records, and packed-vs-scratch `NMSE = 0.000E+000`.
+The 256-dimensional production default was rechecked with
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 6 -ExpectedKvarnLayers "3-23:4"`, passing packed-vs-split and packed-vs-scratch at `NMSE = 0.000E+000`.
+`ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure` passed both CUDA regression tests.
 
 For `llama-cli` smoke runs, use `--single-turn`; default conversation mode can
 stay interactive after generation and causes external harnesses to terminate it

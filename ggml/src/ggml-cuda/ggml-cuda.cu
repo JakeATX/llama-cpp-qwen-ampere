@@ -2951,10 +2951,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const uint32_t kq_mask_type = kq_mask == nullptr ? 0u : (kq_mask->type == GGML_TYPE_F32 ? 1u : 2u);
                 const bool use_scratch_ref = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
                 const bool forced_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
+                const bool unsafe_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
                 const bool forced_split = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
                 const bool forced_serial = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
-                if (forced_fused_batch && params.head_dim >= 512) {
-                    GGML_ABORT("KVarN forced fused-batch CUDA attention is not supported for 512-dimensional K/V heads; use the default split path or LLAMA_KVARN_ATTN_SERIAL_FUSED=1 until the 512 fused-batch correctness gate is fixed");
+                if (forced_fused_batch && params.head_dim >= 512 && !unsafe_fused_batch) {
+                    GGML_ABORT("KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads requires LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1; use the default split path or LLAMA_KVARN_ATTN_SERIAL_FUSED=1 for supported 512-dimensional execution");
                 }
                 if (ggml_cuda_kvarn_attn_trace_enabled() && ggml_cuda_kvarn_attn_trace_claim()) {
                     const bool default_split_512 = params.head_dim >= 512 && !forced_fused_batch && !forced_serial;
