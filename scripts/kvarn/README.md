@@ -601,10 +601,14 @@ Verified local smoke:
   custom KVarN mixed-attention/runtime path as the current decode bottleneck,
   not packed-body dequantization alone or graph construction alone.
   Latest Qwen3.6 35B A3B MTP summary artifact:
-  `artifacts\kvarn-bench\latest-qwen36-35b-tg64-summary`. `tg64` passed exact
-  KVarN layer checks for `3,7,11,15,19,23,27,31,35,39` with normal KV `8.99`
-  tok/s and KVarN `9.24` tok/s (`102.8%` of normal), so the large 256 target is
-  competitive for short decode before body records become active.
+  `artifacts\kvarn-bench\qwen36-35b-256-current`, generated on build
+  `d01a79179` with `-CaseList "tg32:0:32,pp128:128:0" -ExpectedKvarnLayers
+  "3-39:4"`. Both cases passed exact KVarN layer checks for
+  `3,7,11,15,19,23,27,31,35,39`. Results: `tg32` normal KV `15.85` tok/s,
+  KVarN `14.99` tok/s (`94.6%` of normal); `pp128` normal KV `88.43` tok/s,
+  KVarN `10.25` tok/s (`11.6%` of normal). Short decode is close to normal KV
+  on the large 256 target, while prompt processing remains the current
+  production-performance bottleneck.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
