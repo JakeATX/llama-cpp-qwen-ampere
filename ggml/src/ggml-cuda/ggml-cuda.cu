@@ -2956,6 +2956,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 if (forced_fused_batch && params.head_dim >= 512) {
                     GGML_ABORT("KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads is not supported; use the default 512 routing, LLAMA_KVARN_ATTN_SPLIT_KERNELS=1, or LLAMA_KVARN_ATTN_SERIAL_FUSED=1 for supported 512-dimensional execution");
                 }
+                if (forced_fused_batch && dst->ne[2] > 1 && params.n_records > 0 && params.n_pending > 0) {
+                    GGML_ABORT("KVarN forced fused-batch CUDA attention for multi-query active body-record windows is not supported; use the default split path or LLAMA_KVARN_ATTN_SERIAL_FUSED=1 for supported execution");
+                }
                 if (ggml_cuda_kvarn_attn_trace_enabled() && ggml_cuda_kvarn_attn_trace_claim()) {
                     const bool default_split_512 = params.head_dim >= 512 && params.n_records > 0 && !forced_fused_batch && !forced_serial;
                     const bool default_split_active_pending =

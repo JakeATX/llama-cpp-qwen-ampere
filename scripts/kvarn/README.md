@@ -854,13 +854,14 @@ Verified local smoke:
   `KVarN CUDA mixed-attn trace: mode=split-512-default`, confirming Gemma 4
   26B uses the same validated default 512 split-kernel path.
 - Unsupported runtime-mode rejection check:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -Supported512Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -GpuLayers 99`.
-  Latest static-build rerun passed all fifteen current
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -Supported256ActiveModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -Supported512Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -GpuLayers 99`.
+  Latest static-build rerun passed all sixteen current
   rejection checks:
   `KVarN invalid fused-batch env rejection: PASS`,
   `KVarN invalid unsafe fused-batch env rejection: PASS`,
   `KVarN 512 forced fused-batch rejection: PASS`,
   `KVarN 512 unsafe forced fused-batch rejection: PASS`,
+  `KVarN 256 active-pending forced fused-batch rejection: PASS`,
   `KVarN invalid scratch-reference env rejection: PASS`,
   `KVarN out-of-range scratch-reference env rejection: PASS`,
   `KVarN out-of-range trace env rejection: PASS`,
@@ -914,6 +915,14 @@ Verified local smoke:
   Multi-query active-body windows that include both packed body records and
   pending-body tokens now default to split score/AV kernels; forcing the fused
   batch kernel for that shape failed packed-vs-split at `NMSE = 2.019e-05`.
+  A later direct forced-fused Qwen3.6 run at `-Context 512 -Batch 512 -Repeat 1
+  -fit off` passed the packed-vs-split and packed-vs-scratch gates, but repeat
+  testing showed it is not stable enough for production: `-Repeat 8` failed
+  packed-repeat with graph reuse enabled at `NMSE = 3.189e-04`, and with
+  `LLAMA_GRAPH_REUSE_DISABLE=1` at `NMSE = 5.262e-05`. The backend therefore
+  rejects explicit `LLAMA_KVARN_ATTN_FUSED_BATCH=1` for multi-query active
+  windows that contain both packed body records and pending-body tokens instead
+  of accepting an unsafe override.
   The validated active-body logits command is:
   `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 8 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers '3-39:4' -ExtraArgs @('-fit','off') }"`.
   Packed save, split-kernel check, and scratch-reference check all passed exact
@@ -944,6 +953,12 @@ Verified local smoke:
   which implies roughly `127 queries * 16 heads * 2 split kernels * KVarN layers`
   for the final active-body chunk. This is now the primary 256-dimensional
   production-performance blocker.
+  The synthetic CUDA primitive diagnostic for this exact shape is opt-in via
+  `LLAMA_KVARN_TEST_ACTIVE_PENDING_DIAG=1` in
+  `test-kvarn-cuda-scratch-ref`. In isolation it matched forced fused-batch to
+  split output, but running it unconditionally perturbed later sink-only fused
+  tests, narrowing the remaining issue to real graph/state/mask/runtime
+  interaction rather than only static shape arithmetic.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current
   default-fused model-level logits guard is now the acceptance criterion.
@@ -1155,7 +1170,7 @@ exercise packed body storage instead of only sink/tail capacity.
 Latest dispatcher-gate validation:
 `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -TraceAttn -TraceLimit 4 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers '5-47:6' -ExpectedPackedTraceMode fused-batch -ExtraArgs @('--kvarn-tail-tokens','512','-fit','off') }"` passed with the default no-body `mode=fused-batch`, repeat, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers '5-47:6' -ExtraArgs @('-fit','off') }"` passed active 512 packed body records, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`; the same active gate with fit probing enabled drifted during split comparison at `NMSE = 1.563e-03`, so fit-probe output is not being used as the logits gate on this host.
-Explicit forced fused-batch for 512-dimensional heads is now an unsupported-mode rejection, not a dispatcher acceptance gate.
+Explicit forced fused-batch for 512-dimensional heads is now an unsupported-mode rejection, not a dispatcher acceptance gate. Explicit forced fused-batch for 256-dimensional multi-query active windows with both packed body records and pending-body tokens is also rejected; the default split path remains the validated production route for that shape.
 The 256-dimensional production default was rechecked with
 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`, passing exact layer routing, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure` passed both CUDA regression tests.

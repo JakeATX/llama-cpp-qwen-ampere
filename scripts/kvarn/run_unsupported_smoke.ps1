@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)] [string] $SupportedModel,
     [string] $SupportedIswaModel = "",
+    [string] $Supported256ActiveModel = "",
     [string] $Supported512Model = "",
     [string] $UnsupportedDimModel = "",
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-nofa-vs"),
@@ -175,6 +176,29 @@ try {
             } `
             "KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads is not supported" `
             "KVarN 512 unsafe forced fused-batch rejection"
+    }
+
+    if ($Supported256ActiveModel -ne "") {
+        $bodyPrompt = "hello " * 450
+        Invoke-ExpectFailure `
+            $results `
+            @(
+                "-m", $Supported256ActiveModel,
+                "-p", $bodyPrompt,
+                "-o", $tmpOut,
+                "-c", "512",
+                "-b", "512",
+                "-ngl", [string] $GpuLayers,
+                "-fa", "off",
+                "--kv-cache-quant", "kvarn",
+                "--kvarn-preset", "kvarn_k4v2_g128",
+                "-fit", "off"
+            ) `
+            @{
+                "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1"
+            } `
+            "KVarN forced fused-batch CUDA attention for multi-query active body-record windows is not supported" `
+            "KVarN 256 active-pending forced fused-batch rejection"
     }
 
     Invoke-ExpectFailure `

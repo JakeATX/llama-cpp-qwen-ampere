@@ -1515,6 +1515,141 @@ static void run_case(uint32_t head_dim) {
         cudaFree(no_body_pending_k_d);
         cudaFree(no_body_pending_v_d);
 
+        const char * active_pending_diag = std::getenv("LLAMA_KVARN_TEST_ACTIVE_PENDING_DIAG");
+        if (active_pending_diag != nullptr && active_pending_diag[0] == '1' && active_pending_diag[1] == '\0') {
+            const uint32_t n_active_queries = 127;
+            const uint32_t n_active_records = 1;
+            const uint32_t n_active_pending = 127;
+            const uint32_t n_active_tail = 128;
+            const uint32_t active_tail_start = 127;
+            const uint32_t n_active_tokens =
+                n_q36_sink + n_active_records*group + n_active_pending + n_active_tail;
+
+            std::vector<float> active_queries(size_t(n_active_queries)*n_head*head_dim);
+            for (uint32_t iq = 0; iq < n_active_queries; ++iq) {
+                for (uint32_t ih = 0; ih < n_head; ++ih) {
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        active_queries[(size_t(iq)*n_head + ih)*head_dim + d] =
+                            0.128f*std::sin(float(d + 7*ih + 31*iq)*0.023f) -
+                            0.076f*std::cos(float(2*d + 5*ih + 13*iq)*0.017f);
+                    }
+                }
+            }
+
+            std::vector<float> active_pending_k(size_t(n_active_pending)*n_head_kv*head_dim);
+            std::vector<float> active_pending_v(active_pending_k.size());
+            for (uint32_t t = 0; t < n_active_pending; ++t) {
+                for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        const size_t off = (size_t(t)*n_head_kv + ikh)*head_dim + d;
+                        active_pending_k[off] =
+                            0.085f*std::sin(float(d + 11*t + 7*ikh)*0.019f) -
+                            0.054f*std::cos(float(3*d + 13*t + 5*ikh)*0.013f);
+                        active_pending_v[off] =
+                            0.069f*std::cos(float(5*d + 17*t + 3*ikh)*0.017f) +
+                            0.047f*std::sin(float(d + 19*t + 11*ikh)*0.011f);
+                    }
+                }
+            }
+
+            std::vector<float> active_mask(size_t(n_active_queries)*q36_mask_stride_tokens, -1.0e30f);
+            for (uint32_t iq = 0; iq < n_active_queries; ++iq) {
+                for (uint32_t t = 0; t < q36_mask_stride_tokens; ++t) {
+                    active_mask[size_t(iq)*q36_mask_stride_tokens + t] =
+                        t <= n_q36_sink + n_active_records*group + iq ? 0.0f : -1.0e30f;
+                }
+            }
+
+            float * active_queries_d = cuda_upload(active_queries);
+            float * active_pending_k_d = cuda_upload(active_pending_k);
+            float * active_pending_v_d = cuda_upload(active_pending_v);
+            float * active_mask_d = cuda_upload(active_mask);
+            float * active_split_d = nullptr;
+            float * active_fused_d = nullptr;
+            float * active_scores_d = nullptr;
+            float * active_fused_scores_d = nullptr;
+            require_cuda(cudaMalloc(&active_split_d, active_queries.size()*sizeof(float)), "cudaMalloc active-pending split output");
+            require_cuda(cudaMalloc(&active_fused_d, active_queries.size()*sizeof(float)), "cudaMalloc active-pending fused output");
+            require_cuda(cudaMalloc(&active_scores_d, n_active_tokens*sizeof(float)), "cudaMalloc active-pending split scores");
+            require_cuda(cudaMalloc(&active_fused_scores_d, n_active_tokens*sizeof(float)), "cudaMalloc active-pending fused scores");
+
+            set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
+            ggml_cuda_kvarn_attn_mixed_f16_batch(
+                    active_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
+                    mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
+                    active_pending_k_d, active_pending_v_d, active_mask_d,
+                    active_split_d, active_scores_d,
+                    n_active_queries, n_head, n_head_kv,
+                    n_q36_sink, n_active_records, n_active_pending, n_active_tail, active_tail_start, head_dim, group,
+                    params.key_bits, params.value_bits,
+                    head_dim, size_t(n_head)*head_dim,
+                    head_dim, size_t(n_head)*head_dim,
+                    head_dim, size_t(n_head_kv)*head_dim,
+                    head_dim, size_t(n_head_kv)*head_dim,
+                    records[0].k_body.size(), records[0].v_body.size(),
+                    size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                    records[0].k_scales.size(), records[0].v_scales.size(),
+                    size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                    size_t(q36_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
+                    scale,
+                    nullptr);
+            set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
+            require_cuda(cudaGetLastError(), "KVarN CUDA active-pending split launch");
+            require_cuda(cudaDeviceSynchronize(), "KVarN CUDA active-pending split sync");
+
+            set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "1");
+            ggml_cuda_kvarn_attn_mixed_f16_batch(
+                    active_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
+                    mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
+                    active_pending_k_d, active_pending_v_d, active_mask_d,
+                    active_fused_d, active_fused_scores_d,
+                    n_active_queries, n_head, n_head_kv,
+                    n_q36_sink, n_active_records, n_active_pending, n_active_tail, active_tail_start, head_dim, group,
+                    params.key_bits, params.value_bits,
+                    head_dim, size_t(n_head)*head_dim,
+                    head_dim, size_t(n_head)*head_dim,
+                    head_dim, size_t(n_head_kv)*head_dim,
+                    head_dim, size_t(n_head_kv)*head_dim,
+                    records[0].k_body.size(), records[0].v_body.size(),
+                    size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                    records[0].k_scales.size(), records[0].v_scales.size(),
+                    size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                    size_t(q36_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
+                    scale,
+                    nullptr);
+            set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
+            require_cuda(cudaGetLastError(), "KVarN CUDA active-pending forced fused launch");
+            require_cuda(cudaDeviceSynchronize(), "KVarN CUDA active-pending forced fused sync");
+
+            std::vector<float> active_split(active_queries.size());
+            std::vector<float> active_fused(active_queries.size());
+            require_cuda(cudaMemcpy(active_split.data(), active_split_d, active_split.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                    "copy active-pending split output");
+            require_cuda(cudaMemcpy(active_fused.data(), active_fused_d, active_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                    "copy active-pending fused output");
+
+            float active_fused_vs_split_err = 0.0f;
+            for (size_t i = 0; i < active_split.size(); ++i) {
+                active_fused_vs_split_err = std::max(active_fused_vs_split_err, std::fabs(active_split[i] - active_fused[i]));
+            }
+            if (active_fused_vs_split_err >= 1.0e-6f) {
+                std::fprintf(stderr,
+                        "active-pending fused_vs_split=%g q=%u records=%u pending=%u tail=%u\n",
+                        double(active_fused_vs_split_err), n_active_queries, n_active_records, n_active_pending, n_active_tail);
+            }
+            require(active_fused_vs_split_err < 1.0e-6f,
+                    "CUDA active-pending forced fused attention matches split output");
+
+            cudaFree(active_queries_d);
+            cudaFree(active_pending_k_d);
+            cudaFree(active_pending_v_d);
+            cudaFree(active_mask_d);
+            cudaFree(active_split_d);
+            cudaFree(active_fused_d);
+            cudaFree(active_scores_d);
+            cudaFree(active_fused_scores_d);
+        }
+
         cudaFree(q36_queries_d);
         cudaFree(q36_sink_tail_k_d);
         cudaFree(q36_sink_tail_v_d);
