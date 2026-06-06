@@ -2088,15 +2088,26 @@ static void run_case(uint32_t head_dim) {
             float gemma_split_err = 0.0f;
             float gemma_fused_err = 0.0f;
             float gemma_fused_vs_split_err = 0.0f;
+            size_t gemma_fused_worst = 0;
             for (size_t i = 0; i < gemma_ref.size(); ++i) {
                 gemma_split_err = std::max(gemma_split_err, std::fabs(gemma_ref[i] - gemma_split[i]));
-                gemma_fused_err = std::max(gemma_fused_err, std::fabs(gemma_ref[i] - gemma_fused[i]));
+                const float fused_err = std::fabs(gemma_ref[i] - gemma_fused[i]);
+                if (fused_err > gemma_fused_err) {
+                    gemma_fused_err = fused_err;
+                    gemma_fused_worst = i;
+                }
                 gemma_fused_vs_split_err = std::max(gemma_fused_vs_split_err, std::fabs(gemma_split[i] - gemma_fused[i]));
             }
             if (gemma_split_err >= 1.0e-5f || gemma_fused_err >= 1.0e-5f || gemma_fused_vs_split_err >= 1.0e-6f) {
+                const uint32_t worst_d = uint32_t(gemma_fused_worst % head_dim);
+                const uint32_t worst_row = uint32_t(gemma_fused_worst / head_dim);
+                const uint32_t worst_ih = worst_row % gemma_n_head;
+                const uint32_t worst_iq = worst_row / gemma_n_head;
                 std::fprintf(stderr,
-                        "Gemma-shaped 512 sink-only F32-mask errors: split=%g fused=%g fused_vs_split=%g\n",
-                        double(gemma_split_err), double(gemma_fused_err), double(gemma_fused_vs_split_err));
+                        "Gemma-shaped 512 sink-only F32-mask errors: split=%g fused=%g fused_vs_split=%g worst_iq=%u worst_ih=%u worst_d=%u ref=%g split=%g fused=%g\n",
+                        double(gemma_split_err), double(gemma_fused_err), double(gemma_fused_vs_split_err),
+                        worst_iq, worst_ih, worst_d,
+                        double(gemma_ref[gemma_fused_worst]), double(gemma_split[gemma_fused_worst]), double(gemma_fused[gemma_fused_worst]));
             }
             require(gemma_split_err < 1.0e-5f, "CUDA Gemma-shaped 512 sink-only split attention matches CPU reference with F32 mask");
             require(gemma_fused_err < 1.0e-5f, "CUDA Gemma-shaped 512 sink-only forced fused attention matches CPU reference with F32 mask");

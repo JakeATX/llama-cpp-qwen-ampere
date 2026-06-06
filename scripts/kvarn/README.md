@@ -813,12 +813,24 @@ Verified local smoke:
   repeat `NMSE = 2.434e-03` and scratch `NMSE = 1.947e-04`. A graph-reuse guard
   fixed that exact case, but later no-body forced fused-batch repeats still
   failed at `NMSE = 1.349e-04` with fit on and `NMSE = 9.708e-05` with
-  `-fit off`.
+  `-fit off`. The latest CUDA reduction fix adds a barrier after reading the
+  shared-memory max reduction before reusing the same shared `reduce` buffer
+  for denominator reduction. Before the fix, `compute-sanitizer --tool
+  racecheck` reported hazards in KVarN score/softmax kernels and
+  `ctest --repeat until-fail:20` reproduced sink-only fused nondeterminism.
+  After the fix, `ctest --repeat until-fail:30` passed
+  `test-kvarn-cuda-scratch-ref`, racecheck reported `0` hazards, and a
+  temporary graph-guard bypass allowed Gemma 4 12B no-body forced fused-batch
+  to pass packed-repeat, packed-vs-split, and packed-vs-scratch at
+  `NMSE = 0.000E+000`.
   Second, active-body forced fused-batch remains nondeterministic at the larger
   Gemma 4 12B shape. `-Context 512 -Batch 512 -Repeat 32 -PackedFusedBatch
   -CheckPackedRepeat -CheckPackedSplit -ExtraArgs @('-fit','off')` failed
   repeat at `NMSE = 1.233e-05` even with `LLAMA_GRAPH_REUSE_DISABLE=1`; another
   run with graph reuse enabled and fit on failed repeat at `NMSE = 4.205e-03`.
+  After the shared-reduction barrier fix, the same active-body diagnostic still
+  fails packed-repeat at `NMSE = 3.833e-03` when the graph-level forced-fused
+  guards are temporarily bypassed.
   The same active-body shape is repeat-stable through forced split and forced
   serial fused, and forced fused can still match split/scratch on individual
   runs, so the remaining defect is specific to multi-block fused-batch
@@ -834,8 +846,8 @@ Verified local smoke:
   and the default 512 split path produced
   `artifacts\kvarn-bench\gemma12b-512-tail512-split`, with `pp512` normal KV
   `1557.83` tok/s, KVarN `65.95` tok/s (`4.2%`), and `tg64` normal KV
-  `70.14` tok/s, KVarN `43.41` tok/s (`61.9%`). After routing
-  512-dimensional no-body windows through the default fused-batch path, the
+  `70.14` tok/s, KVarN `43.41` tok/s (`61.9%`). In an earlier diagnostic
+  build that routed 512-dimensional no-body windows through fused-batch, the
   same tail512 config without unsafe environment flags produced
   `artifacts\kvarn-bench\gemma12b-512-tail512-default-fused-nobody`, with
   `pp512` normal KV `1836.48` tok/s, KVarN `1578.78` tok/s (`86.0%`), and
@@ -845,10 +857,10 @@ Verified local smoke:
   -ExpectedPackedTraceMode fused-batch -ExtraArgs
   @('--kvarn-tail-tokens','512')` and passed exact Gemma layers, body records
   `0`, packed-vs-split, and packed-vs-scratch with `NMSE = 0.000E+000`. This
-  identifies tail sizing plus fused-batch as the strongest current prompt
-  performance lever, at the cost of a larger FP16 sink/tail window and no
-  compression before the first `sink_tokens + tail_tokens` tokens, so tail512
-  is not the preset default yet.
+  identifies tail sizing plus no-body fused-batch as a prompt-performance lead
+  for future 512-dimensional work. Current production routing keeps
+  multi-query no-body windows on the default split path until the fused-batch
+  path is promoted through the normal graph dispatcher.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus

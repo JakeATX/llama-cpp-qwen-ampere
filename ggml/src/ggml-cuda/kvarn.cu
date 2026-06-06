@@ -652,6 +652,7 @@ static __global__ void kvarn_attn_scores_softmax_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t g = threadIdx.x; g < group_size; g += blockDim.x) {
@@ -759,6 +760,7 @@ static __global__ void kvarn_attn_scores_softmax_n_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -916,6 +918,7 @@ static __global__ void kvarn_attn_scores_softmax_n_batch_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -1096,6 +1099,7 @@ static __global__ void kvarn_attn_mixed_scores_softmax_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -1277,6 +1281,7 @@ static __global__ void kvarn_attn_mixed_scratch_scores_softmax_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -1454,6 +1459,7 @@ static __global__ void kvarn_attn_mixed_f16_scratch_scores_softmax_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -1695,6 +1701,7 @@ static __global__ void kvarn_attn_mixed_f16_scores_softmax_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -1875,6 +1882,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -2070,6 +2078,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_kernel(
         __syncthreads();
     }
     const float max_score = reduce[0];
+    __syncthreads();
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
@@ -2181,8 +2190,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const uint32_t n_gqa = n_head/n_head_kv;
     const bool force_fused_batch_requested = kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
     const bool force_serial_fused = kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
-    const bool force_fused_batch =
-        force_fused_batch_requested && !(n_queries > 1 && n_records == 0);
+    const bool force_fused_batch = force_fused_batch_requested;
     const bool split_default_512 = head_dim >= 512 && n_records > 0 && !force_fused_batch && !force_serial_fused;
     const bool split_default_active_pending =
         n_queries > 1 && n_records > 0 && n_pending > 0 && !force_fused_batch && !force_serial_fused;
