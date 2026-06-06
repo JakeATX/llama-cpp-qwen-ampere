@@ -1065,6 +1065,21 @@ Verified local smoke:
   The earlier `artifacts\kvarn-bench\qwen36-256-default-fused-prod-matrix`
   artifact is stale (`build: c3d286bec`) and should not be used for current
   production claims.
+- `llama-bench` now exposes `--kvarn-iters`, and `run_bench_matrix.ps1` has a
+  matching `-KvarnIters` parameter so prompt-sealing cost can be measured
+  without changing runtime defaults. Fresh Qwen3.6 pp512 sweeps on build
+  `42923ee9f`, RTN quantile `1.0`, and default fused-batch routing:
+  `-KvarnIters 16` in
+  `artifacts\kvarn-bench\qwen36-256-pp512-rtn1-iters16-42923ee9f` measured
+  normal KV `118.51` tok/s and KVarN `91.26` tok/s (`77.0%`).
+  `-KvarnIters 4` in
+  `artifacts\kvarn-bench\qwen36-256-pp512-rtn1-iters4-42923ee9f` measured
+  normal KV `124.67` tok/s and KVarN `98.51` tok/s (`79.0%`).
+  `-KvarnIters 1` in
+  `artifacts\kvarn-bench\qwen36-256-pp512-rtn1-iters1-42923ee9f` measured
+  normal KV `124.86` tok/s and KVarN `100.58` tok/s (`80.6%`). This identifies
+  Sinkhorn pass count as a real but incomplete pp512 lever; the production
+  default remains `16` until model-quality impact is measured.
 - Fresh Qwen3.6 traced pp512 evidence after the parallel body-store change:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp512:512:0" -KvCacheQuant kvarn -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4" -TraceAttn -TraceLimit 96 -OutputDir artifacts\kvarn-bench\qwen36-256-parallel-store-trace-pp512`.
   Latest local result passed exact layers `3,7,11,15,19,23,27,31,35,39` and
@@ -1188,7 +1203,7 @@ Required integration path:
    one slot.
 7. Optimize performance. `llama-bench` now accepts `--kv-cache-quant
    none|kvarn`, `--kvarn-preset`, `--kvarn-sink-tokens`,
-   `--kvarn-tail-tokens`, and `--kvarn-rtn-quantile`, so production
+   `--kvarn-tail-tokens`, `--kvarn-iters`, and `--kvarn-rtn-quantile`, so production
    performance gates can use the standard benchmark tool and sweep FP16
    sink/tail policy. Current KVarN rows remain materially slower than normal
    KV until flash-attention load-path fusion is implemented, but Gemma 4 12B

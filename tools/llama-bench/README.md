@@ -56,6 +56,12 @@ test parameters:
   -ub, --ubatch-size <n>                    (default: 512)
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
+  --kv-cache-quant <none|kvarn>             (default: none)
+  --kvarn-preset <preset>                   KVarN preset, currently kvarn_k4v2_g128
+  --kvarn-sink-tokens <n>                   KVarN FP16 sink tokens (default: 128)
+  --kvarn-tail-tokens <n>                   KVarN FP16 tail tokens (default: 128)
+  --kvarn-iters <n>                         KVarN Sinkhorn-style variance normalization iterations (default: 16)
+  --kvarn-rtn-quantile <q>                  KVarN RTN scale quantile in (0, 1] (default: 1)
   -t, --threads <n>                         (default: system dependent)
   -C, --cpu-mask <hex,hex>                  (default: 0x0)
   --cpu-strict <0|1>                        (default: 0)

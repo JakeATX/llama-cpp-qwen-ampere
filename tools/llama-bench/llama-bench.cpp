@@ -453,6 +453,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --kvarn-preset <preset>                     KVarN preset, currently kvarn_k4v2_g128\n");
     printf("  --kvarn-sink-tokens <n>                     KVarN FP16 sink tokens (default: %u)\n", cmd_params_defaults.kvarn.sink_tokens);
     printf("  --kvarn-tail-tokens <n>                     KVarN FP16 tail tokens (default: %u)\n", cmd_params_defaults.kvarn.tail_tokens);
+    printf("  --kvarn-iters <n>                           KVarN Sinkhorn-style variance normalization iterations (default: %u)\n", cmd_params_defaults.kvarn.sinkhorn_iters);
     printf("  --kvarn-rtn-quantile <q>                    KVarN RTN scale quantile in (0, 1] (default: %.6g)\n", cmd_params_defaults.kvarn.rtn_quantile);
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
@@ -720,6 +721,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.kvarn.tail_tokens = uint32_t(value);
+            } else if (arg == "--kvarn-iters") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const int value = std::stoi(argv[i]);
+                if (value <= 0) {
+                    invalid_param = true;
+                    break;
+                }
+                params.kvarn.sinkhorn_iters = uint32_t(value);
             } else if (arg == "--kvarn-rtn-quantile") {
                 if (++i >= argc) {
                     invalid_param = true;

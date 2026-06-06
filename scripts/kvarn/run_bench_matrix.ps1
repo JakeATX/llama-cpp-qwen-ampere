@@ -6,6 +6,7 @@ param(
     [ValidateSet("on", "off", "auto")] [string] $FlashAttn = "off",
     [string] $KvCacheQuant = "none,kvarn",
     [string] $KvarnPreset = "kvarn_k4v2_g128",
+    [int] $KvarnIters = 16,
     [double] $RtnQuantile = 0.95,
     [int] $Repetitions = 1,
     [int] $MinKvarnLayerLogs = 1,
@@ -29,6 +30,9 @@ if ($Repetitions -le 0) {
 }
 if ($GpuLayers -lt 0) {
     throw "GpuLayers must be non-negative"
+}
+if ($KvarnIters -le 0) {
+    throw "KvarnIters must be positive"
 }
 if ($MinKvarnLayerLogs -lt 1) {
     throw "MinKvarnLayerLogs must be positive"
@@ -253,6 +257,7 @@ $manifest = @(
     "flash_attn=$FlashAttn",
     "gpu_layers=$GpuLayers",
     "kvarn_preset=$KvarnPreset",
+    "kvarn_iters=$KvarnIters",
     "kvarn_rtn_quantile=$rtnQuantileArg",
     "repetitions=$Repetitions",
     "min_kvarn_layer_logs=$MinKvarnLayerLogs",
@@ -278,6 +283,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         "-o", $OutputFormat,
         "--kv-cache-quant", $KvCacheQuant,
         "--kvarn-preset", $KvarnPreset,
+        "--kvarn-iters", [string] $KvarnIters,
         "--kvarn-rtn-quantile", $rtnQuantileArg
     )
     if (-not $Warmup.IsPresent) {
