@@ -2799,12 +2799,9 @@ ggml_tensor * llm_graph_context::build_attn(
                 }
 
                 for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                    ggml_tensor * k_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
-                    ggml_tensor * v_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
-                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_k_body_record_from_pending(
-                                ctx0, k_scratch, il, ih, seal_record));
-                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_v_body_record_from_pending(
-                                ctx0, v_scratch, il, ih, seal_record));
+                    ggml_tensor * scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
+                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_record_from_pending(
+                                ctx0, scratch, il, ih, seal_record));
                 }
             }
         }
@@ -3175,12 +3172,9 @@ ggml_tensor * llm_graph_context::build_attn(
                 }
 
                 for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                    ggml_tensor * k_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
-                    ggml_tensor * v_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
-                    ggml_build_forward_expand(gf, mctx_kvarn->store_k_body_record_from_pending(
-                                ctx0, k_scratch, il, ih, seal_record));
-                    ggml_build_forward_expand(gf, mctx_kvarn->store_v_body_record_from_pending(
-                                ctx0, v_scratch, il, ih, seal_record));
+                    ggml_tensor * scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
+                    ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_record_from_pending(
+                                ctx0, scratch, il, ih, seal_record));
                 }
             }
         }

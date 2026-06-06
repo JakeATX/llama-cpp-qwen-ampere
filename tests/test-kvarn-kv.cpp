@@ -744,15 +744,22 @@ static void test_runtime_body_record_graph_api() {
 
     ggml_tensor * k_store = cache.store_k_body_record(ctx.get(), k_tile, scratch, 0, ih, record);
     ggml_tensor * v_store = cache.store_v_body_record(ctx.get(), v_tile, scratch, 0, ih, record);
+    ggml_tensor * kv_store = cache.store_kv_body_record(ctx.get(), k_tile, v_tile, scratch, 0, ih, record);
 
     require(k_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN K body record store op");
     require(v_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN V body record store op");
+    require(kv_store->op == GGML_OP_KVARN_STORE_KV_BODY, "KVarN fused KV body record store op");
     require(k_store->src[0] == k_tile && k_store->src[1]->view_src == view.scales_k &&
             k_store->src[2] == scratch && k_store->src[3]->view_src == view.body_k,
             "KVarN K body record store sources");
     require(v_store->src[0] == v_tile && v_store->src[1]->view_src == view.scales_v &&
             v_store->src[2] == scratch && v_store->src[3]->view_src == view.body_v,
             "KVarN V body record store sources");
+    require(kv_store->src[0] == k_tile && kv_store->src[1] == v_tile &&
+            kv_store->src[2]->view_src == view.scales_k && kv_store->src[3]->view_src == view.scales_v &&
+            kv_store->src[4] == scratch && kv_store->src[5]->view_src == view.body_k &&
+            kv_store->src[6]->view_src == view.body_v,
+            "KVarN fused KV body record store sources");
     require(k_store->op_params[1] == (int32_t) view.head_dim_k &&
             k_store->op_params[2] == (int32_t) params.group_size &&
             k_store->op_params[3] == (int32_t) params.key_bits,
@@ -761,21 +768,32 @@ static void test_runtime_body_record_graph_api() {
             v_store->op_params[3] == (int32_t) params.value_bits &&
             v_store->op_params[4] == (int32_t) params.sinkhorn_iters,
             "KVarN V body record store params");
+    require(kv_store->op_params[0] == (int32_t) view.head_dim_k &&
+            kv_store->op_params[1] == (int32_t) params.group_size &&
+            kv_store->op_params[2] == (int32_t) params.key_bits &&
+            kv_store->op_params[3] == (int32_t) params.value_bits &&
+            kv_store->op_params[4] == (int32_t) params.sinkhorn_iters,
+            "KVarN fused KV body record store params");
 
     ggml_tensor * tail_idxs = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, params.group_size);
     ggml_tensor * k_pending = cache.cpy_tail_evict_pending_k(ctx.get(), tail_idxs, body_offsets, 0);
     ggml_tensor * v_pending = cache.cpy_tail_evict_pending_v(ctx.get(), tail_idxs, body_offsets, 0);
     ggml_tensor * k_from_pending = cache.store_k_body_record_from_pending(ctx.get(), scratch, 0, ih, record);
     ggml_tensor * v_from_pending = cache.store_v_body_record_from_pending(ctx.get(), scratch, 0, ih, record);
+    ggml_tensor * kv_from_pending = cache.store_kv_body_record_from_pending(ctx.get(), scratch, 0, ih, record);
 
     require(k_pending->op == GGML_OP_SET_ROWS, "KVarN pending K store op");
     require(v_pending->op == GGML_OP_SET_ROWS, "KVarN pending V store op");
     require(k_from_pending->op == GGML_OP_KVARN_STORE_BODY, "KVarN pending K body store op");
     require(v_from_pending->op == GGML_OP_KVARN_STORE_BODY, "KVarN pending V body store op");
+    require(kv_from_pending->op == GGML_OP_KVARN_STORE_KV_BODY, "KVarN pending fused KV body store op");
     require(k_from_pending->src[0]->type == GGML_TYPE_F32 && k_from_pending->src[0]->ne[0] == (int64_t) params.group_size,
             "KVarN pending K body tile shape");
     require(v_from_pending->src[0]->type == GGML_TYPE_F32 && v_from_pending->src[0]->ne[0] == (int64_t) view.head_dim_v,
             "KVarN pending V body tile shape");
+    require(kv_from_pending->src[0]->type == GGML_TYPE_F32 && kv_from_pending->src[0]->ne[0] == (int64_t) params.group_size &&
+            kv_from_pending->src[1]->type == GGML_TYPE_F32 && kv_from_pending->src[1]->ne[0] == (int64_t) view.head_dim_v,
+            "KVarN pending fused KV body tile shapes");
 }
 
 static void test_kvarn_store_body_ggml_ops() {

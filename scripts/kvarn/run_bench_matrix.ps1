@@ -275,6 +275,27 @@ function Get-KvarnStoreTraceSummary([string] $text) {
         $shapeCounts[$shape]++
     }
 
+    foreach ($m in [regex]::Matches(
+            $text,
+            "KVarN CUDA store-body trace: kind=kv\s+head_dim=([0-9]+)\s+group_size=([0-9]+)\s+key_bits=([0-9]+)\s+value_bits=([0-9]+)\s+sinkhorn_iters=([0-9]+)\s+rtn_quantile=([0-9.eE+-]+)\s+k_body_bytes=([0-9]+)\s+v_body_bytes=([0-9]+)\s+k_scale_floats=([0-9]+)\s+v_scale_floats=([0-9]+)\s+scratch_floats=([0-9]+)")) {
+        if (-not $kindCounts.ContainsKey("kv")) {
+            $kindCounts["kv"] = 0
+        }
+        $kindCounts["kv"]++
+
+        $shape = "kv:dim{0}/g{1}/bits{2}+{3}/iters{4}/rtn{5}" -f `
+            $m.Groups[1].Value,
+            $m.Groups[2].Value,
+            $m.Groups[3].Value,
+            $m.Groups[4].Value,
+            $m.Groups[5].Value,
+            $m.Groups[6].Value
+        if (-not $shapeCounts.ContainsKey($shape)) {
+            $shapeCounts[$shape] = 0
+        }
+        $shapeCounts[$shape]++
+    }
+
     $kinds = $kindCounts.GetEnumerator() |
         Sort-Object Name |
         ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }

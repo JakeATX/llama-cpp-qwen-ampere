@@ -766,6 +766,18 @@ ggml_tensor * llama_kv_cache_kvarn_context::store_v_body_record(
     return kv->store_v_body_record(ctx, v_tile, scratch, il, ih, record);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_record(
+        ggml_context * ctx,
+        ggml_tensor * k_tile,
+        ggml_tensor * v_tile,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t ih,
+        uint32_t record) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->store_kv_body_record(ctx, k_tile, v_tile, scratch, il, ih, record);
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::store_k_body_record_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
@@ -784,6 +796,16 @@ ggml_tensor * llama_kv_cache_kvarn_context::store_v_body_record_from_pending(
         uint32_t record) const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return kv->store_v_body_record_from_pending(ctx, scratch, il, ih, record);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_record_from_pending(
+        ggml_context * ctx,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t ih,
+        uint32_t record) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->store_kv_body_record_from_pending(ctx, scratch, il, ih, record);
 }
 
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
@@ -1432,6 +1454,27 @@ ggml_tensor * llama_kv_cache_kvarn::store_v_body_record(
             view.head_dim_v, params.group_size, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
 }
 
+ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record(
+        ggml_context * ctx,
+        ggml_tensor * k_tile,
+        ggml_tensor * v_tile,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t ih,
+        uint32_t record) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (view.head_dim_k != view.head_dim_v) {
+        throw std::runtime_error("KVarN fused K/V body store requires equal K and V head dimensions");
+    }
+    ggml_tensor * k_body   = view_k_body_record(ctx, il, ih, record);
+    ggml_tensor * v_body   = view_v_body_record(ctx, il, ih, record);
+    ggml_tensor * k_scales = view_k_scales_record(ctx, il, ih, record);
+    ggml_tensor * v_scales = view_v_scales_record(ctx, il, ih, record);
+    return ggml_kvarn_store_kv_body(
+            ctx, k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
+            view.head_dim_k, params.group_size, params.key_bits, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+}
+
 ggml_tensor * llama_kv_cache_kvarn::store_k_body_record_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
@@ -1470,6 +1513,38 @@ ggml_tensor * llama_kv_cache_kvarn::store_v_body_record_from_pending(
             layer_tensors[li].pending_v->nb[2], offset);
     ggml_tensor * v_tile = ggml_cont(ctx, pending);
     return store_v_body_record(ctx, v_tile, scratch, il, ih, record);
+}
+
+ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record_from_pending(
+        ggml_context * ctx,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t ih,
+        uint32_t record) const {
+    const size_t li = layer_storage_index(il);
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    assert_kvarn_record_view_bounds(view, ih, record);
+    if (view.head_dim_k != view.head_dim_v) {
+        throw std::runtime_error("KVarN fused pending K/V body store requires equal K and V head dimensions");
+    }
+    GGML_ASSERT(view.head_dim_k == uint32_t(layer_tensors[li].pending_k->ne[0]));
+    GGML_ASSERT(view.head_dim_v == uint32_t(layer_tensors[li].pending_v->ne[0]));
+
+    const size_t k_offset = size_t(ih)*layer_tensors[li].pending_k->nb[1];
+    ggml_tensor * k_pending = ggml_view_2d(
+            ctx, layer_tensors[li].pending_k,
+            view.head_dim_k, params.group_size,
+            layer_tensors[li].pending_k->nb[2], k_offset);
+    ggml_tensor * k_tile = ggml_cont(ctx, ggml_transpose(ctx, k_pending));
+
+    const size_t v_offset = size_t(ih)*layer_tensors[li].pending_v->nb[1];
+    ggml_tensor * v_pending = ggml_view_2d(
+            ctx, layer_tensors[li].pending_v,
+            view.head_dim_v, params.group_size,
+            layer_tensors[li].pending_v->nb[2], v_offset);
+    ggml_tensor * v_tile = ggml_cont(ctx, v_pending);
+
+    return store_kv_body_record(ctx, k_tile, v_tile, scratch, il, ih, record);
 }
 
 void llama_kv_cache_kvarn::append_layer_tokens_reference(

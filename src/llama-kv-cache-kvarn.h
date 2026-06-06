@@ -203,9 +203,13 @@ public:
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record(
             ggml_context * ctx, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * store_kv_body_record(
+            ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_k_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record_from_pending(
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * store_kv_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
 
 private:
@@ -305,9 +309,13 @@ public:
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record(
             ggml_context * ctx, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * store_kv_body_record(
+            ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_k_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record_from_pending(
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * store_kv_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
 
     slot_info find_slot(const llama_ubatch & ubatch) const;

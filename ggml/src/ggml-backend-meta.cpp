@@ -913,6 +913,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 split_state = src_ss[3];
             } break;
+            case GGML_OP_KVARN_STORE_KV_BODY: {
+                GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(split_states_equal(src_ss[2], src_ss[5]));
+                GGML_ASSERT(split_states_equal(src_ss[3], src_ss[6]));
+                GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(split_states_equal(src_ss[5], src_ss[6]));
+                split_state = src_ss[5];
+            } break;
             case GGML_OP_KVARN_ATTN_MIXED: {
                 GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 GGML_ASSERT(split_states_equal(src_ss[1], src_ss[2]));

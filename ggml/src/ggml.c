@@ -1020,6 +1020,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GET_ROWS_BACK",
     "SET_ROWS",
     "KVARN_STORE_BODY",
+    "KVARN_STORE_KV_BODY",
     "KVARN_ATTN_MIXED",
     "DIAG",
     "DIAG_MASK_INF",
@@ -1082,7 +1083,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1132,6 +1133,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "get_rows_back(x)",
     "set_rows(x)",
     "kvarn_store_body(x)",
+    "kvarn_store_kv_body(x,y)",
     "kvarn_attn_mixed(q)",
     "diag(x)",
     "diag_mask_inf(x)",
@@ -1194,7 +1196,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4015,6 +4017,85 @@ struct ggml_tensor * ggml_kvarn_store_v_body(
                int32_t        sinkhorn_iters,
                float          rtn_quantile) {
     return ggml_kvarn_store_body_impl(ctx, tile, body, scales, scratch, 1, head_dim, group_size, value_bits, sinkhorn_iters, rtn_quantile);
+}
+
+struct ggml_tensor * ggml_kvarn_store_kv_body(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k_tile,
+        struct ggml_tensor  * v_tile,
+        struct ggml_tensor  * k_body,
+        struct ggml_tensor  * v_body,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * v_scales,
+        struct ggml_tensor  * scratch,
+               int32_t        head_dim,
+               int32_t        group_size,
+               int32_t        key_bits,
+               int32_t        value_bits,
+               int32_t        sinkhorn_iters,
+               float          rtn_quantile) {
+    GGML_ASSERT(k_tile->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_tile->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_body->type == GGML_TYPE_I8);
+    GGML_ASSERT(v_body->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(scratch->type == GGML_TYPE_F32);
+    GGML_ASSERT(head_dim > 0);
+    GGML_ASSERT(group_size > 0);
+    GGML_ASSERT(key_bits > 0 && key_bits <= 8);
+    GGML_ASSERT(value_bits > 0 && value_bits <= 8);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(rtn_quantile > 0.0f && rtn_quantile <= 1.0f);
+    GGML_ASSERT(ggml_is_contiguous(k_tile));
+    GGML_ASSERT(ggml_is_contiguous(v_tile));
+    GGML_ASSERT(ggml_is_contiguous(k_body));
+    GGML_ASSERT(ggml_is_contiguous(v_body));
+    GGML_ASSERT(ggml_is_contiguous(k_scales));
+    GGML_ASSERT(ggml_is_contiguous(v_scales));
+    GGML_ASSERT(ggml_is_contiguous(scratch));
+    GGML_ASSERT(ggml_nelements(k_tile) == (int64_t) head_dim*group_size);
+    GGML_ASSERT(ggml_nelements(v_tile) == (int64_t) head_dim*group_size);
+    GGML_ASSERT(ggml_nelements(scratch) >= (int64_t) head_dim*group_size + 2*MAX(head_dim, group_size));
+
+    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits   + 7)/8);
+    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int64_t k_scale_floats = 2*head_dim + group_size;
+    const int64_t v_scale_floats = head_dim + 2*group_size;
+    GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
+    GGML_ASSERT(v_body->ne[0] >= v_body_bytes);
+    GGML_ASSERT(k_scales->ne[0] >= k_scale_floats);
+    GGML_ASSERT(v_scales->ne[0] >= v_scale_floats);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, k_body);
+
+    struct kvarn_store_kv_body_params {
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        int32_t sinkhorn_iters;
+        float   rtn_quantile;
+    } params = {
+        head_dim,
+        group_size,
+        key_bits,
+        value_bits,
+        sinkhorn_iters,
+        rtn_quantile,
+    };
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_KVARN_STORE_KV_BODY;
+    result->src[0] = k_tile;
+    result->src[1] = v_tile;
+    result->src[2] = k_scales;
+    result->src[3] = v_scales;
+    result->src[4] = scratch;
+    result->src[5] = k_body;
+    result->src[6] = v_body;
+
+    return result;
 }
 
 struct ggml_tensor * ggml_kvarn_attn_mixed(

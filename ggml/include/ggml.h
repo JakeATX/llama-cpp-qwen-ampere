@@ -524,6 +524,7 @@ extern "C" {
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
         GGML_OP_KVARN_STORE_BODY,
+        GGML_OP_KVARN_STORE_KV_BODY,
         GGML_OP_KVARN_ATTN_MIXED,
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
@@ -1709,6 +1710,22 @@ extern "C" {
             struct ggml_tensor  * scratch,
                    int32_t        head_dim,
                    int32_t        group_size,
+                   int32_t        value_bits,
+                   int32_t        sinkhorn_iters,
+                   float          rtn_quantile);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_store_kv_body(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_tile,
+            struct ggml_tensor  * v_tile,
+            struct ggml_tensor  * k_body,
+            struct ggml_tensor  * v_body,
+            struct ggml_tensor  * k_scales,
+            struct ggml_tensor  * v_scales,
+            struct ggml_tensor  * scratch,
+                   int32_t        head_dim,
+                   int32_t        group_size,
+                   int32_t        key_bits,
                    int32_t        value_bits,
                    int32_t        sinkhorn_iters,
                    float          rtn_quantile);

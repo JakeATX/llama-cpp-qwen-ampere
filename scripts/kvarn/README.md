@@ -150,6 +150,11 @@ Current implemented pieces:
   and scratch tensor as sources, so K and V body stores can be scheduled as
   independent backend ops. CUDA dispatch is wired to the KVarN min/max body
   store primitives.
+- `GGML_OP_KVARN_STORE_KV_BODY` plus `ggml_kvarn_store_kv_body()` for the
+  production graph path. Runtime body sealing uses this paired K/V store when
+  K and V head dimensions match, cutting graph/backend store dispatches in
+  half while preserving the same packed body and FP32 scale layouts. The
+  single K and V store constructors remain for focused tests and diagnostics.
 - `GGML_OP_KVARN_ATTN_MIXED` plus `ggml_kvarn_attn_mixed()` constructor. The
   op produces the normal `[head_dim, n_head, n_tokens]` F32 attention output
   shape from F32 Q, F16 sink/tail tensors, packed body tensors, FP32 scales,
@@ -162,7 +167,7 @@ Current implemented pieces:
   slot for each ubatch from the last token position. Context reserve graphs may
   be built for larger synthetic ubatches.
 - Graph construction writes FP16 sink/tail, stages evicted FP16 tail rows into
-  FP32 pending body slots, emits packed K/V body-store nodes when a graph
+  FP32 pending body slots, emits fused paired K/V body-store nodes when a graph
   completes one body record, and uses KVarN mixed attention for decode and
   bounded prompt batches. It still refuses graph reuse across graphs
   that include body-store ops or shape changes.
@@ -1121,6 +1126,19 @@ Verified local smoke:
   layer count multiplied by the K/V body records sealed during the prompt, and
   they make body-store launch count and store-kernel fusion the next measured
   performance target.
+- Runtime sealing now uses the fused paired K/V store op. Fresh fused-store
+  trace artifacts show the expected halved store dispatch count:
+  `artifacts\kvarn-bench\qwen35-08b-store-trace-fused-kv-afe26d830-dirty`
+  reports `kv=24` and `24x kv:dim256/g128/bits4+2/iters4/rtn1`; the large
+  Qwen3.6 artifact
+  `artifacts\kvarn-bench\qwen36-256-pp512-rtn1-iters4-fused-kv-store-afe26d830-dirty`
+  reports `kv=40` and `40x kv:dim256/g128/bits4+2/iters4/rtn1`. The matching
+  no-trace Qwen3.6 benchmark
+  `artifacts\kvarn-bench\qwen36-256-pp512-rtn1-iters4-fused-kv-store-afe26d830-dirty-notrace`
+  measured normal KV `128.72` tok/s and KVarN `101.40` tok/s (`78.8%`), versus
+  the previous comparable full-range KVarN result of `98.56` tok/s. This is a
+  small measured improvement, not speed parity; the remaining bottleneck is
+  still the internal body-store kernel sequence and custom attention path.
 - 128-dim Qwen2.5 regression on the corrected static CUDA build:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 4 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0-27"`.
   Latest local result passed exact layer routing for `0..27`, packed-repeat,
@@ -1305,6 +1323,18 @@ CPU layer placement, and server multi-slot rejection.
 Focused CUDA primitive tests:
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure --repeat until-fail:3`
 passed both tests for three repeats.
+After adding the fused K/V body-store op, the focused static-build validation
+`ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure`
+passed all three tests. The Qwen2.5 128-dimensional strict logits regression
+passed exact layers `0..27`, packed repeat, packed-vs-split, and
+packed-vs-scratch at `NMSE = 0.000E+000`. The Qwen3.6 active-body fused-store
+gate with `--kvarn-iters 4`, RTN quantile `1.0`, context `512`, and prompt
+phrase `hello ` passed exact layers `3,7,11,15,19,23,27,31,35,39`, body-record
+capacity, packed repeat, and packed-vs-split at `NMSE = 0.000E+000`. Gemma 4
+12B 512-dimensional active-body validation also passed exact layers
+`5,11,17,23,29,35,41,47`, body-record capacity, packed repeat, packed-vs-split,
+and packed-vs-scratch at `NMSE = 0.000E+000`. The explicit rejection smoke
+still passed all fifteen cases after the fused-store graph change.
 
 Fresh normal-vs-KVarN logits-distance measurements for the Sinkhorn-iteration
 performance lever used `-CheckNormalBaseline -SkipScratchCheck` with RTN

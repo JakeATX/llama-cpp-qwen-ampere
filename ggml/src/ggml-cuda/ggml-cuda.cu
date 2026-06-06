@@ -2948,6 +2948,54 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             ctx.stream());
                 }
             } break;
+        case GGML_OP_KVARN_STORE_KV_BODY:
+            {
+                struct kvarn_store_kv_body_params {
+                    int32_t head_dim;
+                    int32_t group_size;
+                    int32_t key_bits;
+                    int32_t value_bits;
+                    int32_t sinkhorn_iters;
+                    float   rtn_quantile;
+                } params;
+                memcpy(&params, dst->op_params, sizeof(params));
+
+                const ggml_tensor * k_tile   = dst->src[0];
+                const ggml_tensor * v_tile   = dst->src[1];
+                const ggml_tensor * k_scales = dst->src[2];
+                const ggml_tensor * v_scales = dst->src[3];
+                const ggml_tensor * scratch  = dst->src[4];
+                const ggml_tensor * v_body   = dst->src[6];
+                const int64_t n_values = int64_t(params.head_dim)*params.group_size;
+                const int64_t k_body_bytes = (n_values*params.key_bits   + 7)/8;
+                const int64_t v_body_bytes = (n_values*params.value_bits + 7)/8;
+                const int64_t k_scale_floats = 2*params.head_dim + params.group_size;
+                const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
+
+                if (ggml_cuda_kvarn_store_trace_enabled() && ggml_cuda_kvarn_store_trace_claim()) {
+                    std::fprintf(stderr,
+                            "KVarN CUDA store-body trace: kind=kv head_dim=%d group_size=%d key_bits=%d value_bits=%d"
+                            " sinkhorn_iters=%d rtn_quantile=%.9g k_body_bytes=%" PRId64
+                            " v_body_bytes=%" PRId64 " k_scale_floats=%" PRId64
+                            " v_scale_floats=%" PRId64 " scratch_floats=%" PRId64 "\n",
+                            params.head_dim, params.group_size, params.key_bits, params.value_bits,
+                            params.sinkhorn_iters, double(params.rtn_quantile),
+                            k_body_bytes, v_body_bytes, k_scale_floats, v_scale_floats,
+                            scratch ? ggml_nelements(scratch) : int64_t(0));
+                }
+
+                ggml_cuda_kvarn_store_body_reference_minmax(
+                        (const float *) k_tile->data,
+                        (const float *) v_tile->data,
+                        (uint8_t *) dst->data,
+                        (uint8_t *) v_body->data,
+                        (float *) k_scales->data,
+                        (float *) v_scales->data,
+                        (float *) scratch->data,
+                        params.head_dim, params.group_size, params.key_bits, params.value_bits,
+                        params.sinkhorn_iters, params.rtn_quantile,
+                        ctx.stream());
+            } break;
         case GGML_OP_KVARN_ATTN_MIXED:
             {
                 struct kvarn_attn_params {
@@ -5597,6 +5645,52 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                        op->ne[0] >= body_bytes &&
                        op->src[1]->ne[0] >= scale_floats &&
                        ggml_nelements(op->src[2]) >= scratch_floats;
+            } break;
+        case GGML_OP_KVARN_STORE_KV_BODY:
+            {
+                struct kvarn_store_kv_body_params {
+                    int32_t head_dim;
+                    int32_t group_size;
+                    int32_t key_bits;
+                    int32_t value_bits;
+                    int32_t sinkhorn_iters;
+                    float   rtn_quantile;
+                } params;
+                memcpy(&params, op->op_params, sizeof(params));
+
+                if (op->type != GGML_TYPE_I8 || op->src[0]->type != GGML_TYPE_F32 ||
+                        op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 ||
+                        op->src[3]->type != GGML_TYPE_F32 || op->src[4]->type != GGML_TYPE_F32 ||
+                        op->src[5]->type != GGML_TYPE_I8  || op->src[6]->type != GGML_TYPE_I8) {
+                    return false;
+                }
+                if (params.head_dim <= 0 || params.group_size <= 0 ||
+                        params.key_bits <= 0 || params.key_bits > 8 ||
+                        params.value_bits <= 0 || params.value_bits > 8 ||
+                        params.sinkhorn_iters <= 0 ||
+                        !(params.rtn_quantile > 0.0f && params.rtn_quantile <= 1.0f)) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) ||
+                        !ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[2]) ||
+                        !ggml_is_contiguous(op->src[3]) || !ggml_is_contiguous(op->src[4]) ||
+                        !ggml_is_contiguous(op->src[5]) || !ggml_is_contiguous(op->src[6])) {
+                    return false;
+                }
+
+                const int64_t n = int64_t(params.head_dim)*params.group_size;
+                const int64_t k_body_bytes = (n*params.key_bits   + 7)/8;
+                const int64_t v_body_bytes = (n*params.value_bits + 7)/8;
+                const int64_t k_scale_floats = 2*params.head_dim + params.group_size;
+                const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
+                const int64_t scratch_floats = n + 2*std::max(params.head_dim, params.group_size);
+                return ggml_nelements(op->src[0]) == n &&
+                       ggml_nelements(op->src[1]) == n &&
+                       op->src[5]->ne[0] >= k_body_bytes &&
+                       op->src[6]->ne[0] >= v_body_bytes &&
+                       op->src[2]->ne[0] >= k_scale_floats &&
+                       op->src[3]->ne[0] >= v_scale_floats &&
+                       ggml_nelements(op->src[4]) >= scratch_floats;
             } break;
         case GGML_OP_KVARN_ATTN_MIXED:
             {
