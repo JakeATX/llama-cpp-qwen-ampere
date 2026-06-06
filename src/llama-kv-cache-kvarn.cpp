@@ -25,7 +25,7 @@ static bool is_power_of_2(uint32_t n) {
 }
 
 #ifdef LLAMA_BUILD
-static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens, bool & invalid_debug_override) {
+static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_override) {
     invalid_debug_override = false;
     const char * env = std::getenv("LLAMA_KVARN_DEBUG_UBATCH");
     if (env != nullptr) {
@@ -40,7 +40,7 @@ static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens, bool
         return uint32_t(value);
     }
 
-    return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
+    return std::max<uint32_t>(1, default_limit);
 }
 
 #endif
@@ -977,7 +977,8 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_batch(
 
     std::vector<llama_ubatch> ubatches;
     bool invalid_debug_ubatch = false;
-    const uint32_t n_kvarn_ubatch = kvarn_ubatch_limit(n_ubatch, params.tail_tokens, invalid_debug_ubatch);
+    const uint32_t default_kvarn_ubatch = std::min<uint32_t>(n_ubatch, params.tail_tokens);
+    const uint32_t n_kvarn_ubatch = kvarn_ubatch_limit(default_kvarn_ubatch, invalid_debug_ubatch);
     if (invalid_debug_ubatch) {
         std::fprintf(stderr,
                 "%s: KVarN debug ubatch override must be a positive integer: LLAMA_KVARN_DEBUG_UBATCH=%s\n",

@@ -10,7 +10,23 @@
 #include <cstdlib>
 #include <limits>
 
-static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens, bool & invalid_debug_override) {
+static bool kvarn_batch_within_no_body_window(const llama_batch_allocr & balloc, uint32_t n_sink_tail_tokens) {
+    const llama_batch & batch = balloc.get_batch();
+    if (batch.pos == nullptr) {
+        return false;
+    }
+
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const llama_pos pos = batch.pos[i];
+        if (pos < 0 || uint32_t(pos) >= n_sink_tail_tokens) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_override) {
     invalid_debug_override = false;
     const char * env = std::getenv("LLAMA_KVARN_DEBUG_UBATCH");
     if (env != nullptr) {
@@ -25,7 +41,7 @@ static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens, bool
         return uint32_t(value);
     }
 
-    return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
+    return std::max<uint32_t>(1, default_limit);
 }
 
 llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
@@ -77,10 +93,14 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
 
     std::vector<llama_ubatch> ubatches;
     bool invalid_debug_ubatch = false;
+    const uint32_t n_sink_tokens = mem_attn->get_sink_tokens();
     const uint32_t n_tail_tokens = mem_attn->get_tail_tokens();
+    const uint32_t n_sink_tail_tokens = n_sink_tokens + n_tail_tokens;
+    const bool no_body_batch = kvarn_batch_within_no_body_window(balloc, n_sink_tail_tokens);
+    const uint32_t default_kvarn_ubatch = std::min<uint32_t>(n_ubatch, n_tail_tokens);
     const uint32_t n_kvarn_ubatch =
-        hparams.n_expert > 0 && balloc.get_n_tokens() > n_tail_tokens ?
-            1 : kvarn_ubatch_limit(n_ubatch, n_tail_tokens, invalid_debug_ubatch);
+        hparams.n_expert > 0 && !no_body_batch ?
+            1 : kvarn_ubatch_limit(default_kvarn_ubatch, invalid_debug_ubatch);
     if (invalid_debug_ubatch) {
         LLAMA_LOG_ERROR("%s: KVarN debug ubatch override must be a positive integer: LLAMA_KVARN_DEBUG_UBATCH=%s\n",
                 __func__, std::getenv("LLAMA_KVARN_DEBUG_UBATCH"));

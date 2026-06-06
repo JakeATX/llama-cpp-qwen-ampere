@@ -104,9 +104,12 @@ Current implemented pieces:
   span (`min(n_ubatch, tail_tokens)`) for dense and non-MoE hybrid models, so
   prompt processing can use masked multi-query KVarN attention without evicting
   a tail slot written earlier in the same graph. MoE hybrid models use the same
-  bounded prompt batching only while the prompt fits inside the sink/tail
-  window; once a batch would cross into packed body records they fall back to
-  single-token ubatches until multi-token MoE active-body correctness is fixed.
+  bounded prompt batching while every token in the batch still fits inside the
+  sink/tail window; once a batch would cross into packed body records they fall
+  back to single-token ubatches until multi-token MoE active-body correctness is
+  fixed. A full `sink_tokens + tail_tokens` MoE graph at the no-body boundary is
+  not accepted yet; Qwen3.6 `pp255`/`pp256` failed decode in that diagnostic, so
+  the production no-body MoE fast path deliberately remains tail-span chunks.
   Qwen3.6 MoE no-body prompt batching is correct through the default
   multi-block fused-batch CUDA path for 256-dimensional heads, with
   serial-fused and split-kernel modes retained only as explicit A/B diagnostics.
@@ -974,6 +977,21 @@ Verified local smoke:
   tok/s and KVarN `pp64 = 98.20` tok/s (`120.7%`), exact KVarN layers
   `3,7,11,15,19,23,27,31,35,39`, 10 KVarN layer log lines, and no body
   records at this short prompt length.
+  Follow-up Qwen3.6 no-body benchmark at build `f3f38c32b` exposed a prompt-size
+  cliff: `pp256` had normal KV `110.36` tok/s but KVarN only `10.20` tok/s
+  (`9.2%`) because the MoE hybrid policy reverted to singleton ubatches for any
+  batch larger than `tail_tokens`, even when all positions were still inside the
+  no-body `sink + tail` window. A too-aggressive full-window diagnostic
+  (`pp255`/`pp256` as one `sink + tail` graph) failed decode, so the committed
+  fix only keeps MoE no-body prompts on the validated tail-span chunk size and
+  keeps active-body MoE singleton. Current matrix:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp64:64:0,tg64:0:64,pp256:256:0" -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4" -OutputDir artifacts\kvarn-bench\qwen36-256-tailspan-nobody-matrix`.
+  Latest result: `pp64` normal KV `77.01` tok/s, KVarN `97.40` tok/s
+  (`126.5%`); `tg64` normal KV `9.89` tok/s, KVarN `10.12` tok/s (`102.3%`);
+  `pp256` normal KV `118.66` tok/s, KVarN `111.69` tok/s (`94.1%`), with exact
+  KVarN layers `3,7,11,15,19,23,27,31,35,39` and no body records. Matching
+  logits gate:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"` passed fused-batch mode, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
   Static normal-vs-KVarN 256-dim benchmark on Qwen3.5 0.8B with active body
   records:
   `build-kvarn-cuda-static-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -p 512 -n 128 -r 1 -ngl 99 -fa off --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
