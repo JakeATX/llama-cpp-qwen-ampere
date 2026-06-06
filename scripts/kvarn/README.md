@@ -945,6 +945,16 @@ Verified local smoke:
   Packed save, split-kernel check, and scratch-reference check all passed exact
   Qwen3.6 layer routing, body-record capacity `2`, and
   `NMSE = 0.000E+000`.
+  Current committed-policy active-body `-Repeat 8` rerun also passed exact
+  routing, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`. The
+  remaining performance gap is severe: `pp512` benchmark artifact
+  `artifacts\kvarn-bench\qwen36-256-active-body-current-committed` measured
+  normal KV `123.25` tok/s and KVarN `8.39` tok/s (`6.8%`) with two body
+  records per KVarN layer. A current-build experiment that allowed tail-span
+  active-body MoE ubatches made packed fused and split agree, but failed the
+  scratch-reference comparison at `NMSE = 1.952e-04`; this narrows the blocker
+  to multi-token active-body graph/storage/reference semantics rather than the
+  fused attention dispatcher alone.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current
   default-fused model-level logits guard is now the acceptance criterion.
@@ -1075,10 +1085,10 @@ Required integration path:
 1. Finish optimization of KVarN prompt batches. `GGML_OP_KVARN_ATTN_MIXED`
    carries an optional KQ/causal mask in `src[10]`, and runtime preparation now
    admits bounded prompt ubatches for dense and non-MoE hybrid models.
-   MoE hybrid models only use bounded ubatches while the prompt fits inside the
-   tail-ring span; active-body MoE prompt chunks still use singleton ubatches
-   because Qwen3.6 multi-token active-body batching failed the model-level
-   packed-vs-split and packed-vs-scratch logits guards.
+   MoE hybrid models use tail-span bounded ubatches while all tokens remain
+   inside the sink/tail no-body window; active-body MoE prompt chunks still use
+   singleton ubatches because Qwen3.6 multi-token active-body batching failed
+   the model-level scratch-reference logits guard.
    The 128/256-dimensional prompt path now uses the faster multi-block fused
    CUDA score/softmax/AV kernel by default for validated no-body windows and is
    guarded by Qwen3.6 split-kernel and scratch-reference logits checks. The
