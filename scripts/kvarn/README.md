@@ -915,10 +915,13 @@ Verified local smoke:
   pending-body tokens now default to split score/AV kernels; forcing the fused
   batch kernel for that shape failed packed-vs-split at `NMSE = 2.019e-05`.
   The validated active-body logits command is:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 8 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4"`.
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 8 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers '3-39:4' -ExtraArgs @('-fit','off') }"`.
   Packed save, split-kernel check, and scratch-reference check all passed exact
   Qwen3.6 layer routing, body-record capacity `2`, and
-  `NMSE = 0.000E+000`.
+  `NMSE = 0.000E+000`. The same gate with the llama-results fit probe enabled
+  passed packed-vs-split but drifted during scratch comparison at
+  `NMSE = 4.434e-04` after fit probing failed with fixed `-ngl 99`, so active
+  Qwen3.6 logits gates use `-fit off` until that harness path is isolated.
   The active-body `pp512` benchmark artifact
   `artifacts\kvarn-bench\qwen36-256-active-body-safe-pending-split` measured
   normal KV `129.34` tok/s and KVarN `28.30` tok/s (`21.9%`) with two body
@@ -928,6 +931,19 @@ Verified local smoke:
   measured KVarN at `8.39` tok/s (`6.8%`), but active-body remains below
   production performance targets until the fused pending-body multi-query path
   is fixed.
+  Current-build rerun at `c3d286bec`:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp384:384:0,pp512:512:0,tg64:0:64" -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4" -OutputDir artifacts\kvarn-bench\qwen36-256-active-body-c3d286bec`.
+  Results: `pp384` normal KV `119.96` tok/s, KVarN `42.19` tok/s (`35.2%`);
+  `pp512` normal KV `123.02` tok/s, KVarN `28.31` tok/s (`23.0%`);
+  `tg64` normal KV `9.90` tok/s, KVarN `10.13` tok/s (`102.3%`).
+  The traced KVarN-only pp512 rerun
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp512:512:0" -KvCacheQuant kvarn -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4" -TraceAttn -TraceLimit 48 -OutputDir artifacts\kvarn-bench\qwen36-256-active-body-trace-c3d286bec`
+  measured KVarN `28.13` tok/s and summarized attention modes as
+  `fused-batch=40; split-active-pending-default=8`. The slow shape is
+  `split-active-pending-default:q127/h16/hkv2/sink128/rec1/pend127/tail128/dim256`,
+  which implies roughly `127 queries * 16 heads * 2 split kernels * KVarN layers`
+  for the final active-body chunk. This is now the primary 256-dimensional
+  production-performance blocker.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current
   default-fused model-level logits guard is now the acceptance criterion.
