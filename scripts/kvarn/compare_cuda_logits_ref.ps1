@@ -8,8 +8,8 @@ param(
     [double] $RtnQuantile = 0.95,
     [int] $Repeat = 32,
     [string] $PromptPhrase = "The quick brown fox studies attention kernels and cache layouts carefully. ",
-    [string] $OutputFile = (Join-Path $env:TEMP "kvarn-packed-logits.gguf"),
-    [string] $PromptFile = (Join-Path $env:TEMP "kvarn-logits-prompt.txt"),
+    [string] $OutputFile = "",
+    [string] $PromptFile = "",
     [int] $DebugUbatch = 0,
     [int] $MinKvarnLayerLogs = 1,
     [int] $MinKvarnBodyRecords = 0,
@@ -47,6 +47,12 @@ if ($MinKvarnBodyRecords -lt 0) {
 }
 if ($TraceLimit -lt 0) {
     throw "TraceLimit must be non-negative"
+}
+if ([string]::IsNullOrWhiteSpace($OutputFile)) {
+    $OutputFile = Join-Path $env:TEMP ("kvarn-packed-logits-{0}.gguf" -f ([guid]::NewGuid().ToString("N")))
+}
+if ([string]::IsNullOrWhiteSpace($PromptFile)) {
+    $PromptFile = Join-Path $env:TEMP ("kvarn-logits-prompt-{0}.txt" -f ([guid]::NewGuid().ToString("N")))
 }
 if (-not [string]::IsNullOrWhiteSpace($ExpectedPackedTraceMode) -and -not $TraceAttn) {
     throw "ExpectedPackedTraceMode requires TraceAttn so the packed CUDA mode is emitted"

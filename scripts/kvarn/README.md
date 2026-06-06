@@ -763,8 +763,18 @@ Verified local smoke:
   F32 mask rows, and `scale=1`. The matching 50-token primitive passes, so the
   remaining forced fused-batch gate likely depends on real model Q/K/V values
   or another runtime detail not reproduced by the synthetic primitive yet.
-  Current runtime behavior rejects that known-bad forced fused-batch mode before
-  executing CUDA attention:
+  A local diagnostic rebuild that temporarily allowed
+  `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` through the current 512 rejection
+  reran Gemma 4 12B at `-Context 512 -Batch 512 -Repeat 1
+  -PackedFusedBatch -CheckPackedSplit -MinKvarnBodyRecords 2` five consecutive
+  times with packed-vs-split and packed-vs-scratch `NMSE = 0.000E+000`. One
+  apparent failure during this investigation was traced to two comparison
+  harnesses racing on the same default temp GGUF output path, not to a stable
+  CUDA mismatch. The committed runtime still rejects 512 forced fused-batch
+  until the unsafe diagnostic gate, Gemma 26B check, and performance decision
+  are made explicit.
+  Current runtime behavior still rejects forced fused-batch mode before
+  executing 512-dimensional CUDA attention:
   `KVarN forced fused-batch CUDA attention is not supported for 512-dimensional K/V heads`.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
@@ -988,7 +998,10 @@ decode implementation: graph reuse must not change deterministic KVarN output,
 and optimization work should continue to use it as a fast regression check.
 `compare_cuda_scratch_ref.ps1` is a stronger live-runtime generated-text guard
 for the current packed attention op, and `compare_cuda_logits_ref.ps1` adds the
-corresponding logits-distance guard. For traced dispatcher checks,
+corresponding logits-distance guard. `compare_cuda_logits_ref.ps1` now uses
+unique temp GGUF and prompt paths by default so concurrent diagnostics cannot
+overwrite each other's saved logits; pass `-OutputFile` or `-PromptFile` only
+when a stable artifact path is intentionally required. For traced dispatcher checks,
 `compare_cuda_logits_ref.ps1 -TraceAttn -ExpectedPackedTraceMode <mode>` now
 also fails if the packed CUDA path does not emit the expected mode, such as
 `fused-batch` for the default validated 128/256-dimensional path or
