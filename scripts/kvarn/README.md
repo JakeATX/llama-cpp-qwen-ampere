@@ -626,7 +626,12 @@ Verified local smoke:
   Qwen3.6 packed-vs-split/scratch logits at `NMSE=0.000E+000`, but the Qwen3.6
   35B A3B MTP `pp128` benchmark remained flat at `10.24` tok/s (`12.3%` of
   normal KV in `artifacts\kvarn-bench\qwen36-35b-256-sink-rows-batch`), so the
-  source change was reverted.
+  source change was reverted. A corrected active-width sink-only MHA reroute
+  with a contiguous sliced KQ mask also passed Qwen3.5 and Qwen3.6
+  packed-vs-split/scratch logits at `NMSE=0.000E+000`, but was slower on
+  Qwen3.6 35B A3B MTP (`tg32` KVarN `13.85` tok/s, `pp128` KVarN `9.62`
+  tok/s in `artifacts\kvarn-bench\qwen36-35b-256-sink-mha-reroute`), so that
+  source change was also reverted.
 - Arg-parser coverage passed:
   `ctest --test-dir build-kvarn-cpu -C Release -R test-arg-parser --output-on-failure`.
 - Focused CPU KVarN coverage passed after adding multi-record body-plan seal
