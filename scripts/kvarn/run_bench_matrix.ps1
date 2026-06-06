@@ -17,6 +17,8 @@ param(
     [switch] $Warmup,
     [switch] $TraceAttn,
     [int] $TraceLimit = 64,
+    [switch] $TraceStore,
+    [int] $TraceStoreLimit = 64,
     [string[]] $ExtraArgs = @()
 )
 
@@ -42,6 +44,9 @@ if ($MinKvarnBodyRecords -lt 0) {
 }
 if ($TraceLimit -le 0) {
     throw "TraceLimit must be positive"
+}
+if ($TraceStoreLimit -le 0) {
+    throw "TraceStoreLimit must be positive"
 }
 if (-not (Test-Path -LiteralPath $Model)) {
     throw "Model not found at $Model"
@@ -244,6 +249,46 @@ function Get-KvarnTraceSummary([string] $text) {
     }
 }
 
+function Get-KvarnStoreTraceSummary([string] $text) {
+    $kindCounts = @{}
+    $shapeCounts = @{}
+
+    foreach ($m in [regex]::Matches(
+            $text,
+            "KVarN CUDA store-body trace: kind=([kv])\s+head_dim=([0-9]+)\s+group_size=([0-9]+)\s+bits=([0-9]+)\s+sinkhorn_iters=([0-9]+)\s+rtn_quantile=([0-9.eE+-]+)\s+body_bytes=([0-9]+)\s+scale_floats=([0-9]+)\s+scratch_floats=([0-9]+)")) {
+        $kind = $m.Groups[1].Value
+        if (-not $kindCounts.ContainsKey($kind)) {
+            $kindCounts[$kind] = 0
+        }
+        $kindCounts[$kind]++
+
+        $shape = "{0}:dim{1}/g{2}/bits{3}/iters{4}/rtn{5}" -f `
+            $kind,
+            $m.Groups[2].Value,
+            $m.Groups[3].Value,
+            $m.Groups[4].Value,
+            $m.Groups[5].Value,
+            $m.Groups[6].Value
+        if (-not $shapeCounts.ContainsKey($shape)) {
+            $shapeCounts[$shape] = 0
+        }
+        $shapeCounts[$shape]++
+    }
+
+    $kinds = $kindCounts.GetEnumerator() |
+        Sort-Object Name |
+        ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }
+    $shapes = $shapeCounts.GetEnumerator() |
+        Sort-Object @{ Expression = { -$_.Value } }, Name |
+        Select-Object -First 8 |
+        ForEach-Object { "{0}x {1}" -f $_.Value, $_.Key }
+
+    return [pscustomobject]@{
+        Kinds = ($kinds -join "; ")
+        Shapes = ($shapes -join "; ")
+    }
+}
+
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 $requiresKvarnEvidence = ($KvCacheQuant.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) |
@@ -267,6 +312,8 @@ $manifest = @(
     "warmup=$($Warmup.IsPresent)",
     "trace_attn=$($TraceAttn.IsPresent)",
     "trace_limit=$TraceLimit",
+    "trace_store=$($TraceStore.IsPresent)",
+    "trace_store_limit=$TraceStoreLimit",
     "extra_args=$($ExtraArgs -join ' ')"
 )
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
@@ -311,9 +358,15 @@ foreach ($case in (Get-BenchCases $CaseList)) {
     $oldErrorActionPreference = $ErrorActionPreference
     $oldTrace = [System.Environment]::GetEnvironmentVariable("LLAMA_KVARN_ATTN_TRACE", "Process")
     $oldTraceLimit = [System.Environment]::GetEnvironmentVariable("LLAMA_KVARN_ATTN_TRACE_LIMIT", "Process")
+    $oldStoreTrace = [System.Environment]::GetEnvironmentVariable("LLAMA_KVARN_STORE_TRACE", "Process")
+    $oldStoreTraceLimit = [System.Environment]::GetEnvironmentVariable("LLAMA_KVARN_STORE_TRACE_LIMIT", "Process")
     if ($TraceAttn.IsPresent) {
         [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_ATTN_TRACE", "1", "Process")
         [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_ATTN_TRACE_LIMIT", [string] $TraceLimit, "Process")
+    }
+    if ($TraceStore.IsPresent) {
+        [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_STORE_TRACE", "1", "Process")
+        [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_STORE_TRACE_LIMIT", [string] $TraceStoreLimit, "Process")
     }
     $ErrorActionPreference = "Continue"
     try {
@@ -324,6 +377,10 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         if ($TraceAttn.IsPresent) {
             [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_ATTN_TRACE", $oldTrace, "Process")
             [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_ATTN_TRACE_LIMIT", $oldTraceLimit, "Process")
+        }
+        if ($TraceStore.IsPresent) {
+            [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_STORE_TRACE", $oldStoreTrace, "Process")
+            [System.Environment]::SetEnvironmentVariable("LLAMA_KVARN_STORE_TRACE_LIMIT", $oldStoreTraceLimit, "Process")
         }
     }
 
@@ -354,6 +411,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
     $kvarnTps = if ($throughput.ContainsKey("kvarn")) { [Nullable[double]] $throughput["kvarn"] } else { $null }
     $ratio = if ($noneTps -ne $null -and $kvarnTps -ne $null -and $noneTps -gt 0.0) { [Nullable[double]] ($kvarnTps/$noneTps) } else { $null }
     $traceSummary = Get-KvarnTraceSummary $text
+    $storeTraceSummary = Get-KvarnStoreTraceSummary $text
     $summaries += [pscustomobject]@{
         Case = $case.Name
         PromptTokens = $case.PromptTokens
@@ -363,6 +421,8 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         KvarnVsNormal = $ratio
         TraceModes = $traceSummary.Modes
         TraceShapes = $traceSummary.Shapes
+        StoreTraceKinds = $storeTraceSummary.Kinds
+        StoreTraceShapes = $storeTraceSummary.Shapes
         Log = (Split-Path -Leaf $logPath)
     }
     if ($ratio -ne $null) {
@@ -374,19 +434,25 @@ $summaryCsv = Join-Path $OutputDir "summary.csv"
 $summaryMd = Join-Path $OutputDir "summary.md"
 $summaries | Export-Csv -NoTypeInformation -LiteralPath $summaryCsv
 $summaryLines = @(
-    "| case | prompt | gen | normal t/s | KVarN t/s | KVarN/normal | trace modes | log |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |"
+    "| case | prompt | gen | normal t/s | KVarN t/s | KVarN/normal | trace modes | store traces | log |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |"
 )
 foreach ($s in $summaries) {
     $normalText = if ($s.NormalTps -ne $null) { "{0:F2}" -f $s.NormalTps } else { "" }
     $kvarnText = if ($s.KvarnTps -ne $null) { "{0:F2}" -f $s.KvarnTps } else { "" }
     $ratioText = if ($s.KvarnVsNormal -ne $null) { "{0:P1}" -f $s.KvarnVsNormal } else { "" }
     $traceText = if ([string]::IsNullOrWhiteSpace($s.TraceModes)) { "" } else { $s.TraceModes }
-    $summaryLines += "| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |" -f `
-        $s.Case, $s.PromptTokens, $s.GenTokens, $normalText, $kvarnText, $ratioText, $traceText, $s.Log
+    $storeTraceText = if ([string]::IsNullOrWhiteSpace($s.StoreTraceKinds)) { "" } else { $s.StoreTraceKinds }
+    $summaryLines += "| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} |" -f `
+        $s.Case, $s.PromptTokens, $s.GenTokens, $normalText, $kvarnText, $ratioText, $traceText, $storeTraceText, $s.Log
     if (-not [string]::IsNullOrWhiteSpace($s.TraceShapes)) {
         $summaryLines += ""
         $summaryLines += "Trace shapes for `{0}`: {1}" -f $s.Case, $s.TraceShapes
+        $summaryLines += ""
+    }
+    if (-not [string]::IsNullOrWhiteSpace($s.StoreTraceShapes)) {
+        $summaryLines += ""
+        $summaryLines += "Store trace shapes for `{0}`: {1}" -f $s.Case, $s.StoreTraceShapes
         $summaryLines += ""
     }
 }

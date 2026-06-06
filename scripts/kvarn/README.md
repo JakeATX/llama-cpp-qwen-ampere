@@ -77,6 +77,12 @@ Current implemented pieces:
   out-of-range values such as `LLAMA_KVARN_ATTN_REF_SCRATCH=2` now fail with an
   explicit invalid environment-flag error instead of being silently treated as
   disabled or enabled.
+  `LLAMA_KVARN_STORE_TRACE=1` emits one low-volume line for each CUDA
+  `GGML_OP_KVARN_STORE_BODY` dispatch, including K/V kind, head dimension,
+  group size, bit width, Sinkhorn iteration count, RTN quantile, packed-body
+  bytes, scale-float count, and scratch-float count. Limit output with
+  `LLAMA_KVARN_STORE_TRACE_LIMIT=N`; malformed store-trace environment values
+  are rejected by the unsupported-mode smoke test.
 - KVarN runtime memory/context skeleton with native slot metadata, sequence
   operations, memory estimates, and production-shaped per-layer/per-KV-head
   storage. Runtime storage keeps sink/tail tokens in FP16 and seals full body
@@ -1090,6 +1096,22 @@ Verified local smoke:
   `q=1 rec=1 pending=0 tail=128`, and `q=1 rec=2 pending=0 tail=128`, each
   seen for the 10 KVarN-routed layers. Trace logging adds overhead, so use the
   non-trace matrix above for throughput.
+- `run_bench_matrix.ps1` now accepts `-TraceStore -TraceStoreLimit N`, which
+  sets `LLAMA_KVARN_STORE_TRACE=1` and summarizes store-body work in
+  `summary.md`/`summary.csv`. Qwen3.5 0.8B `pp512` with `--kvarn-iters 4`,
+  RTN quantile `1.0`, and artifact
+  `artifacts\kvarn-bench\qwen35-08b-store-trace-iters4-62e123464-dirty`
+  measured KVarN `3695.02` tok/s and parsed `k=24; v=24` store traces with
+  shapes `24x k:dim256/g128/bits4/iters4/rtn1` and
+  `24x v:dim256/g128/bits2/iters4/rtn1`. Qwen3.6 35B A3B MTP `pp512` with the
+  same KVarN parameters and artifact
+  `artifacts\kvarn-bench\qwen36-256-store-trace-iters4-62e123464-dirty`
+  measured KVarN `99.30` tok/s and parsed `k=40; v=40` store traces with
+  shapes `40x k:dim256/g128/bits4/iters4/rtn1` and
+  `40x v:dim256/g128/bits2/iters4/rtn1`. These counts are the KVarN-routed
+  layer count multiplied by the K/V body records sealed during the prompt, and
+  they make body-store launch count and store-kernel fusion the next measured
+  performance target.
 - 128-dim Qwen2.5 regression on the corrected static CUDA build:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 4 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0-27"`.
   Latest local result passed exact layer routing for `0..27`, packed-repeat,
@@ -1267,9 +1289,9 @@ packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 
 Explicit rejection smoke:
 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -Supported256ActiveModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -Supported512Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -GpuLayers 99`.
-Latest result passed all thirteen current rejection cases, including invalid
-fused/scratch/trace envs, unsafe debug ubatch values, no-kv-offload, CPU layer
-placement, and server multi-slot rejection.
+Latest result passed all fifteen current rejection cases, including invalid
+fused/scratch/trace/store-trace envs, unsafe debug ubatch values, no-kv-offload,
+CPU layer placement, and server multi-slot rejection.
 
 Focused CUDA primitive tests:
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure --repeat until-fail:3`

@@ -141,10 +141,25 @@ static int ggml_cuda_kvarn_env_int(const char * name, int default_value) {
     return int(value);
 }
 
+static bool ggml_cuda_kvarn_store_trace_enabled() {
+    return ggml_cuda_kvarn_env_flag("LLAMA_KVARN_STORE_TRACE");
+}
+
 static bool ggml_cuda_kvarn_attn_trace_claim() {
     static std::atomic<int> n_trace{0};
 
     const int limit = ggml_cuda_kvarn_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
+    if (limit <= 0) {
+        return true;
+    }
+
+    return n_trace.fetch_add(1, std::memory_order_relaxed) < limit;
+}
+
+static bool ggml_cuda_kvarn_store_trace_claim() {
+    static std::atomic<int> n_trace{0};
+
+    const int limit = ggml_cuda_kvarn_env_int("LLAMA_KVARN_STORE_TRACE_LIMIT", 64);
     if (limit <= 0) {
         return true;
     }
@@ -2900,6 +2915,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * tile    = dst->src[0];
                 const ggml_tensor * scales  = dst->src[1];
                 const ggml_tensor * scratch = dst->src[2];
+                const int64_t n_values = int64_t(params.head_dim)*params.group_size;
+                const int64_t body_bytes = (n_values*params.bits + 7)/8;
+                const int64_t scale_floats = params.is_v ? params.head_dim + 2*params.group_size : 2*params.head_dim + params.group_size;
+
+                if (ggml_cuda_kvarn_store_trace_enabled() && ggml_cuda_kvarn_store_trace_claim()) {
+                    std::fprintf(stderr,
+                            "KVarN CUDA store-body trace: kind=%c head_dim=%d group_size=%d bits=%d"
+                            " sinkhorn_iters=%d rtn_quantile=%.9g body_bytes=%" PRId64
+                            " scale_floats=%" PRId64 " scratch_floats=%" PRId64 "\n",
+                            params.is_v ? 'v' : 'k',
+                            params.head_dim, params.group_size, params.bits,
+                            params.sinkhorn_iters, double(params.rtn_quantile),
+                            body_bytes, scale_floats, scratch ? ggml_nelements(scratch) : int64_t(0));
+                }
 
                 if (params.is_v) {
                     ggml_cuda_kvarn_store_v_body_reference_minmax(
@@ -2953,6 +2982,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const bool forced_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
                 const bool forced_split = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
                 const bool forced_serial = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
+                if (ggml_cuda_kvarn_store_trace_enabled()) {
+                    (void) ggml_cuda_kvarn_env_int("LLAMA_KVARN_STORE_TRACE_LIMIT", 64);
+                }
                 if (ggml_cuda_kvarn_attn_trace_enabled() && ggml_cuda_kvarn_attn_trace_claim()) {
                     const bool split_runtime = use_scratch_ref || forced_split;
                     const bool serial_runtime = !split_runtime && forced_serial;
