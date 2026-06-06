@@ -13,6 +13,8 @@ struct ggml_atx_moe_direct_cache {
     const void * packed_src;
     const void * hot_data;
     const int32_t * expert_map;
+    const struct ggml_tensor * hot_tensor;
+    const struct ggml_tensor * expert_map_tensor;
     int type;
     int layer;
     int tensor_kind;
@@ -43,6 +45,7 @@ GGML_API bool ggml_backend_atx_moe_residency_get_direct_cache(
 GGML_API bool ggml_backend_atx_moe_residency_direct_enabled(void);
 GGML_API bool ggml_backend_atx_moe_residency_direct_require(void);
 GGML_API bool ggml_backend_atx_moe_residency_strict_hot_no_stage(void);
+GGML_API bool ggml_backend_atx_moe_residency_metal_direct_decode(void);
 GGML_API void ggml_backend_atx_moe_residency_note_direct_dispatch(int kernel);
 GGML_API void ggml_backend_atx_moe_residency_note_direct_fallback(const char * reason);
 

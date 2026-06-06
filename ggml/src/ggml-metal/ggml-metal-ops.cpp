@@ -1,5 +1,6 @@
 #include "ggml-metal-ops.h"
 
+#include "ggml-atx-moe-residency.h"
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-metal-common.h"
@@ -2626,6 +2627,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         const size_t smem = pipeline.smem;
 
+        ggml_atx_moe_direct_cache atx_direct{};
+        const bool atx_use_direct = ggml_backend_atx_moe_residency_get_direct_cache(op->src[0], &atx_direct) &&
+            atx_direct.hot_tensor != nullptr && atx_direct.expert_map_tensor != nullptr;
+
         ggml_metal_kargs_mul_mv_id args = {
             /*.nei0 =*/ne20,
             /*.nei1 =*/ne21,
@@ -2647,10 +2652,22 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             /*.ne1  =*/ne1,
             /*.nb1  =*/nb1,
             /*.nr0  =*/nr0,
+            /*.atx_has_direct =*/atx_use_direct ? 1u : 0u,
+            /*.atx_hot_stride =*/atx_use_direct ? atx_direct.hot_stride_bytes : 0ull,
         };
 
         if (ggml_is_quantized(op->src[0]->type)) {
             GGML_ASSERT(ne00 >= nsg * nr0);
+        }
+
+        ggml_metal_buffer_id bid_atx_hot = bid_src0;
+        ggml_metal_buffer_id bid_atx_map = bid_src0;
+        if (atx_use_direct) {
+            bid_atx_hot = ggml_metal_get_buffer_id(atx_direct.hot_tensor);
+            bid_atx_map = ggml_metal_get_buffer_id(atx_direct.expert_map_tensor);
+            ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMVQ);
+        } else if (ggml_backend_atx_moe_residency_direct_enabled() && ggml_backend_atx_moe_residency_direct_require()) {
+            ggml_backend_atx_moe_residency_note_direct_fallback("metal mul_mv_id direct cache unavailable");
         }
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -2659,6 +2676,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
         ggml_metal_encoder_set_buffer(enc, bid_src2, 4);
+        ggml_metal_encoder_set_buffer(enc, bid_atx_hot, 5);
+        ggml_metal_encoder_set_buffer(enc, bid_atx_map, 6);
 
         const int64_t _ne1  = 1;
         const int64_t ne123 = ne20 * ne21;

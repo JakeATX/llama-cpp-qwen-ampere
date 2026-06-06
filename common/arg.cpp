@@ -2671,7 +2671,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_KEEP_EXPERTS"));
     add_opt(common_arg(
         {"--moe-residency-mode"}, "{off,layer,exact-v1,direct,hybrid,auto}",
-        "ATX: select MoE residency runtime mode; exact-v1 uses staged hot experts, direct/hybrid/auto use CUDA direct hot-cache when possible",
+        "ATX: select MoE residency runtime mode; exact-v1 uses staged hot experts, direct/hybrid/auto use GPU direct hot-cache when possible (CUDA + Metal decode)",
         [](common_params & params, const std::string & value) {
             static const std::set<std::string> valid = {"off", "layer", "exact-v1", "direct", "hybrid", "auto"};
             if (valid.find(value) == valid.end()) {
@@ -2705,7 +2705,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_RESIDENCY_STATS"));
     add_opt(common_arg(
         {"--moe-direct-cuda"},
-        "ATX experimental: let CUDA consume resident exact experts directly from compact hot-expert cache instead of staging resident hits",
+        "ATX experimental: enable GPU direct hot-expert cache (CUDA + Metal decode); alias for --moe-residency-mode direct",
         [](common_params &) {
             atx_set_env("ATX_MOE_DIRECT_CUDA", "1");
             atx_set_env("ATX_MOE_RESIDENCY_MODE", "direct");
@@ -2738,7 +2738,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_PREWARM_EXPERTS"));
     add_opt(common_arg(
         {"--moe-pin-cpu-experts"}, "{auto,on,off}",
-        "ATX: control pinned host storage for cold MoE experts",
+        "ATX (experimental, no-op): reserved for pinned host storage for cold MoE experts",
         [](common_params &, const std::string & value) {
             static const std::set<std::string> valid = {"auto", "on", "off"};
             if (valid.find(value) == valid.end()) {
@@ -2749,7 +2749,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_PIN_CPU_EXPERTS"));
     add_opt(common_arg(
         {"--moe-cold-copy-mode"}, "{cpu-id-readback,device-bitset,device-ranges,auto}",
-        "ATX: select cold expert detection/copy strategy for MoE offload",
+        "ATX (experimental, no-op): reserved cold expert detection/copy strategy",
         [](common_params &, const std::string & value) {
             static const std::set<std::string> valid = {"cpu-id-readback", "device-bitset", "device-ranges", "auto"};
             if (valid.find(value) == valid.end()) {
@@ -2771,7 +2771,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_COLD_COALESCE_GAP"));
     add_opt(common_arg(
         {"--moe-policy-output"}, "FILE",
-        "ATX: write the normalized effective MoE policy metadata to FILE",
+        "ATX (experimental, no-op): reserved path for normalized effective MoE policy metadata",
         [](common_params &, const std::string & value) {
             if (value.empty()) {
                 throw std::invalid_argument("empty MoE policy output path");

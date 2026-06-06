@@ -1691,6 +1691,7 @@ struct atx_moe_residency_state {
     uint64_t prompt_used_expert_slices_seen = 0;
     uint64_t prompt_cold_expert_miss_slices = 0;
     uint64_t prompt_resident_direct_hit_slices = 0;
+    uint64_t metal_prompt_staging_bytes = 0;
     std::string mode = "off";
     std::string prewarm = "lazy";
     std::string pin_cpu_experts = "auto";
@@ -1884,6 +1885,7 @@ static void atx_moe_write_stats() {
     out << "    \"resident_bytes_copied\": " << state.resident_bytes_copied << ",\n";
     out << "    \"host_bytes_copied\": " << state.host_bytes_copied << ",\n";
     out << "    \"input_cpy_staging_bytes\": " << state.input_cpy_staging_bytes << ",\n";
+    out << "    \"metal_prompt_staging_bytes\": " << state.metal_prompt_staging_bytes << ",\n";
     out << "    \"input_backend_sync_calls\": " << state.input_backend_sync_calls << ",\n";
     out << "    \"input_backend_sync_ns\": " << state.input_backend_sync_ns << ",\n";
     out << "    \"ids_backend_sync_calls\": " << state.ids_backend_sync_calls << ",\n";
@@ -2015,6 +2017,30 @@ bool ggml_backend_atx_moe_residency_strict_hot_no_stage(void) {
     return state.strict_hot_no_stage;
 }
 
+bool ggml_backend_atx_moe_residency_metal_direct_decode(void) {
+    return ggml_backend_atx_moe_residency_direct_enabled();
+}
+
+static bool atx_buft_supports_direct_moe(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return false;
+    }
+    const char * name = ggml_backend_buft_name(buft);
+    if (name == nullptr) {
+        return false;
+    }
+    const std::string s(name);
+    return s.find("CUDA") != std::string::npos || s.find("Metal") != std::string::npos;
+}
+
+static bool atx_backend_is_metal(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+    const char * name = ggml_backend_name(backend);
+    return name != nullptr && std::string(name).find("Metal") != std::string::npos;
+}
+
 void ggml_backend_atx_moe_residency_note_direct_dispatch(int kernel) {
     atx_moe_residency_state & state = atx_moe_state();
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -2037,7 +2063,7 @@ void ggml_backend_atx_moe_residency_note_direct_fallback(const char * reason) {
         }
     }
     if (state.direct_require) {
-        GGML_ABORT("ATX MoE direct required but CUDA direct fallback occurred: %s\n", reason ? reason : "unknown");
+        GGML_ABORT("ATX MoE direct required but GPU direct fallback occurred: %s\n", reason ? reason : "unknown");
     }
 }
 
@@ -2143,7 +2169,7 @@ static void atx_moe_residency_init() {
     if (state.enabled) {
         GGML_LOG_INFO("ATX MoE residency: mode=%s with %zu global experts and %zu layer-specific entries%s%s\n",
                 state.mode.c_str(), state.global_experts.size(), state.layer_experts.size(),
-                state.direct_cuda ? " (direct CUDA)" : "",
+                state.direct_cuda ? " (direct GPU)" : "",
                 state.strict_hot_no_stage ? " (strict hot-no-stage)" : "");
     }
 }
@@ -2343,6 +2369,13 @@ static bool atx_moe_copy_resident_expert(
         direct.expert_stride_bytes = cache->expert_size;
         direct.hot_stride_bytes = cache->slice_size;
         direct.hot_stride_channel = cache->hot_stride_channel;
+        direct.expert_map_tensor = cache->expert_map_tensor;
+        if (!cache->resident_experts.empty()) {
+            auto hot_it = cache->expert_tensors.find(cache->resident_experts.front());
+            if (hot_it != cache->expert_tensors.end()) {
+                direct.hot_tensor = hot_it->second;
+            }
+        }
         state.direct_caches[input] = direct;
         state.direct_caches[input_cpy] = direct;
         state.direct_cache_registrations++;
@@ -2377,6 +2410,22 @@ static bool atx_moe_copy_resident_expert(
     }
 
     if (state.direct_cuda) {
+        if (atx_backend_is_metal(split_backend) && !is_decode) {
+            // Prompt-phase mul_mm_id on Metal still stages from the resident GPU cache.
+            ggml_backend_tensor_set_async(split_backend, input_cpy, cache_tensor->data, expert_offset, copy_size);
+            state.resident_cache_hit_slices++;
+            state.resident_staging_copy_calls++;
+            state.resident_bytes_copied += copy_size;
+            state.input_cpy_staging_bytes += copy_size;
+            state.metal_prompt_staging_bytes += copy_size;
+            if (layer >= 0) {
+                atx_moe_layer_stats & layer_stats = state.layer_stats[layer];
+                layer_stats.resident_cache_hit_slices++;
+                layer_stats.resident_staging_copy_calls++;
+                layer_stats.resident_bytes_copied += copy_size;
+            }
+            return true;
+        }
         state.resident_cache_hit_slices++;
         state.resident_direct_hit_slices++;
         if (is_decode) {
@@ -2489,17 +2538,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         atx_resident_experts_for_layer(atx_state, atx_tensor.layer, n_expert) :
                         std::vector<int>();
                     const bool atx_use_resident_cache = atx_state.enabled && !atx_resident_experts.empty();
-                    const bool atx_direct_cuda_supported_node =
+                    const bool atx_direct_gpu_supported_node =
                         atx_state.direct_cuda &&
                         node->op == GGML_OP_MUL_MAT_ID &&
                         ggml_is_quantized(input->type) &&
                         input->type != GGML_TYPE_TQ4_1S &&
-                        input->type != GGML_TYPE_TQ3_1S;
-                    if (atx_state.direct_cuda && atx_use_resident_cache && !atx_direct_cuda_supported_node) {
+                        input->type != GGML_TYPE_TQ3_1S &&
+                        atx_buft_supports_direct_moe(sched->bufts[split_backend_id]);
+                    if (atx_state.direct_cuda && atx_use_resident_cache && !atx_direct_gpu_supported_node) {
                         atx_state.direct_kernel_fallbacks++;
                         if (atx_state.direct_require) {
                             atx_state.direct_require_violations++;
-                            GGML_ABORT("ATX MoE direct required but tensor '%s' cannot use direct CUDA (type=%s, op=%d)\n",
+                            GGML_ABORT("ATX MoE direct required but tensor '%s' cannot use direct GPU path (type=%s, op=%d)\n",
                                     ggml_get_name(input), ggml_type_name(input->type), (int) node->op);
                         }
                     }
@@ -2663,7 +2713,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                             if (resident_mask[(size_t) id] != 0 &&
                                     atx_moe_copy_resident_expert(sched, split_backend, input_cpy, input, split_backend_id,
-                                        id, n_expert, expert_size, atx_resident_experts, atx_tensor.layer, atx_is_decode_step, atx_direct_cuda_supported_node)) {
+                                        id, n_expert, expert_size, atx_resident_experts, atx_tensor.layer, atx_is_decode_step, atx_direct_gpu_supported_node)) {
                                 if (atx_state.direct_cuda && !atx_state.strict_hot_no_stage && cold_first_id >= 0) {
                                     // Keep an existing cold host-copy range coalesced across
                                     // resident hot experts. Direct CUDA will consume the hot

@@ -587,6 +587,8 @@ typedef struct {
     int32_t  ne1;
     uint64_t nb1;
     int32_t  nr0;
+    uint32_t atx_has_direct;
+    uint64_t atx_hot_stride;
 } ggml_metal_kargs_mul_mv_id;
 
 // NORM

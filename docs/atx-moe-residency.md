@@ -42,7 +42,7 @@ The stats file is the source of truth for whether a policy actually hit resident
 Current V1 caveats:
 
 - Expert residency disables CPU weight repacking for the model run because the selective MoE copy path requires host-visible source buffers.
-- The cache is durable and GPU-visible, but V1 resident hits are still copied into the packed `ggml_mul_mat_id` staging input. This is functionally correct but can be transfer-bound and slower than whole-layer residency.
+- The cache is durable and GPU-visible. On CUDA and Metal decode (`mul_mv_id`), `--moe-residency-mode direct|hybrid` can consume hot experts from the compact cache without staging into `input_cpy`. Prompt-phase `mul_mm_id` on Metal still stages from the resident GPU cache until the matrix path is wired. `exact-v1` still stages hot experts into `input_cpy`.
 - Cold misses in the exact-cache path are coalesced into contiguous expert ranges before staging. Older V1 builds copied every cold expert one at a time.
 - MTP validation requires `--parallel 1`; the repaired local `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` path passed the smoke with `--spec-type mtp`; see `runs/atx_expert_residency/checkpoint_06_mtp_BLOCKER.RESOLVED.md`.
 

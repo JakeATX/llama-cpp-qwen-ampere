@@ -12470,6 +12470,8 @@ kernel void kernel_mul_mv_id(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device const char * atx_hot,
+        device const int32_t * atx_expert_map,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -12488,7 +12490,17 @@ kernel void kernel_mul_mv_id(
     const int64_t i1 = idx;
     const int64_t i2 = i12;
 
-    device const char * src0_cur = src0s + i02*args.nb02;
+    device const char * src0_cur;
+    if (args.atx_has_direct != 0) {
+        const int32_t hot_idx = ((device const int32_t *) (atx_expert_map))[i02];
+        if (hot_idx >= 0) {
+            src0_cur = atx_hot + (uint64_t) hot_idx * args.atx_hot_stride;
+        } else {
+            src0_cur = src0s + i02*args.nb02;
+        }
+    } else {
+        src0_cur = src0s + i02*args.nb02;
+    }
     device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
 
     device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);
