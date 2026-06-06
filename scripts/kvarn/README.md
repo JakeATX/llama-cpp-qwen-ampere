@@ -47,7 +47,11 @@ Current implemented pieces:
   score/AV kernels. Current clean forced fused-batch diagnostics pass Gemma 4
   12B packed-vs-split/scratch logits, but forcing 512 packed-body records
   remains guarded behind `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` until broader
-  512 coverage and performance justify making that path the default.
+  512 coverage and performance justify making that path the default. Unsafe
+  forced 512 body-record diagnostics also rebuild llama graphs instead of
+  reusing them after a KVarN+ISWA graph-reuse drift was isolated; the default
+  active 512 split path and validated 128/256 fused-batch path keep their normal
+  reuse behavior.
   Use `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`, or
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1 LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` for
   explicit 512 packed-body A/B diagnostics.
@@ -836,6 +840,19 @@ Verified local smoke:
   tok/s (`3.1%`); `tg64` normal KV `70.79` tok/s, KVarN `50.59` tok/s
   (`71.5%`). Forced fused-batch is now a correct diagnostic on this shape and
   faster than split, but it is still far from production prompt parity.
+  A later active-body forced fused-batch rerun at `-Repeat 16` reproduced a
+  packed-vs-split drift (`NMSE = 2.319e-03`) only with llama graph reuse
+  enabled; setting `LLAMA_GRAPH_REUSE_DISABLE=1` passed at `NMSE = 0.000E+000`.
+  The exact runtime-shaped 512 CUDA primitive
+  (`n_queries=2,n_sink=128,n_records=1,n_pending=2,n_tail=128`) passed
+  split-vs-forced-fused parity, narrowing the issue to reused composite graphs
+  rather than fused-batch arithmetic. The runtime now refuses llama graph reuse
+  for unsafe forced 512-dimensional KVarN body-record graphs. Current reruns:
+  `-Context 512 -Batch 512 -Repeat 16 -PackedFusedBatch -CheckPackedSplit`
+  and `-Repeat 32 -PackedFusedBatch -CheckPackedSplit -TraceAttn
+  -ExpectedPackedTraceMode fused-batch-forced` both passed exact Gemma 4 12B
+  KVarN+ISWA layer routing, body-record capacity `2`, packed-vs-split, and
+  packed-vs-scratch at `NMSE = 0.000E+000`.
   Follow-up tail-window diagnostic after exposing `llama-bench`
   `--kvarn-tail-tokens`: running Gemma 4 12B with `--kvarn-tail-tokens 512`
   and the default 512 split path produced
@@ -1115,8 +1132,9 @@ exercise packed body storage instead of only sink/tail capacity.
 Latest dispatcher-gate validation:
 `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers '5-47:6' -ExpectedPackedTraceMode fused-batch -ExtraArgs @('--kvarn-tail-tokens','512') }"` passed with the default no-body `mode=fused-batch` and packed-vs-scratch `NMSE = 0.000E+000`.
 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 40 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode split-512-default` passed with active 512 packed body records, default `mode=split-512-default`, and packed-vs-scratch `NMSE = 0.000E+000`.
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -TraceAttn -TraceLimit 8 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode fused-batch-forced` passed after the unsafe forced 512 body-record graph-reuse guard, with packed-vs-split and packed-vs-scratch at `NMSE = 0.000E+000`.
 The 256-dimensional production default was rechecked with
-`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 6 -ExpectedKvarnLayers "3-23:4"`, passing packed-vs-split and packed-vs-scratch at `NMSE = 0.000E+000`.
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`, passing exact layer routing, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure` passed both CUDA regression tests.
 
 For `llama-cli` smoke runs, use `--single-turn`; default conversation mode can
