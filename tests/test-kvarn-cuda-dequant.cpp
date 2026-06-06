@@ -1591,6 +1591,11 @@ static void run_case(uint32_t head_dim) {
             sink_only_fused_err = std::max(sink_only_fused_err, std::fabs(sink_only_ref[i] - sink_only_fused[i]));
             sink_only_fused_vs_split_err = std::max(sink_only_fused_vs_split_err, std::fabs(sink_only_split[i] - sink_only_fused[i]));
         }
+        if (sink_only_split_err >= 1.0e-5f || sink_only_fused_err >= 1.0e-5f || sink_only_fused_vs_split_err >= 1.0e-6f) {
+            std::fprintf(stderr,
+                    "sink-only F16-mask errors: n=%u split=%g fused=%g fused_vs_split=%g\n",
+                    n_sink_only, double(sink_only_split_err), double(sink_only_fused_err), double(sink_only_fused_vs_split_err));
+        }
         require(sink_only_split_err < 1.0e-5f, "CUDA split sink-only causal attention matches CPU reference with F16 mask");
         require(sink_only_fused_err < 1.0e-5f, "CUDA fused sink-only causal attention matches CPU reference with F16 mask");
         require(sink_only_fused_vs_split_err < 1.0e-6f, "CUDA fused sink-only causal attention matches split output with F16 mask");
@@ -1680,11 +1685,12 @@ static void run_case(uint32_t head_dim) {
 
     if (head_dim == 512) {
         {
-            const uint32_t gemma_sink_only_queries = 14;
-            const uint32_t gemma_sink_only_tokens = 14;
             const uint32_t gemma_n_head = 16;
             const uint32_t gemma_n_head_kv = 1;
             const uint32_t gemma_mask_stride_tokens = 512;
+            const float gemma_scale = 1.0f;
+            const uint32_t gemma_sink_only_queries = 50;
+            const uint32_t gemma_sink_only_tokens = 50;
 
             std::vector<float> gemma_q(size_t(gemma_sink_only_queries)*gemma_n_head*head_dim);
             std::vector<uint16_t> gemma_k_f16(size_t(gemma_sink_only_tokens)*gemma_n_head_kv*head_dim);
@@ -1754,7 +1760,7 @@ static void run_case(uint32_t head_dim) {
                     records[0].k_scales.size(), records[0].v_scales.size(),
                     size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
                     size_t(gemma_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
-                    scale,
+                    gemma_scale,
                     nullptr);
             set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
             require_cuda(cudaGetLastError(), "KVarN CUDA Gemma 512 sink-only split F32-mask launch");
@@ -1778,7 +1784,7 @@ static void run_case(uint32_t head_dim) {
                     records[0].k_scales.size(), records[0].v_scales.size(),
                     size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
                     size_t(gemma_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
-                    scale,
+                    gemma_scale,
                     nullptr);
             set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
             require_cuda(cudaGetLastError(), "KVarN CUDA Gemma 512 sink-only forced fused F32-mask launch");
@@ -1800,7 +1806,7 @@ static void run_case(uint32_t head_dim) {
                         for (uint32_t d = 0; d < head_dim; ++d) {
                             row_scores[t] += q_row[d]*gemma_k_ref[size_t(t)*head_dim + d];
                         }
-                        row_scores[t] = row_scores[t]*scale + gemma_mask_f32[size_t(iq)*gemma_mask_stride_tokens + t];
+                        row_scores[t] = row_scores[t]*gemma_scale + gemma_mask_f32[size_t(iq)*gemma_mask_stride_tokens + t];
                     }
                     float row_max = row_scores[0];
                     for (float s : row_scores) {
@@ -1829,6 +1835,11 @@ static void run_case(uint32_t head_dim) {
                 gemma_split_err = std::max(gemma_split_err, std::fabs(gemma_ref[i] - gemma_split[i]));
                 gemma_fused_err = std::max(gemma_fused_err, std::fabs(gemma_ref[i] - gemma_fused[i]));
                 gemma_fused_vs_split_err = std::max(gemma_fused_vs_split_err, std::fabs(gemma_split[i] - gemma_fused[i]));
+            }
+            if (gemma_split_err >= 1.0e-5f || gemma_fused_err >= 1.0e-5f || gemma_fused_vs_split_err >= 1.0e-6f) {
+                std::fprintf(stderr,
+                        "Gemma-shaped 512 sink-only F32-mask errors: split=%g fused=%g fused_vs_split=%g\n",
+                        double(gemma_split_err), double(gemma_fused_err), double(gemma_fused_vs_split_err));
             }
             require(gemma_split_err < 1.0e-5f, "CUDA Gemma-shaped 512 sink-only split attention matches CPU reference with F32 mask");
             require(gemma_fused_err < 1.0e-5f, "CUDA Gemma-shaped 512 sink-only forced fused attention matches CPU reference with F32 mask");

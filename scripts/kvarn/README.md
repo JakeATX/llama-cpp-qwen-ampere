@@ -427,9 +427,12 @@ Verified local smoke:
   masks, matching `-fa on` and `-fa off` runtime graph mask storage.
   Static focused rerun after adding Gemma-shaped 512 primitive coverage:
   `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref" --output-on-failure`.
-  Latest local result passed. The test now also includes a Gemma-shaped
+  Latest local result passed 10 consecutive focused reruns after extending the
+  Gemma-shaped sink-only case to the traced `scale=1` prompt shape:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref" --output-on-failure --repeat until-fail:10`.
+  The test now also includes Gemma-shaped
   512-dimensional sink-only forced-fused-vs-split primitive case (`16` query
-  heads, `1` KV head, `14` causal queries, `14` sink tokens, and a
+  heads, `1` KV head, `50` causal queries/sink tokens, `scale=1`, and a
   `512`-token padded F32 mask row), plus a Gemma-shaped
   512-dimensional forced-fused-vs-split primitive case (`16` query heads,
   `1` KV head, `17` queries, `128` sink tokens, `2` body records, `128` tail
@@ -730,8 +733,12 @@ Verified local smoke:
   Current forced fused-batch diagnostic still fails as expected:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   Latest local result failed packed-vs-split with `NMSE = 2.680e-04`; the
-  passing 512 sink-only F32-mask primitive means the fused-batch failure still
-  needs a runtime-shape reproducer beyond basic causal sink-only attention.
+  forced fused-batch trace for the save pass showed sink-only Gemma shapes
+  `n_queries=2,n_sink=2` for warmup and `n_queries=50,n_sink=50,n_records=0`
+  for the prompt, both with `head_dim=512`, `n_head=16`, `n_head_kv=1`,
+  F32 mask rows, and `scale=1`. The matching 50-token primitive passes, so the
+  remaining forced fused-batch gate likely depends on real model Q/K/V values
+  or another runtime detail not reproduced by the synthetic primitive yet.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
