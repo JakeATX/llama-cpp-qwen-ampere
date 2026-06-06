@@ -41,11 +41,13 @@ Current implemented pieces:
   sink/tail tokens and packed KVarN body records in one stable softmax.
 - The runtime packed mixed-attention path uses the multi-block fused-batch CUDA
   kernel by default for validated 128/256-dimensional heads. The 512-dimensional
-  Gemma path defaults to the split score/AV kernels after forced fused-batch
-  showed Gemma 4 12B scratch-reference drift. `LLAMA_KVARN_ATTN_FUSED_BATCH=1`
-  is now explicitly rejected for 512-dimensional K/V heads until that
-  correctness gate is fixed; use `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` or
-  `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for 512 A/B diagnostics.
+  Gemma path defaults to the split score/AV kernels. Current clean forced
+  fused-batch diagnostics pass Gemma 4 12B packed-vs-split/scratch logits, but
+  the path remains guarded behind `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`
+  until broader 512 coverage and performance justify making it the default.
+  Use `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`, or
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1 LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` for
+  explicit 512 A/B diagnostics.
 - CUDA F32 scratch mixed-attention primitive that consumes dequantized body
   scratch tensors and is used as a device-side reference for the packed mixed
   attention primitive.
@@ -98,8 +100,8 @@ Current implemented pieces:
   batching is correct through the default multi-block fused-batch CUDA path
   for 256-dimensional heads, with serial-fused and split-kernel modes retained
   only as explicit A/B diagnostics. Gemma 4 512-dimensional heads remain on the
-  split score/AV path by default until the fused 512 path is fixed against the
-  scratch-reference logits guard.
+  split score/AV path by default until the guarded fused 512 path has broader
+  coverage and production-worthy benchmark results.
 - The shared `llama_batch_allocr::split_equal()` path has regression coverage
   ensuring it does not emit more sequence sets than its `n_ubatch` limit. This
   protects KVarN's tail-ring prompt bound and the other memory backends that
@@ -735,6 +737,11 @@ Verified local smoke:
   Range-parser rerun with `-Repeat 1` also passed packed-repeat,
   packed-vs-split, and packed-vs-scratch checks at `NMSE = 0.000E+000`, with
   exact layer checks passing for `0-27` on all four `llama-results` runs.
+  Current rebuild regression at `323a85c70`:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0-27"`.
+  Packed save, split-kernel, and scratch-reference checks all logged 56 KVarN
+  layer lines, passed exact layer checks for `0-27`, and passed with
+  `NMSE = 0.000E+000`.
   Latest active-body-record guard rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27"`.
   Packed save, repeat, split, and scratch-reference checks all passed exact
@@ -745,6 +752,10 @@ Verified local smoke:
   Latest local result passed on the bounded prompt-batch path with
   packed-repeat `NMSE = 0.000E+000` and packed-vs-scratch
   `NMSE = 0.000E+000`.
+  Current rebuild regression at `323a85c70` for Qwen3.5 0.8B:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 6 -ExpectedKvarnLayers "3-23:4"`.
+  Packed save, split-kernel, and scratch-reference checks all passed exact layer
+  checks for `3,7,11,15,19,23` and `NMSE = 0.000E+000`.
 - 512-dim Gemma 4 KVarN+ISWA packed-vs-scratch logits-distance comparisons:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -CheckPackedRepeat`.
   Latest local 12B result passed with packed-repeat `NMSE = 0.000E+000` and
@@ -803,11 +814,19 @@ Verified local smoke:
   diagnostics. Without the unsafe diagnostic flag, forced fused-batch is
   rejected before executing 512-dimensional CUDA attention:
   `KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads requires LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`.
-  Latest clean-branch rerun at build `42da04dba`:
+  Latest clean-branch rerun at build `323a85c70`:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -TraceAttn -TraceLimit 8 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode fused-batch-forced`
   passed exact KVarN layer checks, active body-record capacity `2`, packed
   mode `fused-batch-forced`, packed-vs-split, and packed-vs-scratch with
-  `NMSE = 0.000E+000`.
+  `NMSE = 0.000E+000`. Matching current-build Gemma 4 12B benchmark artifacts:
+  `artifacts\kvarn-bench\gemma12b-512-default-split-current` and
+  `artifacts\kvarn-bench\gemma12b-512-forced-fused-current`. Default split
+  results: `pp512` normal KV `1748.23` tok/s, KVarN `36.94` tok/s (`2.1%`);
+  `tg64` normal KV `70.67` tok/s, KVarN `44.02` tok/s (`62.3%`). Unsafe
+  forced fused-batch results: `pp512` normal KV `1857.51` tok/s, KVarN `57.73`
+  tok/s (`3.1%`); `tg64` normal KV `70.79` tok/s, KVarN `50.59` tok/s
+  (`71.5%`). Forced fused-batch is now a correct diagnostic on this shape and
+  faster than split, but it is still far from production prompt parity.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
@@ -817,7 +836,8 @@ Verified local smoke:
   26B uses the same validated default 512 split-kernel path.
 - Unsupported runtime-mode rejection check:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -Supported512Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -GpuLayers 99`.
-  Latest static-build rerun passed all fourteen current rejection checks:
+  Latest static-build rerun at `323a85c70` passed all fourteen current
+  rejection checks:
   `KVarN invalid fused-batch env rejection: PASS`,
   `KVarN invalid unsafe fused-batch env rejection: PASS`,
   `KVarN 512 forced fused-batch unsafe-gate rejection: PASS`,
@@ -869,6 +889,10 @@ Verified local smoke:
   Packed save, split-kernel check, and scratch-reference check all passed exact
   Qwen3.6 layer routing, body-record capacity `2`, and
   `NMSE = 0.000E+000`.
+  Current rebuild regression at `323a85c70`:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`.
+  Packed save, split-kernel, and scratch-reference checks all passed exact layer
+  checks for `3,7,11,15,19,23,27,31,35,39` and `NMSE = 0.000E+000`.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current
   default-fused model-level logits guard is now the acceptance criterion.
@@ -945,7 +969,7 @@ Verified local smoke:
   Latest local result: `KVarN server smoke: PASS, content = '.'`.
   Body-record guard rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Port 8147 -Context 512 -Predict 1 -Prompt "Hello" -RtnQuantile 0.95 -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "0-27"`.
-  Latest local result passed exact layer routing and
+  Latest local result at `323a85c70` passed exact layer routing and
   `KVarN body-record check: PASS, max body records = 2`.
 - 256-dim server smoke passed:
   `powershell -ExecutionPolicy Bypass -File scripts\kvarn\run_server_smoke.ps1 -Model C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf -BuildDir build-kvarn-cuda-static-vs -Port 8135 -CheckSlotSaveRejection`.
