@@ -167,6 +167,30 @@ function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $la
     Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
 }
 
+function Get-BenchThroughputByKvq([string] $text) {
+    $result = @{}
+    foreach ($line in ($text -split "`r?`n")) {
+        if ($line -notmatch '^\|') {
+            continue
+        }
+        $cols = $line.Split('|') | ForEach-Object { $_.Trim() }
+        if ($cols.Count -lt 10) {
+            continue
+        }
+        $kvq = $cols[6].ToLowerInvariant()
+        if ($kvq -ne "none" -and $kvq -ne "kvarn") {
+            continue
+        }
+        $throughputText = $cols[9]
+        $m = [regex]::Match($throughputText, '([0-9]+(?:\.[0-9]+)?)')
+        if (-not $m.Success) {
+            continue
+        }
+        $result[$kvq] = [double]::Parse($m.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return $result
+}
+
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 $requiresKvarnEvidence = ($KvCacheQuant.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) |
@@ -191,6 +215,7 @@ $manifest = @(
 )
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
 
+$summaries = @()
 foreach ($case in (Get-BenchCases $CaseList)) {
     $argv = @(
         "-m", $modelPath,
@@ -256,6 +281,39 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         Assert-MinKvarnBodyRecords $text $MinKvarnBodyRecords "llama-bench case '$($case.Name)'"
         Write-Host ("KVarN bench log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
     }
+
+    $throughput = Get-BenchThroughputByKvq $text
+    $noneTps = if ($throughput.ContainsKey("none")) { [Nullable[double]] $throughput["none"] } else { $null }
+    $kvarnTps = if ($throughput.ContainsKey("kvarn")) { [Nullable[double]] $throughput["kvarn"] } else { $null }
+    $ratio = if ($noneTps -ne $null -and $kvarnTps -ne $null -and $noneTps -gt 0.0) { [Nullable[double]] ($kvarnTps/$noneTps) } else { $null }
+    $summaries += [pscustomobject]@{
+        Case = $case.Name
+        PromptTokens = $case.PromptTokens
+        GenTokens = $case.GenTokens
+        NormalTps = $noneTps
+        KvarnTps = $kvarnTps
+        KvarnVsNormal = $ratio
+        Log = (Split-Path -Leaf $logPath)
+    }
+    if ($ratio -ne $null) {
+        Write-Host ("KVarN benchmark ratio: {0} = {1:P1} of normal KV" -f $case.Name, $ratio)
+    }
 }
 
+$summaryCsv = Join-Path $OutputDir "summary.csv"
+$summaryMd = Join-Path $OutputDir "summary.md"
+$summaries | Export-Csv -NoTypeInformation -LiteralPath $summaryCsv
+$summaryLines = @(
+    "| case | prompt | gen | normal t/s | KVarN t/s | KVarN/normal | log |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | --- |"
+)
+foreach ($s in $summaries) {
+    $normalText = if ($s.NormalTps -ne $null) { "{0:F2}" -f $s.NormalTps } else { "" }
+    $kvarnText = if ($s.KvarnTps -ne $null) { "{0:F2}" -f $s.KvarnTps } else { "" }
+    $ratioText = if ($s.KvarnVsNormal -ne $null) { "{0:P1}" -f $s.KvarnVsNormal } else { "" }
+    $summaryLines += "| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f `
+        $s.Case, $s.PromptTokens, $s.GenTokens, $normalText, $kvarnText, $ratioText, $s.Log
+}
+[System.IO.File]::WriteAllText($summaryMd, ($summaryLines -join "`n") + "`n")
+Write-Host "KVarN benchmark summary: $summaryMd"
 Write-Host "KVarN benchmark matrix complete: $OutputDir"
