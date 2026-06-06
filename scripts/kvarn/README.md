@@ -1086,6 +1086,15 @@ Verified local smoke:
   normal KV `124.86` tok/s and KVarN `100.58` tok/s (`80.6%`). This identifies
   Sinkhorn pass count as a real but incomplete pp512 lever; the production
   default remains `16` until model-quality impact is measured.
+- The CUDA store path now uses a dedicated full-range min/max packer when
+  `--kvarn-rtn-quantile 1.0` is selected, avoiding the general kth-order row
+  selector for that exact default-quantile case. This is correct but not the
+  main Qwen3.6 `pp512` bottleneck: artifact
+  `artifacts\kvarn-bench\qwen36-256-pp512-rtn1-iters4-fullrange-fast-33a2fd2a8-dirty-no-fit`
+  measured normal KV `120.62` tok/s and KVarN `98.56` tok/s (`81.7%`), compared
+  with the previous `iters4/rtn1` KVarN result of `98.51` tok/s. The matching
+  Qwen3.6 strict active-body logits gate passed exact layers, body-record
+  capacity, packed repeat, and packed-vs-split at `NMSE = 0.000E+000`.
 - Fresh Qwen3.6 traced pp512 evidence after the parallel body-store change:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp512:512:0" -KvCacheQuant kvarn -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4" -TraceAttn -TraceLimit 96 -OutputDir artifacts\kvarn-bench\qwen36-256-parallel-store-trace-pp512`.
   Latest local result passed exact layers `3,7,11,15,19,23,27,31,35,39` and

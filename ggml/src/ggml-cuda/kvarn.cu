@@ -255,6 +255,40 @@ static __global__ void kvarn_quantize_asym_minmax_pack_rows_kernel(
     }
 }
 
+static __global__ void kvarn_quantize_asym_fullrange_pack_rows_kernel(
+        const float * __restrict__ src,
+        uint8_t * __restrict__ body,
+        float * __restrict__ row_scale,
+        float * __restrict__ row_zp,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t bits) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows || threadIdx.x != 0) {
+        return;
+    }
+
+    const uint32_t qmax = (1u << bits) - 1u;
+    const float * row = src + size_t(r)*cols;
+    float mn = row[0];
+    float mx = row[0];
+    for (uint32_t c = 1; c < cols; ++c) {
+        const float v = row[c];
+        mn = fminf(mn, v);
+        mx = fmaxf(mx, v);
+    }
+
+    const float s = (mx > mn) ? (mx - mn)/float(qmax) : 1.0f;
+    row_scale[r] = s;
+    row_zp[r] = mn;
+
+    for (uint32_t c = 0; c < cols; ++c) {
+        const float v = fminf(mx, fmaxf(mn, row[c]));
+        const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
+        kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
+    }
+}
+
 static __global__ void kvarn_store_k_finalize_scales_kernel(
         float * __restrict__ k_scales,
         const float * __restrict__ rtn_scale,
@@ -331,8 +365,13 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
     float * k_col_scale = k_scales + 2*head_dim;
     kvarn_sinkhorn_variance_normalize_parallel(
             data, k_row_scale, k_col_scale, head_dim, group_size, sinkhorn_iters, cuda_stream);
-    kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(head_dim), 1, 0, cuda_stream>>>(
-            data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits, rtn_quantile);
+    if (rtn_quantile >= 1.0f) {
+        kvarn_quantize_asym_fullrange_pack_rows_kernel<<<int(head_dim), 1, 0, cuda_stream>>>(
+                data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits);
+    } else {
+        kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(head_dim), 1, 0, cuda_stream>>>(
+                data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits, rtn_quantile);
+    }
     const int block = 128;
     kvarn_store_k_finalize_scales_kernel<<<int((head_dim + block - 1)/block), block, 0, cuda_stream>>>(
             k_scales, rtn_scale, rtn_zp, head_dim);
@@ -363,8 +402,13 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
     float * v_row_scale = v_scales + head_dim;
     kvarn_sinkhorn_variance_normalize_parallel(
             data, v_row_scale, v_col_scale, group_size, head_dim, sinkhorn_iters, cuda_stream);
-    kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(
-            data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits, rtn_quantile);
+    if (rtn_quantile >= 1.0f) {
+        kvarn_quantize_asym_fullrange_pack_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(
+                data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits);
+    } else {
+        kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(
+                data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits, rtn_quantile);
+    }
     const int block = 128;
     kvarn_store_v_finalize_scales_kernel<<<int((group_size + block - 1)/block), block, 0, cuda_stream>>>(
             v_scales, rtn_scale, rtn_zp, head_dim, group_size);
