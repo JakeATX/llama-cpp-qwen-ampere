@@ -153,8 +153,28 @@ try {
             @{
                 "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1"
             } `
-            "KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads requires LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1" `
-            "KVarN 512 forced fused-batch unsafe-gate rejection"
+            "KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads is not supported" `
+            "KVarN 512 forced fused-batch rejection"
+
+        Invoke-ExpectFailure `
+            $results `
+            @(
+                "-m", $Supported512Model,
+                "-p", $bodyPrompt,
+                "-o", $tmpOut,
+                "-c", "512",
+                "-b", "512",
+                "-ngl", [string] $GpuLayers,
+                "-fa", "off",
+                "--kv-cache-quant", "kvarn",
+                "--kvarn-preset", "kvarn_k4v2_g128"
+            ) `
+            @{
+                "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1"
+                "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH" = "1"
+            } `
+            "KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads is not supported" `
+            "KVarN 512 unsafe forced fused-batch rejection"
     }
 
     Invoke-ExpectFailure `

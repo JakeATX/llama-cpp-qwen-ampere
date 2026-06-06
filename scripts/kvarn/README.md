@@ -44,16 +44,10 @@ Current implemented pieces:
   Gemma path also uses fused-batch by default while no packed body records are
   active, which covers sink/tail-only prompt windows such as 128 sink + 512
   tail. Active 512-dimensional packed body records still default to the split
-  score/AV kernels. Current clean forced fused-batch diagnostics pass Gemma 4
-  12B packed-vs-split/scratch logits, but forcing 512 packed-body records
-  remains guarded behind `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` until broader
-  512 coverage and performance justify making that path the default. Unsafe
-  forced 512 fused-batch diagnostics also rebuild llama graphs instead of
-  reusing them after KVarN+ISWA graph-reuse drift was isolated for both no-body
-  and active-body windows; the default active 512 split path and validated
-  128/256 fused-batch path keep their normal reuse behavior.
-  Use `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`, or
-  `LLAMA_KVARN_ATTN_FUSED_BATCH=1 LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` for
+  score/AV kernels. Explicit forced fused-batch is rejected for 512-dimensional
+  heads after Gemma 4 12B repeat nondeterminism was reproduced with both
+  no-body and active packed-body windows. Use
+  `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` or `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` for
   explicit 512 packed-body A/B diagnostics.
 - CUDA F32 scratch mixed-attention primitive that consumes dequantized body
   scratch tensors and is used as a device-side reference for the packed mixed
@@ -800,74 +794,38 @@ Verified local smoke:
   also passed with exact KVarN full-attention layers `5,11,17,23,29,35,41,47`
   and 16 KVarN layer log lines.
   Latest active-body-record 512 rerun:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6"`.
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers '5-47:6' -ExtraArgs @('-fit','off') }"`.
   Packed save, split-kernel check, and scratch-reference check all passed exact
   full-attention layer routing, body-record capacity `2`, and
-  `NMSE = 0.000E+000`. The model-level active-body-record rerun after the
-  Gemma-shaped 512 primitive guard still passed default split at `NMSE = 0`.
+  `NMSE = 0.000E+000`. The same gate with the llama-results fit probe enabled
+  drifted during the split comparison at `NMSE = 1.563e-03`, so active 512
+  logits gates use `-fit off` until the fit-probe path is isolated.
   Current forced serial-fused rerun:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -PackedSerialFused -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"`.
   Latest local result passed packed-vs-split and packed-vs-scratch at
   `NMSE = 0.000E+000`, so serial fused is no longer the active 512 gate.
-  A forced fused-batch diagnostic then reproduced an unsafe 512 graph-reuse
-  failure even when no body records were active:
-  `-Context 384 -Batch 512 -Repeat 4 -PackedFusedBatch -CheckPackedRepeat
-  -CheckPackedSplit` failed repeat determinism with `NMSE = 2.434e-03` and
-  scratch comparison with `NMSE = 1.947e-04`, while packed-vs-split passed at
-  `NMSE = 0.000E+000`. Because `LLAMA_KVARN_ATTN_REF_SCRATCH=1` still uses the
-  packed fused-batch path when `n_records=0`, this narrowed the bug to unsafe
-  forced 512 fused-batch graph reuse, not packed-body dequant arithmetic.
-  The runtime now refuses llama graph reuse for all explicit unsafe forced
-  512-dimensional KVarN mixed-attention graphs, including no-body windows. The
-  exact old failing command now passes repeat, packed-vs-split, and
-  packed-vs-scratch at `NMSE = 0.000E+000`; trace output for the save pass shows
-  `n_queries=2` and `n_queries=50`, `n_records=0`, `head_dim=512`, F32 masks,
-  and `scale=1`.
-  The earlier forced fused-batch trace for active body records showed
-  Gemma shapes `n_queries=2,n_sink=128,n_records=1,n_pending=2,n_tail=128`,
-  with `head_dim=512`, `n_head=16`, `n_head_kv=1`, F32 mask rows, and `scale=1`.
-  A local diagnostic rebuild that temporarily allowed
-  `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` through the current 512 rejection
-  reran Gemma 4 12B at `-Context 512 -Batch 512 -Repeat 1
-  -PackedFusedBatch -CheckPackedSplit -MinKvarnBodyRecords 2` five consecutive
-  times with packed-vs-split and packed-vs-scratch `NMSE = 0.000E+000`. One
-  apparent failure during this investigation was traced to two comparison
-  harnesses racing on the same default temp GGUF output path, not to a stable
-  CUDA mismatch. The committed runtime now keeps the default 512-dimensional
-  guard but allows this path only when both `LLAMA_KVARN_ATTN_FUSED_BATCH=1`
-  and `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` are set for explicit
-  diagnostics. Without the unsafe diagnostic flag, forced fused-batch is
-  rejected before executing 512-dimensional CUDA attention:
-  `KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads requires LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`.
-  Latest clean-branch rerun at build `323a85c70`:
-  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -TraceAttn -TraceLimit 8 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode fused-batch-forced`
-  passed exact KVarN layer checks, active body-record capacity `2`, packed
-  mode `fused-batch-forced`, packed-vs-split, and packed-vs-scratch with
-  `NMSE = 0.000E+000`. Matching current-build Gemma 4 12B benchmark artifacts:
-  `artifacts\kvarn-bench\gemma12b-512-default-split-current` and
-  `artifacts\kvarn-bench\gemma12b-512-forced-fused-current`. Default split
-  results: `pp512` normal KV `1748.23` tok/s, KVarN `36.94` tok/s (`2.1%`);
-  `tg64` normal KV `70.67` tok/s, KVarN `44.02` tok/s (`62.3%`). Unsafe
-  forced fused-batch results: `pp512` normal KV `1857.51` tok/s, KVarN `57.73`
-  tok/s (`3.1%`); `tg64` normal KV `70.79` tok/s, KVarN `50.59` tok/s
-  (`71.5%`). Forced fused-batch is now a correct diagnostic on this shape and
-  faster than split, but it is still far from production prompt parity.
-  A later active-body forced fused-batch rerun at `-Repeat 16` reproduced a
-  packed-vs-split drift (`NMSE = 2.319e-03`) only with llama graph reuse
-  enabled; setting `LLAMA_GRAPH_REUSE_DISABLE=1` passed at `NMSE = 0.000E+000`.
-  The exact runtime-shaped 512 CUDA primitive
-  (`n_queries=2,n_sink=128,n_records=1,n_pending=2,n_tail=128`) passed
-  split-vs-forced-fused parity, narrowing the issue to reused composite graphs
-  rather than fused-batch arithmetic. The runtime now refuses llama graph reuse
-  for unsafe forced 512-dimensional KVarN body-record graphs. Current reruns:
-  `-Context 512 -Batch 512 -Repeat 16 -PackedFusedBatch -CheckPackedSplit`
-  and `-Repeat 32 -PackedFusedBatch -CheckPackedSplit -TraceAttn
-  -ExpectedPackedTraceMode fused-batch-forced` both passed exact Gemma 4 12B
-  KVarN+ISWA layer routing, body-record capacity `2`, packed-vs-split, and
-  packed-vs-scratch at `NMSE = 0.000E+000`. Current validation separates
-  no-trace logits comparisons from trace-only dispatcher checks because
-  high-volume tracing on this Windows host has produced intermittent
-  comparison drift while the same untraced commands pass at `NMSE = 0`.
+  Forced fused-batch diagnostics then isolated two separate 512 issues. First,
+  no-body forced fused-batch graph reuse drifted at `-Context 384 -Batch 512
+  -Repeat 4 -PackedFusedBatch -CheckPackedRepeat -CheckPackedSplit`, with
+  repeat `NMSE = 2.434e-03` and scratch `NMSE = 1.947e-04`. A graph-reuse guard
+  fixed that exact case, but later no-body forced fused-batch repeats still
+  failed at `NMSE = 1.349e-04` with fit on and `NMSE = 9.708e-05` with
+  `-fit off`.
+  Second, active-body forced fused-batch remains nondeterministic at the larger
+  Gemma 4 12B shape. `-Context 512 -Batch 512 -Repeat 32 -PackedFusedBatch
+  -CheckPackedRepeat -CheckPackedSplit -ExtraArgs @('-fit','off')` failed
+  repeat at `NMSE = 1.233e-05` even with `LLAMA_GRAPH_REUSE_DISABLE=1`; another
+  run with graph reuse enabled and fit on failed repeat at `NMSE = 4.205e-03`.
+  The same active-body shape is repeat-stable through forced split and forced
+  serial fused, and forced fused can still match split/scratch on individual
+  runs, so the remaining defect is specific to multi-block fused-batch
+  repeatability. The runtime now explicitly rejects forced fused-batch when
+  `head_dim >= 512`, even if the legacy
+  `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` flag is set:
+  `KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads is not supported`.
+  Historical `gemma12b-512-forced-fused-current` benchmark rows are retained
+  only as rejected-path evidence; they must not be used to claim production
+  readiness until the fused-batch kernel is fixed.
   Follow-up tail-window diagnostic after exposing `llama-bench`
   `--kvarn-tail-tokens`: running Gemma 4 12B with `--kvarn-tail-tokens 512`
   and the default 512 split path produced
@@ -897,11 +855,12 @@ Verified local smoke:
   26B uses the same validated default 512 split-kernel path.
 - Unsupported runtime-mode rejection check:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_unsupported_smoke.ps1 -SupportedModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -Supported512Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -GpuLayers 99`.
-  Latest static-build rerun at `323a85c70` passed all fourteen current
+  Latest static-build rerun passed all fifteen current
   rejection checks:
   `KVarN invalid fused-batch env rejection: PASS`,
   `KVarN invalid unsafe fused-batch env rejection: PASS`,
-  `KVarN 512 forced fused-batch unsafe-gate rejection: PASS`,
+  `KVarN 512 forced fused-batch rejection: PASS`,
+  `KVarN 512 unsafe forced fused-batch rejection: PASS`,
   `KVarN invalid scratch-reference env rejection: PASS`,
   `KVarN out-of-range scratch-reference env rejection: PASS`,
   `KVarN out-of-range trace env rejection: PASS`,
@@ -1178,9 +1137,9 @@ logits gates. Use
   `-MinKvarnBodyRecords` on these comparison harnesses when a test is meant to
 exercise packed body storage instead of only sink/tail capacity.
 Latest dispatcher-gate validation:
-`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers '5-47:6' -ExpectedPackedTraceMode fused-batch -ExtraArgs @('--kvarn-tail-tokens','512') }"` passed with the default no-body `mode=fused-batch` and packed-vs-scratch `NMSE = 0.000E+000`.
-`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6"` passed active 512 packed body records, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`; a trace-40 rerun emitted `split-512-default` but drifted during the traced comparison, so trace output is not being used as the logits gate on this host.
-`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 4 -FlashAttn off -PackedFusedBatch -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6"` passed after the unsafe forced 512 no-body graph-reuse guard, with repeat, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
+`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -TraceAttn -TraceLimit 4 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers '5-47:6' -ExpectedPackedTraceMode fused-batch -ExtraArgs @('--kvarn-tail-tokens','512','-fit','off') }"` passed with the default no-body `mode=fused-batch`, repeat, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
+`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers '5-47:6' -ExtraArgs @('-fit','off') }"` passed active 512 packed body records, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`; the same active gate with fit probing enabled drifted during split comparison at `NMSE = 1.563e-03`, so fit-probe output is not being used as the logits gate on this host.
+Explicit forced fused-batch for 512-dimensional heads is now an unsupported-mode rejection, not a dispatcher acceptance gate.
 The 256-dimensional production default was rechecked with
 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 256 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4"`, passing exact layer routing, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure` passed both CUDA regression tests.
