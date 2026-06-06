@@ -136,13 +136,15 @@ try {
         "KVarN invalid unsafe fused-batch env rejection"
 
     if ($Supported512Model -ne "") {
+        $bodyPrompt = "hello " * 450
         Invoke-ExpectFailure `
             $results `
             @(
                 "-m", $Supported512Model,
-                "-p", "hello",
+                "-p", $bodyPrompt,
                 "-o", $tmpOut,
-                "-c", [string] $Context,
+                "-c", "512",
+                "-b", "512",
                 "-ngl", [string] $GpuLayers,
                 "-fa", "off",
                 "--kv-cache-quant", "kvarn",

@@ -41,13 +41,16 @@ Current implemented pieces:
   sink/tail tokens and packed KVarN body records in one stable softmax.
 - The runtime packed mixed-attention path uses the multi-block fused-batch CUDA
   kernel by default for validated 128/256-dimensional heads. The 512-dimensional
-  Gemma path defaults to the split score/AV kernels. Current clean forced
-  fused-batch diagnostics pass Gemma 4 12B packed-vs-split/scratch logits, but
-  the path remains guarded behind `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`
-  until broader 512 coverage and performance justify making it the default.
+  Gemma path also uses fused-batch by default while no packed body records are
+  active, which covers sink/tail-only prompt windows such as 128 sink + 512
+  tail. Active 512-dimensional packed body records still default to the split
+  score/AV kernels. Current clean forced fused-batch diagnostics pass Gemma 4
+  12B packed-vs-split/scratch logits, but forcing 512 packed-body records
+  remains guarded behind `LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` until broader
+  512 coverage and performance justify making that path the default.
   Use `LLAMA_KVARN_ATTN_SERIAL_FUSED=1`, `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1`, or
   `LLAMA_KVARN_ATTN_FUSED_BATCH=1 LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1` for
-  explicit 512 A/B diagnostics.
+  explicit 512 packed-body A/B diagnostics.
 - CUDA F32 scratch mixed-attention primitive that consumes dequantized body
   scratch tensors and is used as a device-side reference for the packed mixed
   attention primitive.
@@ -832,14 +835,15 @@ Verified local smoke:
   and the default 512 split path produced
   `artifacts\kvarn-bench\gemma12b-512-tail512-split`, with `pp512` normal KV
   `1557.83` tok/s, KVarN `65.95` tok/s (`4.2%`), and `tg64` normal KV
-  `70.14` tok/s, KVarN `43.41` tok/s (`61.9%`). The same tail512 config under
-  `LLAMA_KVARN_ATTN_FUSED_BATCH=1 LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`
-  produced `artifacts\kvarn-bench\gemma12b-512-tail512-forced-fused`, with
-  `pp512` normal KV `1810.54` tok/s, KVarN `1580.96` tok/s (`87.3%`), and
-  `tg64` normal KV `70.72` tok/s, KVarN `50.31` tok/s (`71.1%`). Matching
-  tail512 forced-fused logits validation used
-  `compare_cuda_logits_ref.ps1 ... -PackedFusedBatch -CheckPackedSplit
-  -TraceAttn -ExpectedPackedTraceMode fused-batch-forced -ExtraArgs
+  `70.14` tok/s, KVarN `43.41` tok/s (`61.9%`). After routing
+  512-dimensional no-body windows through the default fused-batch path, the
+  same tail512 config without unsafe environment flags produced
+  `artifacts\kvarn-bench\gemma12b-512-tail512-default-fused-nobody`, with
+  `pp512` normal KV `1836.48` tok/s, KVarN `1578.78` tok/s (`86.0%`), and
+  `tg64` normal KV `70.51` tok/s, KVarN `50.06` tok/s (`71.0%`). Matching
+  tail512 default logits validation used
+  `compare_cuda_logits_ref.ps1 ... -CheckPackedSplit -TraceAttn
+  -ExpectedPackedTraceMode fused-batch -ExtraArgs
   @('--kvarn-tail-tokens','512')` and passed exact Gemma layers, body records
   `0`, packed-vs-split, and packed-vs-scratch with `NMSE = 0.000E+000`. This
   identifies tail sizing plus fused-batch as the strongest current prompt
@@ -1067,8 +1071,8 @@ Required integration path:
    performance gates can use the standard benchmark tool and sweep FP16
    sink/tail policy. Current KVarN rows remain materially slower than normal
    KV until flash-attention load-path fusion is implemented, but Gemma 4 12B
-   tail512 forced-fused diagnostics show prompt parity is reachable when body
-   sealing is avoided for the first 640 tokens.
+   tail512 default fused-batch diagnostics show prompt parity is reachable
+   while body sealing is avoided for the first 640 tokens.
 
 The current `compare_cuda_reuse.ps1` harness is not a replacement for the
 future fused-versus-scratch logits-distance test. It is a guard for the current
@@ -1085,11 +1089,13 @@ to all packed/split/scratch runs in one comparison. For traced dispatcher checks
 `compare_cuda_logits_ref.ps1 -TraceAttn -ExpectedPackedTraceMode <mode>` now
 also fails if the packed CUDA path does not emit the expected mode, such as
 `fused-batch` for the default validated 128/256-dimensional path or
-`split-512-default` for the current Gemma 4 512-dimensional path. Use
+the 512-dimensional no-body Gemma path, and `split-512-default` for active
+512-dimensional packed body records. Use
   `-MinKvarnBodyRecords` on these comparison harnesses when a test is meant to
 exercise packed body storage instead of only sink/tail capacity.
 Latest dispatcher-gate validation:
-`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -PackedFusedBatch -CheckPackedSplit -TraceAttn -TraceLimit 8 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode fused-batch-forced` passed with `mode=fused-batch-forced`, active body records, and packed-vs-scratch `NMSE = 0.000E+000`.
+`powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers '5-47:6' -ExpectedPackedTraceMode fused-batch -ExtraArgs @('--kvarn-tail-tokens','512') }"` passed with the default no-body `mode=fused-batch` and packed-vs-scratch `NMSE = 0.000E+000`.
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 40 -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "5-47:6" -ExpectedPackedTraceMode split-512-default` passed with active 512 packed body records, default `mode=split-512-default`, and packed-vs-scratch `NMSE = 0.000E+000`.
 The 256-dimensional production default was rechecked with
 `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.5-0.8B-GGUF\Qwen3.5-0.8B-Q4_K_M.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedSplit -TraceAttn -TraceLimit 4 -ExpectedPackedTraceMode fused-batch -MinKvarnLayerLogs 6 -ExpectedKvarnLayers "3-23:4"`, passing packed-vs-split and packed-vs-scratch at `NMSE = 0.000E+000`.
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure` passed both CUDA regression tests.
