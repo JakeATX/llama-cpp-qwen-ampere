@@ -2953,31 +2953,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const bool forced_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
                 const bool forced_split = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
                 const bool forced_serial = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
-                if (forced_fused_batch && params.head_dim >= 512) {
-                    GGML_ABORT("KVarN forced fused-batch CUDA attention for 512-dimensional K/V heads is not supported; use the default 512 routing, LLAMA_KVARN_ATTN_SPLIT_KERNELS=1, or LLAMA_KVARN_ATTN_SERIAL_FUSED=1 for supported 512-dimensional execution");
-                }
-                if (forced_fused_batch && dst->ne[2] > 1 && params.n_records > 0 && params.n_pending > 0) {
-                    GGML_ABORT("KVarN forced fused-batch CUDA attention for multi-query active body-record windows is not supported; use the default split path or LLAMA_KVARN_ATTN_SERIAL_FUSED=1 for supported execution");
-                }
-                if (forced_fused_batch && dst->ne[2] > 1 && params.n_records == 0) {
-                    GGML_ABORT("KVarN forced fused-batch CUDA attention for multi-query no-body windows is not supported; use the default split path or LLAMA_KVARN_ATTN_SERIAL_FUSED=1 for supported execution");
-                }
                 if (ggml_cuda_kvarn_attn_trace_enabled() && ggml_cuda_kvarn_attn_trace_claim()) {
-                    const bool default_split_512 = params.head_dim >= 512 && params.n_records > 0 && !forced_fused_batch && !forced_serial;
-                    const bool default_split_active_pending =
-                        dst->ne[2] > 1 && params.n_records > 0 && params.n_pending > 0 && !forced_fused_batch && !forced_serial;
-                    const bool default_split_no_body =
-                        dst->ne[2] > 1 && params.n_records == 0 && !forced_fused_batch && !forced_serial;
-                    const bool split_runtime = use_scratch_ref || forced_split || default_split_512;
-                    const bool split_active_pending_runtime = !use_scratch_ref && !forced_split && default_split_active_pending;
-                    const bool split_no_body_runtime = !use_scratch_ref && !forced_split && default_split_no_body;
-                    const bool split_any_runtime = split_runtime || split_active_pending_runtime || split_no_body_runtime;
-                    const bool serial_runtime = !split_any_runtime && forced_serial;
+                    const bool split_runtime = use_scratch_ref || forced_split;
+                    const bool serial_runtime = !split_runtime && forced_serial;
                     const char * mode = use_scratch_ref ? "scratch-ref" :
-                        (split_any_runtime ? (
-                                default_split_512 && !forced_split ? "split-512-default" :
-                                (split_active_pending_runtime ? "split-active-pending-default" :
-                                    (split_no_body_runtime ? "split-nobody-default" : "split"))) :
+                        (split_runtime ? "split" :
                             (serial_runtime ? "serial-fused" :
                                 (forced_fused_batch ? "fused-batch-forced" : "fused-batch")));
 
