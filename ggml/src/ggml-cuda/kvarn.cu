@@ -2179,13 +2179,17 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         void * stream) {
     const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
     const uint32_t n_gqa = n_head/n_head_kv;
-    const bool force_fused_batch = kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
+    const bool force_fused_batch_requested = kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
     const bool force_serial_fused = kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
+    const bool force_fused_batch =
+        force_fused_batch_requested && !(n_queries > 1 && n_records == 0);
     const bool split_default_512 = head_dim >= 512 && n_records > 0 && !force_fused_batch && !force_serial_fused;
     const bool split_default_active_pending =
         n_queries > 1 && n_records > 0 && n_pending > 0 && !force_fused_batch && !force_serial_fused;
+    const bool split_default_no_body =
+        n_queries > 1 && n_records == 0 && !force_fused_batch && !force_serial_fused;
     const bool use_split_kernels = kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS") ||
-        split_default_512 || split_default_active_pending;
+        split_default_512 || split_default_active_pending || split_default_no_body;
     const bool use_serial_fused = force_serial_fused && !use_split_kernels;
 
     int block = 1;

@@ -179,12 +179,12 @@ try {
     }
 
     if ($Supported256ActiveModel -ne "") {
-        $bodyPrompt = "hello " * 450
+        $pendingTailPrompt = "hello " * 272
         Invoke-ExpectFailure `
             $results `
             @(
                 "-m", $Supported256ActiveModel,
-                "-p", $bodyPrompt,
+                "-p", $pendingTailPrompt,
                 "-o", $tmpOut,
                 "-c", "512",
                 "-b", "512",
@@ -197,8 +197,8 @@ try {
             @{
                 "LLAMA_KVARN_ATTN_FUSED_BATCH" = "1"
             } `
-            "KVarN forced fused-batch CUDA attention for multi-query active body-record windows is not supported" `
-            "KVarN 256 active-pending forced fused-batch rejection"
+            "KVarN forced fused-batch CUDA attention for multi-query no-body windows is not supported" `
+            "KVarN 256 no-body forced fused-batch rejection"
     }
 
     Invoke-ExpectFailure `
