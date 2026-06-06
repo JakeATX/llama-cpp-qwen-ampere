@@ -956,8 +956,10 @@ Verified local smoke:
   The synthetic CUDA primitive diagnostic for this exact shape is opt-in via
   `LLAMA_KVARN_TEST_ACTIVE_PENDING_DIAG=1` in
   `test-kvarn-cuda-scratch-ref`. In isolation it matched forced fused-batch to
-  split output, but running it unconditionally perturbed later sink-only fused
-  tests, narrowing the remaining issue to real graph/state/mask/runtime
+  split output and a second forced fused launch matched bit-for-bit, proving
+  primitive-level repeat determinism for the synthetic runtime shape. Running
+  the diagnostic unconditionally had previously perturbed later sink-only fused
+  tests, so it remains opt-in; the remaining issue is real model graph/data
   interaction rather than only static shape arithmetic.
   Earlier fused-batch diagnostics exposed and fixed a dynamic shared-memory
   padding issue in `kvarn_attn_mixed_f16_fused_batch_kernel`; the current

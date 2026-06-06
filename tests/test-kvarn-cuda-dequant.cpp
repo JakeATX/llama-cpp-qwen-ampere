@@ -1566,10 +1566,12 @@ static void run_case(uint32_t head_dim) {
             float * active_mask_d = cuda_upload(active_mask);
             float * active_split_d = nullptr;
             float * active_fused_d = nullptr;
+            float * active_fused_repeat_d = nullptr;
             float * active_scores_d = nullptr;
             float * active_fused_scores_d = nullptr;
             require_cuda(cudaMalloc(&active_split_d, active_queries.size()*sizeof(float)), "cudaMalloc active-pending split output");
             require_cuda(cudaMalloc(&active_fused_d, active_queries.size()*sizeof(float)), "cudaMalloc active-pending fused output");
+            require_cuda(cudaMalloc(&active_fused_repeat_d, active_queries.size()*sizeof(float)), "cudaMalloc active-pending fused repeat output");
             require_cuda(cudaMalloc(&active_scores_d, n_active_tokens*sizeof(float)), "cudaMalloc active-pending split scores");
             require_cuda(cudaMalloc(&active_fused_scores_d, n_active_tokens*sizeof(float)), "cudaMalloc active-pending fused scores");
 
@@ -1617,28 +1619,59 @@ static void run_case(uint32_t head_dim) {
                     size_t(q36_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
                     scale,
                     nullptr);
+            ggml_cuda_kvarn_attn_mixed_f16_batch(
+                    active_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
+                    mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
+                    active_pending_k_d, active_pending_v_d, active_mask_d,
+                    active_fused_repeat_d, active_fused_scores_d,
+                    n_active_queries, n_head, n_head_kv,
+                    n_q36_sink, n_active_records, n_active_pending, n_active_tail, active_tail_start, head_dim, group,
+                    params.key_bits, params.value_bits,
+                    head_dim, size_t(n_head)*head_dim,
+                    head_dim, size_t(n_head)*head_dim,
+                    head_dim, size_t(n_head_kv)*head_dim,
+                    head_dim, size_t(n_head_kv)*head_dim,
+                    records[0].k_body.size(), records[0].v_body.size(),
+                    size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                    records[0].k_scales.size(), records[0].v_scales.size(),
+                    size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                    size_t(q36_mask_stride_tokens)*sizeof(float), sizeof(float), 1,
+                    scale,
+                    nullptr);
             set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
             require_cuda(cudaGetLastError(), "KVarN CUDA active-pending forced fused launch");
             require_cuda(cudaDeviceSynchronize(), "KVarN CUDA active-pending forced fused sync");
 
             std::vector<float> active_split(active_queries.size());
             std::vector<float> active_fused(active_queries.size());
+            std::vector<float> active_fused_repeat(active_queries.size());
             require_cuda(cudaMemcpy(active_split.data(), active_split_d, active_split.size()*sizeof(float), cudaMemcpyDeviceToHost),
                     "copy active-pending split output");
             require_cuda(cudaMemcpy(active_fused.data(), active_fused_d, active_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
                     "copy active-pending fused output");
+            require_cuda(cudaMemcpy(active_fused_repeat.data(), active_fused_repeat_d, active_fused_repeat.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                    "copy active-pending fused repeat output");
 
             float active_fused_vs_split_err = 0.0f;
+            float active_fused_repeat_err = 0.0f;
             for (size_t i = 0; i < active_split.size(); ++i) {
                 active_fused_vs_split_err = std::max(active_fused_vs_split_err, std::fabs(active_split[i] - active_fused[i]));
+                active_fused_repeat_err = std::max(active_fused_repeat_err, std::fabs(active_fused[i] - active_fused_repeat[i]));
             }
             if (active_fused_vs_split_err >= 1.0e-6f) {
                 std::fprintf(stderr,
                         "active-pending fused_vs_split=%g q=%u records=%u pending=%u tail=%u\n",
                         double(active_fused_vs_split_err), n_active_queries, n_active_records, n_active_pending, n_active_tail);
             }
+            if (active_fused_repeat_err != 0.0f) {
+                std::fprintf(stderr,
+                        "active-pending fused_repeat_err=%g q=%u records=%u pending=%u tail=%u\n",
+                        double(active_fused_repeat_err), n_active_queries, n_active_records, n_active_pending, n_active_tail);
+            }
             require(active_fused_vs_split_err < 1.0e-6f,
                     "CUDA active-pending forced fused attention matches split output");
+            require(active_fused_repeat_err == 0.0f,
+                    "CUDA active-pending forced fused attention is repeat deterministic");
 
             cudaFree(active_queries_d);
             cudaFree(active_pending_k_d);
@@ -1646,6 +1679,7 @@ static void run_case(uint32_t head_dim) {
             cudaFree(active_mask_d);
             cudaFree(active_split_d);
             cudaFree(active_fused_d);
+            cudaFree(active_fused_repeat_d);
             cudaFree(active_scores_d);
             cudaFree(active_fused_scores_d);
         }
