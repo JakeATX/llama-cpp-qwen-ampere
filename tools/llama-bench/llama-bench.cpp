@@ -451,6 +451,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  --kv-cache-quant <none|kvarn>               (default: %s)\n", join(transform_to_str(cmd_params_defaults.kv_cache_quant_type, llama_kv_cache_quant_type_name), ",").c_str());
     printf("  --kvarn-preset <preset>                     KVarN preset, currently kvarn_k4v2_g128\n");
+    printf("  --kvarn-sink-tokens <n>                     KVarN FP16 sink tokens (default: %u)\n", cmd_params_defaults.kvarn.sink_tokens);
+    printf("  --kvarn-tail-tokens <n>                     KVarN FP16 tail tokens (default: %u)\n", cmd_params_defaults.kvarn.tail_tokens);
     printf("  --kvarn-rtn-quantile <q>                    KVarN RTN scale quantile in (0, 1] (default: %.6g)\n", cmd_params_defaults.kvarn.rtn_quantile);
     printf("  -t, --threads <n>                           (default: %s)\n", join(cmd_params_defaults.n_threads, ",").c_str());
     printf("  -C, --cpu-mask <hex,hex>                    (default: %s)\n", join(cmd_params_defaults.cpu_mask, ",").c_str());
@@ -696,6 +698,28 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
+            } else if (arg == "--kvarn-sink-tokens") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const int value = std::stoi(argv[i]);
+                if (value <= 0) {
+                    invalid_param = true;
+                    break;
+                }
+                params.kvarn.sink_tokens = uint32_t(value);
+            } else if (arg == "--kvarn-tail-tokens") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const int value = std::stoi(argv[i]);
+                if (value <= 0) {
+                    invalid_param = true;
+                    break;
+                }
+                params.kvarn.tail_tokens = uint32_t(value);
             } else if (arg == "--kvarn-rtn-quantile") {
                 if (++i >= argc) {
                     invalid_param = true;

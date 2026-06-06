@@ -827,6 +827,25 @@ Verified local smoke:
   tok/s (`3.1%`); `tg64` normal KV `70.79` tok/s, KVarN `50.59` tok/s
   (`71.5%`). Forced fused-batch is now a correct diagnostic on this shape and
   faster than split, but it is still far from production prompt parity.
+  Follow-up tail-window diagnostic after exposing `llama-bench`
+  `--kvarn-tail-tokens`: running Gemma 4 12B with `--kvarn-tail-tokens 512`
+  and the default 512 split path produced
+  `artifacts\kvarn-bench\gemma12b-512-tail512-split`, with `pp512` normal KV
+  `1557.83` tok/s, KVarN `65.95` tok/s (`4.2%`), and `tg64` normal KV
+  `70.14` tok/s, KVarN `43.41` tok/s (`61.9%`). The same tail512 config under
+  `LLAMA_KVARN_ATTN_FUSED_BATCH=1 LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH=1`
+  produced `artifacts\kvarn-bench\gemma12b-512-tail512-forced-fused`, with
+  `pp512` normal KV `1810.54` tok/s, KVarN `1580.96` tok/s (`87.3%`), and
+  `tg64` normal KV `70.72` tok/s, KVarN `50.31` tok/s (`71.1%`). Matching
+  tail512 forced-fused logits validation used
+  `compare_cuda_logits_ref.ps1 ... -PackedFusedBatch -CheckPackedSplit
+  -TraceAttn -ExpectedPackedTraceMode fused-batch-forced -ExtraArgs
+  @('--kvarn-tail-tokens','512')` and passed exact Gemma layers, body records
+  `0`, packed-vs-split, and packed-vs-scratch with `NMSE = 0.000E+000`. This
+  identifies tail sizing plus fused-batch as the strongest current prompt
+  performance lever, at the cost of a larger FP16 sink/tail window and no
+  compression before the first `sink_tokens + tail_tokens` tokens, so tail512
+  is not the preset default yet.
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-26B-A4B-it-GGUF\gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 384 -Batch 512 -Repeat 2 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 5 -ExpectedKvarnLayers "5-29:6"`.
   Latest local 26B A4B rerun passed exact full-attention layer checks for
   `5,11,17,23,29` with 10 KVarN layer log lines on each pass, plus
@@ -1043,10 +1062,13 @@ Required integration path:
    explicit `--parallel` values above `1` and lowers server auto-parallel to
    one slot.
 7. Optimize performance. `llama-bench` now accepts `--kv-cache-quant
-   none|kvarn`, `--kvarn-preset`, and `--kvarn-rtn-quantile`, so production
-   performance gates can use the standard benchmark tool; current KVarN rows
-   remain materially slower than normal KV until flash-attention load-path
-   fusion is implemented.
+   none|kvarn`, `--kvarn-preset`, `--kvarn-sink-tokens`,
+   `--kvarn-tail-tokens`, and `--kvarn-rtn-quantile`, so production
+   performance gates can use the standard benchmark tool and sweep FP16
+   sink/tail policy. Current KVarN rows remain materially slower than normal
+   KV until flash-attention load-path fusion is implemented, but Gemma 4 12B
+   tail512 forced-fused diagnostics show prompt parity is reachable when body
+   sealing is avoided for the first 640 tokens.
 
 The current `compare_cuda_reuse.ps1` harness is not a replacement for the
 future fused-versus-scratch logits-distance test. It is a guard for the current
@@ -1057,7 +1079,9 @@ for the current packed attention op, and `compare_cuda_logits_ref.ps1` adds the
 corresponding logits-distance guard. `compare_cuda_logits_ref.ps1` now uses
 unique temp GGUF and prompt paths by default so concurrent diagnostics cannot
 overwrite each other's saved logits; pass `-OutputFile` or `-PromptFile` only
-when a stable artifact path is intentionally required. For traced dispatcher checks,
+when a stable artifact path is intentionally required. It also accepts
+`-ExtraArgs` to forward custom runtime flags such as `--kvarn-tail-tokens 512`
+to all packed/split/scratch runs in one comparison. For traced dispatcher checks,
 `compare_cuda_logits_ref.ps1 -TraceAttn -ExpectedPackedTraceMode <mode>` now
 also fails if the packed CUDA path does not emit the expected mode, such as
 `fused-batch` for the default validated 128/256-dimensional path or

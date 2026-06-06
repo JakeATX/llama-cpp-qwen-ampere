@@ -22,7 +22,8 @@ param(
     [switch] $TraceAttn,
     [int] $TraceLimit = 4,
     [string] $ExpectedPackedTraceMode = "",
-    [switch] $KeepArtifacts
+    [switch] $KeepArtifacts,
+    [string[]] $ExtraArgs = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -251,6 +252,9 @@ $commonArgs = @(
 )
 if ($Batch -gt 0) {
     $commonArgs += @("-b", [string] $Batch)
+}
+if ($ExtraArgs.Count -gt 0) {
+    $commonArgs += $ExtraArgs
 }
 
 $packedEnv = @{}
