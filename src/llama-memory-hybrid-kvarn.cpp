@@ -28,10 +28,6 @@ static uint32_t kvarn_ubatch_limit(uint32_t n_ubatch, uint32_t tail_tokens, bool
     return std::max<uint32_t>(1, std::min<uint32_t>(n_ubatch, tail_tokens));
 }
 
-static bool kvarn_debug_ubatch_is_set() {
-    return std::getenv("LLAMA_KVARN_DEBUG_UBATCH") != nullptr;
-}
-
 llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
         const llama_model & model,
         llama_kvarn_params params,
@@ -81,16 +77,18 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
 
     std::vector<llama_ubatch> ubatches;
     bool invalid_debug_ubatch = false;
-    const uint32_t n_kvarn_ubatch = hparams.n_expert > 0 && !kvarn_debug_ubatch_is_set() ?
-        1 : kvarn_ubatch_limit(n_ubatch, mem_attn->get_tail_tokens(), invalid_debug_ubatch);
+    const uint32_t n_tail_tokens = mem_attn->get_tail_tokens();
+    const uint32_t n_kvarn_ubatch =
+        hparams.n_expert > 0 && balloc.get_n_tokens() > n_tail_tokens ?
+            1 : kvarn_ubatch_limit(n_ubatch, n_tail_tokens, invalid_debug_ubatch);
     if (invalid_debug_ubatch) {
         LLAMA_LOG_ERROR("%s: KVarN debug ubatch override must be a positive integer: LLAMA_KVARN_DEBUG_UBATCH=%s\n",
                 __func__, std::getenv("LLAMA_KVARN_DEBUG_UBATCH"));
         return std::make_unique<llama_memory_hybrid_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
-    if (n_kvarn_ubatch > mem_attn->get_tail_tokens()) {
+    if (n_kvarn_ubatch > n_tail_tokens) {
         LLAMA_LOG_ERROR("%s: KVarN debug ubatch override exceeds tail-ring safety limit: %u > %u\n",
-                __func__, n_kvarn_ubatch, mem_attn->get_tail_tokens());
+                __func__, n_kvarn_ubatch, n_tail_tokens);
         return std::make_unique<llama_memory_hybrid_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
