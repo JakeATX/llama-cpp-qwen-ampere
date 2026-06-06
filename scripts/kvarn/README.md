@@ -950,7 +950,10 @@ Verified local smoke:
   and `artifacts\kvarn-bench\qwen36-256-active-body-forced-split-barrier-clean`.
   The promoted no-env default fused route measured `27.86` tok/s in
   `artifacts\kvarn-bench\qwen36-256-active-body-default-fused-promoted`,
-  with exact layer checks and two body records per KVarN layer.
+  with exact layer checks and two body records per KVarN layer. That result was
+  later superseded by the parallel CUDA body-store path below; fused-batch
+  routing was correct, but body sealing was still using single-thread
+  `<<<1, 1>>>` reference store kernels.
   The synthetic CUDA primitive diagnostic for this exact shape is opt-in via
   `LLAMA_KVARN_TEST_ACTIVE_PENDING_DIAG=1` in
   `test-kvarn-cuda-scratch-ref`. In isolation it matched forced fused-batch to
@@ -1029,6 +1032,43 @@ Verified local smoke:
   the split baselines before comparing against the diagnostic fused-batch path,
   so the MHA mixed, Qwen3.6-shaped, and sink-only primitive cases really cover
   split-vs-fused instead of serial-vs-fused.
+- Parallel CUDA body-store implementation:
+  `ggml_cuda_kvarn_store_{k,v}_body_reference_minmax()` now uses per-vector
+  Hadamard kernels, per-row/per-column Sinkhorn kernels, row-parallel min/max
+  quantile packing, and parallel scale finalization instead of the old
+  single-thread `kvarn_store_{k,v}_body_reference_kernel`. The row/vector
+  arithmetic order is preserved for byte-stable parity with the CPU/reference
+  test. Build and validation:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --parallel 4`;
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure --repeat until-fail:10`.
+  Latest local result passed 10 repeats of both CUDA tests. Model-level
+  body-store gate:
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 384 -PromptPhrase 'hello ' -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -MinKvarnLayerLogs 28 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers '0-27' -ExtraArgs @('-fit','off') }"`.
+  Latest local result passed exact layers `0..27`, max body records `2`,
+  packed-repeat, packed-vs-split, and packed-vs-scratch at
+  `NMSE = 0.000E+000`.
+- Fresh Qwen3.6 35B A3B MTP benchmark after rebuilding `llama-bench` and after
+  the parallel body-store change:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp128:128:0,pp512:512:0,tg64:0:64" -KvCacheQuant "none,kvarn" -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -ExpectedKvarnLayers "3-39:4" -OutputDir artifacts\kvarn-bench\qwen36-256-parallel-store-matrix`.
+  Latest local result: `pp128` normal KV `88.39` tok/s, KVarN `109.34` tok/s
+  (`123.7%`); `pp512` normal KV `125.06` tok/s, KVarN `91.42` tok/s
+  (`73.1%`); `tg64` normal KV `9.97` tok/s, KVarN `10.20` tok/s (`102.3%`).
+  Before this store-kernel change, the rebuilt fused-batch default measured
+  `pp512` KVarN `32.54` tok/s (`26.1%` of normal KV) in
+  `artifacts\kvarn-bench\qwen36-256-default-fused-prod-matrix-bef5ab9f4`.
+  The earlier `artifacts\kvarn-bench\qwen36-256-default-fused-prod-matrix`
+  artifact is stale (`build: c3d286bec`) and should not be used for current
+  production claims.
+- Fresh Qwen3.6 traced pp512 evidence after the parallel body-store change:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" -BuildDir build-kvarn-cuda-static-vs -CaseList "pp512:512:0" -KvCacheQuant kvarn -FlashAttn off -Repetitions 1 -MinKvarnLayerLogs 10 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers "3-39:4" -TraceAttn -TraceLimit 96 -OutputDir artifacts\kvarn-bench\qwen36-256-parallel-store-trace-pp512`.
+  Latest local result passed exact layers `3,7,11,15,19,23,27,31,35,39` and
+  max body records `2`; parsed CUDA trace modes were `fused-batch=60`, with no
+  split fallback. The traced artifact includes the expected shapes:
+  `q=128 rec=0 pending=0 tail=0`, `q=128 rec=0 pending=0 tail=128`,
+  `q=127 rec=0 pending=127 tail=128`, `q=127 rec=1 pending=127 tail=128`,
+  `q=1 rec=1 pending=0 tail=128`, and `q=1 rec=2 pending=0 tail=128`, each
+  seen for the 10 KVarN-routed layers. Trace logging adds overhead, so use the
+  non-trace matrix above for throughput.
 - 128-dim Qwen2.5 regression on the corrected static CUDA build:
   `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\compare_cuda_logits_ref.ps1 -Model "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf" -BuildDir build-kvarn-cuda-static-vs -Context 256 -Batch 512 -Repeat 4 -CheckPackedRepeat -CheckPackedSplit -FlashAttn off -MinKvarnLayerLogs 28 -ExpectedKvarnLayers "0-27"`.
   Latest local result passed exact layer routing for `0..27`, packed-repeat,

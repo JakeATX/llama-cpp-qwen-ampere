@@ -79,102 +79,6 @@ static __device__ __forceinline__ float kvarn_kq_mask_bias(
     return 0.0f;
 }
 
-static __device__ void kvarn_hadamard_channels(
-        const float * src,
-        float * dst,
-        uint32_t rows,
-        uint32_t cols,
-        bool channels_are_rows) {
-    const size_t n = size_t(rows)*cols;
-    for (size_t i = 0; i < n; ++i) {
-        dst[i] = src[i];
-    }
-
-    const uint32_t n_channels = channels_are_rows ? rows : cols;
-    const float norm = rsqrtf(float(n_channels));
-
-    if (channels_are_rows) {
-        for (uint32_t c = 0; c < cols; ++c) {
-            for (uint32_t step = 1; step < rows; step <<= 1) {
-                for (uint32_t base = 0; base < rows; base += 2*step) {
-                    for (uint32_t i = 0; i < step; ++i) {
-                        const uint32_t r0 = base + i;
-                        const uint32_t r1 = r0 + step;
-                        const float a = dst[size_t(r0)*cols + c];
-                        const float b = dst[size_t(r1)*cols + c];
-                        dst[size_t(r0)*cols + c] = a + b;
-                        dst[size_t(r1)*cols + c] = a - b;
-                    }
-                }
-            }
-        }
-    } else {
-        for (uint32_t r = 0; r < rows; ++r) {
-            for (uint32_t step = 1; step < cols; step <<= 1) {
-                for (uint32_t base = 0; base < cols; base += 2*step) {
-                    for (uint32_t i = 0; i < step; ++i) {
-                        const uint32_t c0 = base + i;
-                        const uint32_t c1 = c0 + step;
-                        const float a = dst[size_t(r)*cols + c0];
-                        const float b = dst[size_t(r)*cols + c1];
-                        dst[size_t(r)*cols + c0] = a + b;
-                        dst[size_t(r)*cols + c1] = a - b;
-                    }
-                }
-            }
-        }
-    }
-
-    for (size_t i = 0; i < n; ++i) {
-        dst[i] *= norm;
-    }
-}
-
-static __device__ void kvarn_sinkhorn_variance_normalize(
-        float * data,
-        float * row_scale,
-        float * col_scale,
-        uint32_t rows,
-        uint32_t cols,
-        uint32_t iters) {
-    for (uint32_t r = 0; r < rows; ++r) {
-        row_scale[r] = 1.0f;
-    }
-    for (uint32_t c = 0; c < cols; ++c) {
-        col_scale[c] = 1.0f;
-    }
-
-    constexpr float eps = 1.0e-6f;
-
-    for (uint32_t iter = 0; iter < iters; ++iter) {
-        for (uint32_t r = 0; r < rows; ++r) {
-            double ss = 0.0;
-            for (uint32_t c = 0; c < cols; ++c) {
-                const float v = data[size_t(r)*cols + c];
-                ss += double(v)*double(v);
-            }
-            const float rms = sqrtf(float(ss/cols) + eps);
-            row_scale[r] *= rms;
-            for (uint32_t c = 0; c < cols; ++c) {
-                data[size_t(r)*cols + c] /= rms;
-            }
-        }
-
-        for (uint32_t c = 0; c < cols; ++c) {
-            double ss = 0.0;
-            for (uint32_t r = 0; r < rows; ++r) {
-                const float v = data[size_t(r)*cols + c];
-                ss += double(v)*double(v);
-            }
-            const float rms = sqrtf(float(ss/rows) + eps);
-            col_scale[c] *= rms;
-            for (uint32_t r = 0; r < rows; ++r) {
-                data[size_t(r)*cols + c] /= rms;
-            }
-        }
-    }
-}
-
 static __device__ float kvarn_select_kth_row_value(const float * src, uint32_t cols, uint32_t kth) {
     for (uint32_t i = 0; i < cols; ++i) {
         const float v = src[i];
@@ -193,102 +97,212 @@ static __device__ float kvarn_select_kth_row_value(const float * src, uint32_t c
     return src[cols - 1];
 }
 
-static __device__ void kvarn_quantize_asym_minmax_pack(
-        const float * src,
-        uint8_t * body,
-        float * row_scale,
-        float * row_zp,
+static __global__ void kvarn_fill_f32_kernel(float * dst, uint32_t n, float value) {
+    const uint32_t i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = value;
+    }
+}
+
+static __global__ void kvarn_hadamard_rows_kernel(
+        const float * __restrict__ src,
+        float * __restrict__ dst,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows || threadIdx.x != 0) {
+        return;
+    }
+
+    float * row = dst + size_t(r)*cols;
+    const float * src_row = src + size_t(r)*cols;
+    for (uint32_t c = 0; c < cols; ++c) {
+        row[c] = src_row[c];
+    }
+
+    const float norm = rsqrtf(float(cols));
+    for (uint32_t step = 1; step < cols; step <<= 1) {
+        for (uint32_t base = 0; base < cols; base += 2*step) {
+            for (uint32_t i = 0; i < step; ++i) {
+                const uint32_t c0 = base + i;
+                const uint32_t c1 = c0 + step;
+                const float a = row[c0];
+                const float b = row[c1];
+                row[c0] = a + b;
+                row[c1] = a - b;
+            }
+        }
+    }
+
+    for (uint32_t c = 0; c < cols; ++c) {
+        row[c] *= norm;
+    }
+}
+
+static __global__ void kvarn_hadamard_cols_kernel(
+        const float * __restrict__ src,
+        float * __restrict__ dst,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t c = blockIdx.x;
+    if (c >= cols || threadIdx.x != 0) {
+        return;
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        dst[size_t(r)*cols + c] = src[size_t(r)*cols + c];
+    }
+
+    const float norm = rsqrtf(float(rows));
+    for (uint32_t step = 1; step < rows; step <<= 1) {
+        for (uint32_t base = 0; base < rows; base += 2*step) {
+            for (uint32_t i = 0; i < step; ++i) {
+                const uint32_t r0 = base + i;
+                const uint32_t r1 = r0 + step;
+                const size_t i0 = size_t(r0)*cols + c;
+                const size_t i1 = size_t(r1)*cols + c;
+                const float a = dst[i0];
+                const float b = dst[i1];
+                dst[i0] = a + b;
+                dst[i1] = a - b;
+            }
+        }
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        dst[size_t(r)*cols + c] *= norm;
+    }
+}
+
+static __global__ void kvarn_sinkhorn_rows_kernel(
+        float * __restrict__ data,
+        float * __restrict__ row_scale,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows || threadIdx.x != 0) {
+        return;
+    }
+
+    constexpr float eps = 1.0e-6f;
+    double ss = 0.0;
+    for (uint32_t c = 0; c < cols; ++c) {
+        const float v = data[size_t(r)*cols + c];
+        ss += double(v)*double(v);
+    }
+
+    const float rms = sqrtf(float(ss/cols) + eps);
+    row_scale[r] *= rms;
+    for (uint32_t c = 0; c < cols; ++c) {
+        data[size_t(r)*cols + c] /= rms;
+    }
+}
+
+static __global__ void kvarn_sinkhorn_cols_kernel(
+        float * __restrict__ data,
+        float * __restrict__ col_scale,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t c = blockIdx.x;
+    if (c >= cols || threadIdx.x != 0) {
+        return;
+    }
+
+    constexpr float eps = 1.0e-6f;
+    double ss = 0.0;
+    for (uint32_t r = 0; r < rows; ++r) {
+        const float v = data[size_t(r)*cols + c];
+        ss += double(v)*double(v);
+    }
+
+    const float rms = sqrtf(float(ss/rows) + eps);
+    col_scale[c] *= rms;
+    for (uint32_t r = 0; r < rows; ++r) {
+        data[size_t(r)*cols + c] /= rms;
+    }
+}
+
+static __global__ void kvarn_quantize_asym_minmax_pack_rows_kernel(
+        const float * __restrict__ src,
+        uint8_t * __restrict__ body,
+        float * __restrict__ row_scale,
+        float * __restrict__ row_zp,
         uint32_t rows,
         uint32_t cols,
         uint32_t bits,
         float quantile) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows || threadIdx.x != 0) {
+        return;
+    }
+
     const uint32_t qmax = (1u << bits) - 1u;
     const float qt = fminf(1.0f, fmaxf(0.000001f, quantile));
+    const uint32_t lo_i = uint32_t((1.0f - qt)*0.5f*float(cols - 1));
+    const uint32_t hi_i = uint32_t((1.0f - (1.0f - qt)*0.5f)*float(cols - 1));
+    const float * row = src + size_t(r)*cols;
+    const float mn = kvarn_select_kth_row_value(row, cols, lo_i);
+    const float mx = kvarn_select_kth_row_value(row, cols, hi_i);
+    const float s = (mx > mn) ? (mx - mn)/float(qmax) : 1.0f;
 
-    for (uint32_t r = 0; r < rows; ++r) {
-        const uint32_t lo_i = uint32_t((1.0f - qt)*0.5f*float(cols - 1));
-        const uint32_t hi_i = uint32_t((1.0f - (1.0f - qt)*0.5f)*float(cols - 1));
-        const float * row = src + size_t(r)*cols;
-        const float mn = kvarn_select_kth_row_value(row, cols, lo_i);
-        const float mx = kvarn_select_kth_row_value(row, cols, hi_i);
-        const float s = (mx > mn) ? (mx - mn)/float(qmax) : 1.0f;
-        row_scale[r] = s;
-        row_zp[r] = mn;
+    row_scale[r] = s;
+    row_zp[r] = mn;
 
-        for (uint32_t c = 0; c < cols; ++c) {
-            const float v = fminf(mx, fmaxf(mn, src[size_t(r)*cols + c]));
-            const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
-            kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
-        }
+    for (uint32_t c = 0; c < cols; ++c) {
+        const float v = fminf(mx, fmaxf(mn, src[size_t(r)*cols + c]));
+        const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
+        kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
     }
 }
 
-static __global__ void kvarn_store_k_body_reference_kernel(
-        const float * __restrict__ k_tile,
-        uint8_t * __restrict__ k_body,
+static __global__ void kvarn_store_k_finalize_scales_kernel(
         float * __restrict__ k_scales,
-        float * __restrict__ scratch,
-        uint32_t head_dim,
-        uint32_t group_size,
-        uint32_t key_bits,
-        uint32_t sinkhorn_iters,
-        float rtn_quantile) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        const float * __restrict__ rtn_scale,
+        const float * __restrict__ rtn_zp,
+        uint32_t head_dim) {
+    const uint32_t d = blockIdx.x*blockDim.x + threadIdx.x;
+    if (d >= head_dim) {
         return;
     }
 
-    const size_t n = size_t(head_dim)*group_size;
-    const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
-
-    float * data      = scratch;
-    float * rtn_scale = scratch + n;
-    float * rtn_zp    = scratch + n + tmp_rows;
-
-    kvarn_hadamard_channels(k_tile, data, head_dim, group_size, true);
-    float * k_row_scale = k_scales;
-    float * k_zp        = k_scales + head_dim;
-    float * k_col_scale = k_scales + 2*head_dim;
-    kvarn_sinkhorn_variance_normalize(data, k_row_scale, k_col_scale, head_dim, group_size, sinkhorn_iters);
-    kvarn_quantize_asym_minmax_pack(data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits, rtn_quantile);
-    for (uint32_t d = 0; d < head_dim; ++d) {
-        const float row = k_row_scale[d];
-        k_scales[d] = row*rtn_scale[d];
-        k_zp[d]     = row*rtn_zp[d];
-    }
+    const float row = k_scales[d];
+    k_scales[d] = row*rtn_scale[d];
+    k_scales[head_dim + d] = row*rtn_zp[d];
 }
 
-static __global__ void kvarn_store_v_body_reference_kernel(
-        const float * __restrict__ v_tile,
-        uint8_t * __restrict__ v_body,
+static __global__ void kvarn_store_v_finalize_scales_kernel(
         float * __restrict__ v_scales,
-        float * __restrict__ scratch,
+        const float * __restrict__ rtn_scale,
+        const float * __restrict__ rtn_zp,
         uint32_t head_dim,
-        uint32_t group_size,
-        uint32_t value_bits,
-        uint32_t sinkhorn_iters,
-        float rtn_quantile) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        uint32_t group_size) {
+    const uint32_t g = blockIdx.x*blockDim.x + threadIdx.x;
+    if (g >= group_size) {
         return;
     }
 
-    const size_t n = size_t(head_dim)*group_size;
-    const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
-
-    float * data      = scratch;
-    float * rtn_scale = scratch + n;
-    float * rtn_zp    = scratch + n + tmp_rows;
-
-    kvarn_hadamard_channels(v_tile, data, group_size, head_dim, false);
-    float * v_col_scale = v_scales;
     float * v_row_scale = v_scales + head_dim;
     float * v_zp        = v_scales + head_dim + group_size;
-    kvarn_sinkhorn_variance_normalize(data, v_row_scale, v_col_scale, group_size, head_dim, sinkhorn_iters);
-    kvarn_quantize_asym_minmax_pack(data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits, rtn_quantile);
+    const float row = v_row_scale[g];
+    v_row_scale[g] = row*rtn_scale[g];
+    v_zp[g]        = row*rtn_zp[g];
+}
 
-    for (uint32_t g = 0; g < group_size; ++g) {
-        const float row = v_row_scale[g];
-        v_row_scale[g] = row*rtn_scale[g];
-        v_zp[g]        = row*rtn_zp[g];
+static void kvarn_sinkhorn_variance_normalize_parallel(
+        float * data,
+        float * row_scale,
+        float * col_scale,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t iters,
+        cudaStream_t stream) {
+    const int block = 128;
+    kvarn_fill_f32_kernel<<<int((rows + block - 1)/block), block, 0, stream>>>(row_scale, rows, 1.0f);
+    kvarn_fill_f32_kernel<<<int((cols + block - 1)/block), block, 0, stream>>>(col_scale, cols, 1.0f);
+
+    for (uint32_t iter = 0; iter < iters; ++iter) {
+        kvarn_sinkhorn_rows_kernel<<<int(rows), 1, 0, stream>>>(data, row_scale, rows, cols);
+        kvarn_sinkhorn_cols_kernel<<<int(cols), 1, 0, stream>>>(data, col_scale, rows, cols);
     }
 }
 
@@ -304,12 +318,24 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
         float rtn_quantile,
         void * stream) {
     const size_t n = size_t(head_dim)*group_size;
+    const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
+    float * data      = scratch;
+    float * rtn_scale = scratch + n;
+    float * rtn_zp    = scratch + n + tmp_rows;
+
     cudaMemsetAsync(k_body, 0, kvarn_packed_nbytes(n, key_bits), cuda_stream);
-    kvarn_store_k_body_reference_kernel<<<1, 1, 0, cuda_stream>>>(
-            k_tile, k_body, k_scales, scratch,
-            head_dim, group_size, key_bits, sinkhorn_iters, rtn_quantile);
+    kvarn_hadamard_cols_kernel<<<int(group_size), 1, 0, cuda_stream>>>(k_tile, data, head_dim, group_size);
+    float * k_row_scale = k_scales;
+    float * k_col_scale = k_scales + 2*head_dim;
+    kvarn_sinkhorn_variance_normalize_parallel(
+            data, k_row_scale, k_col_scale, head_dim, group_size, sinkhorn_iters, cuda_stream);
+    kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(head_dim), 1, 0, cuda_stream>>>(
+            data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits, rtn_quantile);
+    const int block = 128;
+    kvarn_store_k_finalize_scales_kernel<<<int((head_dim + block - 1)/block), block, 0, cuda_stream>>>(
+            k_scales, rtn_scale, rtn_zp, head_dim);
 }
 
 void ggml_cuda_kvarn_store_v_body_reference_minmax(
@@ -324,12 +350,24 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
         float rtn_quantile,
         void * stream) {
     const size_t n = size_t(head_dim)*group_size;
+    const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
+    float * data      = scratch;
+    float * rtn_scale = scratch + n;
+    float * rtn_zp    = scratch + n + tmp_rows;
+
     cudaMemsetAsync(v_body, 0, kvarn_packed_nbytes(n, value_bits), cuda_stream);
-    kvarn_store_v_body_reference_kernel<<<1, 1, 0, cuda_stream>>>(
-            v_tile, v_body, v_scales, scratch,
-            head_dim, group_size, value_bits, sinkhorn_iters, rtn_quantile);
+    kvarn_hadamard_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(v_tile, data, group_size, head_dim);
+    float * v_col_scale = v_scales;
+    float * v_row_scale = v_scales + head_dim;
+    kvarn_sinkhorn_variance_normalize_parallel(
+            data, v_row_scale, v_col_scale, group_size, head_dim, sinkhorn_iters, cuda_stream);
+    kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(
+            data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits, rtn_quantile);
+    const int block = 128;
+    kvarn_store_v_finalize_scales_kernel<<<int((group_size + block - 1)/block), block, 0, cuda_stream>>>(
+            v_scales, rtn_scale, rtn_zp, head_dim, group_size);
 }
 
 void ggml_cuda_kvarn_store_body_reference_minmax(
