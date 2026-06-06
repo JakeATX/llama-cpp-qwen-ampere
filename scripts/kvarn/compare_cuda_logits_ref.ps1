@@ -19,6 +19,8 @@ param(
     [switch] $PackedSplitKernels,
     [switch] $CheckPackedRepeat,
     [switch] $CheckPackedSplit,
+    [switch] $CheckNormalBaseline,
+    [double] $NormalBaselineMaxNmse = -1.0,
     [switch] $TraceAttn,
     [int] $TraceLimit = 4,
     [string] $ExpectedPackedTraceMode = "",
@@ -46,6 +48,9 @@ if ($MinKvarnLayerLogs -lt 1) {
 }
 if ($MinKvarnBodyRecords -lt 0) {
     throw "MinKvarnBodyRecords must be non-negative"
+}
+if ($NormalBaselineMaxNmse -eq 0.0) {
+    throw "NormalBaselineMaxNmse must be negative to disable the threshold or positive to enforce one"
 }
 if ($TraceLimit -lt 0) {
     throw "TraceLimit must be non-negative"
@@ -173,7 +178,12 @@ function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $la
     Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
 }
 
-function Invoke-Results([string] $exe, [string[]] $argv, [hashtable] $envSet) {
+function Invoke-Results(
+        [string] $exe,
+        [string[]] $argv,
+        [hashtable] $envSet,
+        [bool] $RequireKvarn = $true,
+        [bool] $AllowFailureWithNmse = $false) {
     $oldEnv = @{}
     foreach ($key in $envSet.Keys) {
         $oldEnv[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
@@ -196,8 +206,12 @@ function Invoke-Results([string] $exe, [string[]] $argv, [hashtable] $envSet) {
     }
 
     $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
-    if ($exit -ne 0) {
+    $hasNmse = [regex]::IsMatch($text, "NMSE=([0-9.eE+-]+|nan|inf|-inf)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($exit -ne 0 -and -not ($AllowFailureWithNmse -and $hasNmse)) {
         throw "llama-results failed with exit code $exit`n$text"
+    }
+    if (-not $RequireKvarn) {
+        return $text
     }
     if ($text -notmatch "llama_kv_cache_kvarn:") {
         throw "llama-results succeeded but logs did not show KVarN cache initialization"
@@ -240,13 +254,18 @@ $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 [System.IO.File]::WriteAllText($PromptFile, ($PromptPhrase * $Repeat))
 Remove-Item -LiteralPath $OutputFile -ErrorAction SilentlyContinue
 
-$commonArgs = @(
+$baseArgs = @(
     "-m", $Model,
     "-f", $PromptFile,
     "-o", $OutputFile,
     "-c", [string] $Context,
     "-ngl", [string] $GpuLayers,
-    "-fa", $FlashAttn,
+    "-fa", $FlashAttn
+)
+$normalArgs = $baseArgs + @(
+    "--kv-cache-quant", "none"
+)
+$commonArgs = $baseArgs + @(
     "--kv-cache-quant", "kvarn",
     "--kvarn-preset", "kvarn_k4v2_g128",
     "--kvarn-rtn-quantile", $rtnQuantileArg
@@ -281,6 +300,19 @@ Add-TraceEnv $scratchEnv
 Add-TraceEnv $splitEnv
 
 try {
+    if ($CheckNormalBaseline) {
+        Write-Host "== Saving normal-KV baseline logits"
+        [void] (Invoke-Results $results $normalArgs @{} $false)
+        Write-Host "== Checking packed KVarN logits against normal KV"
+        $normalCheck = Invoke-Results $results ($commonArgs + @("--check")) $packedEnv $true $true
+        $normalNmse = Get-Nmse $normalCheck "packed-vs-normal"
+        if ($NormalBaselineMaxNmse -gt 0.0 -and $normalNmse -gt $NormalBaselineMaxNmse) {
+            throw ("KVarN packed-vs-normal logits exceeded threshold: NMSE = {0:E3}, threshold = {1:E3}" -f $normalNmse, $NormalBaselineMaxNmse)
+        }
+        Write-Host ("KVarN packed-vs-normal logits: INFO, NMSE = {0:E3}" -f $normalNmse)
+        Remove-Item -LiteralPath $OutputFile -ErrorAction SilentlyContinue
+    }
+
     Write-Host "== Saving packed KVarN logits"
     $packedText = Invoke-Results $results $commonArgs $packedEnv
     Assert-ExpectedPackedTraceMode $packedText $ExpectedPackedTraceMode "packed KVarN logits"

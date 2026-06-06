@@ -1231,6 +1231,13 @@ when the purpose is dispatcher tracing only; scratch comparison remains enabled
 by default for logits gates. Use
   `-MinKvarnBodyRecords` on these comparison harnesses when a test is meant to
 exercise packed body storage instead of only sink/tail capacity.
+`compare_cuda_logits_ref.ps1 -CheckNormalBaseline` first saves normal-KV logits,
+then checks packed KVarN against that normal baseline and reports NMSE even when
+`llama-results` exits nonzero because the value exceeds its strict `1e-6`
+identity threshold. This mode is for quality/parameter sweeps only; packed
+repeat, split, and scratch gates remain strict acceptance checks. Add
+`-NormalBaselineMaxNmse <value>` to make a normal-vs-KVarN measurement fail
+above an explicit experiment threshold.
 Latest dispatcher-gate validation:
 Fresh 2026-06-06 concise validation on branch `codex/kvarn-kv-cache-cuda`
 confirmed that the earlier Gemma forced fused-batch failure is stale on the
@@ -1267,6 +1274,22 @@ placement, and server multi-slot rejection.
 Focused CUDA primitive tests:
 `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref|test-kvarn-cuda-mixed-tail" --output-on-failure --repeat until-fail:3`
 passed both tests for three repeats.
+
+Fresh normal-vs-KVarN logits-distance measurements for the Sinkhorn-iteration
+performance lever used `-CheckNormalBaseline -SkipScratchCheck` with RTN
+quantile `1.0` and active body records. On Qwen3.5 0.8B 256-dimensional heads
+at `-Context 512 -Batch 512 -Repeat 384 -PromptPhrase 'hello '`,
+`--kvarn-iters 16` reported `NMSE = 1.325E-003`, `--kvarn-iters 4` reported
+`1.334E-003`, and `--kvarn-iters 1` reported `1.310E-003`. On the large
+Qwen3.6 35B A3B 256-dimensional target with the same context/prompt shape and
+`-fit off`, `--kvarn-iters 16` reported `3.978E-003`,
+`--kvarn-iters 4` reported `3.975E-003`, and `--kvarn-iters 1` reported
+`4.009E-003`. The matching Qwen3.6 `--kvarn-iters 4` strict packed-repeat and
+packed-vs-split rerun passed exact layers `3,7,11,15,19,23,27,31,35,39`, max
+body records `2`, packed repeat `NMSE = 0.000E+000`, and packed-vs-split
+`NMSE = 0.000E+000`. This supports `4` iterations as a plausible future
+performance/quality tuning candidate, but the production default remains `16`
+until broader prompt/task quality checks are run.
 
 `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 1 -FlashAttn off -CheckPackedRepeat -CheckPackedSplit -TraceAttn -TraceLimit 4 -MinKvarnLayerLogs 8 -ExpectedKvarnLayers '5-47:6' -ExpectedPackedTraceMode fused-batch -ExtraArgs @('--kvarn-tail-tokens','512','-fit','off') }"` passed with the default no-body `mode=fused-batch`, repeat, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`.
 `powershell -NoProfile -ExecutionPolicy Bypass -Command "& { .\scripts\kvarn\compare_cuda_logits_ref.ps1 -Model 'C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf' -BuildDir build-kvarn-cuda-static-vs -Context 512 -Batch 512 -Repeat 32 -FlashAttn off -CheckPackedSplit -MinKvarnLayerLogs 8 -MinKvarnBodyRecords 2 -ExpectedKvarnLayers '5-47:6' -ExtraArgs @('-fit','off') }"` passed active 512 packed body records, packed-vs-split, and packed-vs-scratch at `NMSE = 0.000E+000`; the same active gate with fit probing enabled drifted during split comparison at `NMSE = 1.563e-03`, so fit-probe output is not being used as the logits gate on this host.
