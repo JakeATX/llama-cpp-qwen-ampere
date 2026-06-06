@@ -426,6 +426,10 @@ Verified local smoke:
   fused-batch model diagnostic shape (`49` queries, `49` sink tokens, `1024`-byte mask row
   stride). That sink-only fused-batch coverage now runs both F16 and F32 KQ
   masks, matching `-fa on` and `-fa off` runtime graph mask storage.
+  It also includes a no-body sink+pending regression (`128` sink tokens,
+  `128` pending FP32 tokens, `0` body records) so future fused-batch QK
+  optimizations must match the split CUDA path before packed body records are
+  present.
   Static focused rerun after adding Gemma-shaped 512 primitive coverage:
   `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda-scratch-ref" --output-on-failure`.
   Latest local result passed 10 consecutive focused reruns after extending the
@@ -921,6 +925,12 @@ Verified local smoke:
 - Standard benchmark comparison passed:
   `build-kvarn-cuda-nofa-vs\bin\Release\llama-bench.exe -m C:\Users\sjake\OneDrive\Documents\New project\models\Qwen2.5-1.5B-Instruct-GGUF\qwen2.5-1.5b-instruct-q4_k_m.gguf -p 0 -n 384 -r 1 -ngl 99 -fa on --no-warmup --kv-cache-quant none,kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-rtn-quantile 0.95`.
   Latest local result: normal KV `151.20` tok/s, KVarN `49.62` tok/s.
+- Rejected optimization attempt: a 128/256-dimensional fused-batch variant that
+  parallelized QK dot products across a warp passed the standalone synthetic
+  CUDA tests but failed the Qwen3.5 0.8B packed-vs-split runtime logits guard
+  with NMSE `1.723e-03` while body records were still `0`. The code was
+  reverted. The added no-body sink+pending CUDA regression covers this failure
+  class before future QK-kernel work.
 
 Required integration path:
 

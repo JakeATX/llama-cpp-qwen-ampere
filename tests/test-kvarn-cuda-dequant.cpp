@@ -1427,6 +1427,94 @@ static void run_case(uint32_t head_dim) {
         require(q36_fused_err < 1.0e-5f, "CUDA Qwen3.6-shaped 49-query forced fused mixed attention matches CPU reference");
         require(q36_fused_vs_split_err < 1.0e-6f, "CUDA Qwen3.6-shaped 49-query forced fused mixed attention matches split output");
 
+        const uint32_t n_no_body_pending = 128;
+        const uint32_t n_no_body_tokens = n_q36_sink + n_no_body_pending;
+        std::vector<float> no_body_pending_k(size_t(n_no_body_pending)*n_head_kv*head_dim);
+        std::vector<float> no_body_pending_v(no_body_pending_k.size());
+        for (uint32_t t = 0; t < n_no_body_pending; ++t) {
+            for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t off = (size_t(t)*n_head_kv + ikh)*head_dim + d;
+                    no_body_pending_k[off] =
+                        0.083f*std::sin(float(d + 11*t + 7*ikh)*0.019f) -
+                        0.057f*std::cos(float(3*d + 13*t + 5*ikh)*0.013f);
+                    no_body_pending_v[off] =
+                        0.071f*std::cos(float(5*d + 17*t + 3*ikh)*0.017f) +
+                        0.049f*std::sin(float(d + 19*t + 11*ikh)*0.011f);
+                }
+            }
+        }
+        float * no_body_pending_k_d = cuda_upload(no_body_pending_k);
+        float * no_body_pending_v_d = cuda_upload(no_body_pending_v);
+
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q36_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
+                no_body_pending_k_d, no_body_pending_v_d, q36_mask_d,
+                q36_split_d, q36_scores_d,
+                q36_n_queries, n_head, n_head_kv,
+                n_q36_sink, 0, n_no_body_pending, 0, 0, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(q36_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA no-body sink+pending split launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA no-body sink+pending split sync");
+
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q36_queries_d, q36_sink_tail_k_d, q36_sink_tail_v_d,
+                mha_k_body_d, mha_v_body_d, mha_k_scales_d, mha_v_scales_d,
+                no_body_pending_k_d, no_body_pending_v_d, q36_mask_d,
+                q36_fused_d, q36_fused_scores_d,
+                q36_n_queries, n_head, n_head_kv,
+                n_q36_sink, 0, n_no_body_pending, 0, 0, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(q36_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_FUSED_BATCH", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA no-body sink+pending forced fused launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA no-body sink+pending forced fused sync");
+
+        require_cuda(cudaMemcpy(q36_split.data(), q36_split_d, q36_split.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy no-body sink+pending split output");
+        require_cuda(cudaMemcpy(q36_fused.data(), q36_fused_d, q36_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy no-body sink+pending fused output");
+
+        float no_body_fused_vs_split_err = 0.0f;
+        for (size_t i = 0; i < q36_split.size(); ++i) {
+            no_body_fused_vs_split_err = std::max(no_body_fused_vs_split_err, std::fabs(q36_split[i] - q36_fused[i]));
+        }
+        if (no_body_fused_vs_split_err >= 1.0e-6f) {
+            std::fprintf(stderr,
+                    "no-body sink+pending fused_vs_split=%g tokens=%u pending=%u\n",
+                    double(no_body_fused_vs_split_err), n_no_body_tokens, n_no_body_pending);
+        }
+        require(no_body_fused_vs_split_err < 1.0e-6f,
+                "CUDA no-body sink+pending forced fused attention matches split output");
+
+        cudaFree(no_body_pending_k_d);
+        cudaFree(no_body_pending_v_d);
+
         cudaFree(q36_queries_d);
         cudaFree(q36_sink_tail_k_d);
         cudaFree(q36_sink_tail_v_d);
