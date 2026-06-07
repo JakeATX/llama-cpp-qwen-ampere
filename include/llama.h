@@ -155,6 +155,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -333,6 +335,9 @@ extern "C" {
 
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
+
+        // override arch from GGUF to load MTP as a separate ctx
+        const char * override_arch;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -1011,6 +1016,13 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    LLAMA_API struct ggml_tensor * llama_context_get_t_h_pre_norm(struct llama_context * ctx);
+    LLAMA_API struct ggml_tensor * llama_context_get_t_mtp_out   (struct llama_context * ctx);
+
+    LLAMA_API void llama_set_mtp(
+            struct llama_context * ctx_target,
+            struct llama_context * ctx_mtp);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

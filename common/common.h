@@ -276,6 +276,7 @@ struct common_params_sampling {
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
     std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+    bool                     reasoning_control = false;        // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
 
@@ -574,6 +575,8 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    enum llama_kv_cache_quant_type kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_NONE;
+    struct llama_kvarn_params      kvarn              = llama_kvarn_default_params();
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

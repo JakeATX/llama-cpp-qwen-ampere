@@ -85,6 +85,7 @@ add_library(${TARGET}
     json-schema-to-grammar.cpp
     layer-profile.cpp
     layer-profile.h
+    licenses.cpp
     llguidance.cpp
     log.cpp
     log.h

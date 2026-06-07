@@ -4,6 +4,31 @@ This branch keeps KVarN separate from `ggml_type`. `--kv-cache-quant kvarn`
 selects a KV-cache backend mode and uses `llama_kvarn_params` for layout and
 runtime policy.
 
+## Mac Metal MoE residency baseline (ATX reference)
+
+Source: `ATX_FORK.md`, `docs/atx-runs.md`, branch `atx-expert-residency` @
+`18ae6c478bf0c03a6cbbfe2ad2f6993b0593adbc` on `JakeATX/llama.cpp`.
+
+| Scenario | Decode tok/s | Prefill tok/s | Notes |
+|----------|-------------:|--------------:|-------|
+| True full-Metal reference (no `-ncmoe`) | **87.22** | **921.40** | Correct baseline for parity claims |
+| `keep_layers: 0-40` policy | **89.22** (+2.3%) | **929.69** (+0.9%) | Production parity policy |
+| MTP acceptance | 629/788 = 0.79822 | — | Matches reference exactly |
+
+Model: `Qwen3.6-35B-A3B-UD-Q4_K_M` (MTP), M4 Max, ctx 64K, Q8 KV,
+`--parallel 1 --spec-type mtp`.
+
+**Caveat:** `iter_012` (76.69 tok/s) compared against a `-ncmoe 34`
+CPU-MoE/offload reference (51.64 tok/s)—that is offload recovery, not
+full-Metal speedup. CUDA/discrete-memory systems require a separate validation
+matrix on `kvarn-atx-integration`; Mac parity does not transfer automatically.
+
+## CUDA production gate (this machine)
+
+Tier 1: KVarN/normal ratio **≥ 90%** on both prefill (`pp*`) and decode (`tg*`)
+per model×config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
+(output quality) deferred.
+
 Current implemented pieces:
 
 - Public API and common CLI flags for `--kv-cache-quant none|kvarn`.

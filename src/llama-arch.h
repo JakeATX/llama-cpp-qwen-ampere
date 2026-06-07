@@ -81,6 +81,7 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK,
     LLM_ARCH_DEEPSEEK2,
     LLM_ARCH_DEEPSEEK2OCR,
+    LLM_ARCH_DEEPSEEK32,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
@@ -139,6 +140,8 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
+    LLM_ARCH_TALKIE,
+    LLM_ARCH_MELLUM,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -199,6 +202,7 @@ enum llm_kv {
     LLM_KV_MOE_LATENT_SIZE,
     LLM_KV_NEXTN_PREDICT_LAYERS,
     LLM_KV_NUM_DEEPSTACK_LAYERS,
+    LLM_KV_HIDDEN_ACT,
     LLM_KV_POOLING_TYPE,
     LLM_KV_LOGIT_SCALE,
     LLM_KV_DECODER_START_TOKEN_ID,
@@ -238,6 +242,7 @@ enum llm_kv {
     LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN,
     LLM_KV_ATTENTION_SCALE,
     LLM_KV_ATTENTION_OUTPUT_SCALE,
+    LLM_KV_ATTENTION_VALUE_SCALE,
     LLM_KV_ATTENTION_TEMPERATURE_LENGTH,
     LLM_KV_ATTENTION_TEMPERATURE_SCALE,
     LLM_KV_ATTENTION_KEY_LENGTH_MLA,
@@ -248,6 +253,7 @@ enum llm_kv {
     LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
     LLM_KV_ATTENTION_INDEXER_TOP_K,
     LLM_KV_ATTENTION_SHARED_KV_LAYERS,
+    LLM_KV_ATTENTION_RECURRENT_LAYERS,
 
     LLM_KV_ROPE_DIMENSION_COUNT,
     LLM_KV_ROPE_DIMENSION_COUNT_SWA,
@@ -307,12 +313,14 @@ enum llm_kv {
     LLM_KV_TOKENIZER_HF_JSON,
     LLM_KV_TOKENIZER_RWKV,
     LLM_KV_TOKENIZER_CHAT_TEMPLATE,
+    LLM_KV_TOKENIZER_NORMALIZER_LOWERCASE,
     LLM_KV_TOKENIZER_FIM_PRE_ID,
     LLM_KV_TOKENIZER_FIM_SUF_ID,
     LLM_KV_TOKENIZER_FIM_MID_ID,
     LLM_KV_TOKENIZER_FIM_PAD_ID,
     LLM_KV_TOKENIZER_FIM_REP_ID,
     LLM_KV_TOKENIZER_FIM_SEP_ID,
+    LLM_KV_TOKENIZER_SUPPRESS_TOKENS,
 
     LLM_KV_ADAPTER_TYPE,
     LLM_KV_ADAPTER_LORA_ALPHA,
@@ -637,5 +645,6 @@ const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor);
 bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
-bool llm_arch_supports_sm_tensor(const llm_arch & arch);
 bool llm_arch_supports_recurrent_partial_rollback(const llm_arch & arch);
+bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+bool llm_arch_supports_rs_rollback(const llm_arch & arch);

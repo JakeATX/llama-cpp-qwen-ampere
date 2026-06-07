@@ -12,7 +12,7 @@ void llama_model_qwen35_mtp::load_arch_hparams(llama_model_loader & ml) {
     hparams.kv_only_nextn         = true;
     hparams.n_layer_kv_from_start = -1;
     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-        hparams.recurrent_layer_arr[i] = false;
+        hparams.is_recr_impl[i] = 0;
     }
 
     type = LLM_TYPE_UNKNOWN;
