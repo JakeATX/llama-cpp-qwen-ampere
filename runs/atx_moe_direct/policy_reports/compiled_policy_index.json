@@ -1,0 +1,1066 @@
+[
+  {
+    "name": "combined_top_05pct_global_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_global_experts.atx.json",
+    "cells": 0,
+    "layers": 0,
+    "selection": {
+      "percent_of_total_experts": 5,
+      "selected_experts": 13,
+      "total_experts": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.161695763613,
+      "cumulative_scicode_importance_share": 0.187031021595,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.136360505631,
+      "cumulative_mean_activation_share": 0.065380583847
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_global_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_05pct_layer_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.json",
+    "cells": 512,
+    "layers": 37,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 5,
+      "selected_layer_expert_pairs": 512,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.660590412743,
+      "cumulative_scicode_importance_share": 0.742969757523,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.578211067963,
+      "cumulative_mean_activation_share": 0.202223321232,
+      "unique_layers_touched": 37,
+      "unique_experts_touched": 210
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_05pct_layer_experts_hybrid_top_4_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "cells": 512,
+    "layers": 37,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 5,
+      "selected_layer_expert_pairs": 512,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.660590412743,
+      "cumulative_scicode_importance_share": 0.742969757523,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.578211067963,
+      "cumulative_mean_activation_share": 0.202223321232,
+      "unique_layers_touched": 37,
+      "unique_experts_touched": 210
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      35
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_05pct_layer_experts_hybrid_top_8_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "cells": 512,
+    "layers": 37,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 5,
+      "selected_layer_expert_pairs": 512,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.660590412743,
+      "cumulative_scicode_importance_share": 0.742969757523,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.578211067963,
+      "cumulative_mean_activation_share": 0.202223321232,
+      "unique_layers_touched": 37,
+      "unique_experts_touched": 210
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      35,
+      31,
+      34,
+      33,
+      32
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_05pct_layer_experts_hybrid_top_12_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "cells": 512,
+    "layers": 37,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 5,
+      "selected_layer_expert_pairs": 512,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.660590412743,
+      "cumulative_scicode_importance_share": 0.742969757523,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.578211067963,
+      "cumulative_mean_activation_share": 0.202223321232,
+      "unique_layers_touched": 37,
+      "unique_experts_touched": 210
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      35,
+      31,
+      34,
+      33,
+      32,
+      21,
+      18,
+      19,
+      25
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_05pct_layer_experts_hybrid_top_16_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "cells": 512,
+    "layers": 37,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 5,
+      "selected_layer_expert_pairs": 512,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.660590412743,
+      "cumulative_scicode_importance_share": 0.742969757523,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.578211067963,
+      "cumulative_mean_activation_share": 0.202223321232,
+      "unique_layers_touched": 37,
+      "unique_experts_touched": 210
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_05pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      35,
+      31,
+      34,
+      33,
+      32,
+      21,
+      18,
+      19,
+      25,
+      20,
+      17,
+      16,
+      29
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_10pct_global_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_global_experts.atx.json",
+    "cells": 0,
+    "layers": 0,
+    "selection": {
+      "percent_of_total_experts": 10,
+      "selected_experts": 26,
+      "total_experts": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.272538676621,
+      "cumulative_scicode_importance_share": 0.318542382764,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.226534970479,
+      "cumulative_mean_activation_share": 0.128466533857
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_global_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_10pct_layer_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.json",
+    "cells": 1024,
+    "layers": 38,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 10,
+      "selected_layer_expert_pairs": 1024,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.800313006063,
+      "cumulative_scicode_importance_share": 0.858042322518,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.742583689608,
+      "cumulative_mean_activation_share": 0.32495237414,
+      "unique_layers_touched": 38,
+      "unique_experts_touched": 247
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_10pct_layer_experts_hybrid_top_4_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "cells": 1024,
+    "layers": 38,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 10,
+      "selected_layer_expert_pairs": 1024,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.800313006063,
+      "cumulative_scicode_importance_share": 0.858042322518,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.742583689608,
+      "cumulative_mean_activation_share": 0.32495237414,
+      "unique_layers_touched": 38,
+      "unique_experts_touched": 247
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      31
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_10pct_layer_experts_hybrid_top_8_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "cells": 1024,
+    "layers": 38,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 10,
+      "selected_layer_expert_pairs": 1024,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.800313006063,
+      "cumulative_scicode_importance_share": 0.858042322518,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.742583689608,
+      "cumulative_mean_activation_share": 0.32495237414,
+      "unique_layers_touched": 38,
+      "unique_experts_touched": 247
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      31,
+      34,
+      19,
+      32,
+      35
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_10pct_layer_experts_hybrid_top_12_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "cells": 1024,
+    "layers": 38,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 10,
+      "selected_layer_expert_pairs": 1024,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.800313006063,
+      "cumulative_scicode_importance_share": 0.858042322518,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.742583689608,
+      "cumulative_mean_activation_share": 0.32495237414,
+      "unique_layers_touched": 38,
+      "unique_experts_touched": 247
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      31,
+      34,
+      19,
+      32,
+      35,
+      33,
+      20,
+      21,
+      30
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_10pct_layer_experts_hybrid_top_16_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "cells": 1024,
+    "layers": 38,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 10,
+      "selected_layer_expert_pairs": 1024,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.800313006063,
+      "cumulative_scicode_importance_share": 0.858042322518,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.742583689608,
+      "cumulative_mean_activation_share": 0.32495237414,
+      "unique_layers_touched": 38,
+      "unique_experts_touched": 247
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_10pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      37,
+      38,
+      36,
+      31,
+      34,
+      19,
+      32,
+      35,
+      33,
+      20,
+      21,
+      30,
+      28,
+      25,
+      17,
+      29
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_15pct_global_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_global_experts.atx.json",
+    "cells": 0,
+    "layers": 0,
+    "selection": {
+      "percent_of_total_experts": 15,
+      "selected_experts": 39,
+      "total_experts": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.365758790189,
+      "cumulative_scicode_importance_share": 0.426524332734,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.304993247643,
+      "cumulative_mean_activation_share": 0.190588562908
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_global_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_15pct_layer_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.json",
+    "cells": 1536,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 15,
+      "selected_layer_expert_pairs": 1536,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.871043543523,
+      "cumulative_scicode_importance_share": 0.9104168024,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.831670284645,
+      "cumulative_mean_activation_share": 0.415496565547,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 255
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_15pct_layer_experts_hybrid_top_4_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "cells": 1536,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 15,
+      "selected_layer_expert_pairs": 1536,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.871043543523,
+      "cumulative_scicode_importance_share": 0.9104168024,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.831670284645,
+      "cumulative_mean_activation_share": 0.415496565547,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 255
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      37,
+      36,
+      34
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_15pct_layer_experts_hybrid_top_8_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "cells": 1536,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 15,
+      "selected_layer_expert_pairs": 1536,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.871043543523,
+      "cumulative_scicode_importance_share": 0.9104168024,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.831670284645,
+      "cumulative_mean_activation_share": 0.415496565547,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 255
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      37,
+      36,
+      34,
+      33,
+      35,
+      32,
+      20
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_15pct_layer_experts_hybrid_top_12_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "cells": 1536,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 15,
+      "selected_layer_expert_pairs": 1536,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.871043543523,
+      "cumulative_scicode_importance_share": 0.9104168024,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.831670284645,
+      "cumulative_mean_activation_share": 0.415496565547,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 255
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      37,
+      36,
+      34,
+      33,
+      35,
+      32,
+      20,
+      31,
+      19,
+      30,
+      21
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_15pct_layer_experts_hybrid_top_16_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "cells": 1536,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 15,
+      "selected_layer_expert_pairs": 1536,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.871043543523,
+      "cumulative_scicode_importance_share": 0.9104168024,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.831670284645,
+      "cumulative_mean_activation_share": 0.415496565547,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 255
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_15pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      37,
+      36,
+      34,
+      33,
+      35,
+      32,
+      20,
+      31,
+      19,
+      30,
+      21,
+      25,
+      17,
+      28,
+      29
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_20pct_global_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_global_experts.atx.json",
+    "cells": 0,
+    "layers": 0,
+    "selection": {
+      "percent_of_total_experts": 20,
+      "selected_experts": 52,
+      "total_experts": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.444195454634,
+      "cumulative_scicode_importance_share": 0.523796617741,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.364594291526,
+      "cumulative_mean_activation_share": 0.248163755236
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_global_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_20pct_layer_experts",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.json",
+    "cells": 2048,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 20,
+      "selected_layer_expert_pairs": 2048,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.912287774427,
+      "cumulative_scicode_importance_share": 0.940337427439,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.884238121415,
+      "cumulative_mean_activation_share": 0.489241034892,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 256
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.json",
+    "runtime_mode": "hybrid",
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_20pct_layer_experts_hybrid_top_4_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "cells": 2048,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 20,
+      "selected_layer_expert_pairs": 2048,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.912287774427,
+      "cumulative_scicode_importance_share": 0.940337427439,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.884238121415,
+      "cumulative_mean_activation_share": 0.489241034892,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 256
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_4_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      34,
+      36,
+      37
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_20pct_layer_experts_hybrid_top_8_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "cells": 2048,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 20,
+      "selected_layer_expert_pairs": 2048,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.912287774427,
+      "cumulative_scicode_importance_share": 0.940337427439,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.884238121415,
+      "cumulative_mean_activation_share": 0.489241034892,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 256
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_8_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      34,
+      36,
+      37,
+      33,
+      35,
+      32,
+      31
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_20pct_layer_experts_hybrid_top_12_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "cells": 2048,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 20,
+      "selected_layer_expert_pairs": 2048,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.912287774427,
+      "cumulative_scicode_importance_share": 0.940337427439,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.884238121415,
+      "cumulative_mean_activation_share": 0.489241034892,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 256
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_12_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      34,
+      36,
+      37,
+      33,
+      35,
+      32,
+      31,
+      30,
+      29,
+      20,
+      27
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  },
+  {
+    "name": "combined_top_20pct_layer_experts_hybrid_top_16_layers",
+    "source": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "cells": 2048,
+    "layers": 40,
+    "selection": {
+      "percent_of_total_layer_expert_pairs": 20,
+      "selected_layer_expert_pairs": 2048,
+      "total_layer_expert_pairs": 10240,
+      "layers": 40,
+      "experts_per_layer": 256,
+      "rank_metric": "mean_importance_share",
+      "cumulative_mean_importance_share": 0.912287774427,
+      "cumulative_scicode_importance_share": 0.940337427439,
+      "cumulative_terminal_bench_hard_agent_importance_share": 0.884238121415,
+      "cumulative_mean_activation_share": 0.489241034892,
+      "unique_layers_touched": 40,
+      "unique_experts_touched": 256
+    },
+    "compiled_policy": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-atx-expert-residency\\runs\\atx_moe_direct\\policy_reports\\combined_top_20pct_layer_experts.atx.hybrid_top_16_layers.atx.json",
+    "runtime_mode": "hybrid",
+    "promoted_layers": [
+      38,
+      34,
+      36,
+      37,
+      33,
+      35,
+      32,
+      31,
+      30,
+      29,
+      20,
+      27,
+      19,
+      24,
+      21,
+      28
+    ],
+    "budgets_gib": [
+      2.0,
+      4.0,
+      6.0,
+      8.0,
+      10.0,
+      12.0
+    ],
+    "ctx_sizes": [
+      4096,
+      8192,
+      32768,
+      65536,
+      128000
+    ]
+  }
+]

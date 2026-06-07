@@ -1,0 +1,8 @@
+name,prompt_tps,generation_tps,mode,direct_cuda,host_bytes,resident_staging,direct_hits,fallbacks,hot_violations,speedup_vs_exact
+Q4_K_M exact-v1,1.9,3.2,exact-v1,False,8053316096,1089,0,0,0,1.0
+Q4_K_M direct,,,direct,True,8053316096,0,1089,0,0,
+Q4_K_M hybrid top-8,2.3,4.0,hybrid,True,6226434560,0,1206,0,0,1.25
+Q4_K_M hybrid top-16,3.6,7.5,hybrid,True,4847550976,0,675,0,0,2.344
+Q4_K_M no-policy,21.2,7.1,off,False,0,0,0,0,0,2.219
+Q4_K_XL exact-v1,1.9,3.2,exact-v1,False,8100277248,1095,0,0,0,1.0
+Q4_K_XL hybrid top-8,5.3,7.1,hybrid,True,6271623680,0,1203,0,0,2.219

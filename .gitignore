@@ -1,3 +1,7 @@
+# ATX generated policy artifacts (regenerate via scripts/atx_moe_policy_compile.py)
+/runs/atx_moe_direct/policy_reports/
+/runs/atx_moe_direct/cuda_acceptance/
+
 # Extensions
 
 *.a

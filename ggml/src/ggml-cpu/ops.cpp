@@ -12,6 +12,10 @@
 #include <cfloat>
 #include <cmath>
 
+extern "C" {
+GGML_API int turbo3_cpu_wht_group_size;
+}
+
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -679,6 +683,8 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1130,6 +1136,8 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1260,6 +1268,8 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -2235,42 +2245,8 @@ static void ggml_compute_forward_fill_f32(const ggml_compute_params * params, gg
     }
 }
 
-static void ggml_compute_forward_fill_f16(const ggml_compute_params * params, ggml_tensor * dst) {
-    const ggml_fp16_t c = GGML_CPU_FP32_TO_FP16(ggml_get_op_params_f32(dst, 0));
-
-    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne);
-    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb);
-
-    const auto [ir0, ir1] = get_thread_range(params, dst);
-
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t i03 = ir/(ne2*ne1);
-        const int64_t i02 = (ir - i03*ne2*ne1)/ne1;
-        const int64_t i01 = (ir - i03*ne2*ne1 - i02*ne1);
-
-        ggml_fp16_t * dst_ptr  = (ggml_fp16_t *) ((char *) dst->data + i03*nb3 + i02*nb2 + i01*nb1);
-
-        ggml_vec_set_f16(ne0, dst_ptr, c);
-    }
-}
-
 void ggml_compute_forward_fill(const ggml_compute_params * params, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-
-    switch (src0->type) {
-        case GGML_TYPE_F32:
-            {
-                ggml_compute_forward_fill_f32(params, dst);
-            } break;
-        case GGML_TYPE_F16:
-            {
-                ggml_compute_forward_fill_f16(params, dst);
-            } break;
-        default:
-            {
-                GGML_ABORT("unsupported type for ggml_compute_forward_fill: %s", ggml_type_name(src0->type));
-            }
-    }
+    ggml_compute_forward_fill_f32(params, dst);
 }
 
 // ggml_compute_tri
@@ -4429,6 +4405,8 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4706,6 +4684,8 @@ void ggml_compute_forward_set(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4930,6 +4910,8 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5011,6 +4993,13 @@ static void ggml_compute_forward_set_rows_f32(
     const int64_t ir1 = std::min(ir0 + dr, nr);
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+
+    // For turbo types: communicate WHT group size to the quantize function via global
+    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO2_0) {
+        int gs = 0;
+        memcpy(&gs, dst->op_params, sizeof(int));
+        turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
+    }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -5656,6 +5645,11 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TQ3_1S:
+        case GGML_TYPE_TQ4_1S:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -8955,12 +8949,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                                 k->type == v->type &&
                                 neq1 >= Q_TILE_SZ);
 #ifdef GGML_SIMD
-#if defined(__ARM_FEATURE_SVE)
-        const int64_t f32_epr = svcntw();
-#else
-        const int64_t f32_epr = GGML_F32_EPR;
-#endif
-        use_tiled &= (DV % f32_epr == 0);
+        use_tiled &= (DV % GGML_F32_EPR == 0);
 #endif
         int current_chunk = ith;
 
@@ -10552,29 +10541,22 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const bool kda = (neg0 == S_v);
 
-    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
-    const int64_t K = src_state->ne[1];
-    GGML_ASSERT(K >= 1);
-    // per-seq stride in floats (slot 0 of seq s lives at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[2] / sizeof(float);
+    const bool keep_intermediates = (bool) ggml_get_op_params_i32(dst, 0);
 
-    const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    const int64_t per_thread = S_v + (keep_intermediates ? S_v * S_v : 0);
     const int ith = params->ith;
 
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work  = K > 1 ? (delta + S_v) : nullptr;
+    float * state_work  = keep_intermediates ? (delta + S_v) : nullptr;
 
     // output layout: [attn_scores | new_states]
-    // attn_scores: S_v * H * n_tokens * n_seqs    floats
-    // new_states:  S_v * S_v * H * n_seqs * K     floats  (K snapshot slots; last min(n_tokens, K))
+    // attn_scores: S_v * H * n_tokens * n_seqs floats
+    // new_states:  S_v * S_v * H * n_seqs     floats          (final only)
+    //              S_v * S_v * H * n_seqs * T floats (T snaps, keep_intermediates)
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
-
-    // snapshot slot mapping: target_slot = t - shift. When n_tokens < K only the last
-    // n_tokens slots are written; earlier slots are left untouched (caller-owned).
-    const int64_t shift = n_tokens - K;
 
     const float * state_in_base = (const float *)src_state->data;
 
@@ -10595,15 +10577,12 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
-        // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = (K > 1)
+        float * s_out = keep_intermediates
             ? state_work
             : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into the working buffer and operate in-place
-        // state layout (D, K, n_seqs): slot 0 of seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
@@ -10654,13 +10633,10 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             attn_data += S_v * H; // advance to next token
 
-            if (K > 1) {
-                const int64_t target_slot = t - shift;
-                if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                     (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
-                }
+            if (keep_intermediates) {
+                float * curr_state_o = state_out_base + t * state_size_per_snap +
+                                 (iv3 * H + iv1) * S_v * S_v;
+                memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
             }
         }
     }
@@ -10722,6 +10698,104 @@ void ggml_compute_forward_gated_delta_net(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_turbo_wht
+
+// WHT sign arrays (must match Metal shader turbo_wht_signs1/2)
+static const float turbo_wht_s1[128] = {-1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,-1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,-1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1};
+static const float turbo_wht_s2[128] = {1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1};
+
+static void ggml_compute_forward_turbo_wht_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * scale_tensor = dst->src[1];  // InnerQ scale_inv (may be NULL)
+    const float * src_data = (const float *) src->data;
+    float * dst_data = (float *) dst->data;
+    const float * scale_inv = scale_tensor ? (const float *) scale_tensor->data : NULL;
+
+    int direction;
+    int group_size;
+    memcpy(&direction, dst->op_params + 0, sizeof(int));
+    memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
+
+    const int64_t head_dim        = src->ne[0];
+    const int64_t n_heads         = ggml_nelements(src) / head_dim;
+    const int64_t groups_per_head = head_dim / group_size;
+    const int     tail_size       = (int)(head_dim % group_size);
+    const int64_t n_groups        = groups_per_head * n_heads;
+
+    const float inv_sqrt = 1.0f / sqrtf((float)group_size);
+
+    // Parallel over groups
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+    const int64_t grp_start = (n_groups * ith) / nth;
+    const int64_t grp_end = (n_groups * (ith + 1)) / nth;
+
+    // Select sign arrays: for 64-group, use first 64 elements of the 128-element arrays
+    const float * s_first = (direction == 0) ? turbo_wht_s1 : turbo_wht_s2;
+    const float * s_second = (direction == 0) ? turbo_wht_s2 : turbo_wht_s1;
+
+    for (int64_t g = grp_start; g < grp_end; g++) {
+        const int64_t head_idx    = g / groups_per_head;
+        const int64_t grp_in_head = g % groups_per_head;
+        const int64_t base        = head_idx * head_dim + grp_in_head * group_size;
+
+        float x[128];  // max group_size
+        const float * in = src_data + base;
+
+        // InnerQ forward: apply scale_inv BEFORE signs+WHT (for Q pre-rotation)
+        if (direction == 0 && scale_inv != NULL) {
+            for (int i = 0; i < group_size; i++) x[i] = in[i] * scale_inv[i % group_size];
+        } else {
+            for (int i = 0; i < group_size; i++) x[i] = in[i];
+        }
+
+        // Apply first signs
+        for (int i = 0; i < group_size; i++) x[i] *= s_first[i];
+
+        // WHT butterfly (log2(group_size) stages)
+        for (int h = 1; h < group_size; h *= 2) {
+            for (int i = 0; i < group_size; i += h * 2) {
+                for (int j = i; j < i + h; j++) {
+                    float a = x[j], b = x[j + h];
+                    x[j] = a + b;
+                    x[j + h] = a - b;
+                }
+            }
+        }
+
+        // Normalize + second signs
+        float * out = dst_data + base;
+        for (int i = 0; i < group_size; i++) {
+            float val = x[i] * inv_sqrt * s_second[i];
+            // InnerQ inverse: apply scale_inv AFTER WHT+signs (for V un-rotation)
+            if (direction == 1 && scale_inv != NULL) {
+                val *= scale_inv[i % group_size];
+            }
+            out[i] = val;
+        }
+    }
+
+    // Copy tail elements unchanged (identity pass-through)
+    if (tail_size > 0 && ith == 0) {
+        const int64_t tail_offset = groups_per_head * group_size;
+        for (int64_t h = 0; h < n_heads; h++) {
+            const int64_t base = h * head_dim + tail_offset;
+            memcpy(dst_data + base, src_data + base, tail_size * sizeof(float));
+        }
+    }
+}
+
+void ggml_compute_forward_turbo_wht(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32: ggml_compute_forward_turbo_wht_f32(params, dst); break;
+        default: GGML_ABORT("fatal error");
     }
 }
 
@@ -11363,11 +11437,7 @@ static void ggml_compute_forward_fwht_f32(const ggml_compute_params * params, gg
 
         // Scalar passes
 #if defined(GGML_SIMD)
-#if defined(__ARM_FEATURE_SVE)
-        const int step = svcntw();
-#else
         const int step = GGML_F32_EPR;
-#endif
 #else
         const int step = n;
 #endif

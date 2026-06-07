@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "ggml-atx-moe-residency.h"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -515,6 +516,13 @@ static __global__ void mul_mat_vec_q(
 
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
+    const uint32_t channel_x_orig = channel_x;
+
+    const int32_t atx_hot_idx = ids && fusion.atx_expert_map ? fusion.atx_expert_map[channel_x_orig] : -1;
+    const bool atx_use_hot = atx_hot_idx >= 0 && fusion.atx_hot_data != nullptr;
+    const void * vx_active = atx_use_hot ? fusion.atx_hot_data : vx;
+    const uint32_t channel_x_active = atx_use_hot ? (uint32_t) atx_hot_idx : channel_x_orig;
+    const uint32_t stride_channel_x_active = atx_use_hot ? fusion.atx_hot_stride_channel : stride_channel_x;
 
     bool use_gate = false;
     bool use_bias = false;
@@ -568,7 +576,15 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x_active*stride_channel_x_active + row0*stride_row_x;
+    const int32_t atx_gate_hot_idx = ids && fusion.atx_gate_expert_map ? fusion.atx_gate_expert_map[channel_x_orig] : -1;
+    const bool atx_use_gate_hot = atx_gate_hot_idx >= 0 && fusion.atx_gate_hot_data != nullptr;
+    const void * vgate_active = atx_use_gate_hot ? fusion.atx_gate_hot_data : vgate;
+    const int gate_kbx_offset =
+        sample_x*stride_sample_x +
+        (atx_use_gate_hot ? (uint32_t) atx_gate_hot_idx : channel_x_orig) *
+            (atx_use_gate_hot ? fusion.atx_gate_hot_stride_channel : stride_channel_x) +
+        row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -581,11 +597,11 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    vx_active, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate_active, &y[j*stride_col_y + kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -683,6 +699,7 @@ template <ggml_type type, int c_rows_per_block>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const ggml_cuda_mm_fusion_args_device fusion,
         float * __restrict__ dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
@@ -707,11 +724,16 @@ static __global__ void mul_mat_vec_q_moe(
         return;
     }
 
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const uint32_t channel_x_orig = ids[channel_dst + token_idx * ids_stride];
+    const int32_t atx_hot_idx = fusion.atx_expert_map ? fusion.atx_expert_map[channel_x_orig] : -1;
+    const bool atx_use_hot = atx_hot_idx >= 0 && fusion.atx_hot_data != nullptr;
+    const void * vx_active = atx_use_hot ? fusion.atx_hot_data : vx;
+    const uint32_t channel_x = atx_use_hot ? (uint32_t) atx_hot_idx : channel_x_orig;
+    const uint32_t stride_channel_x_active = atx_use_hot ? fusion.atx_hot_stride_channel : stride_channel_x;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset  = channel_x*stride_channel_x_active + row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -722,7 +744,7 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += vec_dot_q_cuda(vx_active, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
         }
     }
 
@@ -783,7 +805,7 @@ static void mul_mat_vec_q_switch_fusion(
 
 template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
-        const void * vx, const void * vy, const int32_t * ids, float * dst,
+        const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
@@ -796,7 +818,7 @@ static void mul_mat_vec_q_moe_launch(
     const dim3 block_dims(warp_size, ncols_dst);
 
     mul_mat_vec_q_moe<type, rows_per_block><<<block_nums, block_dims, 0, stream>>>(
-        vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
+        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
         ncols_dst, ids_stride);
@@ -872,7 +894,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
-            vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
             ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
@@ -1141,6 +1163,16 @@ void ggml_cuda_mul_mat_vec_q(
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
 
+    if (ids) {
+        ggml_atx_moe_direct_cache direct{};
+        if (ggml_backend_atx_moe_residency_get_direct_cache(src0, &direct)) {
+            fusion_local.atx_hot_data = direct.hot_data;
+            fusion_local.atx_expert_map = direct.expert_map;
+            fusion_local.atx_hot_stride_channel = (uint32_t) direct.hot_stride_channel;
+            ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMVQ);
+        }
+    }
+
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
         GGML_ASSERT(  ids || dst->ne[1] == 1);
@@ -1154,6 +1186,15 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
+            if (ids) {
+                ggml_atx_moe_direct_cache gate_direct{};
+                if (ggml_backend_atx_moe_residency_get_direct_cache(fusion->gate, &gate_direct)) {
+                    fusion_local.atx_gate_hot_data = gate_direct.hot_data;
+                    fusion_local.atx_gate_expert_map = gate_direct.expert_map;
+                    fusion_local.atx_gate_hot_stride_channel = (uint32_t) gate_direct.hot_stride_channel;
+                    ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMVQ);
+                }
+            }
         }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
