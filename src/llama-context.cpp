@@ -110,6 +110,8 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    cparams.ctx_type          = params.ctx_type;
+
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
     // re-reserve when graph nodes change.
@@ -342,9 +344,12 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k             =*/ params.type_k,
+            /*.type_v             =*/ params.type_v,
+            /*.swa_full           =*/ params.swa_full,
+            /*.ctx_type           =*/ cparams.ctx_type,
+            /*.kv_cache_quant_type=*/ params.kv_cache_quant_type,
+            /*.kvarn              =*/ params.kvarn,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));

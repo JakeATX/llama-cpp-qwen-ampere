@@ -29,6 +29,70 @@ Tier 1: KVarN/normal ratio **≥ 90%** on both prefill (`pp*`) and decode (`tg*`
 per model×config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
 (output quality) deferred.
 
+**Hardware:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, branch
+`kvarn-atx-integration`, `-fa off`, `--kvarn-preset kvarn_k4v2_g128`.
+
+### P0 CUDA matrix (2026-06-07, post `params_mem` merge fix)
+
+Critical merge fix: `llama_context` now passes `kv_cache_quant_type` and
+`kvarn` into `create_memory` (without this, bench rows labeled `kvarn` used the
+normal KV cache).
+
+| Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate |
+|----------------|------|----------:|----------:|------:|:----:|
+| Qwen3.6 MTP IQ3, `-ngl 99` | pp256 | 55.02 | 32.12 | 58.4% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99` | pp512 | 71.95 | 40.28 | 56.0% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99` | tg64 | 1.64 | 1.21 | 73.8% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 130.38 | 102.96 | 79.0% | FAIL |
+| Gemma 4 12B Q3, `-ngl 99` | pp512 | 1036.48 | 340.17 | 32.8% | FAIL |
+| Gemma 4 12B Q3, `-ngl 99` | tg64 | 27.56 | 4.05 | 14.7% | FAIL |
+
+Artifacts: `artifacts/kvarn-bench/qwen36-mtp-moe-matrix/`,
+`artifacts/kvarn-bench/qwen36-mtp-ncmoe34-matrix/`,
+`artifacts/kvarn-bench/gemma12b-512-matrix-v2/`.
+
+**Notes:**
+
+- Qwen 35B (14.28 GiB) exceeds 12 GB VRAM at `-ngl 99`; use `-ncmoe 34` for
+  stable runs. Full-GPU rows are VRAM-throttled and not production comparable.
+- `-ncmoe 34` pp512 active-body is closest to gate (~79–96% across reruns).
+- `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` on Qwen pp512 **regresses** to ~16%
+  (fused-batch is the correct path).
+- Gemma ISWA+KVarN prefill/decode gaps need CUDA fused-attn / ubatch follow-up
+  on `kvarn-atx-integration` (see trace: `fused-batch` + body-store on pp512).
+
+### Tier 2 gates (CUDA)
+
+| Gate | Status |
+|------|--------|
+| `ctest -R test-kvarn-kv\|test-kvarn-cuda` | PASS (3/3) |
+| `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS |
+| `run_unsupported_smoke.ps1` | PASS (15/15, pre-fix baseline) |
+| `compare_cuda_logits_ref.ps1` | **BLOCKED** — `llama-results.exe` SEGV on launch (integration-branch `common` link issue; use ctest CUDA scratch/mixed-tail gates until fixed) |
+
+### Mac validation handoff
+
+After CUDA P0 stabilizes, rerun on Mac (M4 Max) with true full-Metal reference:
+
+```bash
+git checkout atx-expert-residency   # or kvarn-atx-integration when Metal KVarN lands
+./scripts/atx_moe_session.sh
+# or directly:
+python scripts/atx_moe_metal_server_acceptance.py \
+  --reference-no-ncpu-moe \
+  --layer-scenario best_candidate=0-40
+```
+
+Compare decode/prefill to Mac baseline table above (87.22 / 921.40 tok/s).
+KVarN CUDA-only today; Mac KVarN parity is out of scope until Metal backend exists.
+
+### Expand coverage (deferred)
+
+- DFlash model row — model not present locally; download + smoke pending.
+- Non-MTP Qwen (`Q3_K_XL`) — not downloaded.
+- 128-dim regression — after 256/512 green.
+- Context sweeps 4K→64K — after P0 gate.
+
 Current implemented pieces:
 
 - Public API and common CLI flags for `--kv-cache-quant none|kvarn`.

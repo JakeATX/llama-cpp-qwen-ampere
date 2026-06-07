@@ -191,11 +191,25 @@ function Get-BenchThroughputByKvq([string] $text) {
         if ($cols.Count -lt 10) {
             continue
         }
-        $kvq = $cols[6].ToLowerInvariant()
-        if ($kvq -ne "none" -and $kvq -ne "kvarn") {
+
+        $kvqIdx = -1
+        for ($i = 0; $i -lt $cols.Count; $i++) {
+            $col = $cols[$i].ToLowerInvariant()
+            if ($col -eq "none" -or $col -eq "kvarn") {
+                $kvqIdx = $i
+                break
+            }
+        }
+        if ($kvqIdx -lt 0) {
             continue
         }
-        $throughputText = $cols[9]
+
+        $kvq = $cols[$kvqIdx].ToLowerInvariant()
+        $nonEmptyCols = @($cols | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($nonEmptyCols.Count -lt 2) {
+            continue
+        }
+        $throughputText = $nonEmptyCols[$nonEmptyCols.Count - 1]
         $m = [regex]::Match($throughputText, '([0-9]+(?:\.[0-9]+)?)')
         if (-not $m.Success) {
             continue
