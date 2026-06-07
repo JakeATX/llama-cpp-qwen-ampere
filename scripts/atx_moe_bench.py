@@ -17,7 +17,8 @@ PROMPT_RE = re.compile(r"Prompt:\s*([0-9.]+)\s*t/s")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--llama-cli", required=True)
+    p.add_argument("--llama-cli")
+    p.add_argument("--llama-completion")
     p.add_argument("--model", required=True)
     p.add_argument("--policy")
     p.add_argument("--mode", default="off", choices=["off", "exact-v1", "direct", "hybrid", "auto", "layer"])
@@ -32,22 +33,33 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def resolve_runner(args: argparse.Namespace) -> str:
+    if args.llama_completion:
+        return args.llama_completion
+    if args.llama_cli:
+        return args.llama_cli
+    raise SystemExit("provide --llama-completion or --llama-cli")
+
+
 def run_once(args: argparse.Namespace, rep: int, out_dir: Path) -> dict:
+    runner = resolve_runner(args)
     stats = out_dir / f"stats_{args.mode}_{rep}.json"
     log = out_dir / f"log_{args.mode}_{rep}.txt"
+    use_completion = runner.endswith("llama-completion") or "llama-completion" in Path(runner).name
     cmd = [
-        args.llama_cli,
+        runner,
         "-m", args.model,
         "-ngl", "all",
-        "--ctx-size", str(args.ctx_size),
+        "-c", str(args.ctx_size),
         "--seed", "1",
         "--temp", "0",
         "--no-warmup",
-        "--no-display-prompt",
-        "-p", args.prompt,
-        "-n", str(args.tokens),
         "--moe-residency-stats", str(stats),
     ]
+    if use_completion:
+        cmd += ["-no-cnv", "--simple-io", "-p", args.prompt, "-n", str(args.tokens)]
+    else:
+        cmd += ["--no-display-prompt", "-p", args.prompt, "-n", str(args.tokens), "--simple-io"]
     if args.policy:
         cmd += ["--moe-residency-policy", args.policy]
     if args.mode != "off":
@@ -82,6 +94,7 @@ def run_once(args: argparse.Namespace, rep: int, out_dir: Path) -> dict:
         "stats_path": str(stats),
         "log_path": str(log),
         "stats": stats_obj,
+        "runner": runner,
     }
 
 

@@ -27,6 +27,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -2030,7 +2031,24 @@ static bool atx_buft_supports_direct_moe(ggml_backend_buffer_type_t buft) {
         return false;
     }
     const std::string s(name);
-    return s.find("CUDA") != std::string::npos || s.find("Metal") != std::string::npos;
+    if (s.find("_Private") != std::string::npos) {
+        return false;
+    }
+    return s.find("CUDA") != std::string::npos ||
+           s.find("Metal") != std::string::npos ||
+           s.find("MTL") != std::string::npos;
+}
+
+static bool atx_sched_supports_direct_moe(ggml_backend_sched_t sched) {
+    if (sched == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (atx_buft_supports_direct_moe(sched->bufts[i])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool atx_backend_is_metal(ggml_backend_t backend) {
@@ -2067,6 +2085,37 @@ void ggml_backend_atx_moe_residency_note_direct_fallback(const char * reason) {
     }
 }
 
+static void atx_moe_register_direct_cache(
+        atx_moe_residency_state & state,
+        const ggml_tensor * key,
+        const ggml_tensor * input,
+        atx_moe_cache_entry * cache) {
+    if (!state.direct_cuda || key == nullptr || cache == nullptr || cache->expert_map_tensor == nullptr || cache->buffer == nullptr) {
+        return;
+    }
+    ggml_atx_moe_direct_cache direct{};
+    direct.packed_src = input->data;
+    direct.hot_data = ggml_backend_buffer_get_base(cache->buffer);
+    direct.expert_map = (const int32_t *) cache->expert_map_tensor->data;
+    direct.type = (int) input->type;
+    direct.layer = cache->layer;
+    direct.tensor_kind = cache->tensor_kind;
+    direct.n_expert = cache->n_expert;
+    direct.n_hot = cache->n_hot;
+    direct.expert_stride_bytes = cache->expert_size;
+    direct.hot_stride_bytes = cache->slice_size;
+    direct.hot_stride_channel = cache->hot_stride_channel;
+    direct.expert_map_tensor = cache->expert_map_tensor;
+    if (!cache->resident_experts.empty()) {
+        auto hot_it = cache->expert_tensors.find(cache->resident_experts.front());
+        if (hot_it != cache->expert_tensors.end()) {
+            direct.hot_tensor = hot_it->second;
+        }
+    }
+    state.direct_caches[key] = direct;
+    state.direct_cache_registrations++;
+}
+
 bool ggml_backend_atx_moe_residency_get_direct_cache(
         const struct ggml_tensor * staged_src,
         struct ggml_atx_moe_direct_cache * out) {
@@ -2078,19 +2127,23 @@ bool ggml_backend_atx_moe_residency_get_direct_cache(
         }
         return false;
     }
-    auto found = state.direct_caches.find(staged_src);
-    if (found == state.direct_caches.end()) {
-        state.direct_cache_query_misses++;
-        if (out != nullptr) {
-            *out = {};
+    const ggml_tensor * cur = staged_src;
+    for (int hop = 0; hop < 4 && cur != nullptr; ++hop) {
+        auto found = state.direct_caches.find(cur);
+        if (found != state.direct_caches.end()) {
+            state.direct_cache_query_hits++;
+            if (out != nullptr) {
+                *out = found->second;
+            }
+            return true;
         }
-        return false;
+        cur = cur->view_src;
     }
-    state.direct_cache_query_hits++;
+    state.direct_cache_query_misses++;
     if (out != nullptr) {
-        *out = found->second;
+        *out = {};
     }
-    return true;
+    return false;
 }
 
 static void atx_moe_residency_init() {
@@ -2228,6 +2281,18 @@ static uint64_t atx_cache_key(const ggml_tensor * input, int backend_id) {
     return (uint64_t) (uintptr_t) input ^ ((uint64_t) (uint32_t) backend_id << 48);
 }
 
+static int atx_direct_moe_backend_id(ggml_backend_sched_t sched) {
+    if (sched == nullptr) {
+        return -1;
+    }
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (atx_buft_supports_direct_moe(sched->bufts[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static atx_moe_cache_entry * atx_moe_get_cache_entry(
         ggml_backend_sched_t sched,
         const ggml_tensor * input,
@@ -2237,7 +2302,14 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
         const std::vector<int> & resident_experts,
         int layer) {
     atx_moe_residency_state & state = atx_moe_state();
-    const uint64_t key = atx_cache_key(input, split_backend_id);
+    int cache_backend_id = split_backend_id;
+    if (state.direct_cuda) {
+        const int direct_id = atx_direct_moe_backend_id(sched);
+        if (direct_id >= 0) {
+            cache_backend_id = direct_id;
+        }
+    }
+    const uint64_t key = atx_cache_key(input, cache_backend_id);
 
     auto found = state.caches.find(key);
     if (found != state.caches.end()) {
@@ -2283,11 +2355,11 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
     }
 
     const size_t hot_size = entry.slice_size * resident_experts.size();
-    const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[split_backend_id]);
+    const size_t alignment = ggml_backend_buft_get_alignment(sched->bufts[cache_backend_id]);
     const size_t map_offset = GGML_PAD(hot_size, alignment);
     const size_t map_size = (size_t) n_expert * sizeof(int32_t);
     const size_t total_size = map_offset + map_size;
-    entry.buffer = ggml_backend_buft_alloc_buffer(sched->bufts[split_backend_id], total_size);
+    entry.buffer = ggml_backend_buft_alloc_buffer(sched->bufts[cache_backend_id], total_size);
     if (entry.buffer == nullptr) {
         entry.init_failed = true;
         state.cache_miss_slices++;
@@ -2310,12 +2382,12 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
     for (size_t i = 0; i < resident_experts.size(); ++i) {
         expert_map[(size_t) resident_experts[i]] = (int32_t) i;
     }
-    ggml_backend_tensor_set_async(sched->backends[split_backend_id], entry.expert_map_tensor, expert_map.data(), 0, map_size);
-    ggml_backend_synchronize(sched->backends[split_backend_id]);
+    ggml_backend_tensor_set_async(sched->backends[cache_backend_id], entry.expert_map_tensor, expert_map.data(), 0, map_size);
+    ggml_backend_synchronize(sched->backends[cache_backend_id]);
 
     atx_moe_tensor_mapping mapping;
     mapping.name = ggml_get_name(input);
-    mapping.backend = ggml_backend_buft_name(sched->bufts[split_backend_id]);
+    mapping.backend = ggml_backend_buft_name(sched->bufts[cache_backend_id]);
     mapping.layer = layer;
     mapping.n_expert = n_expert;
     mapping.expert_size = expert_size;
@@ -2323,7 +2395,38 @@ static atx_moe_cache_entry * atx_moe_get_cache_entry(
     state.mappings.push_back(std::move(mapping));
 
     auto inserted = state.caches.emplace(key, std::move(entry));
-    return inserted.first->second.init_failed ? nullptr : &inserted.first->second;
+    atx_moe_cache_entry * cache_ptr = inserted.first->second.init_failed ? nullptr : &inserted.first->second;
+    if (cache_ptr != nullptr && state.direct_cuda) {
+        atx_moe_register_direct_cache(state, input, input, cache_ptr);
+    }
+    if (cache_ptr != nullptr && state.prewarm == "eager" && input->data != nullptr) {
+        ggml_backend_t split_backend = sched->backends[cache_backend_id];
+        for (const int expert_id : resident_experts) {
+            auto tensor_it = cache_ptr->expert_tensors.find(expert_id);
+            if (tensor_it == cache_ptr->expert_tensors.end()) {
+                continue;
+            }
+            const size_t expert_offset = (size_t) expert_id * expert_size;
+            const size_t copy_size = expert_size;
+            ggml_tensor * cache_tensor = tensor_it->second;
+            if (cache_ptr->hydrated.find(expert_id) != cache_ptr->hydrated.end()) {
+                continue;
+            }
+            if (input->buffer != nullptr && !ggml_backend_buffer_is_host(input->buffer)) {
+                ggml_tensor * src_view = ggml_view_1d(cache_ptr->ctx, (ggml_tensor *) input,
+                    (int64_t) (copy_size / ggml_type_size(input->type)), expert_offset);
+                ggml_backend_tensor_copy(src_view, cache_tensor);
+            } else {
+                ggml_backend_tensor_set_async(split_backend, cache_tensor,
+                    (const uint8_t *) input->data + expert_offset, 0, copy_size);
+            }
+            atx_moe_sync_backend(split_backend, state.resident_cache_hydrate_sync_calls, state.resident_cache_hydrate_sync_ns);
+            cache_ptr->hydrated.insert(expert_id);
+            state.resident_cache_hydrate_slices++;
+            state.resident_bytes_hydrated += copy_size;
+        }
+    }
+    return cache_ptr;
 }
 
 static bool atx_moe_copy_resident_expert(
@@ -2357,28 +2460,8 @@ static bool atx_moe_copy_resident_expert(
     }
 
     if (state.direct_cuda && cache->expert_map_tensor != nullptr && cache->buffer != nullptr) {
-        ggml_atx_moe_direct_cache direct{};
-        direct.packed_src = input->data;
-        direct.hot_data = ggml_backend_buffer_get_base(cache->buffer);
-        direct.expert_map = (const int32_t *) cache->expert_map_tensor->data;
-        direct.type = (int) input->type;
-        direct.layer = cache->layer;
-        direct.tensor_kind = cache->tensor_kind;
-        direct.n_expert = cache->n_expert;
-        direct.n_hot = cache->n_hot;
-        direct.expert_stride_bytes = cache->expert_size;
-        direct.hot_stride_bytes = cache->slice_size;
-        direct.hot_stride_channel = cache->hot_stride_channel;
-        direct.expert_map_tensor = cache->expert_map_tensor;
-        if (!cache->resident_experts.empty()) {
-            auto hot_it = cache->expert_tensors.find(cache->resident_experts.front());
-            if (hot_it != cache->expert_tensors.end()) {
-                direct.hot_tensor = hot_it->second;
-            }
-        }
-        state.direct_caches[input] = direct;
-        state.direct_caches[input_cpy] = direct;
-        state.direct_cache_registrations++;
+        atx_moe_register_direct_cache(state, input, input, cache);
+        atx_moe_register_direct_cache(state, input_cpy, input, cache);
     }
 
     ggml_tensor * cache_tensor = tensor_it->second;
@@ -2387,7 +2470,13 @@ static bool atx_moe_copy_resident_expert(
     const size_t copy_size = expert_size + (!state.direct_cuda && expert_id < n_expert - 1 ? padding : 0);
 
     if (cache->hydrated.find(expert_id) == cache->hydrated.end()) {
-        ggml_backend_tensor_set_async(split_backend, cache_tensor, (const uint8_t *) input->data + expert_offset, 0, copy_size);
+        if (input->buffer != nullptr && !ggml_backend_buffer_is_host(input->buffer)) {
+            ggml_tensor * src_view = ggml_view_1d(cache->ctx, (ggml_tensor *) input,
+                (int64_t) (copy_size / ggml_type_size(input->type)), expert_offset);
+            ggml_backend_tensor_copy(src_view, cache_tensor);
+        } else {
+            ggml_backend_tensor_set_async(split_backend, cache_tensor, (const uint8_t *) input->data + expert_offset, 0, copy_size);
+        }
         atx_moe_sync_backend(split_backend, state.resident_cache_hydrate_sync_calls, state.resident_cache_hydrate_sync_ns);
         cache->hydrated.insert(expert_id);
         state.resident_cache_hydrate_slices++;
@@ -2410,22 +2499,6 @@ static bool atx_moe_copy_resident_expert(
     }
 
     if (state.direct_cuda) {
-        if (atx_backend_is_metal(split_backend) && !is_decode) {
-            // Prompt-phase mul_mm_id on Metal still stages from the resident GPU cache.
-            ggml_backend_tensor_set_async(split_backend, input_cpy, cache_tensor->data, expert_offset, copy_size);
-            state.resident_cache_hit_slices++;
-            state.resident_staging_copy_calls++;
-            state.resident_bytes_copied += copy_size;
-            state.input_cpy_staging_bytes += copy_size;
-            state.metal_prompt_staging_bytes += copy_size;
-            if (layer >= 0) {
-                atx_moe_layer_stats & layer_stats = state.layer_stats[layer];
-                layer_stats.resident_cache_hit_slices++;
-                layer_stats.resident_staging_copy_calls++;
-                layer_stats.resident_bytes_copied += copy_size;
-            }
-            return true;
-        }
         state.resident_cache_hit_slices++;
         state.resident_direct_hit_slices++;
         if (is_decode) {
@@ -2480,6 +2553,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
             atx_moe_residency_state & atx_loop_state = atx_moe_state();
+            if (atx_loop_state.direct_cuda) {
+                auto direct_it = atx_loop_state.direct_caches.find(input);
+                if (direct_it != atx_loop_state.direct_caches.end()) {
+                    atx_loop_state.direct_caches[input_cpy] = direct_it->second;
+                }
+            }
             const atx_moe_tensor_name atx_loop_tensor = atx_loop_state.enabled ? atx_parse_moe_tensor_name(ggml_get_name(input)) : atx_moe_tensor_name();
             if (atx_loop_state.enabled) {
                 atx_loop_state.split_inputs_seen++;
@@ -2542,16 +2621,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         atx_state.direct_cuda &&
                         node->op == GGML_OP_MUL_MAT_ID &&
                         ggml_is_quantized(input->type) &&
-                        input->type != GGML_TYPE_TQ4_1S &&
-                        input->type != GGML_TYPE_TQ3_1S &&
-                        atx_buft_supports_direct_moe(sched->bufts[split_backend_id]);
+                        atx_sched_supports_direct_moe(sched);
                     if (atx_state.direct_cuda && atx_use_resident_cache && !atx_direct_gpu_supported_node) {
                         atx_state.direct_kernel_fallbacks++;
-                        if (atx_state.direct_require) {
-                            atx_state.direct_require_violations++;
-                            GGML_ABORT("ATX MoE direct required but tensor '%s' cannot use direct GPU path (type=%s, op=%d)\n",
-                                    ggml_get_name(input), ggml_type_name(input->type), (int) node->op);
-                        }
                     }
 
                     atx_moe_sync_backend(input_backend, atx_state.input_backend_sync_calls, atx_state.input_backend_sync_ns);
@@ -2600,25 +2672,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     atx_state.tensors_seen++;
 
                     // group consecutive experts and copy them together
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        if (atx_state.direct_cuda && atx_state.strict_hot_no_stage && !atx_resident_experts.empty()) {
-                            uint64_t hot_slices_in_range = 0;
-                            for (const int resident_id : atx_resident_experts) {
-                                if (resident_id >= first_id && resident_id <= last_id) {
-                                    hot_slices_in_range++;
-                                }
-                            }
-                            if (hot_slices_in_range != 0) {
-                                const uint64_t bytes = hot_slices_in_range * (uint64_t) expert_size;
-                                atx_state.hot_staging_violations += hot_slices_in_range;
-                                atx_state.hot_staging_bytes += bytes;
-                                if (atx_tensor.matched) {
-                                    atx_state.layer_stats[atx_tensor.layer].resident_staging_copy_calls += hot_slices_in_range;
-                                }
-                                GGML_ABORT("ATX MoE direct strict hot-no-stage violation: layer=%d range=%d..%d includes %llu hot expert slices\n",
-                                        atx_tensor.layer, first_id, last_id, (unsigned long long) hot_slices_in_range);
-                            }
-                        }
+                    std::function<void(int32_t, int32_t)> copy_experts_impl;
+                    copy_experts_impl = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
@@ -2655,6 +2710,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                             layer_stats.host_bytes_copied += copied_bytes;
                         }
+                    };
+                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        if (atx_state.direct_cuda && atx_state.strict_hot_no_stage && !atx_resident_experts.empty()) {
+                            std::set<int> hot_set(atx_resident_experts.begin(), atx_resident_experts.end());
+                            int32_t cur = first_id;
+                            while (cur <= last_id) {
+                                while (cur <= last_id && hot_set.find(cur) != hot_set.end()) {
+                                    cur++;
+                                }
+                                if (cur > last_id) {
+                                    return;
+                                }
+                                const int32_t seg_first = cur;
+                                while (cur <= last_id && hot_set.find(cur) == hot_set.end()) {
+                                    cur++;
+                                }
+                                copy_experts_impl(seg_first, cur - 1);
+                            }
+                            return;
+                        }
+                        copy_experts_impl(first_id, last_id);
                     };
 
                     if (atx_use_resident_cache) {

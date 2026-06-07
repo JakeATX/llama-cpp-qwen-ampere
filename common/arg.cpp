@@ -2796,6 +2796,47 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             atx_set_env("ATX_MOE_RESIDENCY_DEBUG", "1");
         }
     ).set_env("LLAMA_ARG_MOE_RESIDENCY_DEBUG"));
+    add_opt(common_arg(
+        {"--layer-profile"}, "FILE",
+        "ATX: write per-layer graph timing profile to FILE (JSONL)",
+        [](common_params & params, const std::string & value) {
+            params.layer_profile_path = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--layer-profile-detail"}, "off|summary|ops",
+        string_format("ATX layer profile detail level (default: %s)", params.layer_profile_detail.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "summary" && value != "ops") {
+                throw std::invalid_argument("invalid --layer-profile-detail, expected off, summary, or ops");
+            }
+            params.layer_profile_detail = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--layer-profile-sync"}, "none|token|layer",
+        string_format("ATX layer profile synchronization mode (default: %s)", params.layer_profile_sync.c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value != "none" && value != "token" && value != "layer") {
+                throw std::invalid_argument("invalid --layer-profile-sync, expected none, token, or layer");
+            }
+            params.layer_profile_sync = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--layer-profile-warmup"}, "N",
+        string_format("skip first N profiled graph nodes in ATX layer profile output (default: %d)", params.layer_profile_warmup),
+        [](common_params & params, int value) {
+            params.layer_profile_warmup = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--layer-profile-max-tokens"}, "N",
+        string_format("maximum profiled node records to write, -1 is unlimited (default: %d)", params.layer_profile_max_tokens),
+        [](common_params & params, int value) {
+            params.layer_profile_max_tokens = value;
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

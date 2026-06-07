@@ -564,6 +564,8 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    uint32_t atx_has_direct;
+    uint64_t atx_hot_stride;
 } ggml_metal_kargs_mul_mm_id;
 
 typedef struct {

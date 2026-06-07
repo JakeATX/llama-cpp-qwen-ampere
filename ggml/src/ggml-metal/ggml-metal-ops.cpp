@@ -2542,6 +2542,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
                 auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_tq_rotated(lib, op);
 
+                ggml_atx_moe_direct_cache atx_direct{};
+                const bool atx_use_direct = ggml_backend_atx_moe_residency_get_direct_cache(op->src[0], &atx_direct) &&
+                    atx_direct.hot_tensor != nullptr && atx_direct.expert_map_tensor != nullptr;
+
                 ggml_metal_kargs_mul_mm_id args = {
                     /*.ne00  =*/ne00,
                     /*.ne02  =*/ne02,
@@ -2559,7 +2563,17 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     /*.ne1   =*/ne1,
                     /*.r2    =*/r2,
                     /*.r3    =*/r3,
+                    /*.atx_has_direct =*/atx_use_direct ? 1u : 0u,
+                    /*.atx_hot_stride =*/atx_use_direct ? atx_direct.hot_stride_bytes : 0ull,
                 };
+
+                ggml_metal_buffer_id bid_atx_hot = bid_src0;
+                ggml_metal_buffer_id bid_atx_map = bid_src0;
+                if (atx_use_direct) {
+                    bid_atx_hot = ggml_metal_get_buffer_id(atx_direct.hot_tensor);
+                    bid_atx_map = ggml_metal_get_buffer_id(atx_direct.expert_map_tensor);
+                    ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMQ);
+                }
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline);
                 ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -2568,6 +2582,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, bid_tpe, 3);
                 ggml_metal_encoder_set_buffer(enc, bid_ids, 4);
                 ggml_metal_encoder_set_buffer(enc, bid_dst, 5);
+                ggml_metal_encoder_set_buffer(enc, bid_atx_hot, 6);
+                ggml_metal_encoder_set_buffer(enc, bid_atx_map, 7);
 
                 const size_t smem = pipeline.smem;
                 ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
@@ -2586,6 +2602,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             } else {
                 auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
 
+                ggml_atx_moe_direct_cache atx_direct{};
+                const bool atx_use_direct = ggml_backend_atx_moe_residency_get_direct_cache(op->src[0], &atx_direct) &&
+                    atx_direct.hot_tensor != nullptr && atx_direct.expert_map_tensor != nullptr;
+
                 ggml_metal_kargs_mul_mm_id args = {
                     /*.ne00  =*/ne00,
                     /*.ne02  =*/ne02,
@@ -2603,7 +2623,17 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                     /*.ne1   =*/ne1,
                     /*.r2    =*/r2,
                     /*.r3    =*/r3,
+                    /*.atx_has_direct =*/atx_use_direct ? 1u : 0u,
+                    /*.atx_hot_stride =*/atx_use_direct ? atx_direct.hot_stride_bytes : 0ull,
                 };
+
+                ggml_metal_buffer_id bid_atx_hot = bid_src0;
+                ggml_metal_buffer_id bid_atx_map = bid_src0;
+                if (atx_use_direct) {
+                    bid_atx_hot = ggml_metal_get_buffer_id(atx_direct.hot_tensor);
+                    bid_atx_map = ggml_metal_get_buffer_id(atx_direct.expert_map_tensor);
+                    ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMQ);
+                }
 
                 ggml_metal_encoder_set_pipeline(enc, pipeline);
                 ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
@@ -2612,6 +2642,8 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer(enc, bid_tpe, 3);
                 ggml_metal_encoder_set_buffer(enc, bid_ids, 4);
                 ggml_metal_encoder_set_buffer(enc, bid_dst, 5);
+                ggml_metal_encoder_set_buffer(enc, bid_atx_hot, 6);
+                ggml_metal_encoder_set_buffer(enc, bid_atx_map, 7);
 
                 const size_t smem = pipeline.smem;
                 ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
@@ -2666,8 +2698,6 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             bid_atx_hot = ggml_metal_get_buffer_id(atx_direct.hot_tensor);
             bid_atx_map = ggml_metal_get_buffer_id(atx_direct.expert_map_tensor);
             ggml_backend_atx_moe_residency_note_direct_dispatch(GGML_ATX_MOE_DIRECT_KERNEL_MMVQ);
-        } else if (ggml_backend_atx_moe_residency_direct_enabled() && ggml_backend_atx_moe_residency_direct_require()) {
-            ggml_backend_atx_moe_residency_note_direct_fallback("metal mul_mv_id direct cache unavailable");
         }
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);

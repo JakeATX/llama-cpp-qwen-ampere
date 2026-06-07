@@ -11895,6 +11895,8 @@ kernel void kernel_mul_mm_id(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const char * atx_hot,
+        device const int32_t * atx_expert_map,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -11945,10 +11947,20 @@ kernel void kernel_mul_mm_id(
     const short i12 = (id / args.ne20);
     const short i13 = 0;
 
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    device const char * src0_base;
+    if (args.atx_has_direct != 0) {
+        const int32_t hot_idx = ((device const int32_t *) (atx_expert_map))[im];
+        if (hot_idx >= 0) {
+            src0_base = atx_hot + (uint64_t) hot_idx * args.atx_hot_stride;
+        } else {
+            src0_base = src0 + im*args.nb02 + i13*args.nb03;
+        }
+    } else {
+        src0_base = src0 + im*args.nb02 + i13*args.nb03;
+    }
     const short    offset1 = il0/nl;
 
-    device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
+    device const block_q * x = (device const block_q *)(src0_base + args.nb01*(r0 + lr0)) + offset1;
 
     const short iy = 8*(tiitg % NL1);
 
