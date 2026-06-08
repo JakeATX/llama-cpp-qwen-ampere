@@ -29,6 +29,20 @@ static bool kvarn_env_flag(const char * name) {
     return value != 0;
 }
 
+static bool kvarn_cuda_dynamic_shmem_fits(size_t nbytes) {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return true;
+    }
+
+    cudaDeviceProp prop = {};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+        return true;
+    }
+
+    return nbytes <= prop.sharedMemPerBlock;
+}
+
 static __host__ __device__ size_t kvarn_packed_nbytes(size_t n_values, uint32_t bits) {
     return (n_values*bits + 7)/8;
 }
@@ -421,10 +435,61 @@ static __global__ void kvarn_quantize_asym_fullrange_pack_rows_parallel_kernel(
     }
     __syncthreads();
 
-    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
-        const float v = fminf(mx, fmaxf(mn, row[c]));
-        const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
-        kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
+    // Write one packed output byte from one CUDA thread. Calling kvarn_pack_one()
+    // per value lets multiple threads OR into the same byte for k4/v2 rows.
+    const size_t row_bit0 = size_t(r)*cols*bits;
+    const size_t row_nbits = size_t(cols)*bits;
+    const bool row_byte_aligned = ((row_bit0 | row_nbits) & 7u) == 0u;
+    if (!row_byte_aligned) {
+        if (threadIdx.x == 0) {
+            for (uint32_t c = 0; c < cols; ++c) {
+                const float v = fminf(mx, fmaxf(mn, row[c]));
+                const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
+                kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
+            }
+        }
+        return;
+    }
+
+    const size_t row_byte0 = row_bit0 >> 3;
+    const size_t row_nbytes = row_nbits >> 3;
+
+    if (bits == 4) {
+        for (size_t b = threadIdx.x; b < row_nbytes; b += blockDim.x) {
+            const uint32_t c0 = uint32_t(2*b);
+            const uint32_t c1 = c0 + 1;
+
+            const float v0 = fminf(mx, fmaxf(mn, row[c0]));
+            const uint32_t q0 = min(qmax, uint32_t(llroundf((v0 - mn)/s)));
+
+            uint32_t q1 = 0;
+            if (c1 < cols) {
+                const float v1 = fminf(mx, fmaxf(mn, row[c1]));
+                q1 = min(qmax, uint32_t(llroundf((v1 - mn)/s)));
+            }
+
+            body[row_byte0 + b] = uint8_t(q0 | (q1 << 4));
+        }
+    } else if (bits == 2) {
+        for (size_t b = threadIdx.x; b < row_nbytes; b += blockDim.x) {
+            uint32_t packed = 0;
+            const uint32_t c_base = uint32_t(4*b);
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t c = c_base + j;
+                if (c < cols) {
+                    const float v = fminf(mx, fmaxf(mn, row[c]));
+                    const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
+                    packed |= q << (2*j);
+                }
+            }
+            body[row_byte0 + b] = uint8_t(packed);
+        }
+    } else if (threadIdx.x == 0) {
+        for (uint32_t c = 0; c < cols; ++c) {
+            const float v = fminf(mx, fmaxf(mn, row[c]));
+            const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
+            kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
+        }
     }
 }
 
@@ -2517,30 +2582,21 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
     }
     __syncthreads();
 
-    for (uint32_t d = 0; d < head_dim; ++d) {
-        float local = 0.0f;
-        for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+    // Keep warp-cooperative q*k above, but make the value stage dimension
+    // parallel. The first version reduced over tokens for every d, causing
+    // head_dim (=512 for Gemma 4) block-wide reductions and synchronizations.
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float sum = 0.0f;
+        for (uint32_t t = 0; t < n_tokens; ++t) {
             const float v = kvarn_mixed_f16_load_v(
                     v_st, v_body_head, v_scales_head, pending_v_head,
                     t, d, n_sink, n_records, n_pending, n_tail, tail_start,
                     head_dim, group_size, value_bits,
                     sink_tail_stride_token_f16, pending_stride_token_floats,
                     v_body_stride_record_bytes, v_scale_stride_record_floats);
-            local += probs[t]*v;
+            sum += probs[t]*v;
         }
-        reduce[threadIdx.x] = local;
-        __syncthreads();
-
-        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-            if (threadIdx.x < stride) {
-                reduce[threadIdx.x] += reduce[threadIdx.x + stride];
-            }
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) {
-            out_row[d] = reduce[0];
-        }
-        __syncthreads();
+        out_row[d] = sum;
     }
 }
 
@@ -2843,23 +2899,25 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         // the head dimension and issue coalesced f16 sink/tail loads. Keep the
         // 128/256d path unchanged because it is already the passing Qwen path.
         if (head_dim >= 512) {
-            const int warpqk_block = 256;
+            const int warpqk_block = 512;
             const size_t warpqk_shmem = (size_t(n_tokens) + size_t(warpqk_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
-            kvarn_attn_mixed_f16_fused_batch_warpqk_kernel<<<int(n_queries*n_head), warpqk_block, warpqk_shmem, cuda_stream>>>(
-                    q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
-                    kq_mask,
-                    out, scores, n_queries, n_head, n_head_kv,
-                    n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
-                    q_stride_head_floats, q_stride_query_floats,
-                    out_stride_head_floats, out_stride_query_floats,
-                    sink_tail_stride_head_f16, sink_tail_stride_token_f16,
-                    pending_stride_head_floats, pending_stride_token_floats,
-                    k_body_stride_record_bytes, v_body_stride_record_bytes,
-                    k_body_stride_head_bytes, v_body_stride_head_bytes,
-                    k_scale_stride_record_floats, v_scale_stride_record_floats,
-                    k_scale_stride_head_floats, v_scale_stride_head_floats,
-                    kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale);
-            return;
+            if (kvarn_cuda_dynamic_shmem_fits(warpqk_shmem)) {
+                kvarn_attn_mixed_f16_fused_batch_warpqk_kernel<<<int(n_queries*n_head), warpqk_block, warpqk_shmem, cuda_stream>>>(
+                        q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                        kq_mask,
+                        out, scores, n_queries, n_head, n_head_kv,
+                        n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                        q_stride_head_floats, q_stride_query_floats,
+                        out_stride_head_floats, out_stride_query_floats,
+                        sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                        pending_stride_head_floats, pending_stride_token_floats,
+                        k_body_stride_record_bytes, v_body_stride_record_bytes,
+                        k_body_stride_head_bytes, v_body_stride_head_bytes,
+                        k_scale_stride_record_floats, v_scale_stride_record_floats,
+                        k_scale_stride_head_floats, v_scale_stride_head_floats,
+                        kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale);
+                return;
+            }
         }
 
         kvarn_attn_mixed_f16_fused_batch_kernel<<<int(n_queries*n_head), block, shmem, cuda_stream>>>(

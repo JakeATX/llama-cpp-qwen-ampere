@@ -101,8 +101,10 @@ llama_kv_cache_kvarn_iswa::llama_kv_cache_kvarn_iswa(
             n_pad,
             hparams.n_swa,
             hparams.swa_type,
+            nullptr,
             filter_swa,
-            reuse);
+            reuse,
+            nullptr);
 }
 
 llama_memory_context_ptr llama_kv_cache_kvarn_iswa::init_batch(

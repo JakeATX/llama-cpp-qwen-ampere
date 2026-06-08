@@ -402,6 +402,7 @@ $manifest = @(
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
 
 $summaries = @()
+$gateFailures = @()
 foreach ($case in (Get-BenchCases $CaseList)) {
     $argv = @(
         "-m", $modelPath,
@@ -525,7 +526,9 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         throw "llama-bench case '$($case.Name)' could not compute KVarN/normal ratio for production gate; see $logPath"
     }
     if ($FailBelowMinKvarnRatio.IsPresent -and -not $gatePassBool) {
-        throw ("llama-bench case '{0}' failed KVarN production ratio gate: ratio={1:P1}, threshold={2:P1}; see {3}" -f $case.Name, $ratioVal, $MinKvarnRatio, $logPath)
+        $msg = "llama-bench case '{0}' failed KVarN production ratio gate: ratio={1:P1}, threshold={2:P1}; see {3}" -f $case.Name, $ratioVal, $MinKvarnRatio, $logPath
+        $gateFailures += $msg
+        Write-Warning $msg
     }
     $traceSummary = Get-KvarnTraceSummary $text
     $storeTraceSummary = Get-KvarnStoreTraceSummary $text
@@ -581,3 +584,7 @@ foreach ($s in $summaries) {
 [System.IO.File]::WriteAllText($summaryMd, ($summaryLines -join "`n") + "`n")
 Write-Host "KVarN benchmark summary: $summaryMd"
 Write-Host "KVarN benchmark matrix complete: $OutputDir"
+
+if ($gateFailures.Count -gt 0) {
+    throw ("KVarN benchmark gate failures:`n" + ($gateFailures -join "`n"))
+}

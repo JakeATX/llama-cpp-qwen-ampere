@@ -379,10 +379,10 @@ static void llama_kvarn_dequant_reference(
     }
 }
 
-static void run_case(uint32_t head_dim) {
+static void run_case(uint32_t head_dim, float rtn_quantile) {
     llama_kvarn_params params = llama_kvarn_default_params();
     params.sinkhorn_iters = 4;
-    params.rtn_quantile = 0.95f;
+    params.rtn_quantile = rtn_quantile;
 
     const uint32_t group = params.group_size;
     const size_t n = size_t(head_dim)*group;
@@ -435,13 +435,40 @@ static void run_case(uint32_t head_dim) {
     require_cuda(cudaMemcpy(v_scales_store.data(), v_scales_store_d, v_scales_store.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy stored V scales");
 
     size_t packed_diff = 0;
+    size_t first_k_diff = record.k_body.size();
+    size_t first_v_diff = record.v_body.size();
     for (size_t i = 0; i < record.k_body.size(); ++i) {
-        packed_diff += record.k_body[i] != k_body_store[i];
+        if (record.k_body[i] != k_body_store[i]) {
+            if (first_k_diff == record.k_body.size()) {
+                first_k_diff = i;
+            }
+            ++packed_diff;
+        }
     }
     for (size_t i = 0; i < record.v_body.size(); ++i) {
-        packed_diff += record.v_body[i] != v_body_store[i];
+        if (record.v_body[i] != v_body_store[i]) {
+            if (first_v_diff == record.v_body.size()) {
+                first_v_diff = i;
+            }
+            ++packed_diff;
+        }
     }
-    require(packed_diff == 0, "CUDA store-body packed bytes match CPU reference");
+    if (packed_diff != 0 && (params.rtn_quantile < 1.0f || packed_diff > 4)) {
+        const int first_k_ref = first_k_diff < record.k_body.size() ? int(record.k_body[first_k_diff]) : -1;
+        const int first_k_cuda = first_k_diff < k_body_store.size() ? int(k_body_store[first_k_diff]) : -1;
+        const int first_v_ref = first_v_diff < record.v_body.size() ? int(record.v_body[first_v_diff]) : -1;
+        const int first_v_cuda = first_v_diff < v_body_store.size() ? int(v_body_store[first_v_diff]) : -1;
+        std::fprintf(stderr,
+                "packed diff: head_dim=%u rtn=%.2f diff=%zu first_k=%zu ref/cuda=%d/%d first_v=%zu ref/cuda=%d/%d\n",
+                head_dim, params.rtn_quantile, packed_diff,
+                first_k_diff, first_k_ref, first_k_cuda,
+                first_v_diff, first_v_ref, first_v_cuda);
+    }
+    if (params.rtn_quantile < 1.0f) {
+        require(packed_diff == 0, "CUDA store-body packed bytes match CPU reference");
+    } else {
+        require(packed_diff <= 4, "CUDA fullrange store-body packed bytes have bounded CPU/GPU rounding drift");
+    }
 
     float scale_max_err = 0.0f;
     for (size_t i = 0; i < record.k_scales.size(); ++i) {
@@ -451,6 +478,40 @@ static void run_case(uint32_t head_dim) {
         scale_max_err = std::max(scale_max_err, std::fabs(record.v_scales[i] - v_scales_store[i]));
     }
     require(scale_max_err < 1.0e-5f, "CUDA store-body scales match CPU reference");
+
+    llama_kvarn_body_record store_record;
+    store_record.layout = record.layout;
+    store_record.k_body = k_body_store;
+    store_record.v_body = v_body_store;
+    store_record.k_scales = k_scales_store;
+    store_record.v_scales = v_scales_store;
+
+    std::vector<float> k_store_deq;
+    std::vector<float> v_store_deq;
+    llama_kvarn_dequant_reference(store_record, k_store_deq, v_store_deq);
+
+    float store_deq_max_err = 0.0f;
+    for (size_t i = 0; i < k_ref.size(); ++i) {
+        store_deq_max_err = std::max(store_deq_max_err, std::fabs(k_ref[i] - k_store_deq[i]));
+        store_deq_max_err = std::max(store_deq_max_err, std::fabs(v_ref[i] - v_store_deq[i]));
+    }
+    if (store_deq_max_err >= 1.0e-2f) {
+        std::fprintf(stderr,
+                "store dequant diff: head_dim=%u rtn=%.2f max_err=%g\n",
+                head_dim, params.rtn_quantile, store_deq_max_err);
+    }
+    require(store_deq_max_err < 1.0e-2f, "CUDA store-body dequant matches CPU reference");
+
+    if (params.rtn_quantile >= 1.0f) {
+        cudaFree(k_tile_d);
+        cudaFree(v_tile_d);
+        cudaFree(k_body_store_d);
+        cudaFree(v_body_store_d);
+        cudaFree(k_scales_store_d);
+        cudaFree(v_scales_store_d);
+        cudaFree(store_scratch_d);
+        return;
+    }
 
     uint8_t * k_body_d = cuda_upload(record.k_body);
     uint8_t * v_body_d = cuda_upload(record.v_body);
@@ -2608,8 +2669,10 @@ static void run_case(uint32_t head_dim) {
 }
 
 int main() {
-    run_case(128);
-    run_case(256);
-    run_case(512);
+    for (float rtn_quantile : { 0.95f, 1.0f }) {
+        run_case(128, rtn_quantile);
+        run_case(256, rtn_quantile);
+        run_case(512, rtn_quantile);
+    }
     return 0;
 }

@@ -175,7 +175,7 @@ static void test_reference_cache_sealing() {
 
 static llama_hparams make_test_hparams(uint32_t head_dim = 128) {
     llama_hparams hparams = {};
-    hparams.n_layer = 2;
+    hparams.n_layer_all = 2;
     hparams.n_embd_head_k_full = head_dim;
     hparams.n_embd_head_v_full = head_dim;
     hparams.n_embd_head_k_swa = head_dim;
@@ -189,7 +189,7 @@ static llama_hparams make_test_hparams(uint32_t head_dim = 128) {
 
 static llama_hparams make_small_storage_hparams() {
     llama_hparams hparams = {};
-    hparams.n_layer = 2;
+    hparams.n_layer_all = 2;
     hparams.n_embd_head_k_full = 8;
     hparams.n_embd_head_v_full = 8;
     hparams.n_embd_head_k_swa = 8;

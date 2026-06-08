@@ -550,7 +550,7 @@ llama_kvarn_memory_estimate llama_kvarn_estimate_memory(
     const uint32_t n_body      = kv_size > n_sink_tail ? kv_size - n_sink_tail : 0;
     const uint32_t n_records   = (n_body + params.group_size - 1)/params.group_size;
 
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!kvarn_hparams_has_kv(hparams, il)) {
             continue;
         }
@@ -836,7 +836,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params init_params = {
-                /*.mem_size   =*/ size_t(8u*hparams.n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(8u*hparams.n_layer_all*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
@@ -860,7 +860,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     const uint32_t n_records_alloc = std::max<uint32_t>(1, n_records);
     const uint32_t n_sink_tail_alloc = std::max<uint32_t>(1, n_sink_tail);
 
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!kvarn_hparams_has_kv(hparams, il)) {
             continue;
         }
@@ -926,7 +926,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     }
 
     if (reuse) {
-        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
             const int32_t il_reuse = reuse(il);
             if (il_reuse < 0) {
                 continue;

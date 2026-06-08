@@ -1,9 +1,10 @@
 # KVarN CUDA Architect Handover
 
 **Audience:** External architect reviewing the CUDA KVarN vs normal KV throughput gap.  
-**Last updated:** 2026-06-07  
+**Last updated:** 2026-06-08  
 **Branch:** `kvarn-atx-integration`  
-**HEAD:** `030333631ab364069b7f743e8f2988090c1d7f6d`  
+**HEAD:** `cf044f51b` (+ post-merge integration fixes)  
+**Upstream sync:** merged `upstream-ggml/master` @ `42a0afd59` (2026-06-08); `hparams.n_layer` → `n_layer_all` / `n_layer_nextn` migration applied to KVarN paths  
 **Remote:** [https://github.com/JakeATX/llama.cpp](https://github.com/JakeATX/llama.cpp) (`jakeatx` / `fork`)  
 **Review URL:** [https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration)
 
@@ -49,6 +50,7 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 
 | Hash | Description |
 |------|-------------|
+| `cf044f51b` | Merge ggml-org/llama.cpp master (hparams refactor, Granite4 Vision, n_gpu_layers fixes, Vulkan FWHT, CUDA MMVQ PDL) |
 | `591c008dc` | Land KVarN post-ubatch shared infra: tail-safe helper, active-window masks, decode graph reuse, CUDA body-store/attn optimizations |
 | `5f8e46c04` | Fix KVarN memory wiring and bench parser after ATX merge |
 | `c43744da1` | Fix hybrid KVarN ubatch split for recurrent memory (`split_equal` vs `split_simple`) |

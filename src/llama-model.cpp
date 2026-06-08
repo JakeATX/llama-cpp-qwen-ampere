@@ -2069,8 +2069,8 @@ static bool llama_kvarn_env_flag(const char * name) {
     return value != 0;
 }
 
-static bool llama_kvarn_force_experimental_iswa() {
-    return llama_kvarn_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA");
+static bool llama_kvarn_force_normal_iswa_fallback() {
+    return llama_kvarn_env_flag("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK");
 }
 
 static llama_memory_i * llama_kvarn_create_normal_iswa_fallback(
@@ -2107,8 +2107,10 @@ static llama_memory_i * llama_kvarn_create_normal_iswa_fallback(
             cparams.n_seq_max,
             cparams.n_ubatch,
             1,
+            params.mem_other,
             filter,
-            reuse);
+            reuse,
+            nullptr);
 }
 
 static void llama_kvarn_validate_memory_support(
@@ -2143,7 +2145,7 @@ static void llama_kvarn_validate_memory_support(
     }
 
     std::string unsupported_head_dim_msg;
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!hparams.has_kv(il)) {
             continue;
         }
@@ -2174,7 +2176,7 @@ static void llama_kvarn_validate_memory_support(
         throw std::runtime_error(unsupported_head_dim_msg);
     }
 
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
         if (!hparams.has_kv(il)) {
             continue;
         }
@@ -2207,11 +2209,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
 
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-            if (arch == LLM_ARCH_GEMMA4 && !llama_kvarn_force_experimental_iswa()) {
+            if (arch == LLM_ARCH_GEMMA4 && llama_kvarn_force_normal_iswa_fallback()) {
                 LLAMA_LOG_WARN(
-                        "%s: KVarN+ISWA for Gemma 4 is still below the CUDA production throughput gate; "
-                        "using normal ISWA KV cache as the production-safe fallback. "
-                        "Set LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 to run the experimental KVarN+ISWA path.\n",
+                        "%s: LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK=1 is set; "
+                        "using normal ISWA KV cache instead of the production KVarN+ISWA path.\n",
                         __func__);
 
                 return llama_kvarn_create_normal_iswa_fallback(*this, params, cparams);
