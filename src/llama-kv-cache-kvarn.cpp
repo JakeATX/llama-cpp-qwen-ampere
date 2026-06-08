@@ -52,7 +52,7 @@ static size_t packed_nbytes(size_t n_values, uint32_t bits) {
 
 static bool kvarn_hparams_has_kv(const llama_hparams & hparams, uint32_t il) {
     if (hparams.kv_only_nextn) {
-        return hparams.nextn_predict_layers > 0 && il >= (hparams.n_layer - hparams.nextn_predict_layers);
+        return hparams.n_layer_nextn > 0 && il >= hparams.n_layer();
     }
 
     if (hparams.n_layer_kv_from_start >= 0) {

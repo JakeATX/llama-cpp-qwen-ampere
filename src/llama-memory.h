@@ -26,6 +26,8 @@ struct llama_memory_params {
 
     llama_kv_cache_quant_type kv_cache_quant_type;
     llama_kvarn_params        kvarn;
+
+    llama_memory_t mem_other;
 };
 
 enum llama_memory_status {
@@ -87,6 +89,8 @@ struct llama_memory_i {
     // this callback is used to specify which layers should reuse memory from other layers
     // return negative value to indicate that the layer il should not reuse memory
     using layer_reuse_cb = std::function<int32_t(int32_t il)>;
+
+    using layer_share_cb = std::function<int32_t(int32_t il)>;
 
     virtual ~llama_memory_i() = default;
 

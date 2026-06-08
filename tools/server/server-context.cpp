@@ -1,4 +1,3 @@
-
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -14,6 +13,11 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+
+#include "ggml-cpp.h"
+
+// TODO: tmp until the mtmd draft processing is refactored [TAG_MTMD_DRAFT_PROCESSING]
+#include "../../src/llama-ext.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -764,6 +768,127 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        std::string & mmproj_path = params_base.mmproj.path;
+        bool has_mmproj = !mmproj_path.empty();
+        mtmd_context_params mparams = mtmd_context_params_default();
+        if (has_mmproj) {
+            mparams.use_gpu          = params_base.mmproj_use_gpu;
+            mparams.print_timings    = false;
+            mparams.n_threads        = params_base.cpuparams.n_threads;
+            mparams.flash_attn_type  = params_base.flash_attn_type;
+            mparams.warmup           = params_base.warmup;
+            mparams.image_min_tokens = params_base.image_min_tokens;
+            mparams.image_max_tokens = params_base.image_max_tokens;
+            mparams.media_marker     = get_media_marker();
+        }
+
+        // optionally get the memory usage of mmproj
+        if (has_mmproj && params_base.fit_params) {
+            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+            if (!mmproj_mem.empty()) {
+                size_t total = 0;
+                for (auto & [dev, size] : mmproj_mem) {
+                    total += size;
+                }
+                SRV_INF("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB\n", total / (1024.0 * 1024.0));
+                GGML_ASSERT(!params_base.fit_params_target.empty());
+                for (auto & [dev, size] : mmproj_mem) {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                        if (ggml_backend_dev_get(i) == dev) {
+                            if (i < params_base.fit_params_target.size()) {
+                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                                params_base.fit_params_target[i] += size;
+                            }
+                            break;
+                        }
+                    }
+                }
+            } else {
+                SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
+            }
+        }
+
+        // optionally reserve VRAM for the draft / MTP context before fitting the target model
+        if (params_base.fit_params) {
+            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+            const bool has_draft = params_base.speculative.has_dft();
+
+            if (has_draft || spec_mtp) {
+                common_params params_dft = params_base;
+                bool measure_model_bytes = true;
+
+                if (has_draft) {
+                    const auto & params_spec = params_base.speculative.draft;
+                    params_dft.devices               = params_spec.devices;
+                    params_dft.model                 = params_spec.mparams;
+                    params_dft.n_gpu_layers          = params_spec.n_gpu_layers;
+                    params_dft.cache_type_k          = params_spec.cache_type_k;
+                    params_dft.cache_type_v          = params_spec.cache_type_v;
+                    params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+                } else {
+                    // MTP draft context lives on the target model, only context+compute are new
+                    measure_model_bytes = false;
+                }
+
+                params_dft.n_outputs_max = params_base.n_parallel;
+
+                auto mparams_dft = common_model_params_to_llama(params_dft);
+                auto cparams_dft = common_context_params_to_llama(params_dft);
+                if (spec_mtp) {
+                    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                    cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
+                    cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
+                }
+                cparams_dft.n_rs_seq = 0;
+
+                std::vector<ggml_backend_dev_t> devs;
+                uint32_t hp_ngl = 0;
+                uint32_t hp_nct = 0;
+                uint32_t hp_nex = 0;
+                try {
+                    auto dmd = common_get_device_memory_data(
+                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+
+                    GGML_ASSERT(!params_base.fit_params_target.empty());
+                    size_t total = 0;
+
+                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+
+                    if (tgt_devices.empty()) {
+                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                           tgt_devices.push_back(ggml_backend_dev_get(i));
+                        }
+                    }
+
+                    for (size_t j = 0; j < devs.size(); ++j) {
+                        const size_t bytes =
+                            (measure_model_bytes ? dmd[j].mb.model : 0) +
+                            dmd[j].mb.context +
+                            dmd[j].mb.compute;
+                        total += bytes;
+                        for (size_t i = 0; i < tgt_devices.size(); i++) {
+                            if (tgt_devices[i] == devs[j]) {
+                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
+                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
+                                params_base.fit_params_target[i] += bytes;
+                                break;
+                            }
+                        }
+                    }
+                    SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
+                            has_draft ? "draft model" : "MTP context",
+                            total / (1024.0 * 1024.0));
+                } catch (const std::exception & e) {
+                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
+                            has_draft ? "draft model" : "MTP context", e.what());
+                }
+            }
+        }
 
         llama_init = common_init_from_params(params_base);
 
@@ -1124,6 +1249,7 @@ private:
                 /* tmpls                 */ std::move(chat_templates),
                 /* allow_image           */ mctx ? mtmd_support_vision(mctx) : false,
                 /* allow_audio           */ mctx ? mtmd_support_audio (mctx) : false,
+                /* allow_video           */ mctx ? mtmd_helper_support_video(mctx) : false,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
@@ -3212,7 +3338,9 @@ server_context_meta server_context::get_meta() const {
         /* has_mtmd               */ impl->mctx != nullptr,
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
-        /* json_webui_settings    */ impl->json_webui_settings,
+        /* has_inp_video          */ impl->chat_params.allow_video,
+        /* json_ui_settings       */ impl->json_ui_settings,
+        /* json_webui_settings    */ impl->json_webui_settings,  // Deprecated
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
         /* pooling_type           */ llama_pooling_type(impl->ctx),
 
@@ -3728,6 +3856,7 @@ void server_routes::init_routes() {
             { "model_path",                  meta->model_path },
             { "modalities",                  json {
                 {"vision", meta->has_inp_image},
+                {"video",  meta->has_inp_video},
                 {"audio",  meta->has_inp_audio},
             } },
             { "media_marker",                get_media_marker() },
@@ -3882,6 +4011,47 @@ void server_routes::init_routes() {
             TASK_RESPONSE_TYPE_OAI_CHAT);
     };
 
+    this->post_chat_completions_tok = [this](const server_http_req & req) {
+        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_OAI_CHAT);
+    };
+
+    this->post_control = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        const std::string cmpl_id = json_value(body, "id", std::string());
+        const std::string action  = json_value(body, "action", std::string());
+        if (cmpl_id.empty()) {
+            res->error(format_error_response("missing completion id", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (action != "reasoning_end") {
+            res->error(format_error_response("unknown control action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_CONTROL);
+            task.id              = rd.get_new_id();
+            task.params.control_cmpl_id = cmpl_id;
+            task.params.control_action  = action;
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files;
@@ -3898,6 +4068,10 @@ void server_routes::init_routes() {
             body_parsed,
             files,
             TASK_RESPONSE_TYPE_OAI_RESP);
+    };
+
+    this->post_responses_tok_oai = [this](const server_http_req & req) {
+        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_OAI_RESP);
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -3947,20 +4121,7 @@ void server_routes::init_routes() {
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
-        auto res = create_response();
-        std::vector<raw_buffer> files;
-        json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
-        SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
-        SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
-
-        json prompt = body_parsed.at("prompt");
-        llama_tokens tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true);
-        res->ok({{"input_tokens", static_cast<int>(tokens.size())}});
-        return res;
+        return handle_count_tokens(ctx_server.vocab, ctx_server.mctx, req, TASK_RESPONSE_TYPE_ANTHROPIC);
     };
 
     // same with handle_chat_completions, but without inference part
@@ -4433,5 +4594,56 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         ? format_embeddings_response_oaicompat(body, meta->model_name, responses, use_base64)
         : json(responses);
     res->ok(root);
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const llama_vocab * vocab, mtmd_context * mctx, const server_http_req & req, task_response_type res_type) {
+    auto res = create_response();
+    std::vector<raw_buffer> files;
+    json body = json::parse(req.body);
+    bool is_oai = false;
+
+    switch (res_type) {
+        case TASK_RESPONSE_TYPE_OAI_CHAT:
+            {
+                is_oai = true;
+            } break;
+        case TASK_RESPONSE_TYPE_OAI_RESP:
+            {
+                is_oai = true;
+                body = server_chat_convert_responses_to_chatcmpl(body);
+            } break;
+        case TASK_RESPONSE_TYPE_ANTHROPIC:
+            {
+                body = server_chat_convert_anthropic_to_oai(body);
+            } break;
+        default:
+            res->error(format_error_response("invalid res_type", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+    }
+
+    json body_parsed = oaicompat_chat_params_parse(
+            body,
+            meta->chat_params,
+            files);
+    json prompt = body_parsed.at("prompt");
+    // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
+
+    // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
+    size_t n_tokens;
+    if (mctx != nullptr) {
+        if (!prompt.is_string()) {
+            throw std::runtime_error("for mtmd, input prompt must be a string.");
+        }
+        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, true).size();
+    } else {
+        n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
+    }
+
+    json response = {{"input_tokens", static_cast<int64_t>(n_tokens)}};
+    if (is_oai) {
+        response["object"] = "response.input_tokens";
+    }
+    res->ok(response);
     return res;
 }

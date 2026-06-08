@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-mtp.h"
+#include "llama-memory.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -284,7 +285,7 @@ private:
 
     llama_mtp mtp;
 
-    std::unique_ptr<llama_memory_i> memory;
+    llama_memory_ptr memory;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
