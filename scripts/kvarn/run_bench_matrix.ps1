@@ -7,7 +7,7 @@ param(
     [string] $KvCacheQuant = "none,kvarn",
     [string] $KvarnPreset = "kvarn_k4v2_g128",
     [int] $KvarnIters = 16,
-    [double] $RtnQuantile = 0.95,
+    [double] $RtnQuantile = 1.0,
     [int] $Repetitions = 1,
     [int] $MinKvarnLayerLogs = 1,
     [int] $MinKvarnBodyRecords = 0,

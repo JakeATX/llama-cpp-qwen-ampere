@@ -36,7 +36,7 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Gemma KVarN+ISWA (experimental)** | FAIL (~62–69%) | 512-dim fused-batch CUDA decode + ISWA dual-prepare; opt-in only |
+| **Gemma KVarN+ISWA (experimental)** | FAIL (~62–66%) | Post speed-patch (parallel Hadamard, warp-q·k, parallel quantize): pp512 **62.3%**, tg64 **66.0%** at `RtnQuantile=1.0`; still opt-in only |
 | **Gemma production fallback** | Expected PASS | Normal ISWA when `--kv-cache-quant kvarn` (ratio ~100%) |
 | **Tier 2 logits** | Enforceable | `compare_cuda_logits_ref.ps1` NMSE thresholds + `-RunTier2` on production gate |
 | **Qwen `-ngl 99` full GPU** | Not comparable | 35B model exceeds 12 GB VRAM; use `-ncmoe 34` |
@@ -57,6 +57,7 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 | `982919dd9` | Docs: record `ab8a6db8a` gate matrix for Qwen and Gemma re-bench |
 | `4a4c6ff70` | Fix KVarN prefill graph reuse across alternating prompt ubatches (ping-pong `gf_res_alt`) |
 | `030333631` | Scope ping-pong graph reuse to normal KV prefill only; record Qwen gate PASS |
+| (pending) | Gemma 512-dim CUDA speed patch: parallel Hadamard body-store, warp-cooperative fused-batch q·k (`head_dim>=512`), parallel fullrange quantize, `RtnQuantile` default 1.0 in bench/logits scripts |
 
 Earlier integration: `642fab89a` (ATX MoE residency merge), `10f373ac7` (build follow-ups).
 
@@ -165,6 +166,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_production
 ```
 
 Experimental Gemma KVarN+ISWA diagnostic: add `-RunGemmaExperimental`. Tier 2 logits: add `-RunTier2 -Tier2Model <small-model.gguf>`.
+
+Gemma true KVarN+ISWA validation (must pass before removing production fallback):
+
+```powershell
+$env:LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA = "1"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 `
+  -Model "<gemma-4-12b.gguf>" -BuildDir build-kvarn-cuda-static-vs `
+  -CaseList "pp512:512:0,tg64:0:64" -FlashAttn off -Repetitions 3 `
+  -KvarnIters 4 -RtnQuantile 1.0 -MinKvarnRatio 0.90 -FailBelowMinKvarnRatio `
+  -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6" `
+  -OutputDir artifacts\kvarn-bench\gemma-true-kvarn-speed-patch
+Remove-Item Env:\LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA
+```
 
 ### Qwen P0 gate (PASS config)
 

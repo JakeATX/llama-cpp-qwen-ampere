@@ -79,6 +79,13 @@ static __device__ __forceinline__ float kvarn_kq_mask_bias(
     return 0.0f;
 }
 
+static __device__ __forceinline__ float kvarn_warp_reduce_sum(float v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, offset);
+    }
+    return v;
+}
+
 static __device__ float kvarn_select_kth_row_value(const float * src, uint32_t cols, uint32_t kth) {
     for (uint32_t i = 0; i < cols; ++i) {
         const float v = src[i];
@@ -172,6 +179,84 @@ static __global__ void kvarn_hadamard_cols_kernel(
     for (uint32_t r = 0; r < rows; ++r) {
         dst[size_t(r)*cols + c] *= norm;
     }
+}
+
+static __global__ void kvarn_hadamard_rows_parallel_kernel(
+        const float * __restrict__ src,
+        float * __restrict__ dst,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows) {
+        return;
+    }
+
+    extern __shared__ float shmem[];
+    const uint32_t c = threadIdx.x;
+    const float norm = rsqrtf(float(cols));
+
+    if (c < cols) {
+        shmem[c] = src[size_t(r)*cols + c];
+    }
+    __syncthreads();
+
+    for (uint32_t step = 1; step < cols; step <<= 1) {
+        if (c < cols && (c & step) == 0) {
+            const uint32_t c1 = c + step;
+            const float a = shmem[c];
+            const float b = shmem[c1];
+            shmem[c]  = a + b;
+            shmem[c1] = a - b;
+        }
+        __syncthreads();
+    }
+
+    if (c < cols) {
+        dst[size_t(r)*cols + c] = shmem[c]*norm;
+    }
+}
+
+static __global__ void kvarn_hadamard_cols_parallel_kernel(
+        const float * __restrict__ src,
+        float * __restrict__ dst,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t c_col = blockIdx.x;
+    if (c_col >= cols) {
+        return;
+    }
+
+    extern __shared__ float shmem[];
+    const uint32_t r = threadIdx.x;
+    const float norm = rsqrtf(float(rows));
+
+    if (r < rows) {
+        shmem[r] = src[size_t(r)*cols + c_col];
+    }
+    __syncthreads();
+
+    for (uint32_t step = 1; step < rows; step <<= 1) {
+        if (r < rows && (r & step) == 0) {
+            const uint32_t r1 = r + step;
+            const float a = shmem[r];
+            const float b = shmem[r1];
+            shmem[r]  = a + b;
+            shmem[r1] = a - b;
+        }
+        __syncthreads();
+    }
+
+    if (r < rows) {
+        dst[size_t(r)*cols + c_col] = shmem[r]*norm;
+    }
+}
+
+static int kvarn_pow2_block(uint32_t n) {
+    int block = 1;
+    while (block < int(n)) {
+        block <<= 1;
+    }
+    return block;
 }
 
 static __global__ void kvarn_sinkhorn_rows_kernel(
@@ -283,6 +368,60 @@ static __global__ void kvarn_quantize_asym_fullrange_pack_rows_kernel(
     row_zp[r] = mn;
 
     for (uint32_t c = 0; c < cols; ++c) {
+        const float v = fminf(mx, fmaxf(mn, row[c]));
+        const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
+        kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
+    }
+}
+
+static __global__ void kvarn_quantize_asym_fullrange_pack_rows_parallel_kernel(
+        const float * __restrict__ src,
+        uint8_t * __restrict__ body,
+        float * __restrict__ row_scale,
+        float * __restrict__ row_zp,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t bits) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows) {
+        return;
+    }
+
+    const uint32_t qmax = (1u << bits) - 1u;
+    const float * row = src + size_t(r)*cols;
+
+    float local_mn = 3.4028234663852886e38f;
+    float local_mx = -3.4028234663852886e38f;
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float v = row[c];
+        local_mn = fminf(local_mn, v);
+        local_mx = fmaxf(local_mx, v);
+    }
+
+    extern __shared__ float shmem[];
+    shmem[threadIdx.x*2]     = local_mn;
+    shmem[threadIdx.x*2 + 1] = local_mx;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shmem[threadIdx.x*2]     = fminf(shmem[threadIdx.x*2],     shmem[(threadIdx.x + stride)*2]);
+            shmem[threadIdx.x*2 + 1] = fmaxf(shmem[threadIdx.x*2 + 1], shmem[(threadIdx.x + stride)*2 + 1]);
+        }
+        __syncthreads();
+    }
+
+    const float mn = shmem[0];
+    const float mx = shmem[1];
+    const float s  = (mx > mn) ? (mx - mn)/float(qmax) : 1.0f;
+
+    if (threadIdx.x == 0) {
+        row_scale[r] = s;
+        row_zp[r]    = mn;
+    }
+    __syncthreads();
+
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
         const float v = fminf(mx, fmaxf(mn, row[c]));
         const uint32_t q = min(qmax, uint32_t(llroundf((v - mn)/s)));
         kvarn_pack_one(body, bits, size_t(r)*cols + c, q);
@@ -443,14 +582,26 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
     float * rtn_zp    = scratch + n + tmp_rows;
 
     cudaMemsetAsync(k_body, 0, kvarn_packed_nbytes(n, key_bits), cuda_stream);
-    kvarn_hadamard_cols_kernel<<<int(group_size), 1, 0, cuda_stream>>>(k_tile, data, head_dim, group_size);
+    const int k_hadamard_block = kvarn_pow2_block(head_dim);
+    if (k_hadamard_block <= 1024) {
+        kvarn_hadamard_cols_parallel_kernel<<<int(group_size), k_hadamard_block, size_t(k_hadamard_block)*sizeof(float), cuda_stream>>>(
+                k_tile, data, head_dim, group_size);
+    } else {
+        kvarn_hadamard_cols_kernel<<<int(group_size), 1, 0, cuda_stream>>>(k_tile, data, head_dim, group_size);
+    }
     float * k_row_scale = k_scales;
     float * k_col_scale = k_scales + 2*head_dim;
     kvarn_sinkhorn_variance_normalize_parallel(
             data, k_row_scale, k_col_scale, head_dim, group_size, sinkhorn_iters, cuda_stream);
     if (rtn_quantile >= 1.0f) {
-        kvarn_quantize_asym_fullrange_pack_rows_kernel<<<int(head_dim), 1, 0, cuda_stream>>>(
-                data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits);
+        const int k_quant_block = kvarn_pow2_block(group_size);
+        if (k_quant_block <= 1024) {
+            kvarn_quantize_asym_fullrange_pack_rows_parallel_kernel<<<int(head_dim), k_quant_block, size_t(k_quant_block)*2*sizeof(float), cuda_stream>>>(
+                    data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits);
+        } else {
+            kvarn_quantize_asym_fullrange_pack_rows_kernel<<<int(head_dim), 1, 0, cuda_stream>>>(
+                    data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits);
+        }
     } else {
         kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(head_dim), 1, 0, cuda_stream>>>(
                 data, k_body, rtn_scale, rtn_zp, head_dim, group_size, key_bits, rtn_quantile);
@@ -480,14 +631,26 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
     float * rtn_zp    = scratch + n + tmp_rows;
 
     cudaMemsetAsync(v_body, 0, kvarn_packed_nbytes(n, value_bits), cuda_stream);
-    kvarn_hadamard_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(v_tile, data, group_size, head_dim);
+    const int v_hadamard_block = kvarn_pow2_block(head_dim);
+    if (v_hadamard_block <= 1024) {
+        kvarn_hadamard_rows_parallel_kernel<<<int(group_size), v_hadamard_block, size_t(v_hadamard_block)*sizeof(float), cuda_stream>>>(
+                v_tile, data, group_size, head_dim);
+    } else {
+        kvarn_hadamard_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(v_tile, data, group_size, head_dim);
+    }
     float * v_col_scale = v_scales;
     float * v_row_scale = v_scales + head_dim;
     kvarn_sinkhorn_variance_normalize_parallel(
             data, v_row_scale, v_col_scale, group_size, head_dim, sinkhorn_iters, cuda_stream);
     if (rtn_quantile >= 1.0f) {
-        kvarn_quantize_asym_fullrange_pack_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(
-                data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits);
+        const int v_quant_block = kvarn_pow2_block(head_dim);
+        if (v_quant_block <= 1024) {
+            kvarn_quantize_asym_fullrange_pack_rows_parallel_kernel<<<int(group_size), v_quant_block, size_t(v_quant_block)*2*sizeof(float), cuda_stream>>>(
+                    data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits);
+        } else {
+            kvarn_quantize_asym_fullrange_pack_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(
+                    data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits);
+        }
     } else {
         kvarn_quantize_asym_minmax_pack_rows_kernel<<<int(group_size), 1, 0, cuda_stream>>>(
                 data, v_body, rtn_scale, rtn_zp, group_size, head_dim, value_bits, rtn_quantile);
@@ -2110,6 +2273,277 @@ static __global__ void kvarn_attn_mixed_f16_fused_kernel(
     }
 }
 
+static __device__ __forceinline__ float kvarn_mixed_f16_load_k(
+        const uint16_t * __restrict__ sink_tail_k,
+        const uint8_t * __restrict__ k_body,
+        const float * __restrict__ k_scales,
+        const float * __restrict__ pending_k,
+        uint32_t t,
+        uint32_t d,
+        uint32_t n_sink,
+        uint32_t n_records,
+        uint32_t n_pending,
+        uint32_t n_tail,
+        uint32_t tail_start,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        size_t sink_tail_stride_token_f16,
+        size_t pending_stride_token_floats,
+        size_t k_body_stride_record_bytes,
+        size_t k_scale_stride_record_floats) {
+    const uint32_t n_body_tokens = n_records*group_size;
+
+    if (t < n_sink) {
+        const uint16_t * k = sink_tail_k + size_t(t)*sink_tail_stride_token_f16;
+        return __half2float(reinterpret_cast<const __half *>(k)[d]);
+    }
+
+    if (t < n_sink + n_body_tokens) {
+        const uint32_t body_t = t - n_sink;
+        const uint32_t r = body_t/group_size;
+        const uint32_t g = body_t - r*group_size;
+
+        const uint8_t * k_record = k_body + size_t(r)*k_body_stride_record_bytes;
+        const float * k_record_scales = k_scales + size_t(r)*k_scale_stride_record_floats;
+        const float * k_s_col = k_record_scales;
+        const float * k_zp    = k_record_scales + head_dim;
+        const float * k_s_row = k_record_scales + 2*head_dim;
+
+        const size_t i = size_t(d)*group_size + g;
+        const uint32_t kq = kvarn_unpack_one(k_record, key_bits, i);
+        return (float(kq)*k_s_col[d] + k_zp[d])*k_s_row[g];
+    }
+
+    if (t < n_sink + n_body_tokens + n_pending) {
+        const uint32_t pending_t = t - n_sink - n_body_tokens;
+        const float * k = pending_k + size_t(pending_t)*pending_stride_token_floats;
+        return k[d];
+    }
+
+    const uint32_t tail_t = t - n_sink - n_body_tokens - n_pending;
+    const uint32_t tail_slot = (tail_start + tail_t)%n_tail;
+    const uint16_t * k = sink_tail_k + size_t(n_sink + tail_slot)*sink_tail_stride_token_f16;
+    return __half2float(reinterpret_cast<const __half *>(k)[d]);
+}
+
+static __device__ __forceinline__ float kvarn_mixed_f16_load_v(
+        const uint16_t * __restrict__ sink_tail_v,
+        const uint8_t * __restrict__ v_body,
+        const float * __restrict__ v_scales,
+        const float * __restrict__ pending_v,
+        uint32_t t,
+        uint32_t d,
+        uint32_t n_sink,
+        uint32_t n_records,
+        uint32_t n_pending,
+        uint32_t n_tail,
+        uint32_t tail_start,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t value_bits,
+        size_t sink_tail_stride_token_f16,
+        size_t pending_stride_token_floats,
+        size_t v_body_stride_record_bytes,
+        size_t v_scale_stride_record_floats) {
+    const uint32_t n_body_tokens = n_records*group_size;
+
+    if (t < n_sink) {
+        const uint16_t * v = sink_tail_v + size_t(t)*sink_tail_stride_token_f16;
+        return __half2float(reinterpret_cast<const __half *>(v)[d]);
+    }
+
+    if (t < n_sink + n_body_tokens) {
+        const uint32_t body_t = t - n_sink;
+        const uint32_t r = body_t/group_size;
+        const uint32_t g = body_t - r*group_size;
+
+        const uint8_t * v_record = v_body + size_t(r)*v_body_stride_record_bytes;
+        const float * v_record_scales = v_scales + size_t(r)*v_scale_stride_record_floats;
+        const float * v_s_col = v_record_scales;
+        const float * v_s_row = v_record_scales + head_dim;
+        const float * v_zp    = v_record_scales + head_dim + group_size;
+
+        const size_t i = size_t(g)*head_dim + d;
+        const uint32_t vq = kvarn_unpack_one(v_record, value_bits, i);
+        return (float(vq)*v_s_row[g] + v_zp[g])*v_s_col[d];
+    }
+
+    if (t < n_sink + n_body_tokens + n_pending) {
+        const uint32_t pending_t = t - n_sink - n_body_tokens;
+        const float * v = pending_v + size_t(pending_t)*pending_stride_token_floats;
+        return v[d];
+    }
+
+    const uint32_t tail_t = t - n_sink - n_body_tokens - n_pending;
+    const uint32_t tail_slot = (tail_start + tail_t)%n_tail;
+    const uint16_t * v = sink_tail_v + size_t(n_sink + tail_slot)*sink_tail_stride_token_f16;
+    return __half2float(reinterpret_cast<const __half *>(v)[d]);
+}
+
+static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
+        const float * __restrict__ q,
+        const uint16_t * __restrict__ sink_tail_k,
+        const uint16_t * __restrict__ sink_tail_v,
+        const uint8_t * __restrict__ k_body,
+        const uint8_t * __restrict__ v_body,
+        const float * __restrict__ k_scales,
+        const float * __restrict__ v_scales,
+        const float * __restrict__ pending_k,
+        const float * __restrict__ pending_v,
+        const void * __restrict__ kq_mask,
+        float * __restrict__ out,
+        float * __restrict__ scores,
+        uint32_t n_queries,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t n_sink,
+        uint32_t n_records,
+        uint32_t n_pending,
+        uint32_t n_tail,
+        uint32_t tail_start,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        size_t q_stride_head_floats,
+        size_t q_stride_query_floats,
+        size_t out_stride_head_floats,
+        size_t out_stride_query_floats,
+        size_t sink_tail_stride_head_f16,
+        size_t sink_tail_stride_token_f16,
+        size_t pending_stride_head_floats,
+        size_t pending_stride_token_floats,
+        size_t k_body_stride_record_bytes,
+        size_t v_body_stride_record_bytes,
+        size_t k_body_stride_head_bytes,
+        size_t v_body_stride_head_bytes,
+        size_t k_scale_stride_record_floats,
+        size_t v_scale_stride_record_floats,
+        size_t k_scale_stride_head_floats,
+        size_t v_scale_stride_head_floats,
+        size_t kq_mask_stride_query_bytes,
+        size_t kq_mask_stride_token_bytes,
+        uint32_t kq_mask_type,
+        float scale) {
+    (void) scores;
+    const uint32_t row = blockIdx.x;
+    if (row >= n_queries*n_head) {
+        return;
+    }
+
+    const uint32_t iq = row/n_head;
+    const uint32_t ih = row - iq*n_head;
+    const uint32_t n_gqa = n_head/n_head_kv;
+    const uint32_t ikh = ih/n_gqa;
+
+    const float * q_row = q + size_t(iq)*q_stride_query_floats + size_t(ih)*q_stride_head_floats;
+    float * out_row = out + size_t(iq)*out_stride_query_floats + size_t(ih)*out_stride_head_floats;
+    const uint16_t * k_st = sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16;
+    const uint16_t * v_st = sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16;
+    const uint8_t * k_body_head = k_body + size_t(ikh)*k_body_stride_head_bytes;
+    const uint8_t * v_body_head = v_body + size_t(ikh)*v_body_stride_head_bytes;
+    const float * k_scales_head = k_scales + size_t(ikh)*k_scale_stride_head_floats;
+    const float * v_scales_head = v_scales + size_t(ikh)*v_scale_stride_head_floats;
+    const float * pending_k_head = pending_k + size_t(ikh)*pending_stride_head_floats;
+    const float * pending_v_head = pending_v + size_t(ikh)*pending_stride_head_floats;
+    const void * kq_mask_row = kq_mask == nullptr ? nullptr :
+        (const char *) kq_mask + size_t(iq)*kq_mask_stride_query_bytes;
+
+    extern __shared__ float shared[];
+    float * probs = shared;
+    float * reduce = shared + n_sink + n_records*group_size + n_pending + n_tail;
+
+    const uint32_t n_body_tokens = n_records*group_size;
+    const uint32_t n_tokens = n_sink + n_body_tokens + n_pending + n_tail;
+
+    const uint32_t lane = threadIdx.x & 31;
+    const uint32_t warp = threadIdx.x >> 5;
+    const uint32_t n_warps = blockDim.x >> 5;
+
+    for (uint32_t t = warp; t < n_tokens; t += n_warps) {
+        float sum = 0.0f;
+        for (uint32_t d = lane; d < head_dim; d += 32) {
+            const float k = kvarn_mixed_f16_load_k(
+                    k_st, k_body_head, k_scales_head, pending_k_head,
+                    t, d, n_sink, n_records, n_pending, n_tail, tail_start,
+                    head_dim, group_size, key_bits,
+                    sink_tail_stride_token_f16, pending_stride_token_floats,
+                    k_body_stride_record_bytes, k_scale_stride_record_floats);
+            sum += q_row[d]*k;
+        }
+        sum = kvarn_warp_reduce_sum(sum);
+        if (lane == 0) {
+            probs[t] = sum*scale + kvarn_kq_mask_bias(kq_mask_row, kq_mask_type, kq_mask_stride_token_bytes, t);
+        }
+    }
+    __syncthreads();
+
+    float local_max = -3.4028234663852886e38f;
+    for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+        local_max = fmaxf(local_max, probs[t]);
+    }
+    reduce[threadIdx.x] = local_max;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = reduce[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+        const float p = expf(probs[t] - max_score);
+        probs[t] = p;
+        local_sum += p;
+    }
+    reduce[threadIdx.x] = local_sum;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv_denom = 1.0f/reduce[0];
+
+    for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+        probs[t] *= inv_denom;
+    }
+    __syncthreads();
+
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        float local = 0.0f;
+        for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+            const float v = kvarn_mixed_f16_load_v(
+                    v_st, v_body_head, v_scales_head, pending_v_head,
+                    t, d, n_sink, n_records, n_pending, n_tail, tail_start,
+                    head_dim, group_size, value_bits,
+                    sink_tail_stride_token_f16, pending_stride_token_floats,
+                    v_body_stride_record_bytes, v_scale_stride_record_floats);
+            local += probs[t]*v;
+        }
+        reduce[threadIdx.x] = local;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            out_row[d] = reduce[0];
+        }
+        __syncthreads();
+    }
+}
+
 static __global__ void kvarn_attn_mixed_f16_fused_batch_kernel(
         const float * __restrict__ q,
         const uint16_t * __restrict__ sink_tail_k,
@@ -2399,6 +2833,32 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         k_scale_stride_record_floats, v_scale_stride_record_floats,
                         kq_mask_stride_token_bytes, kq_mask_type, scale);
             }
+            return;
+        }
+
+        // Gemma 4 KVarN+ISWA has 512-dimensional K/V heads. The generic fused
+        // kernel maps one token score to one thread, which makes f16 sink/tail
+        // loads strided and serializes each 512-wide dot product within a lane.
+        // Use a warp-per-score variant for 512d heads: lanes cooperate across
+        // the head dimension and issue coalesced f16 sink/tail loads. Keep the
+        // 128/256d path unchanged because it is already the passing Qwen path.
+        if (head_dim >= 512) {
+            const int warpqk_block = 256;
+            const size_t warpqk_shmem = (size_t(n_tokens) + size_t(warpqk_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+            kvarn_attn_mixed_f16_fused_batch_warpqk_kernel<<<int(n_queries*n_head), warpqk_block, warpqk_shmem, cuda_stream>>>(
+                    q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                    kq_mask,
+                    out, scores, n_queries, n_head, n_head_kv,
+                    n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                    q_stride_head_floats, q_stride_query_floats,
+                    out_stride_head_floats, out_stride_query_floats,
+                    sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                    pending_stride_head_floats, pending_stride_token_floats,
+                    k_body_stride_record_bytes, v_body_stride_record_bytes,
+                    k_body_stride_head_bytes, v_body_stride_head_bytes,
+                    k_scale_stride_record_floats, v_scale_stride_record_floats,
+                    k_scale_stride_head_floats, v_scale_stride_head_floats,
+                    kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale);
             return;
         }
 

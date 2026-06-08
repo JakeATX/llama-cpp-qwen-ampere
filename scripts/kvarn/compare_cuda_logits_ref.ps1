@@ -5,7 +5,7 @@ param(
     [int] $GpuLayers = 99,
     [int] $Batch = 0,
     [ValidateSet("on", "off", "auto")] [string] $FlashAttn = "on",
-    [double] $RtnQuantile = 0.95,
+    [double] $RtnQuantile = 1.0,
     [int] $KvarnIters = 16,
     [int] $Repeat = 32,
     [string] $PromptPhrase = "The quick brown fox studies attention kernels and cache layouts carefully. ",
