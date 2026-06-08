@@ -2369,8 +2369,12 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const int av_grid = int((head_dim + av_block - 1)/av_block);
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
+    // Per-head serial launches add n_head kernel launch overheads and regressed
+    // Gemma tg64 (~56% vs 71% pre-refinement). Opt-in via env for A/B only.
+    const bool use_decode_per_head = kvarn_env_flag("LLAMA_KVARN_ATTN_DECODE_PER_HEAD");
+
     if (!use_split_kernels && !use_serial_fused) {
-        if (n_queries == 1) {
+        if (n_queries == 1 && use_decode_per_head) {
             const uint32_t n_gqa = n_head/n_head_kv;
             for (uint32_t ih = 0; ih < n_head; ++ih) {
                 const uint32_t ikh = ih/n_gqa;

@@ -32,26 +32,37 @@ per model×config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
 **Hardware:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, branch
 `kvarn-atx-integration`, `-fa off`, `--kvarn-preset kvarn_k4v2_g128`.
 
-### P0 CUDA matrix (2026-06-07, `591c008dc` post-refinement validation)
+### P0 CUDA matrix (2026-06-07)
 
-Commit `591c008dc` on `build-kvarn-cuda-static-vs`, `-fa off`, `r=3`,
-`--kvarn-preset kvarn_k4v2_g128`. Prior pre-refinement baseline (same branch,
-earlier artifact) in parentheses for delta.
+Qwen rows from `c43744da1` (hybrid `split_equal` fix); Gemma rows from
+`591c008dc` (post-refinement). Build `build-kvarn-cuda-static-vs`, `-fa off`,
+`r=3`, `--kvarn-preset kvarn_k4v2_g128`. Pre-refinement baseline in
+parentheses for delta.
+
+| Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate | Commit |
+|----------------|------|----------:|----------:|------:|:----:|:------:|
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 362.67 | 364.87 | 100.6% | PASS | `c43744da1` |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | 37.50 | 29.56 | 78.8% | FAIL | `c43744da1` |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp256 | — | — | — | pending | — |
+| Gemma 4 12B Q3, `-ngl 99` | pp512 | 2130.57 | 1340.49 | 62.9% (was 58.5%) | FAIL | `591c008dc` |
+| Gemma 4 12B Q3, `-ngl 99` | tg64 | 64.35 | 36.24 | 56.3% (was 71.2%) | FAIL | `591c008dc` |
+
+**Post-fix decode path (`decode-fix-20260607`, same build + `r=3`):** gated
+`n_queries==1` per-head launches behind `LLAMA_KVARN_ATTN_DECODE_PER_HEAD`.
 
 | Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate |
 |----------------|------|----------:|----------:|------:|:----:|
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 362.67 | 364.87 | 100.6% | PASS |
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | 37.50 | 29.56 | 78.8% | FAIL |
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp256 | — | — | — | pending |
-| Gemma 4 12B Q3, `-ngl 99` | pp512 | 2130.57 | 1340.49 | 62.9% (was 58.5%) | FAIL |
-| Gemma 4 12B Q3, `-ngl 99` | tg64 | 64.35 | 36.24 | 56.3% (was 71.2%) | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 382.84 | 364.92 | 95.3% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | 38.72 | 33.81 | 87.3% | FAIL |
+| Gemma 4 12B Q3, `-ngl 99` | pp512 | 2226.45 | 1398.09 | 62.8% | FAIL |
+| Gemma 4 12B Q3, `-ngl 99` | tg64 | 69.05 | 44.59 | 64.6% | FAIL |
 
-Artifacts: `artifacts/kvarn-bench/gemma-591c008dc-post-refinement/`
-(Gemma), `artifacts/kvarn-bench/qwen-post-split-fix/` (Qwen post
-`split_equal` fix, `r=3`). Prior crash repro:
+Artifacts: `artifacts/kvarn-bench/decode-fix-20260607/`.
+(Gemma), `artifacts/kvarn-bench/qwen-post-split-fix/` (Qwen,
+`c43744da1`). Prior crash repro:
 `artifacts/kvarn-bench/qwen-591c008dc-post-refinement/`.
 
-**Qwen hybrid ubatch fix:** `591c008dc` crashed on
+**Qwen hybrid ubatch fix (`c43744da1`):** `591c008dc` crashed on
 `llama-memory-recurrent.cpp:505` (`ubatch.equal_seqs()`) because
 `llama-memory-hybrid-kvarn.cpp` used `split_simple` for single-seq
 contiguous batches; recurrent slots require `split_equal`. Fixed by gating
@@ -63,11 +74,13 @@ contiguous batches; recurrent slots require `split_equal`. Fixed by gating
 - Qwen 35B (14.28 GiB) exceeds 12 GB VRAM at `-ngl 99`; use `-ncmoe 34` for
   stable runs. Full-GPU rows are VRAM-throttled and not production comparable.
 - Gemma pp512 improved +4.4 pp vs pre-refinement; tg64 regressed −14.9 pp
-  (decode body-store / fused-attn follow-up still open).
+  on `591c008dc` — root cause: default `n_queries==1` decode path in
+  `kvarn.cu` launched one CUDA kernel per head instead of one fused-batch
+  grid; fixed by gating behind `LLAMA_KVARN_ATTN_DECODE_PER_HEAD=1`.
 - `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` on Qwen pp512 **regresses** to ~16%
   (fused-batch is the correct path).
-- Gemma tg64 regression (56.3% vs 71.2% pre-refinement) is on the ISWA
-  path and unrelated to the hybrid `split_equal` fix; separate follow-up.
+- Gemma tg64 regression is on the ISWA path and unrelated to the hybrid
+  `split_equal` fix.
 
 ### Tier 2 gates (CUDA)
 
