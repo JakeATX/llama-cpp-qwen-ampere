@@ -95,7 +95,10 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
     while (true) {
         const uint32_t n_kvarn_ubatch =
             kvarn_tail_safe_ubatch_limit(balloc, max_kvarn_ubatch, n_sink_tokens, n_tail_tokens);
-        auto ubatch = kvarn_batch_is_single_seq_contiguous(balloc)
+        // Recurrent slots require equal_seqs ubatches; split_simple is only safe
+        // for attention-only KVarN paths (see llama-memory-recurrent.cpp).
+        const bool need_equal_seqs = mem_recr != nullptr;
+        auto ubatch = (!need_equal_seqs && kvarn_batch_is_single_seq_contiguous(balloc))
             ? balloc.split_simple(n_kvarn_ubatch)
             : balloc.split_equal(n_kvarn_ubatch, true);
         if (ubatch.n_tokens == 0) {

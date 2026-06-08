@@ -32,41 +32,48 @@ per model×config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
 **Hardware:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, branch
 `kvarn-atx-integration`, `-fa off`, `--kvarn-preset kvarn_k4v2_g128`.
 
-### P0 CUDA matrix (2026-06-07, post tail-safe ubatch fix)
+### P0 CUDA matrix (2026-06-07, `591c008dc` post-refinement validation)
 
-Tail-safe ubatch splitting bounds chunks by tail-ring **evictions per graph**
-(≤ `tail_tokens`), not raw token count. Post-fix validation on
-`build-kvarn-cuda-static-vs`:
+Commit `591c008dc` on `build-kvarn-cuda-static-vs`, `-fa off`, `r=3`,
+`--kvarn-preset kvarn_k4v2_g128`. Prior pre-refinement baseline (same branch,
+earlier artifact) in parentheses for delta.
 
 | Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate |
 |----------------|------|----------:|----------:|------:|:----:|
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 404.31 | 360.90 | 89.3% | FAIL |
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | — | — | ≥74% | PASS |
-| Gemma 4 12B Q3, `-ngl 99` | pp512 | 2084.91 | 1219.12 | 58.5% | FAIL |
-| Gemma 4 12B Q3, `-ngl 99` | tg64 | 65.40 | 46.59 | 71.2% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 362.67 | 364.87 | 100.6% | PASS |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | 37.50 | 29.56 | 78.8% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp256 | — | — | — | pending |
+| Gemma 4 12B Q3, `-ngl 99` | pp512 | 2130.57 | 1340.49 | 62.9% (was 58.5%) | FAIL |
+| Gemma 4 12B Q3, `-ngl 99` | tg64 | 64.35 | 36.24 | 56.3% (was 71.2%) | FAIL |
 
-Artifacts: `artifacts/kvarn-bench/qwen-tail-safe-validation/`,
-`artifacts/kvarn-bench/gemma-tail-safe-validation/`.
+Artifacts: `artifacts/kvarn-bench/gemma-591c008dc-post-refinement/`
+(Gemma), `artifacts/kvarn-bench/qwen-post-split-fix/` (Qwen post
+`split_equal` fix, `r=3`). Prior crash repro:
+`artifacts/kvarn-bench/qwen-591c008dc-post-refinement/`.
 
-Critical merge fix (still required): `llama_context` passes `kv_cache_quant_type`
-and `kvarn` into `create_memory` (without this, bench rows labeled `kvarn` use
-the normal KV cache).
+**Qwen hybrid ubatch fix:** `591c008dc` crashed on
+`llama-memory-recurrent.cpp:505` (`ubatch.equal_seqs()`) because
+`llama-memory-hybrid-kvarn.cpp` used `split_simple` for single-seq
+contiguous batches; recurrent slots require `split_equal`. Fixed by gating
+`split_simple` off when `mem_recr` is present. Post-fix: pp512 **PASS**
+(100.6%), tg64 **FAIL** (78.8%, decode perf follow-up).
 
 **Notes:**
 
 - Qwen 35B (14.28 GiB) exceeds 12 GB VRAM at `-ngl 99`; use `-ncmoe 34` for
   stable runs. Full-GPU rows are VRAM-throttled and not production comparable.
-- `-ncmoe 34` pp512 active-body is closest to gate (~79–96% across reruns).
+- Gemma pp512 improved +4.4 pp vs pre-refinement; tg64 regressed −14.9 pp
+  (decode body-store / fused-attn follow-up still open).
 - `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` on Qwen pp512 **regresses** to ~16%
   (fused-batch is the correct path).
-- Gemma ISWA+KVarN prefill/decode gaps need CUDA fused-attn / ubatch follow-up
-  on `kvarn-atx-integration` (see trace: `fused-batch` + body-store on pp512).
+- Gemma tg64 regression (56.3% vs 71.2% pre-refinement) is on the ISWA
+  path and unrelated to the hybrid `split_equal` fix; separate follow-up.
 
 ### Tier 2 gates (CUDA)
 
 | Gate | Status |
 |------|--------|
-| `ctest -R test-kvarn-kv\|test-kvarn-cuda` | PASS (3/3) |
+| `ctest -R test-kvarn-kv\|test-kvarn-cuda\|test-batch-split` | PASS (4/4) |
 | `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS |
 | `run_unsupported_smoke.ps1` | PASS (15/15, pre-fix baseline) |
 | `compare_cuda_logits_ref.ps1` | **UNBLOCKED** — `common_prompt_batch_decode` call-site arity fixed; use static `build-kvarn-cuda-static-vs` if Smart App Control blocks shared DLLs |
