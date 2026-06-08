@@ -322,6 +322,88 @@ static __global__ void kvarn_store_v_finalize_scales_kernel(
     v_zp[g]        = row*rtn_zp[g];
 }
 
+static __global__ void kvarn_sinkhorn_rows_parallel_kernel(
+        float * __restrict__ data,
+        float * __restrict__ row_scale,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows) {
+        return;
+    }
+
+    constexpr float eps = 1.0e-6f;
+    float local_ss = 0.0f;
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float v = data[size_t(r)*cols + c];
+        local_ss += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    shmem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shmem[threadIdx.x] += shmem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float rms = sqrtf(shmem[0]/float(cols) + eps);
+        row_scale[r] *= rms;
+        shmem[0] = rms;
+    }
+    __syncthreads();
+
+    const float inv_rms = 1.0f/shmem[0];
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        data[size_t(r)*cols + c] *= inv_rms;
+    }
+}
+
+static __global__ void kvarn_sinkhorn_cols_parallel_kernel(
+        float * __restrict__ data,
+        float * __restrict__ col_scale,
+        uint32_t rows,
+        uint32_t cols) {
+    const uint32_t c = blockIdx.x;
+    if (c >= cols) {
+        return;
+    }
+
+    constexpr float eps = 1.0e-6f;
+    float local_ss = 0.0f;
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        const float v = data[size_t(r)*cols + c];
+        local_ss += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    shmem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shmem[threadIdx.x] += shmem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float rms = sqrtf(shmem[0]/float(rows) + eps);
+        col_scale[c] *= rms;
+        shmem[0] = rms;
+    }
+    __syncthreads();
+
+    const float inv_rms = 1.0f/shmem[0];
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        data[size_t(r)*cols + c] *= inv_rms;
+    }
+}
+
 static void kvarn_sinkhorn_variance_normalize_parallel(
         float * data,
         float * row_scale,
@@ -331,12 +413,13 @@ static void kvarn_sinkhorn_variance_normalize_parallel(
         uint32_t iters,
         cudaStream_t stream) {
     const int block = 128;
+    const size_t shmem = size_t(block)*sizeof(float);
     kvarn_fill_f32_kernel<<<int((rows + block - 1)/block), block, 0, stream>>>(row_scale, rows, 1.0f);
     kvarn_fill_f32_kernel<<<int((cols + block - 1)/block), block, 0, stream>>>(col_scale, cols, 1.0f);
 
     for (uint32_t iter = 0; iter < iters; ++iter) {
-        kvarn_sinkhorn_rows_kernel<<<int(rows), 1, 0, stream>>>(data, row_scale, rows, cols);
-        kvarn_sinkhorn_cols_kernel<<<int(cols), 1, 0, stream>>>(data, col_scale, rows, cols);
+        kvarn_sinkhorn_rows_parallel_kernel<<<int(rows), block, shmem, stream>>>(data, row_scale, rows, cols);
+        kvarn_sinkhorn_cols_parallel_kernel<<<int(cols), block, shmem, stream>>>(data, col_scale, rows, cols);
     }
 }
 
@@ -2287,6 +2370,34 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
     if (!use_split_kernels && !use_serial_fused) {
+        if (n_queries == 1) {
+            const uint32_t n_gqa = n_head/n_head_kv;
+            for (uint32_t ih = 0; ih < n_head; ++ih) {
+                const uint32_t ikh = ih/n_gqa;
+                const float * q_ptr = q + size_t(ih)*q_stride_head_floats;
+                float * out_ptr = out + size_t(ih)*out_stride_head_floats;
+                const uint16_t * k_st_ptr = sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16;
+                const uint16_t * v_st_ptr = sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16;
+                const uint8_t * k_body_ptr = k_body + size_t(ikh)*k_body_stride_head_bytes;
+                const uint8_t * v_body_ptr = v_body + size_t(ikh)*v_body_stride_head_bytes;
+                const float * k_scales_ptr = k_scales + size_t(ikh)*k_scale_stride_head_floats;
+                const float * v_scales_ptr = v_scales + size_t(ikh)*v_scale_stride_head_floats;
+                const float * pending_k_ptr = pending_k + size_t(ikh)*pending_stride_head_floats;
+                const float * pending_v_ptr = pending_v + size_t(ikh)*pending_stride_head_floats;
+                const void * kq_mask_ptr = kq_mask;
+
+                kvarn_attn_mixed_f16_fused_kernel<<<1, block, shmem, cuda_stream>>>(
+                        q_ptr, k_st_ptr, v_st_ptr, k_body_ptr, v_body_ptr, k_scales_ptr, v_scales_ptr,
+                        pending_k_ptr, pending_v_ptr, kq_mask_ptr, out_ptr, scores,
+                        n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                        sink_tail_stride_token_f16, pending_stride_token_floats,
+                        k_body_stride_record_bytes, v_body_stride_record_bytes,
+                        k_scale_stride_record_floats, v_scale_stride_record_floats,
+                        kq_mask_stride_token_bytes, kq_mask_type, scale);
+            }
+            return;
+        }
+
         kvarn_attn_mixed_f16_fused_batch_kernel<<<int(n_queries*n_head), block, shmem, cuda_stream>>>(
                 q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
                 kq_mask,

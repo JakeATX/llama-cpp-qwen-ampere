@@ -374,6 +374,7 @@ public:
     const llama_kv_cache_kvarn_context * mctx_kvarn;
     std::vector<ggml_tensor *> mixed_attn_nodes;
     bool has_body_store_ops = false;
+    std::vector<uint32_t> baked_seal_records;
 };
 
 // V-less input for the KV cache
@@ -502,6 +503,7 @@ public:
     ggml_tensor * base_tail_evict_idxs = nullptr;// I32 [n_tail_evict]
     std::vector<ggml_tensor *> base_mixed_attn_nodes;
     bool base_has_body_store_ops = false;
+    std::vector<uint32_t> base_baked_seal_records;
 
     const llama_hparams hparams;
     const llama_cparams cparams;

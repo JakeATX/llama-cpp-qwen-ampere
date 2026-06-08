@@ -5,6 +5,7 @@
 #include "llama-model.h"
 #endif
 #include "llama-hparams.h"
+#include "llama-kvarn-ubatch.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -999,7 +1000,7 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_batch(
 
     std::vector<llama_ubatch> ubatches;
     bool invalid_debug_ubatch = false;
-    const uint32_t default_kvarn_ubatch = std::min<uint32_t>(n_ubatch, params.tail_tokens);
+    const uint32_t default_kvarn_ubatch = n_ubatch;
     const uint32_t n_kvarn_ubatch = kvarn_ubatch_limit(default_kvarn_ubatch, invalid_debug_ubatch);
     if (invalid_debug_ubatch) {
         std::fprintf(stderr,
@@ -1007,17 +1008,17 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_batch(
                 __func__, std::getenv("LLAMA_KVARN_DEBUG_UBATCH"));
         return std::make_unique<llama_kv_cache_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
-    if (n_kvarn_ubatch > params.tail_tokens) {
+    if (params.tail_tokens == 0) {
         std::fprintf(stderr,
-                "%s: KVarN debug ubatch override exceeds tail-ring safety limit: %u > %u\n",
-                __func__, n_kvarn_ubatch, params.tail_tokens);
+                "%s: KVarN requires a non-empty tail ring\n",
+                __func__);
         return std::make_unique<llama_kv_cache_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
     while (true) {
-        // Keep each graph within one tail-ring span so tokens written earlier
-        // in the graph are not evicted before their pending-body copy runs.
-        auto ubatch = balloc.split_simple(n_kvarn_ubatch);
+        const uint32_t n_safe_ubatch =
+            kvarn_tail_safe_ubatch_limit(balloc, n_kvarn_ubatch, params.sink_tokens, params.tail_tokens);
+        auto ubatch = balloc.split_simple(n_safe_ubatch);
         if (ubatch.n_tokens == 0) {
             break;
         }
@@ -1745,8 +1746,10 @@ void llama_kv_cache_kvarn::set_input_tail_evict_idxs(ggml_tensor * dst, const ll
 void llama_kv_cache_kvarn::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
-    GGML_ASSERT(dst->ne[0] == kv_size);
+    GGML_ASSERT(dst->ne[0] <= kv_size);
     GGML_ASSERT(dst->ne[1] == ubatch->n_tokens);
+
+    const int64_t n_kv = dst->ne[0];
 
     const auto write = [&](int64_t t, int64_t q, float v) {
         char * p = (char *) dst->data + size_t(q)*dst->nb[1] + size_t(t)*dst->nb[0];
@@ -1759,8 +1762,8 @@ void llama_kv_cache_kvarn::set_input_kq_mask(ggml_tensor * dst, const llama_ubat
 
     for (int64_t q = 0; q < dst->ne[1]; ++q) {
         const llama_pos pos = ubatch->pos ? ubatch->pos[q] : llama_pos(q);
-        const int64_t visible = causal_attn && pos >= 0 ? std::min<int64_t>(int64_t(kv_size), int64_t(pos) + 1) : int64_t(kv_size);
-        for (int64_t t = 0; t < dst->ne[0]; ++t) {
+        const int64_t visible = causal_attn && pos >= 0 ? std::min<int64_t>(n_kv, int64_t(pos) + 1) : n_kv;
+        for (int64_t t = 0; t < n_kv; ++t) {
             write(t, q, t < visible ? 0.0f : -INFINITY);
         }
     }

@@ -807,16 +807,17 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
 
     this->mctx_kvarn = mctx;
 
-    if (has_body_store_ops) {
-        return false;
-    }
-
     const kvarn_active_window window = kvarn_graph_active_window(params.cparams.kvarn, params.ubatch, mctx->get_size());
     if (!window.valid) {
         return false;
     }
 
-    if (!kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch).empty()) {
+    const std::vector<uint32_t> cur_seal_records = kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch);
+    if (has_body_store_ops) {
+        if (cur_seal_records != baked_seal_records) {
+            return false;
+        }
+    } else if (!cur_seal_records.empty()) {
         return false;
     }
 
@@ -827,7 +828,7 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
     res &= body_plan->ne[1] == n_tail_evict;
     res &= body_offsets->ne[0] == n_tail_evict;
     res &= tail_evict_idxs->ne[0] == n_tail_evict;
-    res &= can_reuse_kq_mask(self_kq_mask, mctx->get_size(), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(self_kq_mask, uint32_t(window.n_kv), params.ubatch, params.cparams);
     res &= !mixed_attn_nodes.empty();
 
     for (const ggml_tensor * node : mixed_attn_nodes) {
@@ -961,14 +962,17 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         this->mctx = nullptr;
 
         const auto * base_ctx = mctx->get_base();
-        if (base_has_body_store_ops) {
-            return false;
-        }
         const kvarn_active_window window = kvarn_graph_active_window(params.cparams.kvarn, params.ubatch, base_ctx->get_size());
         if (!window.valid) {
             return false;
         }
-        if (!kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch).empty()) {
+
+        const std::vector<uint32_t> cur_seal_records = kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch);
+        if (base_has_body_store_ops) {
+            if (cur_seal_records != base_baked_seal_records) {
+                return false;
+            }
+        } else if (!cur_seal_records.empty()) {
             return false;
         }
 
@@ -978,7 +982,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         res &= base_body_plan->ne[1] == n_tail_evict;
         res &= base_body_offsets->ne[0] == n_tail_evict;
         res &= base_tail_evict_idxs->ne[0] == n_tail_evict;
-        res &= can_reuse_kq_mask(self_kq_mask, base_ctx->get_size(), params.ubatch, params.cparams);
+        res &= can_reuse_kq_mask(self_kq_mask, uint32_t(window.n_kv), params.ubatch, params.cparams);
         res &= !base_mixed_attn_nodes.empty();
 
         for (const ggml_tensor * node : base_mixed_attn_nodes) {
@@ -2746,7 +2750,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kvarn_impl(
     inp->body_plan = mctx_kvarn->build_input_body_plan(ctx0, ubatch);
     inp->body_offsets = mctx_kvarn->build_input_body_offsets(ctx0, ubatch);
     inp->tail_evict_idxs = mctx_kvarn->build_input_tail_evict_idxs(ctx0, ubatch);
-    inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_kvarn->get_size(), ubatch, cparams);
+    const kvarn_active_window mask_window = kvarn_graph_active_window(cparams.kvarn, ubatch, mctx_kvarn->get_size());
+    const uint32_t mask_n_kv = mask_window.valid ? uint32_t(mask_window.n_kv) : mctx_kvarn->get_size();
+    inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mask_n_kv, ubatch, cparams);
     inp->self_kq_mask_cnv = inp->self_kq_mask;
     return inp;
 }
@@ -2822,9 +2828,8 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
 
             const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
-            if (!seal_records.empty()) {
-                inp_kvarn->has_body_store_ops = true;
-            }
+            inp_kvarn->has_body_store_ops = !seal_records.empty();
+            inp_kvarn->baked_seal_records = seal_records;
 
             for (const uint32_t seal_record : seal_records) {
                 if (seal_record >= layer.n_records) {
@@ -2853,10 +2858,8 @@ ggml_tensor * llm_graph_context::build_attn(
             throw std::runtime_error("KVarN graph backend active body record count exceeds allocated cache capacity");
         }
 
-        const int64_t scores_floats = std::max<int64_t>(
-                kvarn_graph_attn_scratch_floats(
-                    window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size),
-                inp_kvarn->mctx_kvarn->get_size());
+        const int64_t scores_floats = kvarn_graph_attn_scratch_floats(
+                window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
         ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
         ggml_set_name(scores, "kvarn_attn_scores");
 
@@ -3269,9 +3272,8 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
 
             const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
-            if (!seal_records.empty()) {
-                inp->base_has_body_store_ops = true;
-            }
+            inp->base_has_body_store_ops = !seal_records.empty();
+            inp->base_baked_seal_records = seal_records;
 
             for (const uint32_t seal_record : seal_records) {
                 if (seal_record >= layer.n_records) {
@@ -3299,10 +3301,8 @@ ggml_tensor * llm_graph_context::build_attn(
             throw std::runtime_error("KVarN+ISWA graph backend active body record count exceeds allocated cache capacity");
         }
 
-        const int64_t scores_floats = std::max<int64_t>(
-                kvarn_graph_attn_scratch_floats(
-                    window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size),
-                mctx_kvarn->get_size());
+        const int64_t scores_floats = kvarn_graph_attn_scratch_floats(
+                window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
         ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
         ggml_set_name(scores, "kvarn_iswa_attn_scores");
 
@@ -3509,7 +3509,9 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->base_body_plan = base_ctx->build_input_body_plan(ctx0, ubatch);
         inp->base_body_offsets = base_ctx->build_input_body_offsets(ctx0, ubatch);
         inp->base_tail_evict_idxs = base_ctx->build_input_tail_evict_idxs(ctx0, ubatch);
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, base_ctx->get_size(), ubatch, cparams);
+        const kvarn_active_window mask_window = kvarn_graph_active_window(cparams.kvarn, ubatch, base_ctx->get_size());
+        const uint32_t mask_n_kv = mask_window.valid ? uint32_t(mask_window.n_kv) : base_ctx->get_size();
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mask_n_kv, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
 
         const auto * swa_ctx = mctx_kvarn_iswa->get_swa();

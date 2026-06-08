@@ -32,24 +32,25 @@ per model×config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
 **Hardware:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, branch
 `kvarn-atx-integration`, `-fa off`, `--kvarn-preset kvarn_k4v2_g128`.
 
-### P0 CUDA matrix (2026-06-07, post `params_mem` merge fix)
+### P0 CUDA matrix (2026-06-07, post tail-safe ubatch fix)
 
-Critical merge fix: `llama_context` now passes `kv_cache_quant_type` and
-`kvarn` into `create_memory` (without this, bench rows labeled `kvarn` used the
-normal KV cache).
+Tail-safe ubatch splitting bounds chunks by tail-ring **evictions per graph**
+(≤ `tail_tokens`), not raw token count. Post-fix validation on
+`build-kvarn-cuda-static-vs`:
 
 | Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate |
 |----------------|------|----------:|----------:|------:|:----:|
-| Qwen3.6 MTP IQ3, `-ngl 99` | pp256 | 55.02 | 32.12 | 58.4% | FAIL |
-| Qwen3.6 MTP IQ3, `-ngl 99` | pp512 | 71.95 | 40.28 | 56.0% | FAIL |
-| Qwen3.6 MTP IQ3, `-ngl 99` | tg64 | 1.64 | 1.21 | 73.8% | FAIL |
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 130.38 | 102.96 | 79.0% | FAIL |
-| Gemma 4 12B Q3, `-ngl 99` | pp512 | 1036.48 | 340.17 | 32.8% | FAIL |
-| Gemma 4 12B Q3, `-ngl 99` | tg64 | 27.56 | 4.05 | 14.7% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 404.31 | 360.90 | 89.3% | FAIL |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | — | — | ≥74% | PASS |
+| Gemma 4 12B Q3, `-ngl 99` | pp512 | 2084.91 | 1219.12 | 58.5% | FAIL |
+| Gemma 4 12B Q3, `-ngl 99` | tg64 | 65.40 | 46.59 | 71.2% | FAIL |
 
-Artifacts: `artifacts/kvarn-bench/qwen36-mtp-moe-matrix/`,
-`artifacts/kvarn-bench/qwen36-mtp-ncmoe34-matrix/`,
-`artifacts/kvarn-bench/gemma12b-512-matrix-v2/`.
+Artifacts: `artifacts/kvarn-bench/qwen-tail-safe-validation/`,
+`artifacts/kvarn-bench/gemma-tail-safe-validation/`.
+
+Critical merge fix (still required): `llama_context` passes `kv_cache_quant_type`
+and `kvarn` into `create_memory` (without this, bench rows labeled `kvarn` use
+the normal KV cache).
 
 **Notes:**
 
@@ -68,7 +69,7 @@ Artifacts: `artifacts/kvarn-bench/qwen36-mtp-moe-matrix/`,
 | `ctest -R test-kvarn-kv\|test-kvarn-cuda` | PASS (3/3) |
 | `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS |
 | `run_unsupported_smoke.ps1` | PASS (15/15, pre-fix baseline) |
-| `compare_cuda_logits_ref.ps1` | **BLOCKED** — `llama-results.exe` SEGV on launch (integration-branch `common` link issue; use ctest CUDA scratch/mixed-tail gates until fixed) |
+| `compare_cuda_logits_ref.ps1` | **UNBLOCKED** — `common_prompt_batch_decode` call-site arity fixed; use static `build-kvarn-cuda-static-vs` if Smart App Control blocks shared DLLs |
 
 ### Mac validation handoff
 
