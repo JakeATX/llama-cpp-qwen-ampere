@@ -57,7 +57,18 @@ parentheses for delta.
 | Gemma 4 12B Q3, `-ngl 99` | pp512 | 2226.45 | 1398.09 | 62.8% | FAIL |
 | Gemma 4 12B Q3, `-ngl 99` | tg64 | 69.05 | 44.59 | 64.6% | FAIL |
 
-Artifacts: `artifacts/kvarn-bench/decode-fix-20260607/` (post-fix),
+**Decode graph reuse (`qwen-tg64-gate-push`, `r=3`):** one-token decode graphs
+now allocate full-capacity KQ masks and worst-case mixed-attention scratch so
+`can_reuse` stays true as the active window grows (previously rebuilt every
+token when `kq_mask->ne[0]` tracked current `n_kv`).
+
+| Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate |
+|----------------|------|----------:|----------:|------:|:----:|
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | 39.26 | 36.40 | **92.7%** | **PASS** |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 469.31 | 391.40 | 83.4% | FAIL (variance) |
+
+Artifacts: `artifacts/kvarn-bench/qwen-tg64-gate-push/` (tg64 gate),
+`artifacts/kvarn-bench/decode-fix-20260607/` (per-head launch fix),
 `artifacts/kvarn-bench/gemma-591c008dc-post-refinement/` (Gemma baseline),
 `artifacts/kvarn-bench/qwen-post-split-fix/` (Qwen `c43744da1`).
 Prior crash repro: `artifacts/kvarn-bench/qwen-591c008dc-post-refinement/`.

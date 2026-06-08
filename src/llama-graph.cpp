@@ -680,6 +680,51 @@ static kvarn_active_window kvarn_graph_active_window(const llama_kvarn_params & 
     return result;
 }
 
+static bool kvarn_graph_decode_stable_topology(const llama_ubatch & ubatch) {
+    return ubatch.n_tokens == 1;
+}
+
+static kvarn_active_window kvarn_graph_worst_active_window(
+        const llama_kvarn_params & params,
+        uint32_t kv_size) {
+    llama_pos pos = llama_pos(kv_size > 0 ? int(kv_size) - 1 : 0);
+    llama_ubatch ubatch{};
+    ubatch.n_tokens = 1;
+    ubatch.pos = &pos;
+    return kvarn_graph_active_window(params, ubatch, kv_size);
+}
+
+static uint32_t kvarn_graph_mask_n_kv(
+        const kvarn_active_window & window,
+        uint32_t kv_size,
+        const llama_ubatch & ubatch) {
+    if (kvarn_graph_decode_stable_topology(ubatch) && window.valid) {
+        return kv_size;
+    }
+    return window.valid ? uint32_t(window.n_kv) : kv_size;
+}
+
+static kvarn_active_window kvarn_graph_build_scratch_window(
+        const kvarn_active_window & window,
+        const llama_kvarn_params & params,
+        uint32_t kv_size,
+        const llama_ubatch & ubatch) {
+    if (kvarn_graph_decode_stable_topology(ubatch) && window.valid && kv_size > 0) {
+        return kvarn_graph_worst_active_window(params, kv_size);
+    }
+    return window;
+}
+
+static uint32_t kvarn_graph_reuse_mask_n_kv(
+        const kvarn_active_window & window,
+        uint32_t kv_size,
+        const llama_ubatch & ubatch) {
+    if (kvarn_graph_decode_stable_topology(ubatch)) {
+        return kv_size;
+    }
+    return uint32_t(window.n_kv);
+}
+
 static void kvarn_graph_update_mixed_attn_params(ggml_tensor * node, const kvarn_active_window & window) {
     GGML_ASSERT(node->op == GGML_OP_KVARN_ATTN_MIXED);
 
@@ -828,7 +873,11 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
     res &= body_plan->ne[1] == n_tail_evict;
     res &= body_offsets->ne[0] == n_tail_evict;
     res &= tail_evict_idxs->ne[0] == n_tail_evict;
-    res &= can_reuse_kq_mask(self_kq_mask, uint32_t(window.n_kv), params.ubatch, params.cparams);
+    res &= can_reuse_kq_mask(
+            self_kq_mask,
+            kvarn_graph_reuse_mask_n_kv(window, mctx->get_size(), params.ubatch),
+            params.ubatch,
+            params.cparams);
     res &= !mixed_attn_nodes.empty();
 
     for (const ggml_tensor * node : mixed_attn_nodes) {
@@ -837,8 +886,10 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
             return false;
         }
         const int64_t n_head_kv = node->src[1] ? node->src[1]->ne[1] : 0;
+        const kvarn_active_window scratch_window = kvarn_graph_build_scratch_window(
+                window, params.cparams.kvarn, mctx->get_size(), params.ubatch);
         const int64_t required_scratch = kvarn_graph_attn_scratch_floats(
-                window, n_head_kv, window.n_records, node->op_params[5], node->op_params[6]);
+                scratch_window, n_head_kv, scratch_window.n_records, node->op_params[5], node->op_params[6]);
         res &= node->src[9] != nullptr && ggml_nelements(node->src[9]) >= required_scratch;
     }
 
@@ -982,7 +1033,11 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         res &= base_body_plan->ne[1] == n_tail_evict;
         res &= base_body_offsets->ne[0] == n_tail_evict;
         res &= base_tail_evict_idxs->ne[0] == n_tail_evict;
-        res &= can_reuse_kq_mask(self_kq_mask, uint32_t(window.n_kv), params.ubatch, params.cparams);
+        res &= can_reuse_kq_mask(
+                self_kq_mask,
+                kvarn_graph_reuse_mask_n_kv(window, base_ctx->get_size(), params.ubatch),
+                params.ubatch,
+                params.cparams);
         res &= !base_mixed_attn_nodes.empty();
 
         for (const ggml_tensor * node : base_mixed_attn_nodes) {
@@ -991,8 +1046,10 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
                 return false;
             }
             const int64_t n_head_kv = node->src[1] ? node->src[1]->ne[1] : 0;
+            const kvarn_active_window scratch_window = kvarn_graph_build_scratch_window(
+                    window, params.cparams.kvarn, base_ctx->get_size(), params.ubatch);
             const int64_t required_scratch = kvarn_graph_attn_scratch_floats(
-                    window, n_head_kv, window.n_records, node->op_params[5], node->op_params[6]);
+                    scratch_window, n_head_kv, scratch_window.n_records, node->op_params[5], node->op_params[6]);
             res &= node->src[9] != nullptr && ggml_nelements(node->src[9]) >= required_scratch;
         }
 
@@ -2751,7 +2808,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kvarn_impl(
     inp->body_offsets = mctx_kvarn->build_input_body_offsets(ctx0, ubatch);
     inp->tail_evict_idxs = mctx_kvarn->build_input_tail_evict_idxs(ctx0, ubatch);
     const kvarn_active_window mask_window = kvarn_graph_active_window(cparams.kvarn, ubatch, mctx_kvarn->get_size());
-    const uint32_t mask_n_kv = mask_window.valid ? uint32_t(mask_window.n_kv) : mctx_kvarn->get_size();
+    const uint32_t mask_n_kv = kvarn_graph_mask_n_kv(mask_window, mctx_kvarn->get_size(), ubatch);
     inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mask_n_kv, ubatch, cparams);
     inp->self_kq_mask_cnv = inp->self_kq_mask;
     return inp;
@@ -2858,8 +2915,10 @@ ggml_tensor * llm_graph_context::build_attn(
             throw std::runtime_error("KVarN graph backend active body record count exceeds allocated cache capacity");
         }
 
+        const kvarn_active_window scratch_window = kvarn_graph_build_scratch_window(
+                window, cparams.kvarn, inp_kvarn->mctx_kvarn->get_size(), ubatch);
         const int64_t scores_floats = kvarn_graph_attn_scratch_floats(
-                window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
+                scratch_window, layer.n_head_kv, scratch_window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
         ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
         ggml_set_name(scores, "kvarn_attn_scores");
 
@@ -3301,8 +3360,10 @@ ggml_tensor * llm_graph_context::build_attn(
             throw std::runtime_error("KVarN+ISWA graph backend active body record count exceeds allocated cache capacity");
         }
 
+        const kvarn_active_window scratch_window = kvarn_graph_build_scratch_window(
+                window, cparams.kvarn, mctx_kvarn->get_size(), ubatch);
         const int64_t scores_floats = kvarn_graph_attn_scratch_floats(
-                window, layer.n_head_kv, window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
+                scratch_window, layer.n_head_kv, scratch_window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
         ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
         ggml_set_name(scores, "kvarn_iswa_attn_scores");
 
@@ -3510,7 +3571,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->base_body_offsets = base_ctx->build_input_body_offsets(ctx0, ubatch);
         inp->base_tail_evict_idxs = base_ctx->build_input_tail_evict_idxs(ctx0, ubatch);
         const kvarn_active_window mask_window = kvarn_graph_active_window(cparams.kvarn, ubatch, base_ctx->get_size());
-        const uint32_t mask_n_kv = mask_window.valid ? uint32_t(mask_window.n_kv) : base_ctx->get_size();
+        const uint32_t mask_n_kv = kvarn_graph_mask_n_kv(mask_window, base_ctx->get_size(), ubatch);
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mask_n_kv, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
 
