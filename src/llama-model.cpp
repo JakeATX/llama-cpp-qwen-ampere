@@ -26,10 +26,13 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -2024,6 +2027,66 @@ static bool llama_kvarn_device_supports_ops(ggml_backend_dev_t dev, const llama_
     return ggml_backend_dev_supports_op(dev, op);
 }
 
+static bool llama_kvarn_env_flag(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            (value != 0 && value != 1)) {
+        throw std::runtime_error(std::string("invalid KVarN environment flag ") + name +
+                "=" + env + "; expected integer 0 or 1");
+    }
+
+    return value != 0;
+}
+
+static bool llama_kvarn_force_experimental_iswa() {
+    return llama_kvarn_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA");
+}
+
+static llama_memory_i * llama_kvarn_create_normal_iswa_fallback(
+        const llama_model & model,
+        const llama_memory_params & params,
+        const llama_cparams & cparams) {
+    const auto & hparams = model.hparams;
+
+    llama_memory_i::layer_reuse_cb reuse = nullptr;
+    llama_kv_cache::layer_filter_cb filter = nullptr;
+
+    if (model.arch == LLM_ARCH_GEMMA4) {
+        reuse = [&](int32_t il) {
+            if (il >= (int32_t) hparams.n_layer_kv_from_start) {
+                return (int32_t) hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+            }
+
+            return -1;
+        };
+    }
+
+    GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
+    GGML_ASSERT(hparams.is_swa_any());
+
+    return new llama_kv_cache_iswa(
+            model,
+            params.type_k,
+            params.type_v,
+            !cparams.flash_attn,
+            cparams.offload_kqv,
+            params.swa_full,
+            cparams.kv_unified,
+            cparams.n_ctx_seq,
+            cparams.n_seq_max,
+            cparams.n_ubatch,
+            1,
+            filter,
+            reuse);
+}
+
 static void llama_kvarn_validate_memory_support(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -2120,6 +2183,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
 
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+            if (arch == LLM_ARCH_GEMMA4 && !llama_kvarn_force_experimental_iswa()) {
+                LLAMA_LOG_WARN(
+                        "%s: KVarN+ISWA for Gemma 4 is still below the CUDA production throughput gate; "
+                        "using normal ISWA KV cache as the production-safe fallback. "
+                        "Set LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 to run the experimental KVarN+ISWA path.\n",
+                        __func__);
+
+                return llama_kvarn_create_normal_iswa_fallback(*this, params, cparams);
+            }
+
             llama_memory_i::layer_reuse_cb reuse = nullptr;
             llama_kv_cache_kvarn::layer_filter_cb filter = nullptr;
 

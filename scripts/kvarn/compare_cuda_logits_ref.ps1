@@ -6,6 +6,7 @@ param(
     [int] $Batch = 0,
     [ValidateSet("on", "off", "auto")] [string] $FlashAttn = "on",
     [double] $RtnQuantile = 0.95,
+    [int] $KvarnIters = 16,
     [int] $Repeat = 32,
     [string] $PromptPhrase = "The quick brown fox studies attention kernels and cache layouts carefully. ",
     [string] $OutputFile = "",
@@ -21,6 +22,9 @@ param(
     [switch] $CheckPackedSplit,
     [switch] $CheckNormalBaseline,
     [double] $NormalBaselineMaxNmse = -1.0,
+    [double] $RepeatMaxNmse = -1.0,
+    [double] $SplitMaxNmse = -1.0,
+    [double] $ScratchMaxNmse = -1.0,
     [switch] $TraceAttn,
     [int] $TraceLimit = 4,
     [string] $ExpectedPackedTraceMode = "",
@@ -37,6 +41,9 @@ if (!($RtnQuantile -gt 0.0 -and $RtnQuantile -le 1.0)) {
 if ($Repeat -le 0) {
     throw "Repeat must be positive"
 }
+if ($KvarnIters -le 0) {
+    throw "KvarnIters must be positive"
+}
 if ($Batch -lt 0) {
     throw "Batch must be non-negative"
 }
@@ -51,6 +58,15 @@ if ($MinKvarnBodyRecords -lt 0) {
 }
 if ($NormalBaselineMaxNmse -eq 0.0) {
     throw "NormalBaselineMaxNmse must be negative to disable the threshold or positive to enforce one"
+}
+if ($RepeatMaxNmse -eq 0.0) {
+    throw "RepeatMaxNmse must be negative to disable the threshold or positive to enforce one"
+}
+if ($SplitMaxNmse -eq 0.0) {
+    throw "SplitMaxNmse must be negative to disable the threshold or positive to enforce one"
+}
+if ($ScratchMaxNmse -eq 0.0) {
+    throw "ScratchMaxNmse must be negative to disable the threshold or positive to enforce one"
 }
 if ($TraceLimit -lt 0) {
     throw "TraceLimit must be non-negative"
@@ -227,6 +243,15 @@ function Invoke-Results(
     return $text
 }
 
+function Assert-NmseThreshold([double] $value, [double] $threshold, [string] $label) {
+    if ($threshold -lt 0.0) {
+        return
+    }
+    if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -gt $threshold) {
+        throw ("{0} logits exceeded NMSE threshold: NMSE = {1:E3}, threshold = {2:E3}" -f $label, $value, $threshold)
+    }
+}
+
 function Get-Nmse([string] $text, [string] $label) {
     $match = [regex]::Match($text, "NMSE=([0-9.eE+-]+|nan|inf|-inf)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     if (-not $match.Success) {
@@ -268,6 +293,7 @@ $normalArgs = $baseArgs + @(
 $commonArgs = $baseArgs + @(
     "--kv-cache-quant", "kvarn",
     "--kvarn-preset", "kvarn_k4v2_g128",
+    "--kvarn-iters", [string] $KvarnIters,
     "--kvarn-rtn-quantile", $rtnQuantileArg
 )
 if ($Batch -gt 0) {
@@ -306,9 +332,7 @@ try {
         Write-Host "== Checking packed KVarN logits against normal KV"
         $normalCheck = Invoke-Results $results ($commonArgs + @("--check")) $packedEnv $true $true
         $normalNmse = Get-Nmse $normalCheck "packed-vs-normal"
-        if ($NormalBaselineMaxNmse -gt 0.0 -and $normalNmse -gt $NormalBaselineMaxNmse) {
-            throw ("KVarN packed-vs-normal logits exceeded threshold: NMSE = {0:E3}, threshold = {1:E3}" -f $normalNmse, $NormalBaselineMaxNmse)
-        }
+        Assert-NmseThreshold $normalNmse $NormalBaselineMaxNmse "KVarN packed-vs-normal"
         Write-Host ("KVarN packed-vs-normal logits: INFO, NMSE = {0:E3}" -f $normalNmse)
         Remove-Item -LiteralPath $OutputFile -ErrorAction SilentlyContinue
     }
@@ -324,6 +348,7 @@ try {
         Write-Host "== Checking packed KVarN repeat determinism"
         $repeatCheck = Invoke-Results $results ($commonArgs + @("--check")) $packedEnv
         $repeatNmse = Get-Nmse $repeatCheck "packed-repeat"
+        Assert-NmseThreshold $repeatNmse $RepeatMaxNmse "KVarN packed repeat"
         Write-Host ("KVarN packed repeat logits: PASS, NMSE = {0:E3}" -f $repeatNmse)
     }
 
@@ -334,6 +359,7 @@ try {
             Write-Host $splitCheck
         }
         $splitNmse = Get-Nmse $splitCheck "packed-vs-split"
+        Assert-NmseThreshold $splitNmse $SplitMaxNmse "KVarN packed-vs-split"
         Write-Host ("KVarN packed-vs-split logits: PASS, NMSE = {0:E3}" -f $splitNmse)
     }
 
@@ -344,6 +370,7 @@ try {
             Write-Host $check
         }
         $nmse = Get-Nmse $check "packed-vs-scratch"
+        Assert-NmseThreshold $nmse $ScratchMaxNmse "KVarN packed-vs-scratch"
         Write-Host ("KVarN packed-vs-scratch logits: PASS, NMSE = {0:E3}" -f $nmse)
     }
 } finally {

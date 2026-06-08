@@ -16,6 +16,9 @@ param(
     [string] $OutputDir = "",
     [switch] $Warmup,
     [switch] $TraceAttn,
+    [double] $MinKvarnRatio = -1.0,
+    [switch] $FailBelowMinKvarnRatio,
+    [switch] $AllowKvarnFallback,
     [int] $TraceLimit = 64,
     [switch] $TraceStore,
     [int] $TraceStoreLimit = 64,
@@ -45,6 +48,12 @@ if ($MinKvarnBodyRecords -lt 0) {
 if ($TraceLimit -le 0) {
     throw "TraceLimit must be positive"
 }
+if ($MinKvarnRatio -eq 0.0 -or $MinKvarnRatio -gt 1.0) {
+    throw "MinKvarnRatio must be negative to disable the gate or in (0, 1] to enforce one"
+}
+if ($FailBelowMinKvarnRatio.IsPresent -and $MinKvarnRatio -lt 0.0) {
+    throw "FailBelowMinKvarnRatio requires MinKvarnRatio to be set"
+}
 if ($TraceStoreLimit -le 0) {
     throw "TraceStoreLimit must be positive"
 }
@@ -68,6 +77,17 @@ $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 
 function Convert-ToFileStem([string] $name) {
     return ($name -replace '[^A-Za-z0-9_.-]', '_')
+}
+
+function Format-NullableDouble([Nullable[double]] $value, [string] $format) {
+    if ($value -eq $null) {
+        return ""
+    }
+    return $value.Value.ToString($format, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Test-KvarnEvidence([string] $text) {
+    return ($text -match "llama_kv_cache_kvarn:")
 }
 
 function Get-BenchCases([string] $caseList) {
@@ -328,6 +348,9 @@ $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::Inva
 $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
 $requiresKvarnEvidence = ($KvCacheQuant.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) |
     ForEach-Object { $_.Trim().ToLowerInvariant() }) -contains "kvarn"
+$requiresKvarnEvidence = $requiresKvarnEvidence -and -not $AllowKvarnFallback.IsPresent
+$kvqIncludesKvarn = ($KvCacheQuant.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) |
+    ForEach-Object { $_.Trim().ToLowerInvariant() }) -contains "kvarn"
 $manifest = @(
     "model=$modelPath",
     "bench=$bench",
@@ -349,6 +372,9 @@ $manifest = @(
     "trace_limit=$TraceLimit",
     "trace_store=$($TraceStore.IsPresent)",
     "trace_store_limit=$TraceStoreLimit",
+    "min_kvarn_ratio=$MinKvarnRatio",
+    "fail_below_min_kvarn_ratio=$($FailBelowMinKvarnRatio.IsPresent)",
+    "allow_kvarn_fallback=$($AllowKvarnFallback.IsPresent)",
     "extra_args=$($ExtraArgs -join ' ')"
 )
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
@@ -425,8 +451,9 @@ foreach ($case in (Get-BenchCases $CaseList)) {
     if ($exit -ne 0) {
         throw "llama-bench failed for case '$($case.Name)' with exit code $exit; see $logPath"
     }
+    $hasKvarnEvidence = Test-KvarnEvidence $text
     if ($requiresKvarnEvidence) {
-        if ($text -notmatch "llama_kv_cache_kvarn:") {
+        if (-not $hasKvarnEvidence) {
             throw "llama-bench case '$($case.Name)' succeeded but logs did not show KVarN cache initialization; see $logPath"
         }
         $kvarnLayerLogs = ([regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer")).Count
@@ -439,29 +466,66 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         Assert-ExpectedKvarnLayers $text $expectedKvarnLayerIds "llama-bench case '$($case.Name)'"
         Assert-MinKvarnBodyRecords $text $MinKvarnBodyRecords "llama-bench case '$($case.Name)'"
         Write-Host ("KVarN bench log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
+    } elseif ($kvqIncludesKvarn -and -not $hasKvarnEvidence) {
+        Write-Warning ("llama-bench case '{0}' did not initialize KVarN tensors; treating the KVarN row as production fallback because AllowKvarnFallback was set" -f $case.Name)
+    } elseif ($kvqIncludesKvarn -and $hasKvarnEvidence) {
+        $kvarnLayerLogs = ([regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer")).Count
+        Write-Host ("KVarN bench log check: INFO, KVarN layer lines = {0}" -f $kvarnLayerLogs)
     }
 
     $throughput = Get-BenchThroughputByKvq $text
-    $noneTps = if ($throughput.ContainsKey("none")) { [Nullable[double]] $throughput["none"] } else { $null }
-    $kvarnTps = if ($throughput.ContainsKey("kvarn")) { [Nullable[double]] $throughput["kvarn"] } else { $null }
-    $ratio = if ($noneTps -ne $null -and $kvarnTps -ne $null -and $noneTps -gt 0.0) { [Nullable[double]] ($kvarnTps/$noneTps) } else { $null }
+    $noneVal = if ($throughput.ContainsKey("none")) { [double] $throughput["none"] } else { [double]::NaN }
+    $kvarnVal = if ($throughput.ContainsKey("kvarn")) { [double] $throughput["kvarn"] } else { [double]::NaN }
+    $ratioVal = if (-not [double]::IsNaN($noneVal) -and -not [double]::IsNaN($kvarnVal) -and $noneVal -gt 0.0) {
+        $kvarnVal / $noneVal
+    } else {
+        [double]::NaN
+    }
+    $noneTps = if (-not [double]::IsNaN($noneVal)) { [Nullable[double]] $noneVal } else { $null }
+    $kvarnTps = if (-not [double]::IsNaN($kvarnVal)) { [Nullable[double]] $kvarnVal } else { $null }
+    $ratio = if (-not [double]::IsNaN($ratioVal)) { [Nullable[double]] $ratioVal } else { $null }
+    $backendMode = if ($kvqIncludesKvarn -and $hasKvarnEvidence) {
+        "kvarn"
+    } elseif ($kvqIncludesKvarn -and $AllowKvarnFallback.IsPresent) {
+        "normal-kv-fallback"
+    } else {
+        "normal"
+    }
+    $gatePassBool = $false
+    if ($MinKvarnRatio -gt 0.0 -and -not [double]::IsNaN($ratioVal)) {
+        $gatePassBool = ($ratioVal -ge $MinKvarnRatio)
+    }
+    if ($AllowKvarnFallback.IsPresent -and $backendMode -eq "normal-kv-fallback") {
+        $gatePassBool = $true
+    }
+    $gatePass = if ($MinKvarnRatio -gt 0.0) { [Nullable[bool]] $gatePassBool } else { $null }
+    if ($MinKvarnRatio -gt 0.0 -and [double]::IsNaN($ratioVal)) {
+        throw "llama-bench case '$($case.Name)' could not compute KVarN/normal ratio for production gate; see $logPath"
+    }
+    if ($FailBelowMinKvarnRatio.IsPresent -and -not $gatePassBool) {
+        throw ("llama-bench case '{0}' failed KVarN production ratio gate: ratio={1:P1}, threshold={2:P1}; see {3}" -f $case.Name, $ratioVal, $MinKvarnRatio, $logPath)
+    }
     $traceSummary = Get-KvarnTraceSummary $text
     $storeTraceSummary = Get-KvarnStoreTraceSummary $text
     $summaries += [pscustomobject]@{
         Case = $case.Name
+        BackendMode = $backendMode
         PromptTokens = $case.PromptTokens
         GenTokens = $case.GenTokens
         NormalTps = $noneTps
         KvarnTps = $kvarnTps
         KvarnVsNormal = $ratio
+        GateThreshold = if ($MinKvarnRatio -gt 0.0) { [Nullable[double]] $MinKvarnRatio } else { $null }
+        GatePass = $gatePass
+        GatePassBool = $gatePassBool
         TraceModes = $traceSummary.Modes
         TraceShapes = $traceSummary.Shapes
         StoreTraceKinds = $storeTraceSummary.Kinds
         StoreTraceShapes = $storeTraceSummary.Shapes
         Log = (Split-Path -Leaf $logPath)
     }
-    if ($ratio -ne $null) {
-        Write-Host ("KVarN benchmark ratio: {0} = {1:P1} of normal KV" -f $case.Name, $ratio)
+    if (-not [double]::IsNaN($ratioVal)) {
+        Write-Host ("KVarN benchmark ratio: {0} = {1:P1} of normal KV" -f $case.Name, $ratioVal)
     }
 }
 
@@ -469,17 +533,18 @@ $summaryCsv = Join-Path $OutputDir "summary.csv"
 $summaryMd = Join-Path $OutputDir "summary.md"
 $summaries | Export-Csv -NoTypeInformation -LiteralPath $summaryCsv
 $summaryLines = @(
-    "| case | prompt | gen | normal t/s | KVarN t/s | KVarN/normal | trace modes | store traces | log |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |"
+    "| case | backend mode | prompt | gen | normal t/s | KVarN t/s | KVarN/normal | gate | trace modes | store traces | log |",
+    "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |"
 )
 foreach ($s in $summaries) {
-    $normalText = if ($s.NormalTps -ne $null) { "{0:F2}" -f $s.NormalTps } else { "" }
-    $kvarnText = if ($s.KvarnTps -ne $null) { "{0:F2}" -f $s.KvarnTps } else { "" }
-    $ratioText = if ($s.KvarnVsNormal -ne $null) { "{0:P1}" -f $s.KvarnVsNormal } else { "" }
+    $normalText = Format-NullableDouble $s.NormalTps "F2"
+    $kvarnText = Format-NullableDouble $s.KvarnTps "F2"
+    $ratioText = if ($s.KvarnVsNormal -ne $null) { $s.KvarnVsNormal.Value.ToString("P1", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" }
+    $gateText = if ($MinKvarnRatio -lt 0.0) { "" } elseif ($s.GatePassBool) { "PASS" } else { "FAIL" }
     $traceText = if ([string]::IsNullOrWhiteSpace($s.TraceModes)) { "" } else { $s.TraceModes }
     $storeTraceText = if ([string]::IsNullOrWhiteSpace($s.StoreTraceKinds)) { "" } else { $s.StoreTraceKinds }
-    $summaryLines += "| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} |" -f `
-        $s.Case, $s.PromptTokens, $s.GenTokens, $normalText, $kvarnText, $ratioText, $traceText, $storeTraceText, $s.Log
+    $summaryLines += "| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9} | {10} |" -f `
+        $s.Case, $s.BackendMode, $s.PromptTokens, $s.GenTokens, $normalText, $kvarnText, $ratioText, $gateText, $traceText, $storeTraceText, $s.Log
     if (-not [string]::IsNullOrWhiteSpace($s.TraceShapes)) {
         $summaryLines += ""
         $summaryLines += "Trace shapes for `{0}`: {1}" -f $s.Case, $s.TraceShapes

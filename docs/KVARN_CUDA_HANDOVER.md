@@ -24,12 +24,21 @@ This branch integrates KVarN (quantized KV-cache) on CUDA with ATX MoE residency
 
 Verified at commit `4a4c6ff70` (ping-pong + iters4); ping-pong scoping fix landed in `030333631`.
 
+### Production policy (Gemma ISWA fallback)
+
+Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because experimental KVarN+ISWA is below the 90% throughput gate (~62–69%). Qwen hybrid KVarN remains fully enabled.
+
+- **Production default:** `create_memory()` in `src/llama-model.cpp` routes Gemma 4 KVarN+SWA to `llama_kv_cache_iswa` with a warning.
+- **Experimental opt-in:** `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` restores `llama_kv_cache_kvarn_iswa` for CUDA optimization work.
+- **One-command gate:** `scripts/kvarn/run_production_gate.ps1` — Qwen true KVarN ≥90%, Gemma production fallback ≥90%.
+
 ### Remaining
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Gemma 4 12B Q3 (ISWA)** | FAIL (~62–69%) | 512-dim fused-batch CUDA decode + ISWA dual-prepare overhead |
-| **Tier 2 logits** | Pending | `llama-results` / `compare_cuda_logits_ref.ps1` NMSE gates |
+| **Gemma KVarN+ISWA (experimental)** | FAIL (~62–69%) | 512-dim fused-batch CUDA decode + ISWA dual-prepare; opt-in only |
+| **Gemma production fallback** | Expected PASS | Normal ISWA when `--kv-cache-quant kvarn` (ratio ~100%) |
+| **Tier 2 logits** | Enforceable | `compare_cuda_logits_ref.ps1` NMSE thresholds + `-RunTier2` on production gate |
 | **Qwen `-ngl 99` full GPU** | Not comparable | 35B model exceeds 12 GB VRAM; use `-ncmoe 34` |
 
 **Hardware reference:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, `-fa off`.
@@ -146,6 +155,17 @@ Baseline (pre-refinement): `artifacts/kvarn-bench/gemma-591c008dc-post-refinemen
 
 Prerequisites: CUDA build at `build-kvarn-cuda-static-vs`, models on disk.
 
+### Production gate (recommended)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_production_gate.ps1 `
+  -QwenModel "C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf" `
+  -GemmaModel "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" `
+  -BuildDir build-kvarn-cuda-static-vs
+```
+
+Experimental Gemma KVarN+ISWA diagnostic: add `-RunGemmaExperimental`. Tier 2 logits: add `-RunTier2 -Tier2Model <small-model.gguf>`.
+
 ### Qwen P0 gate (PASS config)
 
 ```powershell
@@ -160,18 +180,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matr
   -OutputDir artifacts\kvarn-bench\qwen-pp512-gate-push\final
 ```
 
-### Gemma P0 gate (FAIL baseline — architect review target)
+### Gemma experimental KVarN+ISWA (below gate — CUDA work target)
 
 ```powershell
+$env:LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA = "1"
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\kvarn\run_bench_matrix.ps1 `
   -Model "C:\Users\sjake\Downloads\gemma-4-12b-it-UD-Q3_K_XL.gguf" `
   -BuildDir build-kvarn-cuda-static-vs `
   -CaseList "pp512:512:0,tg64:0:64" `
-  -FlashAttn off `
-  -Repetitions 3 `
-  -MinKvarnLayerLogs 8 `
-  -ExpectedKvarnLayers "5-47:6" `
-  -OutputDir artifacts\kvarn-bench\gemma-gate-push
+  -FlashAttn off -Repetitions 3 -KvarnIters 4 `
+  -MinKvarnLayerLogs 8 -ExpectedKvarnLayers "5-47:6" `
+  -OutputDir artifacts\kvarn-bench\gemma-experimental-iswa
+Remove-Item Env:\LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA
 ```
 
 ### Tier 2 logits (example)
@@ -204,8 +224,10 @@ python scripts/kvarn/kv_memory_estimate.py --self-test
 | P0 | `ggml/src/ggml-cuda/kvarn.cu` | Fused-batch attn, body store, env-flag gates |
 | P1 | `src/llama-graph.cpp` / `src/llama-graph.h` | Mask/scratch reuse helpers |
 | P1 | `tests/test-batch-split.cpp` | Tail-safe splitter unit tests |
-| P1 | `scripts/kvarn/run_bench_matrix.ps1` | Bench harness + artifact layout |
-| P1 | `scripts/kvarn/compare_cuda_logits_ref.ps1` | Tier 2 logits NMSE |
+| P0 | `src/llama-model.cpp` | Gemma KVarN+ISWA production fallback routing |
+| P1 | `scripts/kvarn/run_production_gate.ps1` | One-command Tier 1 acceptance matrix |
+| P1 | `scripts/kvarn/run_bench_matrix.ps1` | Bench harness + ratio gate enforcement |
+| P1 | `scripts/kvarn/compare_cuda_logits_ref.ps1` | Tier 2 logits NMSE thresholds |
 | P2 | `scripts/kvarn/README.md` | Extended runbook and historical bench tables |
 
 ---
@@ -220,6 +242,7 @@ python scripts/kvarn/kv_memory_estimate.py --self-test
 | Per-head decode kernels as default | `02ccf7639` regression; keep behind `LLAMA_KVARN_ATTN_DECODE_PER_HEAD=1` |
 | Ping-pong `gf_res_alt` for KVarN or decode | `030333631` — KVarN prefill and single-token decode must stay single-slot |
 | Tracking `kq_mask->ne[0]` to current `n_kv` for reuse | Forces graph rebuild every decode token; use stable full-capacity topology |
+| Default Gemma 4 to `llama_kv_cache_kvarn_iswa` in production | Below 90% gate; use ISWA fallback unless `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` |
 
 ---
 
