@@ -57,10 +57,10 @@ parentheses for delta.
 | Gemma 4 12B Q3, `-ngl 99` | pp512 | 2226.45 | 1398.09 | 62.8% | FAIL |
 | Gemma 4 12B Q3, `-ngl 99` | tg64 | 69.05 | 44.59 | 64.6% | FAIL |
 
-Artifacts: `artifacts/kvarn-bench/decode-fix-20260607/`.
-(Gemma), `artifacts/kvarn-bench/qwen-post-split-fix/` (Qwen,
-`c43744da1`). Prior crash repro:
-`artifacts/kvarn-bench/qwen-591c008dc-post-refinement/`.
+Artifacts: `artifacts/kvarn-bench/decode-fix-20260607/` (post-fix),
+`artifacts/kvarn-bench/gemma-591c008dc-post-refinement/` (Gemma baseline),
+`artifacts/kvarn-bench/qwen-post-split-fix/` (Qwen `c43744da1`).
+Prior crash repro: `artifacts/kvarn-bench/qwen-591c008dc-post-refinement/`.
 
 **Qwen hybrid ubatch fix (`c43744da1`):** `591c008dc` crashed on
 `llama-memory-recurrent.cpp:505` (`ubatch.equal_seqs()`) because
