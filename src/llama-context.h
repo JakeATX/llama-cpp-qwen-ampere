@@ -354,7 +354,11 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_alt;
     llm_graph_result_ptr gf_res_reserve;
+
+    // last graph result bound to the backend scheduler; used to rebind when alternating slots
+    llm_graph_result * gf_res_sched = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

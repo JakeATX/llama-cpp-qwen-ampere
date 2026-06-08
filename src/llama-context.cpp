@@ -482,6 +482,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
+    gf_res_alt.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
@@ -811,6 +812,10 @@ bool llama_context::memory_update(bool optimize) {
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        if (gf_res_alt) {
+            gf_res_alt->reset();
+        }
+        gf_res_sched = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1250,25 +1255,31 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
-
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(gf_res_prev.get(), ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    auto can_reuse_graph = [&](llm_graph_result * candidate) {
+        return !graph_reuse_disable && candidate && candidate->get_gf() && candidate->can_reuse(gparams);
+    };
+
+    llm_graph_result * res = gf_res_prev.get();
+    bool reused = false;
+
+    if (can_reuse_graph(res)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
-
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+        reused = true;
+    } else if (can_reuse_graph(gf_res_alt.get())) {
+        res = gf_res_alt.get();
+        reused = true;
+    } else {
+        // Keep the last graph in the alternate slot so alternating prefill ubatches
+        // (for example 384 + 128 prompt chunks) can reuse both topologies across reps.
+        if (!graph_reuse_disable && res->get_gf() && gf_res_alt) {
+            std::swap(gf_res_prev, gf_res_alt);
+            res = gf_res_prev.get();
         }
 
-        n_reused++;
-    } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1276,7 +1287,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        ggml_cgraph * gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1291,6 +1302,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        gf_res_sched = res;
+    }
+
+    if (reused) {
+        // with pipeline parallelism, the previous graph_compute_async may still be running
+        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+        // that the previous compute is still reading.
+        if (cparams.pipeline_parallel) {
+            ggml_backend_sched_synchronize(sched.get());
+        }
+
+        if (res != gf_res_sched) {
+            ggml_backend_sched_reset(sched.get());
+            if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
+                LLAMA_LOG_ERROR("%s: failed to rebind reused graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            gf_res_sched = res;
+        }
+
+        n_reused++;
     }
 
     // set the input data for the input tensors
@@ -2183,6 +2217,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
+    if (gf_res_alt) {
+        gf_res_alt->reset();
+    }
+    gf_res_sched = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this

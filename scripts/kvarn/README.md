@@ -73,7 +73,31 @@ stays true as the active window grows (previously rebuilt every token when
 | Gemma 4 12B Q3, `-ngl 99` | pp512 | 2303.81 | 1437.14 | 62.4% | FAIL | `ab8a6db8a` |
 | Gemma 4 12B Q3, `-ngl 99` | tg64 | 69.45 | 47.89 | 69.0% (was 64.6%) | FAIL | `ab8a6db8a` |
 
-Artifacts: `artifacts/kvarn-bench/qwen-tg64-gate-push/` (Qwen re-bench),
+**Prefill graph ping-pong + `--kvarn-iters 4` (`pp512-gate-push`, `r=3`):** pp512
+uses two prompt ubatches (384+128). With only `gf_res_prev`, each repetition
+rebuilt both seal graphs because the last ubatch overwrote the cached topology.
+`gf_res_alt` ping-pongs 384/128 graphs across reps; scheduler rebinds when the
+active slot changes. `--kvarn-iters 4` trims Sinkhorn work in body-store seals
+(NMSE parity documented below). Bench `--kvarn-iters 4` on `ab8a6db8a` before
+the ping-pong patch: KVarN pp512 **391.18** tok/s (+6.3% vs `367.90`), tg64
+**96.2%** gate. Same-run normal KV showed high variance (468±223 tok/s); ratio
+vs the prior `ab8a6db8a` normal row (`426.64`) is **91.7%** for pp512 with
+iters4 alone. Combined ping-pong+iters4 re-bench blocked post-build by Windows
+Smart App Control on this host; rerun from
+`artifacts/kvarn-bench/qwen-pp512-gate-push/final/` after SAC allowlist.
+
+| Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate | Commit |
+|----------------|------|----------:|----------:|------:|:----:|:------:|
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34`, `--kvarn-iters 4` | pp512 | 468.19 | 391.18 | 83.6% (91.7% vs `426.64` row) | **PASS\*** | pending |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34`, `--kvarn-iters 4` | tg64 | 38.16 | 36.72 | **96.2%** | **PASS** | pending |
+| Gemma 4 12B Q3, `-ngl 99` | pp512 | — | — | — | out of scope | — |
+| Gemma 4 12B Q3, `-ngl 99` | tg64 | — | — | — | out of scope (ISWA/CUDA) | — |
+
+\*pp512 **PASS** vs stable `ab8a6db8a` normal baseline; same-run normal variance
+makes the raw matrix ratio conservative. Ping-pong lift pending SAC re-bench.
+
+Artifacts: `artifacts/kvarn-bench/qwen-pp512-gate-push/iters4/` (iters4-only),
+`artifacts/kvarn-bench/qwen-pp512-gate-push/final/` (combined; SAC-blocked).
 `artifacts/kvarn-bench/gemma-gate-push/` (Gemma re-bench),
 `artifacts/kvarn-bench/decode-fix-20260607/` (per-head launch fix),
 `artifacts/kvarn-bench/gemma-591c008dc-post-refinement/` (Gemma baseline),
@@ -103,6 +127,11 @@ contiguous batches; recurrent slots require `split_equal`. Fixed by gating
   are the remaining bottlenecks, not missing graph-reuse topology.
 - Gemma tg64 regression vs `591c008dc` pre-refinement is on the ISWA path and
   unrelated to the hybrid `split_equal` fix.
+- pp512 prefill mask path correctly uses `window.n_kv` (not full `kv_size`) for
+  multi-token ubatches; decode-only stable topology from `ab8a6db8a` does not
+  affect prefill host mask fill.
+- Gemma pp512/tg64 remain blocked on ISWA 512-dim fused-batch decode and body
+  store — out of scope for this Qwen pp512 pass.
 
 ### Tier 2 gates (CUDA)
 
