@@ -79,11 +79,33 @@ function Convert-ToFileStem([string] $name) {
     return ($name -replace '[^A-Za-z0-9_.-]', '_')
 }
 
-function Format-NullableDouble([Nullable[double]] $value, [string] $format) {
-    if ($value -eq $null) {
+function Get-NullableDoubleValue($value) {
+    if ($null -eq $value) {
+        return $null
+    }
+    if ($value -is [Nullable[double]]) {
+        if (-not $value.HasValue) {
+            return $null
+        }
+        return [double] $value.Value
+    }
+    return [double] $value
+}
+
+function Format-NullableDouble($value, [string] $format) {
+    $d = Get-NullableDoubleValue $value
+    if ($null -eq $d) {
         return ""
     }
-    return $value.Value.ToString($format, [System.Globalization.CultureInfo]::InvariantCulture)
+    return $d.ToString($format, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Format-RatioPercent($value) {
+    $d = Get-NullableDoubleValue $value
+    if ($null -eq $d) {
+        return ""
+    }
+    return $d.ToString("P1", [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 function Test-KvarnEvidence([string] $text) {
@@ -539,7 +561,7 @@ $summaryLines = @(
 foreach ($s in $summaries) {
     $normalText = Format-NullableDouble $s.NormalTps "F2"
     $kvarnText = Format-NullableDouble $s.KvarnTps "F2"
-    $ratioText = if ($s.KvarnVsNormal -ne $null) { $s.KvarnVsNormal.Value.ToString("P1", [System.Globalization.CultureInfo]::InvariantCulture) } else { "" }
+    $ratioText = Format-RatioPercent $s.KvarnVsNormal
     $gateText = if ($MinKvarnRatio -lt 0.0) { "" } elseif ($s.GatePassBool) { "PASS" } else { "FAIL" }
     $traceText = if ([string]::IsNullOrWhiteSpace($s.TraceModes)) { "" } else { $s.TraceModes }
     $storeTraceText = if ([string]::IsNullOrWhiteSpace($s.StoreTraceKinds)) { "" } else { $s.StoreTraceKinds }

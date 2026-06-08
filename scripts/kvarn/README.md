@@ -29,6 +29,12 @@ Tier 1: KVarN/normal ratio **≥ 90%** on both prefill (`pp*`) and decode (`tg*`
 per model×config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
 (output quality) deferred.
 
+**One-command acceptance:** `scripts/kvarn/run_production_gate.ps1` builds, runs
+KVarN unit tests, gates Qwen on true KVarN (≥90%), and gates Gemma on production
+ISWA fallback (≥90%). Gemma experimental KVarN+ISWA is opt-in via
+`-RunGemmaExperimental` or `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` (known below
+gate; for CUDA work only). Tier 2: `-RunTier2 -LogitsModel <small.gguf>`.
+
 **Hardware:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, branch
 `kvarn-atx-integration`, `-fa off`, `--kvarn-preset kvarn_k4v2_g128`.
 

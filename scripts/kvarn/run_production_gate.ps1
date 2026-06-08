@@ -8,6 +8,7 @@ param(
     [switch] $SkipTests,
     [switch] $RunGemmaExperimental,
     [switch] $RunTier2,
+    [Alias("LogitsModel")]
     [string] $Tier2Model = "",
     [string[]] $QwenExtraArgs = @("-ncmoe", "34")
 )
@@ -24,7 +25,7 @@ if (-not (Test-Path -LiteralPath $GemmaModel)) {
     throw "GemmaModel not found at $GemmaModel"
 }
 if ($RunTier2.IsPresent -and [string]::IsNullOrWhiteSpace($Tier2Model)) {
-    throw "RunTier2 requires Tier2Model"
+    throw "RunTier2 requires -Tier2Model (or -LogitsModel)"
 }
 if ($RunTier2.IsPresent -and -not (Test-Path -LiteralPath $Tier2Model)) {
     throw "Tier2Model not found at $Tier2Model"
