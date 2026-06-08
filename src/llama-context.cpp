@@ -1259,6 +1259,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(gf_res_prev.get(), ubatch, mctx, gtype);
 
+    // Ping-pong only for multi-token prefill (e.g. 384+128 pp512). Decode is always
+    // n_tokens==1 and must not swap slots; KVarN mixed-attn scratch cannot share sched
+    // across two cached topologies.
+    const bool use_alt_slot = gf_res_alt &&
+        ubatch.n_tokens > 1 &&
+        cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN;
+
     auto can_reuse_graph = [&](llm_graph_result * candidate) {
         return !graph_reuse_disable && candidate && candidate->get_gf() && candidate->can_reuse(gparams);
     };
@@ -1269,25 +1276,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (can_reuse_graph(res)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
         reused = true;
-    } else if (can_reuse_graph(gf_res_alt.get())) {
+    } else if (use_alt_slot && can_reuse_graph(gf_res_alt.get())) {
         res = gf_res_alt.get();
         reused = true;
     } else {
         // Keep the last graph in the alternate slot so alternating prefill ubatches
         // (for example 384 + 128 prompt chunks) can reuse both topologies across reps.
-        if (!graph_reuse_disable && res->get_gf() && gf_res_alt) {
+        if (!graph_reuse_disable && use_alt_slot && res->get_gf()) {
             std::swap(gf_res_prev, gf_res_alt);
             res = gf_res_prev.get();
         }
 
         res->reset();
 
+        // build_graph stores tensors in params.res; recompute after any slot swap above.
+        const auto build_gparams = graph_params(res, ubatch, mctx, gtype);
+
+        ggml_backend_sched_synchronize(sched.get());
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
-        ggml_cgraph * gf = model.build_graph(gparams);
+        ggml_cgraph * gf = model.build_graph(build_gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1307,12 +1318,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (reused) {
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
+        // graph_compute_async may still be running; wait before set_inputs / rebind.
+        ggml_backend_sched_synchronize(sched.get());
 
         if (res != gf_res_sched) {
             ggml_backend_sched_reset(sched.get());

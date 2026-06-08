@@ -76,28 +76,24 @@ stays true as the active window grows (previously rebuilt every token when
 **Prefill graph ping-pong + `--kvarn-iters 4` (`pp512-gate-push`, `r=3`):** pp512
 uses two prompt ubatches (384+128). With only `gf_res_prev`, each repetition
 rebuilt both seal graphs because the last ubatch overwrote the cached topology.
-`gf_res_alt` ping-pongs 384/128 graphs across reps; scheduler rebinds when the
-active slot changes. `--kvarn-iters 4` trims Sinkhorn work in body-store seals
-(NMSE parity documented below). Bench `--kvarn-iters 4` on `ab8a6db8a` before
-the ping-pong patch: KVarN pp512 **391.18** tok/s (+6.3% vs `367.90`), tg64
-**96.2%** gate. Same-run normal KV showed high variance (468±223 tok/s); ratio
-vs the prior `ab8a6db8a` normal row (`426.64`) is **91.7%** for pp512 with
-iters4 alone. Combined ping-pong+iters4 re-bench blocked post-build by Windows
-Smart App Control on this host; rerun from
-`artifacts/kvarn-bench/qwen-pp512-gate-push/final/` after SAC allowlist.
+`gf_res_alt` ping-pongs 384/128 graphs across reps for **normal KV prefill only**
+(`n_tokens > 1`, not KVarN); decode (`tg*`) and KVarN prefill keep the single-slot
+path. Scheduler rebinds when the active slot changes. `--kvarn-iters 4` trims
+Sinkhorn work in body-store seals (NMSE parity documented below). Prior iters4-only
+bench on `ab8a6db8a` (no ping-pong): pp512 **91.7%** vs that row's normal baseline,
+tg64 **96.2%**. Combined ping-pong+iters4 at `4a4c6ff70` (with ping-pong scoping
+fix): **full Qwen `-ncmoe 34` cell PASS** — both cases ≥90%.
 
 | Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate | Commit |
 |----------------|------|----------:|----------:|------:|:----:|:------:|
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34`, `--kvarn-iters 4` | pp512 | 468.19 | 391.18 | 83.6% (91.7% vs `426.64` row) | **PASS\*** | pending |
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34`, `--kvarn-iters 4` | tg64 | 38.16 | 36.72 | **96.2%** | **PASS** | pending |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34`, `--kvarn-iters 4` | pp512 | 380.27 | 376.78 | **99.1%** | **PASS** | `4a4c6ff70` |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34`, `--kvarn-iters 4` | tg64 | 39.74 | 36.84 | **92.7%** | **PASS** | `4a4c6ff70` |
 | Gemma 4 12B Q3, `-ngl 99` | pp512 | — | — | — | out of scope | — |
 | Gemma 4 12B Q3, `-ngl 99` | tg64 | — | — | — | out of scope (ISWA/CUDA) | — |
 
-\*pp512 **PASS** vs stable `ab8a6db8a` normal baseline; same-run normal variance
-makes the raw matrix ratio conservative. Ping-pong lift pending SAC re-bench.
-
-Artifacts: `artifacts/kvarn-bench/qwen-pp512-gate-push/iters4/` (iters4-only),
-`artifacts/kvarn-bench/qwen-pp512-gate-push/final/` (combined; SAC-blocked).
+Artifacts: `artifacts/kvarn-bench/qwen-pp512-gate-push/iters4/` (iters4-only,
+`ab8a6db8a`), `artifacts/kvarn-bench/qwen-pp512-gate-push/final/` (combined
+ping-pong + iters4, `4a4c6ff70`).
 `artifacts/kvarn-bench/gemma-gate-push/` (Gemma re-bench),
 `artifacts/kvarn-bench/decode-fix-20260607/` (per-head launch fix),
 `artifacts/kvarn-bench/gemma-591c008dc-post-refinement/` (Gemma baseline),
