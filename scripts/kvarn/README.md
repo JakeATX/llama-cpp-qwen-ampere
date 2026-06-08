@@ -57,17 +57,24 @@ parentheses for delta.
 | Gemma 4 12B Q3, `-ngl 99` | pp512 | 2226.45 | 1398.09 | 62.8% | FAIL |
 | Gemma 4 12B Q3, `-ngl 99` | tg64 | 69.05 | 44.59 | 64.6% | FAIL |
 
-**Decode graph reuse (`qwen-tg64-gate-push`, `r=3`):** one-token decode graphs
-now allocate full-capacity KQ masks and worst-case mixed-attention scratch so
-`can_reuse` stays true as the active window grows (previously rebuilt every
-token when `kq_mask->ne[0]` tracked current `n_kv`).
+**Decode graph reuse (`ab8a6db8a`, `r=3`):** one-token decode graphs now allocate
+full-capacity KQ masks and worst-case mixed-attention scratch so `can_reuse`
+stays true as the active window grows (previously rebuilt every token when
+`kq_mask->ne[0]` tracked current `n_kv`). Applied to **both** dense KVarN
+(`llm_graph_input_attn_kvarn`) and ISWA base layers
+(`llm_graph_input_attn_kv_iswa` / `build_attn_inp_kv_iswa` /
+`base_mixed_attn_nodes`) via shared helpers `kvarn_graph_mask_n_kv`,
+`kvarn_graph_build_scratch_window`, and `kvarn_graph_reuse_mask_n_kv`.
 
-| Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate |
-|----------------|------|----------:|----------:|------:|:----:|
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | 39.26 | 36.40 | **92.7%** | **PASS** |
-| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 469.31 | 391.40 | 83.4% | FAIL (variance) |
+| Model / config | Case | Normal t/s | KVarN t/s | Ratio | Gate | Commit |
+|----------------|------|----------:|----------:|------:|:----:|:------:|
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | pp512 | 426.64 | 367.90 | 86.2% | FAIL | `ab8a6db8a` |
+| Qwen3.6 MTP IQ3, `-ngl 99 -ncmoe 34` | tg64 | 38.80 | 36.86 | **95.0%** | **PASS** | `ab8a6db8a` |
+| Gemma 4 12B Q3, `-ngl 99` | pp512 | 2303.81 | 1437.14 | 62.4% | FAIL | `ab8a6db8a` |
+| Gemma 4 12B Q3, `-ngl 99` | tg64 | 69.45 | 47.89 | 69.0% (was 64.6%) | FAIL | `ab8a6db8a` |
 
-Artifacts: `artifacts/kvarn-bench/qwen-tg64-gate-push/` (tg64 gate),
+Artifacts: `artifacts/kvarn-bench/qwen-tg64-gate-push/` (Qwen re-bench),
+`artifacts/kvarn-bench/gemma-gate-push/` (Gemma re-bench),
 `artifacts/kvarn-bench/decode-fix-20260607/` (per-head launch fix),
 `artifacts/kvarn-bench/gemma-591c008dc-post-refinement/` (Gemma baseline),
 `artifacts/kvarn-bench/qwen-post-split-fix/` (Qwen `c43744da1`).
@@ -90,8 +97,12 @@ contiguous batches; recurrent slots require `split_equal`. Fixed by gating
   grid; fixed by gating behind `LLAMA_KVARN_ATTN_DECODE_PER_HEAD=1`.
 - `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` on Qwen pp512 **regresses** to ~16%
   (fused-batch is the correct path).
-- Gemma tg64 regression is on the ISWA path and unrelated to the hybrid
-  `split_equal` fix.
+- Gemma tg64 decode graph reuse fix (`ab8a6db8a`, ISWA base layers) recovered
+  +4.4 pp vs `02ccf7639` per-head launch fix (64.6% → 69.0%) but remains well
+  below the 90% gate — ISWA/SWA-layer attention and 512-dim fused-batch decode
+  are the remaining bottlenecks, not missing graph-reuse topology.
+- Gemma tg64 regression vs `591c008dc` pre-refinement is on the ISWA path and
+  unrelated to the hybrid `split_equal` fix.
 
 ### Tier 2 gates (CUDA)
 
