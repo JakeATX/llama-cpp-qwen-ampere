@@ -908,18 +908,6 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
-bool llm_arch_supports_recurrent_partial_rollback(const llm_arch & arch) {
-    switch (arch) {
-        case LLM_ARCH_QWEN35:
-        case LLM_ARCH_QWEN35MOE:
-        case LLM_ARCH_QWEN35_MTP:
-        case LLM_ARCH_QWEN35MOE_MTP:
-            return true;
-        default:
-            return false;
-    }
-}
-
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:

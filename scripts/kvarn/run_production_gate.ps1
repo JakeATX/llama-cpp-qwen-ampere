@@ -4,6 +4,8 @@ param(
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-static-vs"),
     [string] $OutputDir = "",
     [double] $Tier1MinRatio = 0.90,
+    [int] $QwenRepetitions = 5,
+    [int] $GemmaRepetitions = 3,
     [switch] $SkipBuild,
     [switch] $SkipTests,
     [switch] $RunGemmaExperimental,
@@ -17,6 +19,12 @@ $ErrorActionPreference = "Stop"
 
 if ($Tier1MinRatio -le 0.0 -or $Tier1MinRatio -gt 1.0) {
     throw "Tier1MinRatio must be in (0, 1]"
+}
+if ($QwenRepetitions -le 0) {
+    throw "QwenRepetitions must be positive"
+}
+if ($GemmaRepetitions -le 0) {
+    throw "GemmaRepetitions must be positive"
 }
 if (-not (Test-Path -LiteralPath $QwenModel)) {
     throw "QwenModel not found at $QwenModel"
@@ -54,11 +62,19 @@ function Invoke-Logged([string] $Name, [scriptblock] $Body) {
     if (Test-Path -LiteralPath $log) {
         Remove-Item -LiteralPath $log -Force
     }
+    $oldErrorActionPreference = $ErrorActionPreference
     try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 0
         & $Body 2>&1 | Tee-Object -FilePath $log | Write-Host
+        if ($global:LASTEXITCODE -ne 0) {
+            throw "$Name failed with exit code $global:LASTEXITCODE"
+        }
     } catch {
         Write-Error "$Name failed; see $log"
         throw
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
     }
 }
 
@@ -67,6 +83,8 @@ $manifest = @(
     "gemma_model=$((Resolve-Path -LiteralPath $GemmaModel).Path)",
     "build_dir=$BuildDir",
     "tier1_min_ratio=$Tier1MinRatio",
+    "qwen_repetitions=$QwenRepetitions",
+    "gemma_repetitions=$GemmaRepetitions",
     "run_gemma_experimental=$($RunGemmaExperimental.IsPresent)",
     "run_tier2=$($RunTier2.IsPresent)",
     "tier2_model=$Tier2Model",
@@ -95,7 +113,7 @@ Invoke-Logged "tier1 qwen kvarn" {
         -BuildDir $BuildDir `
         -CaseList "pp512:512:0,tg64:0:64" `
         -FlashAttn off `
-        -Repetitions 3 `
+        -Repetitions $QwenRepetitions `
         -KvarnIters 4 `
         -MinKvarnRatio $Tier1MinRatio `
         -FailBelowMinKvarnRatio `
@@ -115,7 +133,7 @@ try {
             -BuildDir $BuildDir `
             -CaseList "pp512:512:0,tg64:0:64" `
             -FlashAttn off `
-            -Repetitions 3 `
+            -Repetitions $GemmaRepetitions `
             -KvarnIters 4 `
             -MinKvarnRatio $Tier1MinRatio `
             -FailBelowMinKvarnRatio `
@@ -129,15 +147,17 @@ try {
 
 if ($RunGemmaExperimental.IsPresent) {
     $oldForceIswa = [Environment]::GetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", "Process")
+    $oldForceNormalIswa = [Environment]::GetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", "Process")
     try {
         [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", "1", "Process")
+        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", $null, "Process")
         Invoke-Logged "tier1 gemma experimental kvarn iswa" {
             & $benchScript `
                 -Model $GemmaModel `
                 -BuildDir $BuildDir `
                 -CaseList "pp512:512:0,tg64:0:64" `
                 -FlashAttn off `
-                -Repetitions 3 `
+                -Repetitions $GemmaRepetitions `
                 -KvarnIters 4 `
                 -MinKvarnLayerLogs 8 `
                 -ExpectedKvarnLayers "5-47:6" `
@@ -146,6 +166,7 @@ if ($RunGemmaExperimental.IsPresent) {
         }
     } finally {
         [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", $oldForceIswa, "Process")
+        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", $oldForceNormalIswa, "Process")
     }
 }
 

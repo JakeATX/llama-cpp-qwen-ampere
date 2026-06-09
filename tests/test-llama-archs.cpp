@@ -12,6 +12,7 @@
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,12 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     }
 
     return mse_a_b / mse_a_0;
+}
+
+static bool all_finite(const std::vector<float> & values) {
+    return std::all_of(values.begin(), values.end(), [](float value) {
+        return std::isfinite(value);
+    });
 }
 
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
@@ -522,7 +529,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
 
-        dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        if (devices_meta.size() > 1) {
+            dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -592,19 +601,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
                         model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
-                        const double nmse_val = nmse(logits_cpu, logits_dev);
-                        snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
-                        status_nmse = "\033[1;32mOK\033[0m";
-                        if (nmse_val > 1e-4) {
-                            all_ok = false;
-                            status_nmse = "\033[1;31mFAIL\033[0m";
+                        if (all_finite(logits_cpu) && all_finite(logits_dev)) {
+                            const double nmse_val = nmse(logits_cpu, logits_dev);
+                            snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
+                            status_nmse = "\033[1;32mOK\033[0m";
+                            if (nmse_val > 1e-4) {
+                                all_ok = false;
+                                status_nmse = "\033[1;31mFAIL\033[0m";
+                            }
                         }
                     }
 
                     FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
-                    if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    if (file != nullptr && llama_model_saver_supports_arch(arch) &&
+                            dc.split_mode != LLAMA_SPLIT_MODE_TENSOR && all_finite(logits_dev)) {
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();

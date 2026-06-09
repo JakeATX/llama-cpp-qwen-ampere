@@ -3,7 +3,7 @@
 **Audience:** External architect reviewing the CUDA KVarN vs normal KV throughput gap.  
 **Last updated:** 2026-06-08  
 **Branch:** `kvarn-atx-integration`  
-**HEAD:** `cf044f51b` (+ post-merge integration fixes)  
+**HEAD:** `54ddfa768` + working-tree mainline parity fixes  
 **Upstream sync:** merged `upstream-ggml/master` @ `42a0afd59` (2026-06-08); `hparams.n_layer` → `n_layer_all` / `n_layer_nextn` migration applied to KVarN paths  
 **Remote:** [https://github.com/JakeATX/llama.cpp](https://github.com/JakeATX/llama.cpp) (`jakeatx` / `fork`)  
 **Review URL:** [https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration)
@@ -25,6 +25,28 @@ This branch integrates KVarN (quantized KV-cache) on CUDA with ATX MoE residency
 
 Verified at commit `4a4c6ff70` (ping-pong + iters4); ping-pong scoping fix landed in `030333631`.
 
+### Post-merge validation (2026-06-08)
+
+`artifacts/kvarn-production-gate/20260608-164314/`, Qwen Q4_K_M split + Gemma Q4_K_XL, `-fa off`, Release build `54ddfa768`.
+
+| Model | Case | Backend mode | Normal t/s | KVarN t/s | Ratio | Gate |
+|-------|------|--------------|-----------:|----------:|------:|:----:|
+| Qwen3.6 MTP Q4_K_M (`-ncmoe 34`) | pp512 | true KVarN | 115.64 | 194.65 | **168.3%** | **PASS** |
+| Qwen3.6 MTP Q4_K_M (`-ncmoe 34`) | tg64 | true KVarN | 27.91 | 33.48 | **120.0%** | **PASS** |
+| Gemma 4 Q4_K_XL | pp512 | normal ISWA fallback | 2218.50 | 2715.60 | **122.4%** | **PASS** |
+| Gemma 4 Q4_K_XL | tg64 | normal ISWA fallback | 63.93 | 65.10 | **101.8%** | **PASS** |
+
+Post-common propagation recheck:
+
+| Model | Case | Backend mode | Normal t/s | KVarN/fallback t/s | Ratio | Gate | Artifact |
+|-------|------|--------------|-----------:|-------------------:|------:|:----:|----------|
+| Qwen3.6 MTP Q4_K_M (`-ncmoe 34`) | pp512 | true KVarN | 100.56 | 180.48 | **179.5%** | **PASS** | `artifacts/kvarn-production-gate/20260608-170024/qwen-tier1/` |
+| Qwen3.6 MTP Q4_K_M (`-ncmoe 34`, r=5 rerun) | tg64 | true KVarN | 27.25 | 33.77 | **123.9%** | **PASS** | `artifacts/kvarn-bench/qwen-tier1-tg64-rerun-post-common/` |
+| Gemma 4 Q4_K_XL | pp512 | normal ISWA fallback | 2219.04 | 2709.42 | **122.1%** | **PASS** | `artifacts/kvarn-bench/gemma-tier1-fallback-post-common/` |
+| Gemma 4 Q4_K_XL | tg64 | normal ISWA fallback | 64.35 | 64.77 | **100.7%** | **PASS** | `artifacts/kvarn-bench/gemma-tier1-fallback-post-common/` |
+
+The full wrapper run at `artifacts/kvarn-production-gate/20260608-170024/` had a noisy Qwen `tg64` r=3 failure (73.1%) with high variance; the same case passed at r=5. `run_production_gate.ps1` now defaults Qwen Tier 1 to 5 repetitions.
+
 ### Production policy (Gemma ISWA fallback)
 
 Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because experimental KVarN+ISWA is below the 90% throughput gate (~62–69%). Qwen hybrid KVarN remains fully enabled.
@@ -38,7 +60,8 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 | Area | Status | Notes |
 |------|--------|-------|
 | **Gemma KVarN+ISWA (experimental)** | FAIL (~62–66%) | Post speed-patch (parallel Hadamard, warp-q·k, parallel quantize): pp512 **62.3%**, tg64 **66.0%** at `RtnQuantile=1.0`; still opt-in only |
-| **Gemma production fallback** | Expected PASS | Normal ISWA when `--kv-cache-quant kvarn` (ratio ~100%) |
+| **Gemma production fallback** | PASS | Normal ISWA when `--kv-cache-quant kvarn`; post-common Q4_XL gate: pp512 **122.1%**, tg64 **100.7%** |
+| **Common KVarN param propagation** | FIXED | `common_context_params_to_llama()` again copies `kv_cache_quant_type` + `kvarn`; server load-failure test now covers an explicit unsupported preset |
 | **Tier 2 logits** | Enforceable | `compare_cuda_logits_ref.ps1` NMSE thresholds + `-RunTier2` on production gate |
 | **Qwen `-ngl 99` full GPU** | Not comparable | 35B model exceeds 12 GB VRAM; use `-ncmoe 34` |
 
@@ -139,6 +162,7 @@ Baseline (pre-refinement): `artifacts/kvarn-bench/gemma-591c008dc-post-refinemen
 | **Decode per-head launch regression** | `02ccf7639` | Default `n_queries==1` path launched one CUDA kernel per head; gated behind env flag |
 | **Decode graph rebuild every token** | `ab8a6db8a` | `kq_mask->ne[0]` tracked current `n_kv`; now stable full-capacity topology |
 | **Ping-pong graph cache for 384+128 ubatches** | `4a4c6ff70` / `030333631` | `gf_res_alt` ping-pong for normal KV prefill; scoped away from KVarN/decode |
+| **Common init KVarN propagation** | pending | Restores `kv_cache_quant_type`/`kvarn` into `llama_context_params`; cleans partial common init state on context failure |
 
 ---
 

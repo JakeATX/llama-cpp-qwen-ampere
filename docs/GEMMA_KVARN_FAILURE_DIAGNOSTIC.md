@@ -1,7 +1,7 @@
 # Gemma 4 KVarN+ISWA throughput failure — evidence-based diagnostic
 
 **Audience:** Architect / CUDA implementer  
-**Branch:** `kvarn-atx-integration` @ `5f3f037a4` (speed patch)  
+**Branch:** `kvarn-atx-integration` @ `54ddfa768` + working-tree mainline parity fixes  
 **Hardware:** RTX 5070 12 GB, `build-kvarn-cuda-static-vs`, `-fa off`, `-ngl 99`  
 **Model:** `gemma-4-12b-it-UD-Q3_K_XL.gguf` (Gemma 4 12B Q3)  
 **Gate:** KVarN/normal ≥ 90% on pp512 and tg64 with `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`
@@ -14,6 +14,8 @@
 |--------------|------|----------:|----------:|------:|:----:|
 | `artifacts/kvarn-bench/gemma-speed-patch-v2/` | pp512 | 2193.48 ± **510.54** | 1365.94 ± **3.76** | **62.3%** | FAIL |
 | `artifacts/kvarn-bench/gemma-speed-patch-v2/` | tg64 | 66.92 ± 3.83 | 44.20 ± 3.06 | **66.0%** | FAIL |
+| `artifacts/kvarn-bench/gemma-true-kvarn-post-memset-skip-iters4/` | pp512 | 2356.15 ± **629.57** | 1443.76 ± **6.29** | **61.3%** | FAIL |
+| `artifacts/kvarn-bench/gemma-true-kvarn-post-memset-skip-iters4/` | tg64 | 63.99 ± 1.67 | 45.19 ± 0.04 | **70.6%** | FAIL |
 | `artifacts/kvarn-bench/gemma-true-kvarn-speed-patch/` | pp512 | 2305.01 ± 588.89 | 1357.04 ± 147.60 | **58.9%** | FAIL (aborted before tg64) |
 | `artifacts/kvarn-bench/gemma-gate-push/` | pp512 | 2303.81 ± 641.63 | 1437.14 ± 42.95 | **62.4%** | FAIL |
 | `artifacts/kvarn-bench/gemma-gate-push/` | tg64 | 69.45 | 47.89 | **69.0%** | FAIL |
@@ -21,6 +23,21 @@
 **Source logs:** `pp512.md.txt`, `tg64.md.txt`, `summary.csv` in each directory.
 
 **Post speed-patch (`5f3f037a4`):** marginal pp512 movement (58.9% → 62.3%); tg64 flat (~66–69%). ctest still green.
+
+### Post-merge production fallback check
+
+These are **not** true KVarN+ISWA runs. They validate the production policy where Gemma 4 with `--kv-cache-quant kvarn` routes to normal ISWA KV unless `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` is set.
+
+| Artifact dir | FA | Case | Normal t/s | Fallback t/s | Ratio | Gate |
+|--------------|:--:|------|----------:|-------------:|------:|:----:|
+| `artifacts/kvarn-production-gate/20260608-164314/gemma-tier1-production-fallback/` | off | pp512 | 2218.50 | 2715.60 | **122.4%** | PASS |
+| `artifacts/kvarn-production-gate/20260608-164314/gemma-tier1-production-fallback/` | off | tg64 | 63.93 | 65.10 | **101.8%** | PASS |
+| `artifacts/kvarn-bench/gemma-tier1-fallback-post-common/` | off | pp512 | 2219.04 | 2709.42 | **122.1%** | PASS |
+| `artifacts/kvarn-bench/gemma-tier1-fallback-post-common/` | off | tg64 | 64.35 | 64.77 | **100.7%** | PASS |
+| `artifacts/kvarn-bench/post-merge-gemma-fa-on/` | on | pp512 | 746.13 | 764.58 | **102.5%** | informational |
+| `artifacts/kvarn-bench/post-merge-gemma-fa-on/` | on | tg64 | 35.90 | 36.45 | **101.5%** | informational |
+
+FA-on fallback pp512 moved down from the older ~111% note to **102.5%**, but remains over the production gate because the backend mode is normal ISWA fallback.
 
 ---
 
@@ -71,7 +88,7 @@ Manifest: `min_kvarn_body_records=0`, `extra_args=--kvarn-tail-tokens 512`.
 - Fullrange quantize (512-wide rows) — patched parallel
 - **8 KVarN layers × 2 records** per pp512 bench completion
 
-Next code target: **fuse or batch body-store seals** across K+V and/or layers; profile seal frequency per ubatch in ISWA `prepare()`.
+The latest code skips redundant body-buffer `cudaMemsetAsync` launches for full-range byte-overwriting K4/V2 rows. It is safe but only marginal: pp512 remains **61.3%** on the Q4_XL gate-shaped run. Next code target remains **fuse or batch body-store seals** across K+V and/or layers; profile seal frequency per ubatch in ISWA `prepare()`.
 
 ---
 
@@ -106,7 +123,15 @@ Decode does **not** hit body-store (records stay 0). Remaining gap is:
 
 Historical tg64 (pre speed-patch): `gemma-gate-push/` **69.0%**, `decode-fix-20260607/gemma/` **64.6%**.
 
-**Architect action:** Profile decode with `-TraceAttn` on tg64; compare `fused-batch` vs `warpqk` dispatch at `head_dim=512`. Target: reduce per-layer launch count and ISWA `prepare()` overhead on `n_queries=1`.
+Post-cleanup A/Bs confirmed the current warpqk default is still best:
+
+| Artifact dir | Variant | KVarN tg64 | Ratio |
+|--------------|---------|-----------:|------:|
+| `artifacts/kvarn-bench/gemma-true-kvarn-post-memset-skip-iters4/` | default warpqk | 45.19 | **70.6%** |
+| `artifacts/kvarn-bench/gemma-true-kvarn-serial-fused-tg64/` | `LLAMA_KVARN_ATTN_SERIAL_FUSED=1` | 38.59 | **60.2%** |
+| `artifacts/kvarn-bench/gemma-true-kvarn-decode-per-head-tg64/` | `LLAMA_KVARN_ATTN_DECODE_PER_HEAD=1` | 38.54 | **60.2%** |
+
+**Architect action:** keep warpqk as default. Profile decode with `-TraceAttn` on tg64 and target ISWA `prepare()` overhead plus the 512-dim value stage; do not promote serial fused or per-head decode.
 
 ---
 

@@ -627,6 +627,14 @@ static void kvarn_sinkhorn_variance_normalize_parallel(
     }
 }
 
+static bool kvarn_fullrange_packer_overwrites_body(uint32_t cols, uint32_t bits) {
+    if (bits != 2 && bits != 4) {
+        return false;
+    }
+
+    return (size_t(cols)*bits) % 8 == 0;
+}
+
 void ggml_cuda_kvarn_store_k_body_reference_minmax(
         const float * k_tile,
         uint8_t * k_body,
@@ -646,7 +654,9 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
     float * rtn_scale = scratch + n;
     float * rtn_zp    = scratch + n + tmp_rows;
 
-    cudaMemsetAsync(k_body, 0, kvarn_packed_nbytes(n, key_bits), cuda_stream);
+    if (rtn_quantile < 1.0f || !kvarn_fullrange_packer_overwrites_body(group_size, key_bits)) {
+        cudaMemsetAsync(k_body, 0, kvarn_packed_nbytes(n, key_bits), cuda_stream);
+    }
     const int k_hadamard_block = kvarn_pow2_block(head_dim);
     if (k_hadamard_block <= 1024) {
         kvarn_hadamard_cols_parallel_kernel<<<int(group_size), k_hadamard_block, size_t(k_hadamard_block)*sizeof(float), cuda_stream>>>(
@@ -695,7 +705,9 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
     float * rtn_scale = scratch + n;
     float * rtn_zp    = scratch + n + tmp_rows;
 
-    cudaMemsetAsync(v_body, 0, kvarn_packed_nbytes(n, value_bits), cuda_stream);
+    if (rtn_quantile < 1.0f || !kvarn_fullrange_packer_overwrites_body(head_dim, value_bits)) {
+        cudaMemsetAsync(v_body, 0, kvarn_packed_nbytes(n, value_bits), cuda_stream);
+    }
     const int v_hadamard_block = kvarn_pow2_block(head_dim);
     if (v_hadamard_block <= 1024) {
         kvarn_hadamard_rows_parallel_kernel<<<int(group_size), v_hadamard_block, size_t(v_hadamard_block)*sizeof(float), cuda_stream>>>(

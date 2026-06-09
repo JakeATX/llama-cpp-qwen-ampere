@@ -21,6 +21,7 @@ int main(int argc, char ** argv) {
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_KVARN;
     params.kvarn = llama_kvarn_default_params();
+    params.kvarn.group_size = 64;
 
     server_context ctx_server;
     const bool loaded = ctx_server.load_model(params);
@@ -28,7 +29,7 @@ int main(int argc, char ** argv) {
     llama_backend_free();
 
     if (loaded) {
-        std::fprintf(stderr, "expected KVarN server model load to fail for unsupported fixture model\n");
+        std::fprintf(stderr, "expected KVarN server model load to fail for unsupported KVarN preset\n");
         return 1;
     }
 
