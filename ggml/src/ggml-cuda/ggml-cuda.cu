@@ -3058,8 +3058,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     int32_t value_bits;
                     int32_t sinkhorn_iters;
                     float   rtn_quantile;
+                    int32_t n_heads;
                 } params;
                 memcpy(&params, dst->op_params, sizeof(params));
+                if (params.n_heads <= 0) {
+                    params.n_heads = 1;
+                }
 
                 const ggml_tensor * k_tile   = dst->src[0];
                 const ggml_tensor * v_tile   = dst->src[1];
@@ -3076,26 +3080,49 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 if (ggml_cuda_kvarn_store_trace_enabled() && ggml_cuda_kvarn_store_trace_claim()) {
                     std::fprintf(stderr,
                             "KVarN CUDA store-body trace: kind=kv head_dim=%d group_size=%d key_bits=%d value_bits=%d"
-                            " sinkhorn_iters=%d rtn_quantile=%.9g k_body_bytes=%" PRId64
+                            " sinkhorn_iters=%d rtn_quantile=%.9g n_heads=%d k_body_bytes=%" PRId64
                             " v_body_bytes=%" PRId64 " k_scale_floats=%" PRId64
                             " v_scale_floats=%" PRId64 " scratch_floats=%" PRId64 "\n",
                             params.head_dim, params.group_size, params.key_bits, params.value_bits,
-                            params.sinkhorn_iters, double(params.rtn_quantile),
+                            params.sinkhorn_iters, double(params.rtn_quantile), params.n_heads,
                             k_body_bytes, v_body_bytes, k_scale_floats, v_scale_floats,
                             scratch ? ggml_nelements(scratch) : int64_t(0));
                 }
 
-                ggml_cuda_kvarn_store_body_reference_minmax(
-                        (const float *) k_tile->data,
-                        (const float *) v_tile->data,
-                        (uint8_t *) dst->data,
-                        (uint8_t *) v_body->data,
-                        (float *) k_scales->data,
-                        (float *) v_scales->data,
-                        (float *) scratch->data,
-                        params.head_dim, params.group_size, params.key_bits, params.value_bits,
-                        params.sinkhorn_iters, params.rtn_quantile,
-                        ctx.stream());
+                if (params.n_heads > 1) {
+                    const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
+                    ggml_cuda_kvarn_store_body_pending_heads_minmax(
+                            (const float *) k_tile->data,
+                            (const float *) v_tile->data,
+                            (uint8_t *) dst->data,
+                            (uint8_t *) v_body->data,
+                            (float *) k_scales->data,
+                            (float *) v_scales->data,
+                            (float *) scratch->data,
+                            uint32_t(params.n_heads),
+                            uint32_t(params.head_dim), uint32_t(params.group_size),
+                            uint32_t(params.key_bits), uint32_t(params.value_bits),
+                            uint32_t(params.sinkhorn_iters), params.rtn_quantile,
+                            size_t(dst->nb[1]),
+                            size_t(v_body->nb[1]),
+                            size_t(k_scales->nb[1]/sizeof(float)),
+                            size_t(v_scales->nb[1]/sizeof(float)),
+                            size_t(pending_group_stride),
+                            size_t(pending_group_stride),
+                            ctx.stream());
+                } else {
+                    ggml_cuda_kvarn_store_body_reference_minmax(
+                            (const float *) k_tile->data,
+                            (const float *) v_tile->data,
+                            (uint8_t *) dst->data,
+                            (uint8_t *) v_body->data,
+                            (float *) k_scales->data,
+                            (float *) v_scales->data,
+                            (float *) scratch->data,
+                            params.head_dim, params.group_size, params.key_bits, params.value_bits,
+                            params.sinkhorn_iters, params.rtn_quantile,
+                            ctx.stream());
+                }
             } break;
         case GGML_OP_KVARN_ATTN_MIXED:
             {
@@ -3137,10 +3164,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 if (ggml_cuda_kvarn_attn_trace_enabled() && ggml_cuda_kvarn_attn_trace_claim()) {
                     const bool split_runtime = use_scratch_ref || forced_split;
                     const bool serial_runtime = !split_runtime && forced_serial;
+                    const bool sinktail_decode = !split_runtime && !serial_runtime &&
+                        params.head_dim >= 512 && params.n_records == 0 && params.n_pending == 0 &&
+                        dst->ne[2] == 1;
+                    const bool sinktail_f16 = !split_runtime && !serial_runtime &&
+                        params.head_dim >= 512 && params.n_records == 0 && params.n_pending == 0 &&
+                        !sinktail_decode;
+                    const bool warpqk_f16_dequant = !split_runtime && !serial_runtime &&
+                        params.head_dim >= 512 && params.n_records > 0;
+                    const bool warpqk_f16 = !split_runtime && !serial_runtime &&
+                        params.head_dim >= 512 && !sinktail_f16 && !warpqk_f16_dequant;
                     const char * mode = use_scratch_ref ? "scratch-ref" :
                         (split_runtime ? "split" :
                             (serial_runtime ? "serial-fused" :
-                                (forced_fused_batch ? "fused-batch-forced" : "fused-batch")));
+                                (sinktail_decode ? "sinktail-decode" :
+                                    (sinktail_f16 ? "sinktail-f16" :
+                                    (warpqk_f16_dequant ? "warpqk-f16-dequant" :
+                                        (warpqk_f16 ? "warpqk-f16" :
+                                            (forced_fused_batch ? "fused-batch-forced" : "fused-batch")))))));
 
                     std::fprintf(stderr,
                             "KVarN CUDA mixed-attn trace: mode=%s n_queries=%" PRId64 " n_head=%" PRId64
@@ -5783,8 +5824,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     int32_t value_bits;
                     int32_t sinkhorn_iters;
                     float   rtn_quantile;
+                    int32_t n_heads;
                 } params;
                 memcpy(&params, op->op_params, sizeof(params));
+                if (params.n_heads <= 0) {
+                    params.n_heads = 1;
+                }
 
                 if (op->type != GGML_TYPE_I8 || op->src[0]->type != GGML_TYPE_F32 ||
                         op->src[1]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 ||
@@ -5811,6 +5856,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int64_t v_body_bytes = (n*params.value_bits + 7)/8;
                 const int64_t k_scale_floats = 2*params.head_dim + params.group_size;
                 const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
+                const int64_t per_pipeline = n + 2*std::max(params.head_dim, params.group_size);
+                const int64_t pipeline_scratch_floats = params.head_dim >= 512 ? 2*per_pipeline : per_pipeline;
+                const int64_t batch_scratch_floats = 2*n + pipeline_scratch_floats;
+
+                if (params.n_heads > 1) {
+                    return op->src[0]->ne[0] == params.head_dim &&
+                           op->src[1]->ne[0] == params.head_dim &&
+                           op->src[0]->ne[1] == params.n_heads &&
+                           op->src[1]->ne[1] == params.n_heads &&
+                           op->src[0]->ne[2] == params.group_size &&
+                           op->src[1]->ne[2] == params.group_size &&
+                           op->ne[0] >= k_body_bytes &&
+                           op->src[6]->ne[0] >= v_body_bytes &&
+                           op->ne[1] == params.n_heads &&
+                           op->src[6]->ne[1] == params.n_heads &&
+                           op->src[2]->ne[0] >= k_scale_floats &&
+                           op->src[3]->ne[0] >= v_scale_floats &&
+                           op->src[2]->ne[1] == params.n_heads &&
+                           op->src[3]->ne[1] == params.n_heads &&
+                           ggml_nelements(op->src[4]) >= batch_scratch_floats;
+                }
+
                 const int64_t scratch_floats = n + 2*std::max(params.head_dim, params.group_size);
                 return ggml_nelements(op->src[0]) == n &&
                        ggml_nelements(op->src[1]) == n &&

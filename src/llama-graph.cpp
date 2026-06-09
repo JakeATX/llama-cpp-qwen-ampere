@@ -824,7 +824,8 @@ static int64_t kvarn_graph_attn_scratch_floats(
         int64_t head_dim,
         int64_t group_size) {
     int64_t result = window.n_kv;
-    if (kvarn_graph_use_attn_scratch_ref() && n_records_scratch > 0) {
+    if (n_records_scratch > 0 &&
+            (kvarn_graph_use_attn_scratch_ref() || head_dim >= 512)) {
         result += 2*n_head_kv*n_records_scratch*head_dim*group_size;
     }
     return result;
@@ -2907,15 +2908,24 @@ ggml_tensor * llm_graph_context::build_attn(
             inp_kvarn->has_body_store_ops = !seal_records.empty();
             inp_kvarn->baked_seal_records = seal_records;
 
+            ggml_tensor * body_store_scratch = nullptr;
+            if (!seal_records.empty()) {
+                body_store_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
+            }
+
             for (const uint32_t seal_record : seal_records) {
                 if (seal_record >= layer.n_records) {
                     throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
                 }
 
-                for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                    ggml_tensor * scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
-                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_record_from_pending(
-                                ctx0, scratch, il, ih, seal_record));
+                if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
+                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads_from_pending(
+                                ctx0, body_store_scratch, il, seal_record));
+                } else {
+                    for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
+                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_record_from_pending(
+                                    ctx0, body_store_scratch, il, ih, seal_record));
+                    }
                 }
             }
         }
@@ -3353,15 +3363,24 @@ ggml_tensor * llm_graph_context::build_attn(
             inp->base_has_body_store_ops = !seal_records.empty();
             inp->base_baked_seal_records = seal_records;
 
+            ggml_tensor * body_store_scratch = nullptr;
+            if (!seal_records.empty()) {
+                body_store_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
+            }
+
             for (const uint32_t seal_record : seal_records) {
                 if (seal_record >= layer.n_records) {
                     throw std::runtime_error("KVarN+ISWA graph backend attempted to seal a body record outside cache capacity");
                 }
 
-                for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                    ggml_tensor * scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
-                    ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_record_from_pending(
-                                ctx0, scratch, il, ih, seal_record));
+                if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
+                    ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads_from_pending(
+                                ctx0, body_store_scratch, il, seal_record));
+                } else {
+                    for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
+                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_record_from_pending(
+                                    ctx0, body_store_scratch, il, ih, seal_record));
+                    }
                 }
             }
         }

@@ -1736,6 +1736,23 @@ extern "C" {
                    int32_t        sinkhorn_iters,
                    float          rtn_quantile);
 
+    GGML_API struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pending_k,
+            struct ggml_tensor  * pending_v,
+            struct ggml_tensor  * k_body,
+            struct ggml_tensor  * v_body,
+            struct ggml_tensor  * k_scales,
+            struct ggml_tensor  * v_scales,
+            struct ggml_tensor  * scratch,
+                   int32_t        n_heads,
+                   int32_t        head_dim,
+                   int32_t        group_size,
+                   int32_t        key_bits,
+                   int32_t        value_bits,
+                   int32_t        sinkhorn_iters,
+                   float          rtn_quantile);
+
     GGML_API struct ggml_tensor * ggml_kvarn_attn_mixed(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

@@ -809,6 +809,15 @@ ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_record_from_pending(
     return kv->store_kv_body_record_from_pending(ctx, scratch, il, ih, record);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_all_heads_from_pending(
+        ggml_context * ctx,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t record) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->store_kv_body_all_heads_from_pending(ctx, scratch, il, record);
+}
+
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const llama_model * model,
         const llama_hparams & hparams,
@@ -1367,7 +1376,12 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
         throw std::invalid_argument("KVarN body store scratch requires equal K and V head dimensions");
     }
 
-    return size_t(view.head_dim_k)*params.group_size + 2*std::max<uint32_t>(view.head_dim_k, params.group_size);
+    const size_t tile_floats = size_t(view.head_dim_k)*params.group_size;
+    const size_t per_pipeline =
+        tile_floats + 2*std::max<uint32_t>(view.head_dim_k, params.group_size);
+    const size_t pipeline_scratch = view.head_dim_k >= 512 ? 2*per_pipeline : per_pipeline;
+    // 512d batch seal keeps transpose tiles plus pipelined K/V scratch in one buffer.
+    return view.head_dim_k >= 512 ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::build_body_store_scratch(ggml_context * ctx, int32_t il) const {
@@ -1514,6 +1528,95 @@ ggml_tensor * llama_kv_cache_kvarn::store_v_body_record_from_pending(
             layer_tensors[li].pending_v->nb[2], offset);
     ggml_tensor * v_tile = ggml_cont(ctx, pending);
     return store_v_body_record(ctx, v_tile, scratch, il, ih, record);
+}
+
+ggml_tensor * llama_kv_cache_kvarn::view_k_body_record_heads(
+        ggml_context * ctx, int32_t il, uint32_t record) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (record >= view.n_records) {
+        throw std::out_of_range("KVarN body record index is out of range");
+    }
+
+    const size_t offset = size_t(record)*view.body_k->nb[1];
+    ggml_tensor * result = ggml_view_2d(
+            ctx, view.body_k, view.layout_k.k_body_bytes, view.n_head_kv,
+            view.body_k->nb[2], offset);
+    ggml_format_name(result, "kvarn_k_body_l%d_r%u_heads", il, record);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::view_v_body_record_heads(
+        ggml_context * ctx, int32_t il, uint32_t record) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (record >= view.n_records) {
+        throw std::out_of_range("KVarN body record index is out of range");
+    }
+
+    const size_t offset = size_t(record)*view.body_v->nb[1];
+    ggml_tensor * result = ggml_view_2d(
+            ctx, view.body_v, view.layout_v.v_body_bytes, view.n_head_kv,
+            view.body_v->nb[2], offset);
+    ggml_format_name(result, "kvarn_v_body_l%d_r%u_heads", il, record);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::view_k_scales_record_heads(
+        ggml_context * ctx, int32_t il, uint32_t record) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (record >= view.n_records) {
+        throw std::out_of_range("KVarN body record index is out of range");
+    }
+
+    const size_t offset = size_t(record)*view.scales_k->nb[1];
+    ggml_tensor * result = ggml_view_2d(
+            ctx, view.scales_k, view.layout_k.k_scale_floats, view.n_head_kv,
+            view.scales_k->nb[2], offset);
+    ggml_format_name(result, "kvarn_k_scales_l%d_r%u_heads", il, record);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::view_v_scales_record_heads(
+        ggml_context * ctx, int32_t il, uint32_t record) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (record >= view.n_records) {
+        throw std::out_of_range("KVarN body record index is out of range");
+    }
+
+    const size_t offset = size_t(record)*view.scales_v->nb[1];
+    ggml_tensor * result = ggml_view_2d(
+            ctx, view.scales_v, view.layout_v.v_scale_floats, view.n_head_kv,
+            view.scales_v->nb[2], offset);
+    ggml_format_name(result, "kvarn_v_scales_l%d_r%u_heads", il, record);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads_from_pending(
+        ggml_context * ctx,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t record) const {
+    const size_t li = layer_storage_index(il);
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (record >= view.n_records) {
+        throw std::out_of_range("KVarN body record index is out of range");
+    }
+    if (view.head_dim_k != view.head_dim_v) {
+        throw std::runtime_error("KVarN fused pending K/V body store requires equal K and V head dimensions");
+    }
+    if (view.n_head_kv <= 1) {
+        return store_kv_body_record_from_pending(ctx, scratch, il, 0, record);
+    }
+
+    ggml_tensor * k_body   = view_k_body_record_heads(ctx, il, record);
+    ggml_tensor * v_body   = view_v_body_record_heads(ctx, il, record);
+    ggml_tensor * k_scales = view_k_scales_record_heads(ctx, il, record);
+    ggml_tensor * v_scales = view_v_scales_record_heads(ctx, il, record);
+    return ggml_kvarn_store_kv_body_pending_heads(
+            ctx, layer_tensors[li].pending_k, layer_tensors[li].pending_v,
+            k_body, v_body, k_scales, v_scales, scratch,
+            int32_t(view.n_head_kv), int32_t(view.head_dim_k), int32_t(params.group_size),
+            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(params.sinkhorn_iters), params.rtn_quantile);
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record_from_pending(

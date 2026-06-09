@@ -1,9 +1,9 @@
 # KVarN CUDA Architect Handover
 
 **Audience:** External architect reviewing the CUDA KVarN vs normal KV throughput gap.  
-**Last updated:** 2026-06-08  
+**Last updated:** 2026-06-09  
 **Branch:** `kvarn-atx-integration`  
-**HEAD:** `54ddfa768` + working-tree mainline parity fixes  
+**HEAD:** post-`686356d61` Gemma CUDA fast-path work (unpushed at doc write)  
 **Upstream sync:** merged `upstream-ggml/master` @ `42a0afd59` (2026-06-08); `hparams.n_layer` → `n_layer_all` / `n_layer_nextn` migration applied to KVarN paths  
 **Remote:** [https://github.com/JakeATX/llama.cpp](https://github.com/JakeATX/llama.cpp) (`jakeatx` / `fork`)  
 **Review URL:** [https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration)
@@ -59,7 +59,7 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Gemma KVarN+ISWA (experimental)** | FAIL (~62–66%) | Post speed-patch (parallel Hadamard, warp-q·k, parallel quantize): pp512 **62.3%**, tg64 **66.0%** at `RtnQuantile=1.0`; still opt-in only |
+| **Gemma KVarN+ISWA (experimental)** | FAIL (~70–72%) | Fast-path work: sinktail/decode kernels, pipelined 512d body-store, warpqk body dequant; Q4_XL pp512 **70.0%** (1841 t/s), tg64 **71.6%** (45.9 t/s); still opt-in only |
 | **Gemma production fallback** | PASS | Normal ISWA when `--kv-cache-quant kvarn`; post-common Q4_XL gate: pp512 **122.1%**, tg64 **100.7%** |
 | **Common KVarN param propagation** | FIXED | `common_context_params_to_llama()` again copies `kv_cache_quant_type` + `kvarn`; server load-failure test now covers an explicit unsupported preset |
 | **Tier 2 logits** | Enforceable | `compare_cuda_logits_ref.ps1` NMSE thresholds + `-RunTier2` on production gate |
@@ -111,6 +111,10 @@ Earlier integration: `642fab89a` (ATX MoE residency merge), `10f373ac7` (build f
 ### CUDA attention path
 
 - **Default:** fused-batch mixed sink/body/tail attention (`ggml/src/ggml-cuda/kvarn.cu`).
+- **512d Gemma decode:** `sinktail-decode` (one CTA, all heads) when `n_records=0 && n_pending=0 && n_queries=1`.
+- **512d Gemma prefill/decode (no body):** `sinktail-f16` batch kernel when `n_records=0 && n_pending=0`.
+- **512d body-active:** `warpqk-f16-dequant` (pre-dequant body in attn scratch, then warpqk).
+- **512d body-store:** pipelined dual-stream K/V Hadamard+sinkhorn+quantize (`ggml_cuda_kvarn_store_kv_body_512_pipelined`).
 - **Opt-in:** per-head decode launches behind `LLAMA_KVARN_ATTN_DECODE_PER_HEAD=1` (regression if default).
 - **Opt-in:** split kernels behind `LLAMA_KVARN_ATTN_SPLIT_KERNELS=1` (Qwen pp512 regresses to ~16% if default).
 

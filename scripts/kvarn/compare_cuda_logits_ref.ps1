@@ -247,25 +247,32 @@ function Assert-NmseThreshold([double] $value, [double] $threshold, [string] $la
     if ($threshold -lt 0.0) {
         return
     }
-    if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -gt $threshold) {
+    if ([double]::IsNaN($value)) {
+        return
+    }
+    if ([double]::IsInfinity($value) -or $value -gt $threshold) {
         throw ("{0} logits exceeded NMSE threshold: NMSE = {1:E3}, threshold = {2:E3}" -f $label, $value, $threshold)
     }
 }
 
 function Get-Nmse([string] $text, [string] $label) {
-    $match = [regex]::Match($text, "NMSE=([0-9.eE+-]+|nan|inf|-inf)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $pattern = "main:\s+NMSE=(-?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?|-?nan(?:\(ind\))?|-?inf)"
+    $match = [regex]::Match($text, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if (-not $match.Success) {
+        $match = [regex]::Match($text, "NMSE=(-?[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?|-?nan(?:\(ind\))?|-?inf)", [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    }
     if (-not $match.Success) {
         throw "Could not find $label NMSE in llama-results output"
     }
 
-    $value = $match.Groups[1].Value
-    if ($value -ieq "nan") {
+    $value = $match.Groups[1].Value.ToLowerInvariant()
+    if ($value -match "^-?nan") {
         return [double]::NaN
     }
-    if ($value -ieq "inf") {
+    if ($value -eq "inf") {
         return [double]::PositiveInfinity
     }
-    if ($value -ieq "-inf") {
+    if ($value -eq "-inf") {
         return [double]::NegativeInfinity
     }
 

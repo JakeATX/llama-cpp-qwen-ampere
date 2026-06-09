@@ -1,7 +1,7 @@
 # Gemma 4 KVarN+ISWA throughput failure — evidence-based diagnostic
 
 **Audience:** Architect / CUDA implementer  
-**Branch:** `kvarn-atx-integration` @ `54ddfa768` + working-tree mainline parity fixes  
+**Branch:** `kvarn-atx-integration` @ `686356d61` + Gemma CUDA fast-path work  
 **Hardware:** RTX 5070 12 GB, `build-kvarn-cuda-static-vs`, `-fa off`, `-ngl 99`  
 **Model:** `gemma-4-12b-it-UD-Q3_K_XL.gguf` (Gemma 4 12B Q3)  
 **Gate:** KVarN/normal ≥ 90% on pp512 and tg64 with `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`
@@ -16,6 +16,11 @@
 | `artifacts/kvarn-bench/gemma-speed-patch-v2/` | tg64 | 66.92 ± 3.83 | 44.20 ± 3.06 | **66.0%** | FAIL |
 | `artifacts/kvarn-bench/gemma-true-kvarn-post-memset-skip-iters4/` | pp512 | 2356.15 ± **629.57** | 1443.76 ± **6.29** | **61.3%** | FAIL |
 | `artifacts/kvarn-bench/gemma-true-kvarn-post-memset-skip-iters4/` | tg64 | 63.99 ± 1.67 | 45.19 ± 0.04 | **70.6%** | FAIL |
+| `artifacts/kvarn-bench/gemma-sinktail-decode-p0/` | pp512 | 2629.52 ± 432.56 | 1841.00 ± 9.97 | **70.0%** | FAIL |
+| `artifacts/kvarn-bench/gemma-sinktail-decode-p0/` | tg64 | 64.12 ± 1.13 | 45.94 ± 0.14 | **71.6%** | FAIL |
+| `artifacts/kvarn-bench/gemma-batch-store-p1/` | pp512 | 2643.18 ± — | 1872.23 ± — | **70.8%** | FAIL |
+| `artifacts/kvarn-bench/gemma-batch-store-p1/` | tg64 | 66.35 ± 1.33 | 48.87 ± 0.07 | **73.7%** | FAIL |
+| `artifacts/kvarn-bench/gemma-sinktail-fastpath-tg64/` | tg64 | 39.92 ± 27.99 | 43.51 ± 0.10 | **109.0%** | PASS (normal-KV variance) |
 | `artifacts/kvarn-bench/gemma-true-kvarn-speed-patch/` | pp512 | 2305.01 ± 588.89 | 1357.04 ± 147.60 | **58.9%** | FAIL (aborted before tg64) |
 | `artifacts/kvarn-bench/gemma-gate-push/` | pp512 | 2303.81 ± 641.63 | 1437.14 ± 42.95 | **62.4%** | FAIL |
 | `artifacts/kvarn-bench/gemma-gate-push/` | tg64 | 69.45 | 47.89 | **69.0%** | FAIL |
@@ -88,7 +93,7 @@ Manifest: `min_kvarn_body_records=0`, `extra_args=--kvarn-tail-tokens 512`.
 - Fullrange quantize (512-wide rows) — patched parallel
 - **8 KVarN layers × 2 records** per pp512 bench completion
 
-The latest code skips redundant body-buffer `cudaMemsetAsync` launches for full-range byte-overwriting K4/V2 rows. It is safe but only marginal: pp512 remains **61.3%** on the Q4_XL gate-shaped run. Next code target remains **fuse or batch body-store seals** across K+V and/or layers; profile seal frequency per ubatch in ISWA `prepare()`.
+The latest code skips redundant body-buffer `cudaMemsetAsync` launches for full-range byte-overwriting K4/V2 rows. Post fast-path work (sinktail/dequant/pipelined store), Q4_XL pp512 improved to **~1872 t/s (~71% ratio)** vs **~1369 t/s (~57%)** pre-patch; tg64 KVarN **~49 t/s (~74% ratio)** vs **~45 t/s (~71%)**. Gemma KVarN layers use **`n_head_kv=1`**, so multi-head body-store batching is a graph/sched win only on models with `n_head_kv>1` (Qwen). KVarN absolute throughput is stable (low σ); ratio swings remain driven by normal-KV variance. Next code target: ISWA dual-`prepare()` on pp512 and more KVarN decode absolute headroom when normal tg64 is ~66 t/s.
 
 ---
 
@@ -183,21 +188,17 @@ Fallback avoids experimental KVarN+ISWA entirely → stable but **not** measurin
 
 ## 8. Recommended architect experiments (ordered)
 
-1. **Body-store profile** — `-TraceStore` on pp512 with default tail; expect shapes like `k:dim512/g128/...` per seal. Compare seal count with vs without `--kvarn-tail-tokens 512`.
+1. **Decode no-body fast path** — validate the dedicated 512d sink/tail fused-batch kernel on `tg64` first. This is the production-shaped case where `body records = 0`, so any tg64 improvement can be attributed to the attention kernel rather than body-store seals.
 
-2. **Attention profile** — `-TraceAttn` on tg64; record `fused-batch` vs warpqk shapes (`dim512`, `n_queries=1`, `n_tokens`).
+2. **Body-store profile** — `-TraceStore` on pp512 with default tail; expect shapes like `k:dim512/g128/...` per seal. Compare seal count with vs without `--kvarn-tail-tokens 512`.
 
-3. **A/B absolute throughput** (not ratio-only):
+3. **Attention profile** — `-TraceAttn` on tg64; record `fused-batch` vs warpqk/sinktail shapes (`dim512`, `n_queries=1`, `n_tokens`).
 
-   ```powershell
-   $env:LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA = "1"
-   # A: body-active (current gate)
-   # B: --kvarn-tail-tokens 512 (body_records=0 diagnostic)
-   ```
+4. **A/B absolute throughput** (not ratio-only) — report KVarN absolute t/s next to ratio because normal pp512 remains noisy.
 
-4. **ISWA prepare audit** — `src/llama-kv-cache-kvarn-iswa.cpp` dual `prepare()` per ubatch; count graph nodes vs normal ISWA fallback.
+5. **ISWA prepare audit** — `src/llama-kv-cache-kvarn-iswa.cpp` dual `prepare()` per ubatch; count graph nodes vs normal ISWA fallback.
 
-5. **Do not flip** `llama-model.cpp` Gemma fallback until **both** pp512 and tg64 ≥ 90% with **body_records ≥ 2** (production-realistic tail), not tail512 no-body diagnostic alone.
+6. **Do not flip** `llama-model.cpp` Gemma fallback until **both** pp512 and tg64 ≥ 90% with **body_records ≥ 2** (production-realistic tail), not tail512 no-body diagnostic alone.
 
 ---
 

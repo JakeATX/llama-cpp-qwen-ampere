@@ -211,6 +211,8 @@ public:
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_kv_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * store_kv_body_all_heads_from_pending(
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t record) const;
 
 private:
     llama_memory_status status;
@@ -317,6 +319,12 @@ public:
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_kv_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * store_kv_body_all_heads_from_pending(
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t record) const;
+    ggml_tensor * view_k_body_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
+    ggml_tensor * view_v_body_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
+    ggml_tensor * view_k_scales_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
+    ggml_tensor * view_v_scales_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
 
     slot_info find_slot(const llama_ubatch & ubatch) const;
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches) const;
