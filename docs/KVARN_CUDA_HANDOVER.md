@@ -32,7 +32,7 @@ Start here to critique the latest Gemma CUDA work (experimental gate still **FAI
 
 **Not changed (gate did not pass):** `src/llama-model.cpp` Gemma ISWA fallback policy remains production default.
 
-**Latest Gemma experimental bench** (`LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`, Q4_K_XL, iters=4, rtn=1.0): `artifacts/kvarn-bench/gemma-batch-store-p1/` — pp512 **70.8%** (1872 t/s), tg64 **73.7%** (48.9 t/s). Gemma KVarN layers use **`n_head_kv=1`**, so multi-head seal batching does not reduce launch count on Gemma.
+**Latest Gemma experimental bench** (`LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`, Q4_K_XL, iters=4, rtn=1.0): `artifacts/kvarn-bench/gemma-architect-rerun/` — pp512 **64.8%** (1565/2415 t/s), tg64 **71.7%** (44.4/61.9 t/s). Pre-P0 (`gemma-batch-store-p1`): pp512 **70.8%**, tg64 **73.7%**. Gemma KVarN layers use **`n_head_kv=1`**.
 
 ---
 
