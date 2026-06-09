@@ -1,7 +1,7 @@
 # Gemma 4 KVarN+ISWA throughput failure — evidence-based diagnostic
 
 **Audience:** Architect / CUDA implementer  
-**Branch:** `kvarn-atx-integration` @ `686356d61` + Gemma CUDA fast-path work  
+**Branch:** `kvarn-atx-integration` @ [`f5bdd5b6c`](https://github.com/JakeATX/llama.cpp/commit/f5bdd5b6c) ([compare 686356d61..f5bdd5b6c](https://github.com/JakeATX/llama.cpp/compare/686356d61...f5bdd5b6c))  
 **Hardware:** RTX 5070 12 GB, `build-kvarn-cuda-static-vs`, `-fa off`, `-ngl 99`  
 **Model:** `gemma-4-12b-it-UD-Q3_K_XL.gguf` (Gemma 4 12B Q3)  
 **Gate:** KVarN/normal ≥ 90% on pp512 and tg64 with `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`

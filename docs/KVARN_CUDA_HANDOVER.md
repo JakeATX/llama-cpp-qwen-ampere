@@ -3,10 +3,33 @@
 **Audience:** External architect reviewing the CUDA KVarN vs normal KV throughput gap.  
 **Last updated:** 2026-06-09  
 **Branch:** `kvarn-atx-integration`  
-**HEAD:** post-`686356d61` Gemma CUDA fast-path work (unpushed at doc write)  
+**HEAD:** [`f5bdd5b6c`](https://github.com/JakeATX/llama.cpp/commit/f5bdd5b6c) — *cuda: Gemma 512d sinktail, pipelined body-store, and batch seal path*  
 **Upstream sync:** merged `upstream-ggml/master` @ `42a0afd59` (2026-06-08); `hparams.n_layer` → `n_layer_all` / `n_layer_nextn` migration applied to KVarN paths  
 **Remote:** [https://github.com/JakeATX/llama.cpp](https://github.com/JakeATX/llama.cpp) (`jakeatx` / `fork`)  
 **Review URL:** [https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration)
+
+### Architect review entry point
+
+Start here to critique the latest Gemma CUDA work (experimental gate still **FAIL** ~71% pp512 / ~74% tg64):
+
+| Resource | URL |
+|----------|-----|
+| **Branch tip (all code)** | [tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration) |
+| **Gemma fast-path commit** | [commit/f5bdd5b6c](https://github.com/JakeATX/llama.cpp/commit/f5bdd5b6c) |
+| **Failure diagnostic** | [docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md](https://github.com/JakeATX/llama.cpp/blob/kvarn-atx-integration/docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md) |
+| **Diff vs parent** | [686356d61..f5bdd5b6c](https://github.com/JakeATX/llama.cpp/compare/686356d61...f5bdd5b6c) |
+
+**Files changed in `f5bdd5b6c` (CUDA + graph + docs):**
+
+- `ggml/src/ggml-cuda/kvarn.cu`, `kvarn.cuh`, `ggml-cuda.cu` — sinktail/decode attn, pipelined 512d body-store, warpqk body dequant, optional all-heads seal
+- `src/llama-graph.cpp`, `src/llama-kv-cache-kvarn.cpp`, `src/llama-kv-cache-kvarn.h` — graph wiring, scratch hoisting, batch seal op
+- `ggml/src/ggml.c`, `ggml/include/ggml.h` — `ggml_kvarn_store_kv_body_pending_heads`
+- `scripts/kvarn/compare_cuda_logits_ref.ps1` — NMSE parse fix (`-nan(ind)`)
+- `tests/test-kvarn-kv.cpp`, `docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md`
+
+**Not changed (gate did not pass):** `src/llama-model.cpp` Gemma ISWA fallback policy remains production default.
+
+**Latest Gemma experimental bench** (`LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`, Q4_K_XL, iters=4, rtn=1.0): `artifacts/kvarn-bench/gemma-batch-store-p1/` — pp512 **70.8%** (1872 t/s), tg64 **73.7%** (48.9 t/s). Gemma KVarN layers use **`n_head_kv=1`**, so multi-head seal batching does not reduce launch count on Gemma.
 
 ---
 
@@ -59,7 +82,7 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Gemma KVarN+ISWA (experimental)** | FAIL (~70–72%) | Fast-path work: sinktail/decode kernels, pipelined 512d body-store, warpqk body dequant; Q4_XL pp512 **70.0%** (1841 t/s), tg64 **71.6%** (45.9 t/s); still opt-in only |
+| **Gemma KVarN+ISWA (experimental)** | FAIL (~71–74%) | `@ f5bdd5b6c`: sinktail/decode, pipelined 512d body-store, warpqk body dequant; Q4_XL pp512 **70.8%** (1872 t/s), tg64 **73.7%** (48.9 t/s); still opt-in only |
 | **Gemma production fallback** | PASS | Normal ISWA when `--kv-cache-quant kvarn`; post-common Q4_XL gate: pp512 **122.1%**, tg64 **100.7%** |
 | **Common KVarN param propagation** | FIXED | `common_context_params_to_llama()` again copies `kv_cache_quant_type` + `kvarn`; server load-failure test now covers an explicit unsupported preset |
 | **Tier 2 logits** | Enforceable | `compare_cuda_logits_ref.ps1` NMSE thresholds + `-RunTier2` on production gate |
@@ -82,7 +105,8 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 | `982919dd9` | Docs: record `ab8a6db8a` gate matrix for Qwen and Gemma re-bench |
 | `4a4c6ff70` | Fix KVarN prefill graph reuse across alternating prompt ubatches (ping-pong `gf_res_alt`) |
 | `030333631` | Scope ping-pong graph reuse to normal KV prefill only; record Qwen gate PASS |
-| (pending) | Gemma 512-dim CUDA speed patch: parallel Hadamard body-store, warp-cooperative fused-batch q·k (`head_dim>=512`), parallel fullrange quantize, `RtnQuantile` default 1.0 in bench/logits scripts |
+| `686356d61` | Stabilize mainline parity and KVarN production gates after upstream merge |
+| `f5bdd5b6c` | Gemma 512d CUDA fast paths: sinktail/decode attn, pipelined body-store, warpqk body dequant, all-heads seal op; logits NMSE script fix; experimental gate still ~71% pp512 |
 
 Earlier integration: `642fab89a` (ATX MoE residency merge), `10f373ac7` (build follow-ups).
 
