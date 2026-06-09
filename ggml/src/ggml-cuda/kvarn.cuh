@@ -150,6 +150,29 @@ void ggml_cuda_kvarn_dequant_body_n_k_token_major(
         size_t v_out_stride_floats,
         void * stream);
 
+// f16 outputs, token-major K (g*head_dim + d); used by the 512d warpqk
+// attention path to halve body-scratch read traffic. k_out/v_out point to
+// __half storage (void* to keep this header CUDA-type-free for hosts).
+void ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
+        const uint8_t * k_body,
+        const uint8_t * v_body,
+        const float * k_scales,
+        const float * v_scales,
+        void * k_out,
+        void * v_out,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        size_t k_body_stride_bytes,
+        size_t v_body_stride_bytes,
+        size_t k_scale_stride_floats,
+        size_t v_scale_stride_floats,
+        size_t k_out_stride_elems,
+        size_t v_out_stride_elems,
+        void * stream);
+
 void ggml_cuda_kvarn_qk_body(
         const float * q,
         const uint8_t * k_body,

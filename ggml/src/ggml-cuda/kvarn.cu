@@ -563,7 +563,8 @@ static __global__ void kvarn_sinkhorn_rows_parallel_kernel(
         float * __restrict__ data,
         float * __restrict__ row_scale,
         uint32_t rows,
-        uint32_t cols) {
+        uint32_t cols,
+        uint32_t init_scale) {
     const uint32_t r = blockIdx.x;
     if (r >= rows) {
         return;
@@ -589,7 +590,9 @@ static __global__ void kvarn_sinkhorn_rows_parallel_kernel(
 
     if (threadIdx.x == 0) {
         const float rms = sqrtf(shmem[0]/float(cols) + eps);
-        row_scale[r] *= rms;
+        // First iteration initializes the multiplicative scale, replacing the
+        // separate fill launch that previously set it to 1.0f.
+        row_scale[r] = init_scale != 0 ? rms : row_scale[r]*rms;
         shmem[0] = rms;
     }
     __syncthreads();
@@ -604,7 +607,8 @@ static __global__ void kvarn_sinkhorn_cols_parallel_kernel(
         float * __restrict__ data,
         float * __restrict__ col_scale,
         uint32_t rows,
-        uint32_t cols) {
+        uint32_t cols,
+        uint32_t init_scale) {
     const uint32_t c = blockIdx.x;
     if (c >= cols) {
         return;
@@ -630,7 +634,7 @@ static __global__ void kvarn_sinkhorn_cols_parallel_kernel(
 
     if (threadIdx.x == 0) {
         const float rms = sqrtf(shmem[0]/float(rows) + eps);
-        col_scale[c] *= rms;
+        col_scale[c] = init_scale != 0 ? rms : col_scale[c]*rms;
         shmem[0] = rms;
     }
     __syncthreads();
@@ -651,12 +655,20 @@ static void kvarn_sinkhorn_variance_normalize_parallel(
         cudaStream_t stream) {
     const int block = 128;
     const size_t shmem = size_t(block)*sizeof(float);
-    kvarn_fill_f32_kernel<<<int((rows + block - 1)/block), block, 0, stream>>>(row_scale, rows, 1.0f);
-    kvarn_fill_f32_kernel<<<int((cols + block - 1)/block), block, 0, stream>>>(col_scale, cols, 1.0f);
+    // Scale init (previously two fill launches of 1.0f) is folded into the
+    // first row/col iteration via init_scale, trimming 4 launches per seal
+    // (K + V pipelines). With iters==0 the fills are still required so the
+    // finalize kernels see neutral scales.
+    if (iters == 0) {
+        kvarn_fill_f32_kernel<<<int((rows + block - 1)/block), block, 0, stream>>>(row_scale, rows, 1.0f);
+        kvarn_fill_f32_kernel<<<int((cols + block - 1)/block), block, 0, stream>>>(col_scale, cols, 1.0f);
+        return;
+    }
 
     for (uint32_t iter = 0; iter < iters; ++iter) {
-        kvarn_sinkhorn_rows_parallel_kernel<<<int(rows), block, shmem, stream>>>(data, row_scale, rows, cols);
-        kvarn_sinkhorn_cols_parallel_kernel<<<int(cols), block, shmem, stream>>>(data, col_scale, rows, cols);
+        const uint32_t init = iter == 0 ? 1u : 0u;
+        kvarn_sinkhorn_rows_parallel_kernel<<<int(rows), block, shmem, stream>>>(data, row_scale, rows, cols, init);
+        kvarn_sinkhorn_cols_parallel_kernel<<<int(cols), block, shmem, stream>>>(data, col_scale, rows, cols, init);
     }
 }
 
@@ -1137,13 +1149,19 @@ void ggml_cuda_kvarn_dequant_body(
             head_dim, group_size, key_bits, value_bits, n);
 }
 
+template<typename T>
+static __device__ __forceinline__ T kvarn_dequant_store_cast(float v);
+template<> __device__ __forceinline__ float kvarn_dequant_store_cast<float>(float v) { return v; }
+template<> __device__ __forceinline__ __half kvarn_dequant_store_cast<__half>(float v) { return __float2half(v); }
+
+template<typename T>
 static __global__ void kvarn_dequant_n_kernel(
         const uint8_t * __restrict__ k_body,
         const uint8_t * __restrict__ v_body,
         const float * __restrict__ k_scales,
         const float * __restrict__ v_scales,
-        float * __restrict__ k_out,
-        float * __restrict__ v_out,
+        T * __restrict__ k_out,
+        T * __restrict__ v_out,
         uint32_t n_records,
         uint32_t head_dim,
         uint32_t group_size,
@@ -1170,8 +1188,8 @@ static __global__ void kvarn_dequant_n_kernel(
     const uint8_t * v_record = v_body + size_t(r)*v_body_stride_bytes;
     const float * k_record_scales = k_scales + size_t(r)*k_scale_stride_floats;
     const float * v_record_scales = v_scales + size_t(r)*v_scale_stride_floats;
-    float * k_record_out = k_out + size_t(r)*k_out_stride_floats;
-    float * v_record_out = v_out + size_t(r)*v_out_stride_floats;
+    T * k_record_out = k_out + size_t(r)*k_out_stride_floats;
+    T * v_record_out = v_out + size_t(r)*v_out_stride_floats;
 
     // The persistent packed K layout is always record/dim-major
     // (i_packed = d*group_size + g). When k_token_major is set, the f32
@@ -1194,7 +1212,7 @@ static __global__ void kvarn_dequant_n_kernel(
     const float * k_s_row = k_record_scales + 2*head_dim;
 
     const uint32_t kq = kvarn_unpack_one(k_record, key_bits, i_packed_k);
-    k_record_out[i] = (float(kq)*k_s_col[d_k] + k_zp[d_k])*k_s_row[g_k];
+    k_record_out[i] = kvarn_dequant_store_cast<T>((float(kq)*k_s_col[d_k] + k_zp[d_k])*k_s_row[g_k]);
 
     const uint32_t g_v = i / head_dim;
     const uint32_t d_v = i - size_t(g_v)*head_dim;
@@ -1204,7 +1222,7 @@ static __global__ void kvarn_dequant_n_kernel(
     const float * v_zp    = v_record_scales + head_dim + group_size;
 
     const uint32_t vq = kvarn_unpack_one(v_record, value_bits, i);
-    v_record_out[i] = (float(vq)*v_s_row[g_v] + v_zp[g_v])*v_s_col[d_v];
+    v_record_out[i] = kvarn_dequant_store_cast<T>((float(vq)*v_s_row[g_v] + v_zp[g_v])*v_s_col[d_v]);
 }
 
 void ggml_cuda_kvarn_dequant_body_n(
@@ -1274,6 +1292,43 @@ void ggml_cuda_kvarn_dequant_body_n_k_token_major(
             k_body_stride_bytes, v_body_stride_bytes,
             k_scale_stride_floats, v_scale_stride_floats,
             k_out_stride_floats, v_out_stride_floats, n_per_record, 1u);
+}
+
+// f16 variant of the token-major dequant: same indexing, __half outputs.
+// Halves body-scratch read traffic in the 512d warpqk attention path. The
+// f16 rounding (~1e-3 relative) is negligible against the 4-bit/2-bit body
+// quantization error and is covered by Tier 2 logits gates.
+void ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
+        const uint8_t * k_body,
+        const uint8_t * v_body,
+        const float * k_scales,
+        const float * v_scales,
+        void * k_out,
+        void * v_out,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        size_t k_body_stride_bytes,
+        size_t v_body_stride_bytes,
+        size_t k_scale_stride_floats,
+        size_t v_scale_stride_floats,
+        size_t k_out_stride_elems,
+        size_t v_out_stride_elems,
+        void * stream) {
+    const size_t n_per_record = size_t(head_dim)*group_size;
+    const size_t n_total = size_t(n_records)*n_per_record;
+    const int block = 256;
+    const int grid = int((n_total + block - 1)/block);
+
+    kvarn_dequant_n_kernel<__half><<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+            k_body, v_body, k_scales, v_scales,
+            static_cast<__half *>(k_out), static_cast<__half *>(v_out),
+            n_records, head_dim, group_size, key_bits, value_bits,
+            k_body_stride_bytes, v_body_stride_bytes,
+            k_scale_stride_floats, v_scale_stride_floats,
+            k_out_stride_elems, v_out_stride_elems, n_per_record, 1u);
 }
 
 static __global__ void kvarn_qk_body_kernel(
@@ -3107,9 +3162,9 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
         size_t kq_mask_stride_token_bytes,
         uint32_t kq_mask_type,
         float scale,
-        const float * __restrict__ body_k_f32,
-        const float * __restrict__ body_v_f32,
-        size_t body_f32_stride_head_floats) {
+        const __half * __restrict__ body_k_f16,
+        const __half * __restrict__ body_v_f16,
+        size_t body_f16_stride_head_elems) {
     (void) scores;
     const uint32_t row = blockIdx.x;
     if (row >= n_queries*n_head) {
@@ -3131,10 +3186,10 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
     const float * v_scales_head = v_scales + size_t(ikh)*v_scale_stride_head_floats;
     const float * pending_k_head = pending_k + size_t(ikh)*pending_stride_head_floats;
     const float * pending_v_head = pending_v + size_t(ikh)*pending_stride_head_floats;
-    const float * k_body_f32_head = body_k_f32 == nullptr ? nullptr :
-        body_k_f32 + size_t(ikh)*body_f32_stride_head_floats;
-    const float * v_body_f32_head = body_v_f32 == nullptr ? nullptr :
-        body_v_f32 + size_t(ikh)*body_f32_stride_head_floats;
+    const __half * k_body_f16_head = body_k_f16 == nullptr ? nullptr :
+        body_k_f16 + size_t(ikh)*body_f16_stride_head_elems;
+    const __half * v_body_f16_head = body_v_f16 == nullptr ? nullptr :
+        body_v_f16 + size_t(ikh)*body_f16_stride_head_elems;
     const void * kq_mask_row = kq_mask == nullptr ? nullptr :
         (const char *) kq_mask + size_t(iq)*kq_mask_stride_query_bytes;
 
@@ -3162,11 +3217,12 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
         float sum = 0.0f;
         for (uint32_t d = lane; d < head_dim; d += 32) {
             float k = 0.0f;
-            if (k_body_f32_head != nullptr && t >= n_sink && t < n_sink + n_body_tokens) {
+            if (k_body_f16_head != nullptr && t >= n_sink && t < n_sink + n_body_tokens) {
                 const uint32_t body_t = t - n_sink;
-                // Dequant scratch K is token-major (g*head_dim + d): adjacent
-                // lanes read adjacent floats, giving fully coalesced loads.
-                k = k_body_f32_head[size_t(body_t)*head_dim + d];
+                // Dequant scratch K is token-major f16 (g*head_dim + d):
+                // adjacent lanes read adjacent halves — coalesced and half the
+                // bytes of the previous f32 scratch.
+                k = __half2float(k_body_f16_head[size_t(body_t)*head_dim + d]);
             } else {
                 k = kvarn_mixed_f16_load_k(
                         k_st, k_body_head, k_scales_head, pending_k_head,
@@ -3229,10 +3285,10 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
         float sum = 0.0f;
         for (uint32_t t = 0; t < n_tokens; ++t) {
             float v = 0.0f;
-            if (v_body_f32_head != nullptr && t >= n_sink && t < n_sink + n_body_tokens) {
+            if (v_body_f16_head != nullptr && t >= n_sink && t < n_sink + n_body_tokens) {
                 const uint32_t body_t = t - n_sink;
-                // V scratch is token-major (g*head_dim + d), contiguous in t.
-                v = v_body_f32_head[size_t(body_t)*head_dim + d];
+                // V scratch is token-major f16 (g*head_dim + d), contiguous in t.
+                v = __half2float(v_body_f16_head[size_t(body_t)*head_dim + d]);
             } else {
                 v = kvarn_mixed_f16_load_v(
                         v_st, v_body_head, v_scales_head, pending_v_head,
@@ -3591,22 +3647,27 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             // shared = q_sh[head_dim] + probs[n_tokens] + reduce[block]
             const size_t warpqk_shmem = (size_t(head_dim) + size_t(n_tokens) + size_t(warpqk_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
             if (kvarn_cuda_dynamic_shmem_fits(warpqk_shmem)) {
-                const float * body_k_f32 = nullptr;
-                const float * body_v_f32 = nullptr;
-                size_t body_f32_stride_head_floats = 0;
+                const __half * body_k_f16 = nullptr;
+                const __half * body_v_f16 = nullptr;
+                size_t body_f16_stride_head_elems = 0;
 
                 if (n_records > 0 && scores != nullptr) {
                     const size_t n_per_record = size_t(group_size)*head_dim;
                     const size_t n_per_head = size_t(n_records)*n_per_record;
                     const size_t dequant_base = size_t(n_tokens);
-                    float * k_dequant = scores + dequant_base;
-                    float * v_dequant = k_dequant + size_t(n_head_kv)*n_per_head;
+                    // Carve the f16 K/V regions out of the float scores
+                    // scratch after the probs area. Element budget: the
+                    // scratch is sized for 2*n_head_kv*n_per_head FLOATS, and
+                    // the same count of HALVES occupies half the bytes, so
+                    // capacity checks in can_reuse remain valid.
+                    __half * k_dequant = reinterpret_cast<__half *>(scores + dequant_base);
+                    __half * v_dequant = k_dequant + size_t(n_head_kv)*n_per_head;
 
                     for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
-                        // K is dequantized into token-major scratch so the
-                        // warpqk QK loop issues coalesced per-lane loads. The
+                        // K dequantized token-major f16: coalesced per-lane
+                        // loads at half the read traffic of f32 scratch. The
                         // persistent packed layout is unchanged.
-                        ggml_cuda_kvarn_dequant_body_n_k_token_major(
+                        ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
                                 k_body + size_t(ikh)*k_body_stride_head_bytes,
                                 v_body + size_t(ikh)*v_body_stride_head_bytes,
                                 k_scales + size_t(ikh)*k_scale_stride_head_floats,
@@ -3620,9 +3681,9 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                                 cuda_stream);
                     }
 
-                    body_k_f32 = k_dequant;
-                    body_v_f32 = v_dequant;
-                    body_f32_stride_head_floats = n_per_head;
+                    body_k_f16 = k_dequant;
+                    body_v_f16 = v_dequant;
+                    body_f16_stride_head_elems = n_per_head;
                 }
 
                 kvarn_attn_mixed_f16_fused_batch_warpqk_kernel<<<int(n_queries*n_head), warpqk_block, warpqk_shmem, cuda_stream>>>(
@@ -3639,7 +3700,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         k_scale_stride_record_floats, v_scale_stride_record_floats,
                         k_scale_stride_head_floats, v_scale_stride_head_floats,
                         kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
-                        body_k_f32, body_v_f32, body_f32_stride_head_floats);
+                        body_k_f16, body_v_f16, body_f16_stride_head_elems);
                 return;
             }
         }

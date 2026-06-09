@@ -985,6 +985,57 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
         require_cuda(cudaFree(body_v_tm_d), "free token-major V body");
     }
 
+    // f16 token-major variant used by the warpqk dispatch: same indexing as
+    // the f32 token-major path, values within f16 rounding of the reference.
+    {
+        __half * body_k_h_d = nullptr;
+        __half * body_v_h_d = nullptr;
+        require_cuda(cudaMalloc(&body_k_h_d, size_t(n_records)*n*sizeof(__half)), "cudaMalloc f16 token-major K body");
+        require_cuda(cudaMalloc(&body_v_h_d, size_t(n_records)*n*sizeof(__half)), "cudaMalloc f16 token-major V body");
+
+        ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
+                multi_k_body_d, multi_v_body_d,
+                multi_k_scales_d, multi_v_scales_d,
+                body_k_h_d, body_v_h_d,
+                n_records, head_dim, group,
+                params.key_bits, params.value_bits,
+                records[0].k_body.size(), records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                n, n,
+                nullptr);
+        require_cuda(cudaGetLastError(), "KVarN CUDA f16 token-major dequant launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA f16 token-major dequant sync");
+
+        std::vector<__half> body_k_h(size_t(n_records)*n);
+        std::vector<__half> body_v_h(size_t(n_records)*n);
+        require_cuda(cudaMemcpy(body_k_h.data(), body_k_h_d, body_k_h.size()*sizeof(__half), cudaMemcpyDeviceToHost),
+                "copy f16 token-major K body");
+        require_cuda(cudaMemcpy(body_v_h.data(), body_v_h_d, body_v_h.size()*sizeof(__half), cudaMemcpyDeviceToHost),
+                "copy f16 token-major V body");
+
+        float f16_max_rel_err = 0.0f;
+        for (uint32_t r = 0; r < n_records; ++r) {
+            const size_t rec_off = size_t(r)*n;
+            for (uint32_t g = 0; g < group; ++g) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const float k_h  = __half2float(body_k_h[rec_off + size_t(g)*head_dim + d]);
+                    const float k_ref = multi_k_ref[rec_off + size_t(d)*group + g];
+                    const float denom = std::max(std::fabs(k_ref), 1.0e-3f);
+                    f16_max_rel_err = std::max(f16_max_rel_err, std::fabs(k_h - k_ref)/denom);
+                }
+            }
+        }
+        for (size_t i = 0; i < body_v_h.size(); ++i) {
+            const float v_h = __half2float(body_v_h[i]);
+            const float denom = std::max(std::fabs(multi_v_ref[i]), 1.0e-3f);
+            f16_max_rel_err = std::max(f16_max_rel_err, std::fabs(v_h - multi_v_ref[i])/denom);
+        }
+        require(f16_max_rel_err < 2.0e-3f, "CUDA f16 token-major dequant within f16 rounding of CPU reference");
+
+        require_cuda(cudaFree(body_k_h_d), "free f16 token-major K body");
+        require_cuda(cudaFree(body_v_h_d), "free f16 token-major V body");
+    }
+
     ggml_cuda_kvarn_attn_mixed_f32_scratch(
             q_d,
             sink_k_d, sink_v_d,
