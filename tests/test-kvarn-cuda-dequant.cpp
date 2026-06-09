@@ -37,6 +37,21 @@ static void require_cuda(cudaError_t err, const char * msg) {
     }
 }
 
+// Matches llama-graph kvarn_graph_attn_scratch_floats: the 512d warpqk path
+// dequantizes body K/V into the tail of the scores buffer.
+static size_t kvarn_test_attn_scores_floats(
+        uint32_t n_tokens,
+        uint32_t n_head_kv,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size) {
+    size_t result = n_tokens;
+    if (n_records > 0 && head_dim >= 512) {
+        result += 2 * size_t(n_head_kv) * n_records * head_dim * group_size;
+    }
+    return result;
+}
+
 template <typename T>
 static T * cuda_upload(const std::vector<T> & src) {
     T * ptr = nullptr;
@@ -922,6 +937,54 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     }
     require(scratch_dequant_max_err < 1.0e-6f, "CUDA multi-record scratch dequant matches CPU reference");
 
+    // Token-major K variant: same values, K transposed within each record to
+    // (g*head_dim + d); V layout identical to the legacy wrapper.
+    {
+        float * body_k_tm_d = nullptr;
+        float * body_v_tm_d = nullptr;
+        require_cuda(cudaMalloc(&body_k_tm_d, size_t(n_records)*n*sizeof(float)), "cudaMalloc token-major K body");
+        require_cuda(cudaMalloc(&body_v_tm_d, size_t(n_records)*n*sizeof(float)), "cudaMalloc token-major V body");
+
+        ggml_cuda_kvarn_dequant_body_n_k_token_major(
+                multi_k_body_d, multi_v_body_d,
+                multi_k_scales_d, multi_v_scales_d,
+                body_k_tm_d, body_v_tm_d,
+                n_records, head_dim, group,
+                params.key_bits, params.value_bits,
+                records[0].k_body.size(), records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                n, n,
+                nullptr);
+        require_cuda(cudaGetLastError(), "KVarN CUDA token-major scratch dequant launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA token-major scratch dequant sync");
+
+        std::vector<float> body_k_tm(size_t(n_records)*n);
+        std::vector<float> body_v_tm(size_t(n_records)*n);
+        require_cuda(cudaMemcpy(body_k_tm.data(), body_k_tm_d, body_k_tm.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy token-major K body");
+        require_cuda(cudaMemcpy(body_v_tm.data(), body_v_tm_d, body_v_tm.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy token-major V body");
+
+        float token_major_max_err = 0.0f;
+        for (uint32_t r = 0; r < n_records; ++r) {
+            const size_t rec_off = size_t(r)*n;
+            for (uint32_t g = 0; g < group; ++g) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const float k_tm  = body_k_tm[rec_off + size_t(g)*head_dim + d];
+                    const float k_ref = multi_k_ref[rec_off + size_t(d)*group + g];
+                    token_major_max_err = std::max(token_major_max_err, std::fabs(k_tm - k_ref));
+                }
+            }
+        }
+        for (size_t i = 0; i < body_v_tm.size(); ++i) {
+            token_major_max_err = std::max(token_major_max_err, std::fabs(multi_v_ref[i] - body_v_tm[i]));
+        }
+        require(token_major_max_err < 1.0e-6f, "CUDA token-major K dequant matches transposed CPU reference");
+
+        require_cuda(cudaFree(body_k_tm_d), "free token-major K body");
+        require_cuda(cudaFree(body_v_tm_d), "free token-major V body");
+    }
+
     ggml_cuda_kvarn_attn_mixed_f32_scratch(
             q_d,
             sink_k_d, sink_v_d,
@@ -1107,7 +1170,9 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     require_cuda(cudaMalloc(&mha_mixed_out_d, size_t(n_queries)*n_head*head_dim*sizeof(float)), "cudaMalloc MHA mixed output");
     require_cuda(cudaMalloc(&mha_mixed_fused_out_d, size_t(n_queries)*n_head*head_dim*sizeof(float)), "cudaMalloc MHA fused mixed output");
     require_cuda(cudaMalloc(&mha_mixed_scores_d, n_mha_mixed_tokens*sizeof(float)), "cudaMalloc MHA mixed scores");
-    require_cuda(cudaMalloc(&mha_mixed_fused_scores_d, n_mha_mixed_tokens*sizeof(float)), "cudaMalloc MHA fused mixed scores");
+    const size_t mha_fused_scores_floats = kvarn_test_attn_scores_floats(
+            n_mha_mixed_tokens, n_head_kv, n_records, head_dim, group);
+    require_cuda(cudaMalloc(&mha_mixed_fused_scores_d, mha_fused_scores_floats*sizeof(float)), "cudaMalloc MHA fused mixed scores");
 
     const uint32_t mha_mask_stride_tokens = head_dim == 256 ? 1024 : n_mha_mixed_tokens;
     std::vector<uint16_t> mha_mask_f16(size_t(n_queries)*mha_mask_stride_tokens, f32_to_f16_bits(-1.0e30f));
@@ -2249,7 +2314,9 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
         require_cuda(cudaMalloc(&gemma_split_d, gemma_queries.size()*sizeof(float)), "cudaMalloc Gemma-shaped split output");
         require_cuda(cudaMalloc(&gemma_fused_d, gemma_queries.size()*sizeof(float)), "cudaMalloc Gemma-shaped fused output");
         require_cuda(cudaMalloc(&gemma_scores_d, n_gemma_tokens*sizeof(float)), "cudaMalloc Gemma-shaped split scores");
-        require_cuda(cudaMalloc(&gemma_fused_scores_d, n_gemma_tokens*sizeof(float)), "cudaMalloc Gemma-shaped fused scores");
+        const size_t gemma_fused_scores_floats = kvarn_test_attn_scores_floats(
+                n_gemma_tokens, gemma_n_head_kv, n_gemma_records, head_dim, group);
+        require_cuda(cudaMalloc(&gemma_fused_scores_d, gemma_fused_scores_floats*sizeof(float)), "cudaMalloc Gemma-shaped fused scores");
 
         set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
         ggml_cuda_kvarn_attn_mixed_f16_batch(
@@ -2479,7 +2546,9 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             require_cuda(cudaMalloc(&gemma_rt_fused_d, gemma_rt_queries_v.size()*sizeof(float)), "cudaMalloc Gemma runtime-shape fused output");
             require_cuda(cudaMalloc(&gemma_rt_fused_repeat_d, gemma_rt_queries_v.size()*sizeof(float)), "cudaMalloc Gemma runtime-shape fused repeat output");
             require_cuda(cudaMalloc(&gemma_rt_scores_d, n_gemma_rt_tokens*sizeof(float)), "cudaMalloc Gemma runtime-shape split scores");
-            require_cuda(cudaMalloc(&gemma_rt_fused_scores_d, n_gemma_rt_tokens*sizeof(float)), "cudaMalloc Gemma runtime-shape fused scores");
+            const size_t gemma_rt_fused_scores_floats = kvarn_test_attn_scores_floats(
+                    n_gemma_rt_tokens, gemma_rt_n_head_kv, n_gemma_rt_records, head_dim, group);
+            require_cuda(cudaMalloc(&gemma_rt_fused_scores_d, gemma_rt_fused_scores_floats*sizeof(float)), "cudaMalloc Gemma runtime-shape fused scores");
 
             set_env_var("LLAMA_KVARN_ATTN_SPLIT_KERNELS", "1");
             ggml_cuda_kvarn_attn_mixed_f16_batch(

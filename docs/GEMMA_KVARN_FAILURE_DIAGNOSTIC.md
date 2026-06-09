@@ -217,3 +217,91 @@ Fallback avoids experimental KVarN+ISWA entirely → stable but **not** measurin
 | `scripts/kvarn/README.md` § tail512 diagnostic | Narrative cross-ref |
 | `src/llama-model.cpp` | Gemma production fallback (keep until true path passes) |
 | `ggml/src/ggml-cuda/kvarn.cu` | Hadamard / warpqk / quantize kernels |
+
+---
+
+## 10. Token-major K scratch + multi-CTA sinktail decode (2026-06-09)
+
+Applied `0001-cuda-coalesced-token-major-K-dequant-scratch-warpqk-.patch` per
+second architect verdict (`ARCHITECT_REVIEW_VERDICT_AND_REVISED_HANDOFF.md`).
+R1–R4 in `kvarn.cu` / `kvarn.cuh`; test buffer sizing fix for 512d warpqk
+dequant scratch in `tests/test-kvarn-cuda-dequant.cpp`.
+
+### Root-cause findings
+
+**F1 — pp512 regression (1872→1565 t/s) traced to uncoalesced f32 K scratch reads.**
+P0-1 dequantizes the K body into f32 scratch in the *packed* record/dim-major
+layout (`d*group_size + g`). In `kvarn_attn_mixed_f16_fused_batch_warpqk_kernel`,
+lane `d` then reads `k_f32[r*hd*gs + d*gs + g]`: adjacent lanes are
+`group_size` floats (512 B at gs=128) apart, so every warp K load fans out to
+32 scattered sectors instead of coalesced lines. The pre-P0 in-kernel path was
+wrong-but-fast; P0 made it correct-but-uncoalesced. V scratch was already
+token-major and unaffected.
+
+**F2 — warpqk re-reads the 512-wide q row from global memory once per token**
+(`n_tokens × head_dim` redundant loads per CTA; ~639 tokens at pp512 end).
+
+**F3 — tg64 sinktail-decode launches ONE thread block** (`<<<1, n_head*32>>>`)
+for the whole layer: a single SM performs all decode attention while the rest
+of the GPU idles. This, not ISWA prepare, is the structural decode ceiling.
+Softmax max/denom were additionally serialized on lane 0 of each warp.
+
+**F4 — seal batching (hypothesis A2) confirmed inert at pp512 but not patched.**
+With gs=128 and the 384+128 ubatch split, `kvarn_graph_seal_records()` returns
+exactly one record per ubatch, so the multi-record op never fires. Cross-ubatch
+seal deferral would change the `n_pending` window math baked into
+`kvarn_graph_active_window()` and the pending-buffer capacity contract; too
+invasive for a static-only pass. Same for KVarN prefill ping-pong (A4): seal
+record indices are baked into op params, so alternating 384/128 graphs can
+never `can_reuse` until seal indices become runtime inputs. Both deferred with
+notes rather than half-patched.
+
+### Patches landed (this pass)
+
+| # | File(s) | Change |
+|---|---------|--------|
+| R1 | `ggml/src/ggml-cuda/kvarn.cu`, `kvarn.cuh` | `kvarn_dequant_n_kernel` gains a `k_token_major` mode; new export `ggml_cuda_kvarn_dequant_body_n_k_token_major` writes K f32 scratch as `g*head_dim + d` (matching V). Legacy wrapper/behavior bit-identical (`k_token_major=0` reduces to the old indexing). Packed persistent layouts untouched. |
+| R2 | `ggml/src/ggml-cuda/kvarn.cu` | warpqk kernel: K f32 body read is now token-major and fully coalesced (`body_t*head_dim + d`); V index simplified to the same form; q row staged once into shared memory (`q_sh[head_dim]`) and reused for all token scores. Dispatch shmem grown by `head_dim` floats; dispatch now calls the token-major dequant. |
+| R3 | `ggml/src/ggml-cuda/kvarn.cu` | `kvarn_attn_mixed_f16_sinktail_decode_kernel` rewritten: one CTA **per head** (grid `n_head`, block 128, 4 warps splitting tokens), q staged in shared memory, block-parallel softmax max/sum reductions, dimension-parallel AV. Dispatch launch + shmem updated (`head_dim + n_tokens + block` floats). |
+| R4 | `tests/test-kvarn-cuda-dequant.cpp` | New check: token-major K dequant equals the transposed CPU reference; V identical to legacy wrapper. |
+
+512d paths are gated; Qwen3.6 MTP regression measured 2026-06-09 (see below).
+
+### Measured validation (RTX 5070, Gemma Q4_XL, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`, r=5, iters=4, rtn=1.0)
+
+Artifact: `artifacts/kvarn-bench/gemma-token-major-k-scratch-rerun/`
+
+| Case | Normal t/s | KVarN t/s | Ratio | vs post-P0 `95390d5b1` | Gate ≥90% |
+|------|----------:|----------:|------:|------------------------|:---------:|
+| pp512 | 2465.51 | 1732.84 | **70.3%** | +168 t/s (+10.7%) from 1565 | **FAIL** |
+| tg64 | 61.60 | 46.13 | **74.9%** | +1.7 t/s (+3.8%) from 44.4 | **FAIL** |
+
+- Tier 0: `test-kvarn-kv`, `test-kvarn-cuda-*`, `test-batch-split` — **PASS**
+- Tier 2 Gemma logits (repeat/split/scratch) — **PASS** (NMSE identical)
+- Trace: pp512 `warpqk-f16-dequant` with `rec2` on final ubatch; tg64 `sinktail-decode` with `rec0`
+- Production fallback (no experimental ISWA): pp512 **110.8%**, tg64 **100.9%** — unchanged safe path
+
+**Verdict:** patch **kept** — F1 coalescing hypothesis supported (pp512 recovered toward pre-P0 1872 t/s);
+F3 multi-CTA decode modestly helps tg64. **Not production-ready** for flipping `llama-model.cpp`
+experimental policy; need ~+486 pp512 KVarN t/s and ~+9 tg64 KVarN t/s for 90% gate.
+
+### What to run next
+
+```powershell
+ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-kv|test-kvarn-cuda|test-batch-split" --output-on-failure
+$env:LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA = "1"
+powershell scripts\kvarn\run_bench_matrix.ps1 -Model <gemma-Q4_XL> -CaseList "pp512:512:0,tg64:0:64"
+powershell scripts\kvarn\compare_cuda_logits_ref.ps1 -Model <gemma> -CheckPackedRepeat -CheckPackedSplit
+# Qwen non-regression at head_dim 128:
+powershell scripts\kvarn\run_bench_matrix.ps1 -Model <qwen3.6-mtp> -CaseList "pp512:512:0,tg64:0:64"
+```
+
+Next suspects (pp512 still <90% after R1/R2): (1) f16 dequant scratch, (2) per-layer
+seal launch count (~28 kernels/seal at `--kvarn-iters 4`), (3) seal-index-as-runtime-input
+for prefill graph reuse (A4).
+
+**Qwen3.6 MTP regression** (`Qwen3.6-35B-A3B-MTP-UD-Q4_K_M` split, `-ncmoe 34`, artifact
+`artifacts/kvarn-bench/qwen36-mtp-q4km-token-major-regression/`): pp512 **83.0%** (FAIL,
+normal ±36 t/s — high MoE variance), tg64 **97.1%** (PASS). IQ3_XXS path in older docs is
+not on disk; use Q4_K_M split for RTX 5070 regression. Full handover:
+[`KVARN_ARCHITECT_HANDOVER_ROUND2.md`](KVARN_ARCHITECT_HANDOVER_ROUND2.md).

@@ -127,6 +127,29 @@ void ggml_cuda_kvarn_dequant_body_n(
         size_t v_out_stride_floats,
         void * stream);
 
+// K f32 output in token-major layout (g*head_dim + d); V identical to
+// ggml_cuda_kvarn_dequant_body_n. Used by the 512d warpqk attention path
+// so per-lane K reads are coalesced.
+void ggml_cuda_kvarn_dequant_body_n_k_token_major(
+        const uint8_t * k_body,
+        const uint8_t * v_body,
+        const float * k_scales,
+        const float * v_scales,
+        float * k_out,
+        float * v_out,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        size_t k_body_stride_bytes,
+        size_t v_body_stride_bytes,
+        size_t k_scale_stride_floats,
+        size_t v_scale_stride_floats,
+        size_t k_out_stride_floats,
+        size_t v_out_stride_floats,
+        void * stream);
+
 void ggml_cuda_kvarn_qk_body(
         const float * q,
         const uint8_t * k_body,
