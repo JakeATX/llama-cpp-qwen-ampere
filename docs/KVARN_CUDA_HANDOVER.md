@@ -3,21 +3,24 @@
 **Audience:** External architect reviewing the CUDA KVarN vs normal KV throughput gap.  
 **Last updated:** 2026-06-09  
 **Branch:** `kvarn-atx-integration`  
-**HEAD:** [`f5bdd5b6c`](https://github.com/JakeATX/llama.cpp/commit/f5bdd5b6c) — *cuda: Gemma 512d sinktail, pipelined body-store, and batch seal path*  
+**HEAD:** [`95390d5b1`](https://github.com/JakeATX/llama.cpp/commit/95390d5b1) — *architect P0: K-layout, event-ordered store, ISWA trace, multi-record seal*  
+**Code-review agent:** [`docs/AGENT_CODE_REVIEW_HANDOVER.md`](AGENT_CODE_REVIEW_HANDOVER.md)  
 **Upstream sync:** merged `upstream-ggml/master` @ `42a0afd59` (2026-06-08); `hparams.n_layer` → `n_layer_all` / `n_layer_nextn` migration applied to KVarN paths  
 **Remote:** [https://github.com/JakeATX/llama.cpp](https://github.com/JakeATX/llama.cpp) (`jakeatx` / `fork`)  
 **Review URL:** [https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration)
 
 ### Architect review entry point
 
-Start here to critique the latest Gemma CUDA work (experimental gate still **FAIL** ~71% pp512 / ~74% tg64):
+Start here to critique the latest Gemma CUDA work (experimental gate still **FAIL** ~65% pp512 / ~72% tg64 post-P0):
 
 | Resource | URL |
 |----------|-----|
+| **Code-review agent handover** | [docs/AGENT_CODE_REVIEW_HANDOVER.md](https://github.com/JakeATX/llama.cpp/blob/kvarn-atx-integration/docs/AGENT_CODE_REVIEW_HANDOVER.md) |
 | **Branch tip (all code)** | [tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration) |
-| **Gemma fast-path commit** | [commit/f5bdd5b6c](https://github.com/JakeATX/llama.cpp/commit/f5bdd5b6c) |
+| **Latest commit** | [commit/95390d5b1](https://github.com/JakeATX/llama.cpp/commit/95390d5b1) |
 | **Failure diagnostic** | [docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md](https://github.com/JakeATX/llama.cpp/blob/kvarn-atx-integration/docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md) |
-| **Diff vs parent** | [686356d61..f5bdd5b6c](https://github.com/JakeATX/llama.cpp/compare/686356d61...f5bdd5b6c) |
+| **Architect P0 handoff** | [docs/KVARN_PRODUCTION_PATCH_HANDOFF.md](https://github.com/JakeATX/llama.cpp/blob/kvarn-atx-integration/docs/KVARN_PRODUCTION_PATCH_HANDOFF.md) |
+| **Diff P0** | [c6ad0c5d4..95390d5b1](https://github.com/JakeATX/llama.cpp/compare/c6ad0c5d4...95390d5b1) |
 
 **Files changed in `f5bdd5b6c` (CUDA + graph + docs):**
 
@@ -82,7 +85,7 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 
 | Area | Status | Notes |
 |------|--------|-------|
-| **Gemma KVarN+ISWA (experimental)** | FAIL (~71–74%) | `@ f5bdd5b6c`: sinktail/decode, pipelined 512d body-store, warpqk body dequant; Q4_XL pp512 **70.8%** (1872 t/s), tg64 **73.7%** (48.9 t/s); still opt-in only |
+| **Gemma KVarN+ISWA (experimental)** | FAIL (~65–72%) | `@ 95390d5b1`: P0 correctness (K-layout, event store) + prior fast paths; Q4_XL pp512 **64.8%**, tg64 **71.7%**; Tier2 logits PASS; still opt-in only |
 | **Gemma production fallback** | PASS | Normal ISWA when `--kv-cache-quant kvarn`; post-common Q4_XL gate: pp512 **122.1%**, tg64 **100.7%** |
 | **Common KVarN param propagation** | FIXED | `common_context_params_to_llama()` again copies `kv_cache_quant_type` + `kvarn`; server load-failure test now covers an explicit unsupported preset |
 | **Tier 2 logits** | Enforceable | `compare_cuda_logits_ref.ps1` NMSE thresholds + `-RunTier2` on production gate |
@@ -106,7 +109,8 @@ Gemma 4 with `--kv-cache-quant kvarn` **defaults to normal ISWA KV** because exp
 | `4a4c6ff70` | Fix KVarN prefill graph reuse across alternating prompt ubatches (ping-pong `gf_res_alt`) |
 | `030333631` | Scope ping-pong graph reuse to normal KV prefill only; record Qwen gate PASS |
 | `686356d61` | Stabilize mainline parity and KVarN production gates after upstream merge |
-| `f5bdd5b6c` | Gemma 512d CUDA fast paths: sinktail/decode attn, pipelined body-store, warpqk body dequant, all-heads seal op; logits NMSE script fix; experimental gate still ~71% pp512 |
+| `f5bdd5b6c` | Gemma 512d CUDA fast paths: sinktail/decode attn, pipelined body-store, warpqk body dequant, all-heads seal op |
+| `95390d5b1` | Architect P0: warpqk K scratch layout, event-ordered 512d store, ISWA prepare trace, multi-record seal op; see `docs/AGENT_CODE_REVIEW_HANDOVER.md` |
 
 Earlier integration: `642fab89a` (ATX MoE residency merge), `10f373ac7` (build follow-ups).
 

@@ -2,7 +2,8 @@
 
 Repo: `JakeATX/llama.cpp`
 Branch: `kvarn-atx-integration`
-Code anchor reviewed: `f5bdd5b6c` (`cuda: Gemma 512d sinktail, pipelined body-store, and batch seal path`)
+Code anchor reviewed: `f5bdd5b6c` (`cuda: Gemma 512d sinktail, pipelined body-store, and batch seal path`)  
+**Implemented in:** `95390d5b1` — see [`docs/AGENT_CODE_REVIEW_HANDOVER.md`](AGENT_CODE_REVIEW_HANDOFF.md) for next-agent tasking.
 
 This handoff is for implementation by the coding agent. I reviewed the uploaded next-thread handover, `docs/KVARN_CUDA_HANDOVER.md`, `docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md`, and the relevant CUDA/graph/model code via the GitHub connector. I did not build or benchmark in this sandbox.
 

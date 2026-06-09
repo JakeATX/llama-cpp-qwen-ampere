@@ -1,7 +1,8 @@
 # Gemma 4 KVarN+ISWA throughput failure — evidence-based diagnostic
 
 **Audience:** Architect / CUDA implementer  
-**Branch:** `kvarn-atx-integration` @ [`f5bdd5b6c`](https://github.com/JakeATX/llama.cpp/commit/f5bdd5b6c) ([compare 686356d61..f5bdd5b6c](https://github.com/JakeATX/llama.cpp/compare/686356d61...f5bdd5b6c))  
+**Branch:** `kvarn-atx-integration` @ [`95390d5b1`](https://github.com/JakeATX/llama.cpp/commit/95390d5b1)  
+**Code-review handover:** [`docs/AGENT_CODE_REVIEW_HANDOVER.md`](AGENT_CODE_REVIEW_HANDOVER.md)  
 **Hardware:** RTX 5070 12 GB, `build-kvarn-cuda-static-vs`, `-fa off`, `-ngl 99`  
 **Model:** `gemma-4-12b-it-UD-Q3_K_XL.gguf` (Gemma 4 12B Q3)  
 **Gate:** KVarN/normal ≥ 90% on pp512 and tg64 with `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`
@@ -20,6 +21,8 @@
 | `artifacts/kvarn-bench/gemma-sinktail-decode-p0/` | tg64 | 64.12 ± 1.13 | 45.94 ± 0.14 | **71.6%** | FAIL |
 | `artifacts/kvarn-bench/gemma-batch-store-p1/` | pp512 | 2643.18 ± — | 1872.23 ± — | **70.8%** | FAIL |
 | `artifacts/kvarn-bench/gemma-batch-store-p1/` | tg64 | 66.35 ± 1.33 | 48.87 ± 0.07 | **73.7%** | FAIL |
+| `artifacts/kvarn-bench/gemma-architect-rerun/` | pp512 | 2414.73 ± — | 1564.67 ± — | **64.8%** | FAIL (post-P0 K-layout) |
+| `artifacts/kvarn-bench/gemma-architect-rerun/` | tg64 | 61.91 ± — | 44.37 ± 0.10 | **71.7%** | FAIL (post-P0) |
 | `artifacts/kvarn-bench/gemma-sinktail-fastpath-tg64/` | tg64 | 39.92 ± 27.99 | 43.51 ± 0.10 | **109.0%** | PASS (normal-KV variance) |
 | `artifacts/kvarn-bench/gemma-true-kvarn-speed-patch/` | pp512 | 2305.01 ± 588.89 | 1357.04 ± 147.60 | **58.9%** | FAIL (aborted before tg64) |
 | `artifacts/kvarn-bench/gemma-gate-push/` | pp512 | 2303.81 ± 641.63 | 1437.14 ± 42.95 | **62.4%** | FAIL |
