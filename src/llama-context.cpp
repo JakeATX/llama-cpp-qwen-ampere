@@ -1320,18 +1320,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Ping-pong only for multi-token prefill (e.g. 384+128 pp512). Decode is always
     // n_tokens==1 and must not swap slots.
     //
-    // KVarN prefill is now included: the per-slot can_reuse() check compares
-    // baked seal-record indices against the current ubatch, and llama-bench
-    // style prefill re-seals the same record per chunk size (record 0 for the
-    // 384 chunk, record 1 for the 128 chunk), so both cached topologies
-    // validate. The reused-slot path below fully re-resets and re-allocates
-    // the scheduler when switching slots, so the KVarN mixed-attn scratch is
-    // rebound rather than shared across topologies. Escape hatch for A/B:
-    // LLAMA_KVARN_DISABLE_PREFILL_PINGPONG=1 restores the old exclusion.
-    static const bool kvarn_pingpong_disabled = llama_kvarn_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_PINGPONG");
+    // KVarN+ISWA prefill ping-pong is opt-in only: enabling it without fixing
+    // scheduler buffer assignment for kvarn_iswa_kqv_out-* tensors aborts on
+    // the 384+128 pp512 path (pre-allocated tensor in CUDA0 cannot run
+    // KVARN_ATTN_MIXED). Set LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1 for A/B once
+    // the ISWA reuse path re-binds mixed-attn outputs across slot swaps.
+    static const bool kvarn_pingpong_enable = llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_PREFILL_PINGPONG");
     const bool use_alt_slot = gf_res_alt &&
         ubatch.n_tokens > 1 &&
-        (cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN || !kvarn_pingpong_disabled);
+        (cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN || kvarn_pingpong_enable);
 
     auto can_reuse_graph = [&](llm_graph_result * candidate) {
         return !graph_reuse_disable && candidate && candidate->get_gf() && candidate->can_reuse(gparams);

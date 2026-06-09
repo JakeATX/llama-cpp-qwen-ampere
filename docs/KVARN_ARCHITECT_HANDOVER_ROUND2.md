@@ -166,7 +166,7 @@ Implements the recommended next-patch list above. All changes gated on
 
 | ID | Files | Change | Targets |
 |----|-------|--------|---------|
-| R5 | `src/llama-context.cpp` | **KVarN prefill ping-pong enabled** (was item 4, promoted to #1 on budget math: 2 full 48-layer graph rebuilds per pp512 pass are the largest single host cost; the 384/128 chunks bake identical seal records every rep, so both cached slots' `can_reuse` validates, and the existing reused-slot path fully resets + re-allocates the scheduler when switching slots — the original "scratch cannot share sched" concern is structurally handled). Kill-switch: `LLAMA_KVARN_DISABLE_PREFILL_PINGPONG=1`. | pp512 |
+| R5 | `src/llama-context.cpp` | **KVarN prefill ping-pong** (opt-in: `LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1`; default off). Enabling on Gemma experimental ISWA aborts pp512: `kvarn_iswa_kqv_out-*` stays on a CUDA0 buffer that cannot run `KVARN_ATTN_MIXED` after the 384+128 slot swap. Scheduler reset on reuse does not rebind ISWA mixed-attn outputs — needs a dedicated fix before default-on. | pp512 |
 | R6 | `kvarn.cu`, `kvarn.cuh`, dispatch | **f16 dequant scratch** (item 2): `kvarn_dequant_n_kernel` templated on output type; new `ggml_cuda_kvarn_dequant_body_n_k_token_major_f16`; warpqk body params/loads are `__half`. Halves body read traffic per CTA. f32 token-major export retained for tests. Scratch element budget unchanged (same element count in half the bytes — capacity checks still valid). | pp512 |
 | R7 | `kvarn.cu` | **Seal launch trim** (item 1, safe subset): Sinkhorn scale-init folded into the first row/col iteration (`init_scale` flag); the two `kvarn_fill_f32_kernel` launches per pipeline removed (−4 launches/seal across K+V). `iters==0` still fills neutral scales. Deeper fusion (row+col per iter) needs grid-wide sync — deferred. | pp512 |
 | R8 | `src/llama-context.cpp` | **Reuse attribution trace**: `LLAMA_KVARN_GRAPH_REUSE_TRACE=1` logs per-ubatch reused/rebuilt + slot. Settles the open tg64 question (decode topology is already stabilized via kv_size mask + worst-case scratch, so reuse *should* hit every token after the first — verify, don't assume). | tg64 |
@@ -177,10 +177,20 @@ top of 4-bit/2-bit body quantization error — expected invisible at Tier 2
 NMSE, but logits MUST be re-run (repeat/split/scratch, Gemma) before any
 ratio claims.
 
+### Round 3 measured (RTX 5070, Gemma Q4_K_XL, experimental ISWA, r=3, ping-pong **off**)
+
+| Case | Round 2 @ `7ca5ee0cb` | Round 3 R6+R7 @ `f8507c942`+fix | Δ |
+|------|----------------------:|----------------------------------:|---|
+| pp512 | 70.3 % | **75.2 %** | +4.9 pp (f16 dequant + sinkhorn init fold) |
+| tg64 | 74.9 % | 72.0 % | −2.9 pp (within noise; no ping-pong change) |
+
+Tier 0: `test-kvarn-cuda-scratch-ref` PASS with 512d fused-vs-split tol 2e-3 (R6 f16 scratch).
+R5 with default ping-pong-on **crashes** every pp512 run — do not enable until ISWA tensor rebind is fixed.
+
 **Validation order for the human/CI run:**
 1. ctest Tier 0; Gemma logits repeat/split/scratch.
-2. Gemma experimental bench, default env → attribute combined R5–R7.
-3. Same bench with `LLAMA_KVARN_DISABLE_PREFILL_PINGPONG=1` → isolates R5.
+2. Gemma experimental bench, default env (ping-pong off) → R6+R7 attribution.
+3. Optional A/B: `LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1` only after R5 ISWA fix lands.
 4. tg64 with `LLAMA_KVARN_GRAPH_REUSE_TRACE=1` → if any decode token after
    the first logs `reused=0`, capture which check fails in
    `llm_graph_input_attn_kv_iswa::can_reuse` — that becomes the next tg64

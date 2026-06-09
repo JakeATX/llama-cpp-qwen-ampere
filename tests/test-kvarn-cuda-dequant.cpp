@@ -2504,9 +2504,17 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             gemma_fused_err = std::max(gemma_fused_err, std::fabs(gemma_ref[i] - gemma_fused[i]));
             gemma_fused_vs_split_err = std::max(gemma_fused_vs_split_err, std::fabs(gemma_split[i] - gemma_fused[i]));
         }
+        // 512d warpqk fused uses f16 body scratch; split keeps f32 in-kernel dequant.
+        const float gemma_body_fused_vs_split_tol = head_dim >= 512 ? 2.0e-3f : 1.0e-6f;
+        if (gemma_fused_vs_split_err >= gemma_body_fused_vs_split_tol) {
+            std::fprintf(stderr,
+                    "Gemma-shaped fused_vs_split=%g tol=%g (512d f16 scratch vs split f32)\n",
+                    double(gemma_fused_vs_split_err), double(gemma_body_fused_vs_split_tol));
+        }
         require(gemma_split_err < 1.0e-5f, "CUDA Gemma-shaped 17-query split mixed attention matches CPU reference");
         require(gemma_fused_err < 1.0e-5f, "CUDA Gemma-shaped 17-query forced fused mixed attention matches CPU reference");
-        require(gemma_fused_vs_split_err < 1.0e-6f, "CUDA Gemma-shaped 17-query forced fused mixed attention matches split output");
+        require(gemma_fused_vs_split_err < gemma_body_fused_vs_split_tol,
+                "CUDA Gemma-shaped 17-query forced fused mixed attention matches split output");
 
         cudaFree(gemma_queries_d);
         cudaFree(gemma_sink_tail_k_d);
@@ -2714,7 +2722,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
                         double(gemma_rt_fused_repeat_err), worst_iq, worst_ih, worst_d,
                         double(gemma_rt_fused[gemma_rt_repeat_worst]), double(gemma_rt_fused_repeat[gemma_rt_repeat_worst]));
             }
-            require(gemma_rt_fused_vs_split_err < 1.0e-6f,
+            require(gemma_rt_fused_vs_split_err < 2.0e-3f,
                     "CUDA Gemma runtime-shape 512 forced fused mixed attention matches split output");
             require(gemma_rt_fused_repeat_err == 0.0f,
                     "CUDA Gemma runtime-shape 512 forced fused mixed attention is repeat deterministic");
