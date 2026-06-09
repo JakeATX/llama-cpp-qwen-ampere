@@ -4119,6 +4119,11 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
         int32_t sinkhorn_iters;
         float   rtn_quantile;
         int32_t n_heads;
+        int32_t n_record_batch;
+        int32_t record_0;
+        int32_t record_1;
+        int32_t record_2;
+        int32_t record_3;
     } params = {
         head_dim,
         group_size,
@@ -4127,6 +4132,8 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
         sinkhorn_iters,
         rtn_quantile,
         1,
+        0,
+        0, 0, 0, 0,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4214,6 +4221,11 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
         int32_t sinkhorn_iters;
         float   rtn_quantile;
         int32_t n_heads;
+        int32_t n_record_batch;
+        int32_t record_0;
+        int32_t record_1;
+        int32_t record_2;
+        int32_t record_3;
     } params = {
         head_dim,
         group_size,
@@ -4222,6 +4234,109 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
         sinkhorn_iters,
         rtn_quantile,
         n_heads,
+        0,
+        0, 0, 0, 0,
+    };
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_KVARN_STORE_KV_BODY;
+    result->src[0] = pending_k;
+    result->src[1] = pending_v;
+    result->src[2] = k_scales;
+    result->src[3] = v_scales;
+    result->src[4] = scratch;
+    result->src[5] = k_body;
+    result->src[6] = v_body;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_kvarn_store_kv_body_pending_records(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pending_k,
+        struct ggml_tensor  * pending_v,
+        struct ggml_tensor  * k_body,
+        struct ggml_tensor  * v_body,
+        struct ggml_tensor  * k_scales,
+        struct ggml_tensor  * v_scales,
+        struct ggml_tensor  * scratch,
+        const int32_t       * records,
+               int32_t        n_record_batch,
+               int32_t        head_dim,
+               int32_t        group_size,
+               int32_t        key_bits,
+               int32_t        value_bits,
+               int32_t        sinkhorn_iters,
+               float          rtn_quantile) {
+    GGML_ASSERT(pending_k->type == GGML_TYPE_F32);
+    GGML_ASSERT(pending_v->type == GGML_TYPE_F32);
+    GGML_ASSERT(k_body->type == GGML_TYPE_I8);
+    GGML_ASSERT(v_body->type == GGML_TYPE_I8);
+    GGML_ASSERT(k_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(v_scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(scratch->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_record_batch > 1 && n_record_batch <= 4);
+    GGML_ASSERT(records != NULL);
+    GGML_ASSERT(head_dim > 0);
+    GGML_ASSERT(group_size > 0);
+    GGML_ASSERT(key_bits > 0 && key_bits <= 8);
+    GGML_ASSERT(value_bits > 0 && value_bits <= 8);
+    GGML_ASSERT(sinkhorn_iters > 0);
+    GGML_ASSERT(rtn_quantile > 0.0f && rtn_quantile <= 1.0f);
+    GGML_ASSERT(ggml_is_contiguous(pending_k));
+    GGML_ASSERT(ggml_is_contiguous(pending_v));
+    GGML_ASSERT(ggml_is_contiguous(k_body));
+    GGML_ASSERT(ggml_is_contiguous(v_body));
+    GGML_ASSERT(ggml_is_contiguous(k_scales));
+    GGML_ASSERT(ggml_is_contiguous(v_scales));
+    GGML_ASSERT(ggml_is_contiguous(scratch));
+    GGML_ASSERT(pending_k->ne[0] == head_dim);
+    GGML_ASSERT(pending_v->ne[0] == head_dim);
+    GGML_ASSERT(pending_k->ne[2] == group_size);
+    GGML_ASSERT(pending_v->ne[2] == group_size);
+
+    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits   + 7)/8);
+    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int64_t tile_floats = (int64_t) head_dim*group_size;
+    const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size);
+    const int64_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
+    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
+    GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
+    GGML_ASSERT(v_body->ne[0] >= v_body_bytes);
+    GGML_ASSERT(ggml_nelements(scratch) >= scratch_floats);
+
+    for (int32_t i = 0; i < n_record_batch; ++i) {
+        GGML_ASSERT(records[i] >= 0);
+    }
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, k_body);
+
+    struct kvarn_store_kv_body_params {
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        int32_t sinkhorn_iters;
+        float   rtn_quantile;
+        int32_t n_heads;
+        int32_t n_record_batch;
+        int32_t record_0;
+        int32_t record_1;
+        int32_t record_2;
+        int32_t record_3;
+    } params = {
+        head_dim,
+        group_size,
+        key_bits,
+        value_bits,
+        sinkhorn_iters,
+        rtn_quantile,
+        1,
+        n_record_batch,
+        n_record_batch > 0 ? records[0] : 0,
+        n_record_batch > 1 ? records[1] : 0,
+        n_record_batch > 2 ? records[2] : 0,
+        n_record_batch > 3 ? records[3] : 0,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 

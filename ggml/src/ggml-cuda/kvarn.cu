@@ -29,12 +29,30 @@ static bool kvarn_env_flag(const char * name) {
     return value != 0;
 }
 
-static cudaStream_t kvarn_aux_cuda_stream() {
-    static cudaStream_t stream = nullptr;
-    if (stream == nullptr) {
-        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+struct kvarn_aux_cuda_state {
+    cudaStream_t stream     = nullptr;
+    cudaEvent_t  main_ready = nullptr;
+    cudaEvent_t  aux_done   = nullptr;
+    int          device     = -1;
+};
+
+static kvarn_aux_cuda_state & kvarn_aux_cuda_state_get() {
+    thread_local kvarn_aux_cuda_state st;
+
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (st.stream == nullptr || st.device != dev) {
+        if (st.stream != nullptr) {
+            cudaStreamDestroy(st.stream);
+            cudaEventDestroy(st.main_ready);
+            cudaEventDestroy(st.aux_done);
+        }
+        st.device = dev;
+        cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking);
+        cudaEventCreateWithFlags(&st.main_ready, cudaEventDisableTiming);
+        cudaEventCreateWithFlags(&st.aux_done,   cudaEventDisableTiming);
     }
-    return stream;
+    return st;
 }
 
 static bool kvarn_cuda_dynamic_shmem_fits(size_t nbytes) {
@@ -792,7 +810,13 @@ static void ggml_cuda_kvarn_store_kv_body_512_pipelined(
         cudaMemsetAsync(v_body, 0, kvarn_packed_nbytes(n, value_bits), cuda_stream);
     }
 
-    cudaStream_t aux_stream = kvarn_aux_cuda_stream();
+    kvarn_aux_cuda_state & aux = kvarn_aux_cuda_state_get();
+    cudaStream_t aux_stream = aux.stream;
+
+    // k_tile/v_tile are produced by prior kernels on cuda_stream. The aux stream
+    // must not read them until those writes are visible.
+    cudaEventRecord(aux.main_ready, cuda_stream);
+    cudaStreamWaitEvent(aux_stream, aux.main_ready, 0);
 
     const int k_hadamard_block = kvarn_pow2_block(head_dim);
     if (k_hadamard_block <= 1024) {
@@ -850,7 +874,9 @@ static void ggml_cuda_kvarn_store_kv_body_512_pipelined(
             k_scales, k_rtn_scale, k_rtn_zp, head_dim);
     kvarn_store_v_finalize_scales_kernel<<<int((group_size + block - 1)/block), block, 0, aux_stream>>>(
             v_scales, v_rtn_scale, v_rtn_zp, head_dim, group_size);
-    cudaStreamSynchronize(aux_stream);
+
+    cudaEventRecord(aux.aux_done, aux_stream);
+    cudaStreamWaitEvent(cuda_stream, aux.aux_done, 0);
 }
 
 static __global__ void kvarn_transpose_pending_k_head_kernel(
@@ -887,6 +913,76 @@ static __global__ void kvarn_gather_pending_v_head_kernel(
     v_tile[i] = pending[size_t(d) + size_t(g)*pending_head_stride];
 }
 
+void ggml_cuda_kvarn_store_body_pending_records_minmax(
+        const float * pending_k,
+        const float * pending_v,
+        uint8_t * k_body,
+        uint8_t * v_body,
+        float * k_scales,
+        float * v_scales,
+        float * scratch,
+        const int32_t * records,
+        uint32_t n_record_batch,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        uint32_t sinkhorn_iters,
+        float rtn_quantile,
+        size_t k_body_record_stride_bytes,
+        size_t v_body_record_stride_bytes,
+        size_t k_body_head_stride_bytes,
+        size_t v_body_head_stride_bytes,
+        size_t k_scale_record_stride_floats,
+        size_t v_scale_record_stride_floats,
+        size_t k_scale_head_stride_floats,
+        size_t v_scale_head_stride_floats,
+        size_t pending_k_head_stride_floats,
+        size_t pending_v_head_stride_floats,
+        void * stream) {
+    const size_t tile_floats = size_t(head_dim)*group_size;
+    float * k_tile = scratch;
+    float * v_tile = scratch + tile_floats;
+    float * pipeline = scratch + 2*tile_floats;
+    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    const int block = 256;
+    const int grid = int((tile_floats + block - 1)/block);
+
+    const float * k_pending = pending_k;
+    const float * v_pending = pending_v;
+    kvarn_transpose_pending_k_head_kernel<<<grid, block, 0, cuda_stream>>>(
+            k_pending, k_tile, head_dim, group_size, uint32_t(pending_k_head_stride_floats));
+    kvarn_gather_pending_v_head_kernel<<<grid, block, 0, cuda_stream>>>(
+            v_pending, v_tile, head_dim, group_size, uint32_t(pending_v_head_stride_floats));
+
+    for (uint32_t bi = 0; bi < n_record_batch; ++bi) {
+        const uint32_t record = uint32_t(records[bi]);
+        if (head_dim >= 512) {
+            ggml_cuda_kvarn_store_kv_body_512_pipelined(
+                    k_tile, v_tile,
+                    k_body + size_t(record)*k_body_record_stride_bytes,
+                    v_body + size_t(record)*v_body_record_stride_bytes,
+                    k_scales + size_t(record)*k_scale_record_stride_floats,
+                    v_scales + size_t(record)*v_scale_record_stride_floats,
+                    pipeline,
+                    head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile, stream);
+        } else {
+            ggml_cuda_kvarn_store_k_body_reference_minmax(
+                    k_tile,
+                    k_body + size_t(record)*k_body_record_stride_bytes,
+                    k_scales + size_t(record)*k_scale_record_stride_floats,
+                    pipeline,
+                    head_dim, group_size, key_bits, sinkhorn_iters, rtn_quantile, stream);
+            ggml_cuda_kvarn_store_v_body_reference_minmax(
+                    v_tile,
+                    v_body + size_t(record)*v_body_record_stride_bytes,
+                    v_scales + size_t(record)*v_scale_record_stride_floats,
+                    pipeline,
+                    head_dim, group_size, value_bits, sinkhorn_iters, rtn_quantile, stream);
+        }
+    }
+}
+
 void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         const float * pending_k,
         const float * pending_v,
@@ -911,7 +1007,6 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         void * stream) {
     const size_t tile_floats = size_t(head_dim)*group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
-    const size_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
     float * pipeline = scratch + 2*tile_floats;
@@ -2981,7 +3076,13 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
         for (uint32_t d = lane; d < head_dim; d += 32) {
             float k = 0.0f;
             if (k_body_f32_head != nullptr && t >= n_sink && t < n_sink + n_body_tokens) {
-                k = k_body_f32_head[size_t(t - n_sink)*head_dim + d];
+                const uint32_t body_t = t - n_sink;
+                const uint32_t r = body_t/group_size;
+                const uint32_t g = body_t - r*group_size;
+                k = k_body_f32_head[
+                        size_t(r)*size_t(head_dim)*group_size +
+                        size_t(d)*group_size +
+                        g];
             } else {
                 k = kvarn_mixed_f16_load_k(
                         k_st, k_body_head, k_scales_head, pending_k_head,
@@ -3045,7 +3146,13 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
         for (uint32_t t = 0; t < n_tokens; ++t) {
             float v = 0.0f;
             if (v_body_f32_head != nullptr && t >= n_sink && t < n_sink + n_body_tokens) {
-                v = v_body_f32_head[size_t(t - n_sink)*head_dim + d];
+                const uint32_t body_t = t - n_sink;
+                const uint32_t r = body_t/group_size;
+                const uint32_t g = body_t - r*group_size;
+                v = v_body_f32_head[
+                        size_t(r)*size_t(group_size)*head_dim +
+                        size_t(g)*head_dim +
+                        d];
             } else {
                 v = kvarn_mixed_f16_load_v(
                         v_st, v_body_head, v_scales_head, pending_v_head,

@@ -818,6 +818,15 @@ ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_all_heads_from_pending
     return kv->store_kv_body_all_heads_from_pending(ctx, scratch, il, record);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_records_from_pending(
+        ggml_context * ctx,
+        ggml_tensor * scratch,
+        int32_t il,
+        const std::vector<uint32_t> & records) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->store_kv_body_records_from_pending(ctx, scratch, il, records);
+}
+
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const llama_model * model,
         const llama_hparams & hparams,
@@ -1588,6 +1597,40 @@ ggml_tensor * llama_kv_cache_kvarn::view_v_scales_record_heads(
             view.scales_v->nb[2], offset);
     ggml_format_name(result, "kvarn_v_scales_l%d_r%u_heads", il, record);
     return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_from_pending(
+        ggml_context * ctx,
+        ggml_tensor * scratch,
+        int32_t il,
+        const std::vector<uint32_t> & records) const {
+    const size_t li = layer_storage_index(il);
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (records.empty()) {
+        throw std::invalid_argument("KVarN record batch seal requires at least one record");
+    }
+    if (records.size() > 4) {
+        throw std::invalid_argument("KVarN record batch seal supports at most four records per op");
+    }
+    for (const uint32_t record : records) {
+        if (record >= view.n_records) {
+            throw std::out_of_range("KVarN body record index is out of range");
+        }
+    }
+    if (view.head_dim_k != view.head_dim_v) {
+        throw std::runtime_error("KVarN fused pending K/V body store requires equal K and V head dimensions");
+    }
+
+    std::vector<int32_t> record_ids(records.begin(), records.end());
+    return ggml_kvarn_store_kv_body_pending_records(
+            ctx, layer_tensors[li].pending_k, layer_tensors[li].pending_v,
+            layer_tensors[li].body_k, layer_tensors[li].body_v,
+            layer_tensors[li].scales_k, layer_tensors[li].scales_v,
+            scratch,
+            record_ids.data(), int32_t(record_ids.size()),
+            int32_t(view.head_dim_k), int32_t(params.group_size),
+            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(params.sinkhorn_iters), params.rtn_quantile);
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads_from_pending(

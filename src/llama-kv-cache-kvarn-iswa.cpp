@@ -8,8 +8,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cerrno>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 
 static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_override) {
@@ -28,6 +30,11 @@ static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_
     }
 
     return std::max<uint32_t>(1, default_limit);
+}
+
+static bool kvarn_iswa_prepare_trace_enabled() {
+    const char * env = std::getenv("LLAMA_KVARN_ISWA_PREPARE_TRACE");
+    return env != nullptr && std::strcmp(env, "0") != 0;
 }
 
 llama_kv_cache_kvarn_iswa::llama_kv_cache_kvarn_iswa(
@@ -147,16 +154,31 @@ llama_memory_context_ptr llama_kv_cache_kvarn_iswa::init_batch(
         return std::make_unique<llama_kv_cache_kvarn_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
+    const auto t_base0 = std::chrono::steady_clock::now();
     auto sinfos_base = kv_base->prepare(ubatches);
+    const auto t_base1 = std::chrono::steady_clock::now();
     if (sinfos_base.empty()) {
         LLAMA_LOG_ERROR("%s: failed to prepare KVarN base ubatches\n", __func__);
         return std::make_unique<llama_kv_cache_kvarn_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
+    const auto t_swa0 = std::chrono::steady_clock::now();
     auto sinfos_swa = kv_swa->prepare(ubatches);
+    const auto t_swa1 = std::chrono::steady_clock::now();
     if (sinfos_swa.empty()) {
         LLAMA_LOG_ERROR("%s: failed to prepare SWA ubatches\n", __func__);
         return std::make_unique<llama_kv_cache_kvarn_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    if (kvarn_iswa_prepare_trace_enabled()) {
+        const auto base_us = std::chrono::duration_cast<std::chrono::microseconds>(t_base1 - t_base0).count();
+        const auto swa_us  = std::chrono::duration_cast<std::chrono::microseconds>(t_swa1  - t_swa0 ).count();
+        uint32_t n_tokens_total = 0;
+        for (const llama_ubatch & ub : ubatches) {
+            n_tokens_total += ub.n_tokens;
+        }
+        LLAMA_LOG_INFO("%s: KVarN+ISWA prepare trace: ubatches=%zu tokens=%u base_us=%lld swa_us=%lld\n",
+                __func__, ubatches.size(), n_tokens_total, (long long) base_us, (long long) swa_us);
     }
 
     return std::make_unique<llama_kv_cache_kvarn_iswa_context>(

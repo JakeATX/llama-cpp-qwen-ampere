@@ -3059,6 +3059,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     int32_t sinkhorn_iters;
                     float   rtn_quantile;
                     int32_t n_heads;
+                    int32_t n_record_batch;
+                    int32_t record_0;
+                    int32_t record_1;
+                    int32_t record_2;
+                    int32_t record_3;
                 } params;
                 memcpy(&params, dst->op_params, sizeof(params));
                 if (params.n_heads <= 0) {
@@ -3070,6 +3075,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * k_scales = dst->src[2];
                 const ggml_tensor * v_scales = dst->src[3];
                 const ggml_tensor * scratch  = dst->src[4];
+                const ggml_tensor * k_body   = dst->src[5];
                 const ggml_tensor * v_body   = dst->src[6];
                 const int64_t n_values = int64_t(params.head_dim)*params.group_size;
                 const int64_t k_body_bytes = (n_values*params.key_bits   + 7)/8;
@@ -3078,18 +3084,56 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
 
                 if (ggml_cuda_kvarn_store_trace_enabled() && ggml_cuda_kvarn_store_trace_claim()) {
-                    std::fprintf(stderr,
-                            "KVarN CUDA store-body trace: kind=kv head_dim=%d group_size=%d key_bits=%d value_bits=%d"
-                            " sinkhorn_iters=%d rtn_quantile=%.9g n_heads=%d k_body_bytes=%" PRId64
-                            " v_body_bytes=%" PRId64 " k_scale_floats=%" PRId64
-                            " v_scale_floats=%" PRId64 " scratch_floats=%" PRId64 "\n",
-                            params.head_dim, params.group_size, params.key_bits, params.value_bits,
-                            params.sinkhorn_iters, double(params.rtn_quantile), params.n_heads,
-                            k_body_bytes, v_body_bytes, k_scale_floats, v_scale_floats,
-                            scratch ? ggml_nelements(scratch) : int64_t(0));
+                    if (params.n_record_batch > 1) {
+                        std::fprintf(stderr,
+                                "KVarN CUDA store-body trace: kind=kv-records head_dim=%d group_size=%d"
+                                " n_record_batch=%d records=%d,%d,%d,%d scratch_floats=%" PRId64 "\n",
+                                params.head_dim, params.group_size, params.n_record_batch,
+                                params.record_0, params.record_1, params.record_2, params.record_3,
+                                scratch ? ggml_nelements(scratch) : int64_t(0));
+                    } else {
+                        std::fprintf(stderr,
+                                "KVarN CUDA store-body trace: kind=kv head_dim=%d group_size=%d key_bits=%d value_bits=%d"
+                                " sinkhorn_iters=%d rtn_quantile=%.9g n_heads=%d k_body_bytes=%" PRId64
+                                " v_body_bytes=%" PRId64 " k_scale_floats=%" PRId64
+                                " v_scale_floats=%" PRId64 " scratch_floats=%" PRId64 "\n",
+                                params.head_dim, params.group_size, params.key_bits, params.value_bits,
+                                params.sinkhorn_iters, double(params.rtn_quantile), params.n_heads,
+                                k_body_bytes, v_body_bytes, k_scale_floats, v_scale_floats,
+                                scratch ? ggml_nelements(scratch) : int64_t(0));
+                    }
                 }
 
-                if (params.n_heads > 1) {
+                if (params.n_record_batch > 1) {
+                    const int32_t records[4] = {
+                        params.record_0, params.record_1, params.record_2, params.record_3,
+                    };
+                    const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
+                    ggml_cuda_kvarn_store_body_pending_records_minmax(
+                            (const float *) k_tile->data,
+                            (const float *) v_tile->data,
+                            (uint8_t *) k_body->data,
+                            (uint8_t *) v_body->data,
+                            (float *) k_scales->data,
+                            (float *) v_scales->data,
+                            (float *) scratch->data,
+                            records,
+                            uint32_t(params.n_record_batch),
+                            uint32_t(params.head_dim), uint32_t(params.group_size),
+                            uint32_t(params.key_bits), uint32_t(params.value_bits),
+                            uint32_t(params.sinkhorn_iters), params.rtn_quantile,
+                            size_t(k_body->nb[1]),
+                            size_t(v_body->nb[1]),
+                            size_t(k_body->nb[2]),
+                            size_t(v_body->nb[2]),
+                            size_t(k_scales->nb[1]/sizeof(float)),
+                            size_t(v_scales->nb[1]/sizeof(float)),
+                            size_t(k_scales->nb[2]/sizeof(float)),
+                            size_t(v_scales->nb[2]/sizeof(float)),
+                            size_t(pending_group_stride),
+                            size_t(pending_group_stride),
+                            ctx.stream());
+                } else if (params.n_heads > 1) {
                     const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
                     ggml_cuda_kvarn_store_body_pending_heads_minmax(
                             (const float *) k_tile->data,
@@ -5825,6 +5869,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     int32_t sinkhorn_iters;
                     float   rtn_quantile;
                     int32_t n_heads;
+                    int32_t n_record_batch;
+                    int32_t record_0;
+                    int32_t record_1;
+                    int32_t record_2;
+                    int32_t record_3;
                 } params;
                 memcpy(&params, op->op_params, sizeof(params));
                 if (params.n_heads <= 0) {
@@ -5859,6 +5908,18 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int64_t per_pipeline = n + 2*std::max(params.head_dim, params.group_size);
                 const int64_t pipeline_scratch_floats = params.head_dim >= 512 ? 2*per_pipeline : per_pipeline;
                 const int64_t batch_scratch_floats = 2*n + pipeline_scratch_floats;
+
+                if (params.n_record_batch > 1) {
+                    return op->src[0]->ne[0] == params.head_dim &&
+                           op->src[1]->ne[0] == params.head_dim &&
+                           op->src[0]->ne[2] == params.group_size &&
+                           op->src[1]->ne[2] == params.group_size &&
+                           op->src[5]->ne[0] >= k_body_bytes &&
+                           op->src[6]->ne[0] >= v_body_bytes &&
+                           op->src[2]->ne[0] >= k_scale_floats &&
+                           op->src[3]->ne[0] >= v_scale_floats &&
+                           ggml_nelements(op->src[4]) >= batch_scratch_floats;
+                }
 
                 if (params.n_heads > 1) {
                     return op->src[0]->ne[0] == params.head_dim &&

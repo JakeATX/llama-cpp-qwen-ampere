@@ -2913,18 +2913,23 @@ ggml_tensor * llm_graph_context::build_attn(
                 body_store_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
 
-            for (const uint32_t seal_record : seal_records) {
-                if (seal_record >= layer.n_records) {
-                    throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
-                }
+            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && seal_records.size() > 1) {
+                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_records_from_pending(
+                            ctx0, body_store_scratch, il, seal_records));
+            } else {
+                for (const uint32_t seal_record : seal_records) {
+                    if (seal_record >= layer.n_records) {
+                        throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
+                    }
 
-                if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
-                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads_from_pending(
-                                ctx0, body_store_scratch, il, seal_record));
-                } else {
-                    for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_record_from_pending(
-                                    ctx0, body_store_scratch, il, ih, seal_record));
+                    if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
+                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads_from_pending(
+                                    ctx0, body_store_scratch, il, seal_record));
+                    } else {
+                        for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
+                            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_record_from_pending(
+                                        ctx0, body_store_scratch, il, ih, seal_record));
+                        }
                     }
                 }
             }
@@ -3368,18 +3373,23 @@ ggml_tensor * llm_graph_context::build_attn(
                 body_store_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
 
-            for (const uint32_t seal_record : seal_records) {
-                if (seal_record >= layer.n_records) {
-                    throw std::runtime_error("KVarN+ISWA graph backend attempted to seal a body record outside cache capacity");
-                }
+            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && seal_records.size() > 1) {
+                ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_records_from_pending(
+                            ctx0, body_store_scratch, il, seal_records));
+            } else {
+                for (const uint32_t seal_record : seal_records) {
+                    if (seal_record >= layer.n_records) {
+                        throw std::runtime_error("KVarN+ISWA graph backend attempted to seal a body record outside cache capacity");
+                    }
 
-                if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
-                    ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads_from_pending(
-                                ctx0, body_store_scratch, il, seal_record));
-                } else {
-                    for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_record_from_pending(
-                                    ctx0, body_store_scratch, il, ih, seal_record));
+                    if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
+                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads_from_pending(
+                                    ctx0, body_store_scratch, il, seal_record));
+                    } else {
+                        for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
+                            ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_record_from_pending(
+                                        ctx0, body_store_scratch, il, ih, seal_record));
+                        }
                     }
                 }
             }
