@@ -3,7 +3,7 @@
 **Audience:** New agent performing **read-only / patch** architecture review (no local GPU, no model files, no benchmark execution).  
 **Mission:** Exhaustively review the codebase, identify root causes of Gemma true KVarN+ISWA throughput gap vs normal KV, **implement fixes**, and leave the branch ready for a human or CI agent to run gates.  
 **Branch:** `kvarn-atx-integration`  
-**HEAD:** [`95390d5b1`](https://github.com/JakeATX/llama.cpp/commit/95390d5b1)  
+**HEAD:** [`8b369f7e6`](https://github.com/JakeATX/llama.cpp/commit/8b369f7e6) (code @ [`95390d5b1`](https://github.com/JakeATX/llama.cpp/commit/95390d5b1))  
 **Review tree:** [github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration)
 
 ---
@@ -180,14 +180,16 @@ powershell scripts\kvarn\compare_cuda_logits_ref.ps1 -Model <gemma> -CheckPacked
 | `f5bdd5b6c` | Gemma 512d sinktail, pipelined store, warpqk dequant, multi-head seal |
 | `c6ad0c5d4` | Architect review entry in handover doc |
 | `95390d5b1` | P0: K scratch layout, event-ordered store, ISWA prepare trace, multi-record seal op |
+| `e2b064ea7` | This handover doc + diagnostic sync |
+| `8b369f7e6` | Bench numbers synced to `gemma-architect-rerun` |
 
-**Compare for your review:** [c6ad0c5d4..95390d5b1](https://github.com/JakeATX/llama.cpp/compare/c6ad0c5d4...95390d5b1)
+**Compare for your review:** [c6ad0c5d4..95390d5b1](https://github.com/JakeATX/llama.cpp/compare/c6ad0c5d4...95390d5b1) (code); [95390d5b1..HEAD](https://github.com/JakeATX/llama.cpp/compare/95390d5b1...kvarn-atx-integration) (docs only)
 
 ---
 
 ## Instructions to the review agent (copy into your task)
 
-> Exhaustively review `kvarn-atx-integration` @ `95390d5b1` per `docs/AGENT_CODE_REVIEW_HANDOVER.md`. You cannot run benchmarks. Read every file in §File reading order, trace pp512 and tg64 hot paths for Gemma 512d KVarN+ISWA, and implement minimal patches that address §Known shortcomings. Prioritize pp512 absolute throughput (body-store graph batching, warpqk-dequant efficiency, KVarN prefill graph reuse) then tg64 (ISWA prepare, decode overhead). Preserve Qwen head_dim 128 behavior. Do not flip `llama-model.cpp` Gemma policy until gates pass. Commit with clear messages; exclude Nex scripts. Update `docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md` with hypothesis + files touched when done.
+> Exhaustively review `kvarn-atx-integration` @ `8b369f7e6` (CUDA/graph code @ `95390d5b1`) per `docs/AGENT_CODE_REVIEW_HANDOVER.md`. You cannot run benchmarks. Read every file in §File reading order, trace pp512 and tg64 hot paths for Gemma 512d KVarN+ISWA, and implement minimal patches that address §Known shortcomings. Prioritize pp512 absolute throughput (body-store graph batching, warpqk-dequant efficiency, KVarN prefill graph reuse) then tg64 (ISWA prepare, decode overhead). Preserve Qwen head_dim 128 behavior. Do not flip `llama-model.cpp` Gemma policy until gates pass. Commit with clear messages; exclude Nex scripts. Update `docs/GEMMA_KVARN_FAILURE_DIAGNOSTIC.md` with hypothesis + files touched when done.
 
 ---
 
