@@ -1348,6 +1348,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // fixed rather than guessed.
         if (candidate != gf_res_sched) {
             candidate->prepare_rebind();
+            // The candidate's op_params reflect its last set_input, which can
+            // belong to a different ubatch than the one it is being reused
+            // for; supports_op checks op_params against baked shapes, so
+            // re-sync them with the current ubatch's window first (idempotent
+            // with the set_input that follows on successful reuse).
+            candidate->refresh_kvarn_params(ubatch);
             ggml_cgraph * cg = candidate->get_gf();
             const int n_nodes = ggml_graph_n_nodes(cg);
             for (int i = 0; i < n_nodes; ++i) {
@@ -1370,6 +1376,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                         std::fprintf(stderr,
                                 "%s: graph rebind rejected: node '%s' (op %s) unsupported by every backend after rebind; rebuilding instead\n",
                                 __func__, node->name, ggml_op_name(node->op));
+                        // Dump the data the supports_op conditions evaluate so
+                        // the failing conditional is computable from the log.
+                        std::fprintf(stderr,
+                                "%s:   op_params[0..8]=%d,%d,%d,%d,%d,%d,%d,%d,%d ne=%lld,%lld,%lld,%lld\n",
+                                __func__,
+                                node->op_params[0], node->op_params[1], node->op_params[2],
+                                node->op_params[3], node->op_params[4], node->op_params[5],
+                                node->op_params[6], node->op_params[7], node->op_params[8],
+                                (long long) node->ne[0], (long long) node->ne[1],
+                                (long long) node->ne[2], (long long) node->ne[3]);
+                        for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                            if (node->src[si] == nullptr) {
+                                continue;
+                            }
+                            std::fprintf(stderr,
+                                    "%s:   src[%d] '%s' type=%d ne=%lld,%lld,%lld,%lld buffer=%s\n",
+                                    __func__, si, node->src[si]->name, int(node->src[si]->type),
+                                    (long long) node->src[si]->ne[0], (long long) node->src[si]->ne[1],
+                                    (long long) node->src[si]->ne[2], (long long) node->src[si]->ne[3],
+                                    node->src[si]->buffer ? ggml_backend_buffer_name(node->src[si]->buffer) : "(null)");
+                        }
                     }
                     return false;
                 }

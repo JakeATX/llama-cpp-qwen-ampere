@@ -1034,6 +1034,25 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_attn_kv_iswa::refresh_kvarn_params(const llama_ubatch & ubatch) {
+    if (mctx_kvarn_iswa == nullptr || base_mixed_attn_nodes.empty()) {
+        return;
+    }
+    // Window-indirect graphs keep frozen op_params by design (CUDA graph
+    // replay stability) — never rewrite them here.
+    if (base_window_indirect) {
+        return;
+    }
+    const kvarn_active_window window = kvarn_graph_active_window(
+            cparams.kvarn, ubatch, mctx_kvarn_iswa->get_base()->get_size());
+    if (!window.valid) {
+        return;
+    }
+    for (ggml_tensor * node : base_mixed_attn_nodes) {
+        kvarn_graph_update_mixed_attn_params(node, window);
+    }
+}
+
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (const auto * mctx = dynamic_cast<const llama_kv_cache_kvarn_iswa_context *>(params.mctx)) {
         this->mctx_kvarn_iswa = mctx;
@@ -1476,6 +1495,14 @@ void llm_graph_result::prepare_rebind() {
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         t->buffer = nullptr;
         t->data   = nullptr;
+    }
+}
+
+void llm_graph_result::refresh_kvarn_params(const llama_ubatch & ubatch) {
+    for (auto & input : inputs) {
+        if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(input.get())) {
+            iswa->refresh_kvarn_params(ubatch);
+        }
     }
 }
 

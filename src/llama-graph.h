@@ -507,6 +507,7 @@ public:
     ggml_tensor * base_kvarn_window = nullptr;   // I32 [8]
     bool base_window_indirect = false;
     std::vector<ggml_tensor *> base_mixed_attn_nodes;
+    void refresh_kvarn_params(const llama_ubatch & ubatch);
     bool base_has_body_store_ops = false;
     std::vector<uint32_t> base_baked_seal_records;
 
@@ -795,6 +796,14 @@ public:
     // (weights, KV cache) are only referenced via src pointers from other
     // contexts and are untouched.
     void prepare_rebind();
+
+    // Re-synchronize KVarN mixed-attn op_params with the window of the given
+    // ubatch on all inputs that own such nodes. Used before rebind validation:
+    // a cached graph's op_params reflect its *last* set_input, which is not
+    // guaranteed to match the ubatch it is about to be reused for, and
+    // supports_op evaluates op_params against baked shapes. Idempotent with
+    // the set_input that follows a successful reuse.
+    void refresh_kvarn_params(const llama_ubatch & ubatch);
 
     int64_t get_max_nodes() const;
 

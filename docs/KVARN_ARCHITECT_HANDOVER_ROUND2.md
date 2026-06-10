@@ -400,3 +400,39 @@ within noise until rebind actually sticks).
    `prepare_rebind()` so ping-pong slot swap reuses (trace already names the node).
 2. If still <90%: QT=8 f16 q-staging, seal fusion, or host prefill graph reuse.
 3. Qwen Q4_K_M split `-ncmoe 34` warmup regression (not run this pass).
+
+---
+
+## Round 7 patches (architect, 2026-06-10) — QT=8 + rebind param re-sync
+
+### R14 — QT=8 warpqk tier
+QT=4 delivered +356 t/s on exactly the predicted mechanism, so the same lever
+is turned again: dispatch now prefers QT=8 when `n_queries > 4` and the tiled
+layout fits (`8*head_dim + 8*n_tokens + block + pad` ≈ 39 KB at pp512 — under
+the 48 KB ceiling, no opt-in attribute needed), falling back QT=8→4→1. Halves
+CTA count again and doubles K/V amortization and FMA reuse on both pp512
+ubatch shapes. Decode (n_queries==1) remains QT=1, bit-identical.
+
+### R15 — rebind validation: param re-sync + numeric failure dump
+Round 6 trace localized the ping-pong blocker: only the **128-token slot**
+fails, on `kvarn_iswa_kqv_out-5` / `KVARN_ATTN_MIXED`. Every supports_op
+condition for that op is `op_params` vs baked-shape arithmetic — and a cached
+graph's op_params reflect its **last set_input**, which is not guaranteed to
+be the ubatch it is about to be reused for (e.g. a failed can_reuse probe of
+the other slot earlier in the rep leaves no trace, but warmup/eval-order
+effects can). Fix: `llm_graph_result::refresh_kvarn_params(ubatch)` re-syncs
+mixed-attn op_params with the **current** ubatch's window before the
+supports_op sweep (idempotent with the set_input that follows; window-indirect
+decode graphs are explicitly skipped to preserve CUDA-graph param freezing).
+If the 128 slot still rejects, the trace now dumps op_params[0..8] and every
+src tensor's type/ne/buffer, making the failing conditional directly
+computable from the log — no more guessing.
+
+### Validation order
+1. ctest + Gemma logits (QT=8 reorders accumulation again — noise-level only).
+2. Gemma experimental pp512 (R14 measurement vs 84.9%) + tg64 hold (≥100%).
+3. pp512 with `LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1` + `REUSE_TRACE=1`:
+   if R15's re-sync fixed the 128 slot, both slots reuse — measure; if not,
+   paste the numeric dump into round 8.
+4. Qwen3.6 Q4_K_M split `-ncmoe 34` with warmup (QT change is head_dim>=512
+   only).
