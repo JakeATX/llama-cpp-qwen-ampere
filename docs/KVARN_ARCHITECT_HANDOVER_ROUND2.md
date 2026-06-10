@@ -214,3 +214,81 @@ R5 proves insufficient), full Sinkhorn iteration fusion (grid sync).
 | tg64 decode graph reuse | **Confirmed** — trace shows `reused=1` on every token after the first |
 
 Round 4 does **not** improve throughput. Gemma experimental @ r=3: pp512 **76.1%**, tg64 **75.7%**. Gate remains open (≥90%).
+
+---
+
+## Round 5 patches (architect, 2026-06-09) — CUDA-graph-safe decode + rebind fix
+
+### tg64 root cause (new, measured-mechanism)
+
+Round 4 proved decode graph reuse works, so the gap is not rebuilds. Static
+trace found it: `GGML_OP_KVARN_ATTN_MIXED` **disables CUDA graph capture for
+the entire decode graph** (`ggml-cuda.cu` ~3867), and even without that hard
+disable, `ggml_cuda_graph_update_required` memcmps the full node struct
+**including op_params** — KVarN rewrites op_params every token
+(`kvarn_graph_update_mixed_attn_params`), which would force per-token
+re-capture. Net effect: every decode token pays raw launch overhead on all
+~48 layers (~600+ launches × ~3-5 µs ≈ 2-4 ms/token) while the normal path
+replays a captured graph. That matches the ~3.5 ms/token tg64 gap.
+
+### R10 — device-side window indirection (the fix)
+
+Mainline-proven pattern: dynamic values go through **input tensors**, never
+op_params, so node properties stay bit-stable and the captured graph replays.
+
+| Piece | File | Change |
+|---|---|---|
+| `GGML_MAX_SRC` 11→12 | `ggml/include/ggml.h` | room for src[11] |
+| `ggml_kvarn_attn_mixed_set_window()` | `ggml.h/.c` | attach I32[≥5] window tensor as src[11] |
+| Frozen op_params + shared `kvarn_iswa_window` input | `llama-graph.{h,cpp}` (ISWA builder) | in the pure sink/tail decode regime (`n_tokens==1`, `records==0`, `pending==0`, no seal ops) the op bakes worst-case caps (`sink_tokens`/`tail_tokens`, `tail_start=0`) and all KVarN layers share one I32[8] input carrying the live window |
+| `set_input` | `llama-graph.cpp` | window-indirect graphs stream `[n_sink, n_records, n_pending, n_tail, tail_start]` into the input tensor; op_params are **never** rewritten (that's what kept invalidating capture) |
+| `can_reuse` regime guard | `llama-graph.cpp` | a window-indirect graph is never reused once the live window leaves the sink/tail regime (records/pending > 0) — rebuild on regime transitions |
+| CUDA glue | `ggml-cuda.cu` | capture disable now only when `src[11]==NULL`; `supports_op` validates src[11] I32[≥5]; dispatch gets `window_dev` |
+| Kernel | `kvarn.cu` | `sinktail-decode` reads `n_sink/n_tail/tail_start` from device memory when `window_dev` set; host args carry frozen caps for grid/shmem sizing (runtime ≤ caps by construction) |
+
+Scope: covers the tg64 gate regime exactly (decode from pos 0–255 stays
+records=0/pending=0). Long-context decode (pending>0) falls back to today's
+non-captured behavior — no regression, follow-up below.
+
+### R11 — ping-pong rebind fix (unblocks R5)
+
+Root cause of the `kvarn_iswa_kqv_out` abort: re-allocating a **cached** graph
+on a scheduler that has since allocated a different topology leaves stale
+`buffer/data` on its intermediates; `ggml_backend_sched_backend_id_from_cur`
+then treats them as **pre-allocated** and aborts when the (stale) buffer/op
+combination fails `supports_op`. Fix: `llm_graph_result::prepare_rebind()`
+clears buffer/data on every tensor owned by the result's compute context;
+called in the rebind path right after `sched_reset`. Views of external cache
+tensors are re-initialized from `view_src` by the allocator; weights/KV
+tensors live in other contexts and are untouched. The
+`..._ISWA_PREFILL_PINGPONG_UNSAFE` gate is dropped (env still parsed);
+ping-pong remains opt-in via `LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1` until
+benched, then default-on.
+
+### Validation order
+
+1. ctest Tier 0 + Gemma logits repeat/split/scratch (R10 must be
+   numerics-neutral: same kernel, values read from device instead of args).
+2. tg64 with `GGML_CUDA_DISABLE_GRAPHS` **unset**: expect a one-time capture
+   then pure replay; `LLAMA_KVARN_GRAPH_REUSE_TRACE=1` should still show
+   reused=1. Compare tg64 vs round-4 75.7% — this is the patch under test.
+3. tg64 with `GGML_CUDA_DISABLE_GRAPHS=1` to isolate R10's contribution.
+4. pp512 with `LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1` (crash repro first on
+   tiny run): if the abort is gone, measure; if still crashing, capture the
+   abort tensor name — next suspect is input tensors flagged
+   GGML_TENSOR_FLAG_INPUT needing their flag-driven backend pinning re-run.
+5. Qwen Q4_K_M regression (window indirection is ISWA-builder-only; Qwen
+   path untouched).
+
+### Designed-but-not-landed (next pp512 patch, in order)
+
+1. **Q-tiled warpqk** (QT=4): grid `ceil(n_queries/4)×n_head`, stage 4 q rows
+   in shmem (`4*head_dim + 4*n_tokens + block` floats ≈ 20.5 KB at pp512 —
+   fits), compute 4 score rows per K element and 4 AV outputs per V element.
+   Cuts body/sink-tail read traffic 4× and quadruples FMA reuse — the warpqk
+   path is scalar with zero cross-query reuse today, vs cuBLAS GEMM on the
+   normal path; this is the dominant remaining kernel-side pp512 gap.
+2. Extend R10 window indirection to the pending>0 decode regime (needs the
+   dequant pre-pass record count host-side: bake worst-case records and make
+   the dequant grid self-limiting from window_dev).
+3. Sinkhorn row+col fusion via cooperative launch (only if seals still show).

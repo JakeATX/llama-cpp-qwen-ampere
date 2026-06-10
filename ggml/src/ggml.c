@@ -4470,6 +4470,15 @@ struct ggml_tensor * ggml_kvarn_attn_mixed(
     return result;
 }
 
+void ggml_kvarn_attn_mixed_set_window(
+        struct ggml_tensor * attn,
+        struct ggml_tensor * window) {
+    GGML_ASSERT(attn != NULL && attn->op == GGML_OP_KVARN_ATTN_MIXED);
+    GGML_ASSERT(window != NULL && window->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(window) >= 5);
+    attn->src[11] = window;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(

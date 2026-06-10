@@ -3543,7 +3543,8 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         size_t kq_mask_stride_token_bytes,
         uint32_t kq_mask_type,
         float scale,
-        void * stream) {
+        void * stream,
+        const int32_t * window_dev) {
     const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
     const uint32_t n_gqa = n_head/n_head_kv;
     (void) kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");

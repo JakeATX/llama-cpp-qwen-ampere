@@ -383,4 +383,9 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         size_t kq_mask_stride_token_bytes,
         uint32_t kq_mask_type,
         float scale,
-        void * stream);
+        // optional device-side live window [n_sink, n_records, n_pending,
+        // n_tail, tail_start]; when non-null and the op is in the pure
+        // sink/tail decode regime, kernels read the window from device memory
+        // (CUDA-graph-replay-safe; host args carry frozen caps for sizing)
+        void * stream,
+        const int32_t * window_dev = nullptr);

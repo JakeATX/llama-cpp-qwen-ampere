@@ -1321,33 +1321,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Ping-pong only for multi-token prefill (e.g. 384+128 pp512). Decode is always
     // n_tokens==1 and must not swap slots.
     //
-    // KVarN+ISWA prefill ping-pong is opt-in only: enabling it without fixing
-    // scheduler buffer assignment for kvarn_iswa_kqv_out-* tensors aborts on
-    // the 384+128 pp512 path (pre-allocated tensor in CUDA0 cannot run
-    // KVARN_ATTN_MIXED). Keep that crash behind a second explicit unsafe env
-    // until the ISWA reuse path re-binds mixed-attn outputs across slot swaps.
+    // KVarN prefill ping-pong remains opt-in (LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1)
+    // until benches validate it. The previous KVarN+ISWA rebind abort
+    // (kvarn_iswa_kqv_out pre-allocated in a buffer that cannot run
+    // KVARN_ATTN_MIXED) is addressed by prepare_rebind() clearing stale
+    // scheduler allocations before re-allocating a cached graph, so the extra
+    // UNSAFE gate is no longer required; the env is still parsed for
+    // compatibility with existing scripts.
     static const bool kvarn_pingpong_enable = llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_PREFILL_PINGPONG");
-    static const bool kvarn_iswa_pingpong_unsafe =
-        llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_ISWA_PREFILL_PINGPONG_UNSAFE");
-
-    const bool is_kvarn_iswa_mctx =
-        dynamic_cast<const llama_kv_cache_kvarn_iswa_context *>(mctx) != nullptr;
-
-    static bool warned_kvarn_iswa_pingpong_blocked = false;
-    if (kvarn_pingpong_enable && is_kvarn_iswa_mctx && !kvarn_iswa_pingpong_unsafe &&
-            !warned_kvarn_iswa_pingpong_blocked) {
-        std::fprintf(stderr,
-                "%s: LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1 requested, but KVarN+ISWA prefill "
-                "ping-pong is still blocked by the known mixed-attn output rebind crash; "
-                "set LLAMA_KVARN_ENABLE_ISWA_PREFILL_PINGPONG_UNSAFE=1 only for crash reproduction.\n",
-                __func__);
-        warned_kvarn_iswa_pingpong_blocked = true;
-    }
+    (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_ISWA_PREFILL_PINGPONG_UNSAFE");
 
     const bool use_alt_slot = gf_res_alt &&
         ubatch.n_tokens > 1 &&
-        (cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN ||
-         (kvarn_pingpong_enable && (!is_kvarn_iswa_mctx || kvarn_iswa_pingpong_unsafe)));
+        (cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN || kvarn_pingpong_enable);
 
     auto can_reuse_graph = [&](llm_graph_result * candidate) {
         return !graph_reuse_disable && candidate && candidate->get_gf() && candidate->can_reuse(gparams);
@@ -1406,6 +1392,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (res != gf_res_sched) {
             ggml_backend_sched_reset(sched.get());
+            // The cached graph's intermediates still carry buffer/data from a
+            // previous scheduler epoch; clear them so the re-split assigns
+            // them fresh instead of treating them as pre-allocated (root
+            // cause of the kvarn_iswa_kqv_out "cannot run the operation"
+            // abort when ping-ponging KVarN+ISWA prefill graphs).
+            res->prepare_rebind();
             if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
                 LLAMA_LOG_ERROR("%s: failed to rebind reused graph\n", __func__);
                 ret = GGML_STATUS_ALLOC_FAILED;

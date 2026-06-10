@@ -221,7 +221,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            11
+#define GGML_MAX_SRC            12
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -1770,6 +1770,14 @@ extern "C" {
                    int32_t        value_bits,
                    int32_t        sinkhorn_iters,
                    float          rtn_quantile);
+
+    // Attach an optional I32 window tensor (>= 5 elems: n_sink, n_records,
+    // n_pending, n_tail, tail_start) as src[11]. When present, CUDA kernels
+    // read the live attention window from device memory so the op is safe to
+    // replay inside a captured CUDA graph with frozen op_params.
+    GGML_API void ggml_kvarn_attn_mixed_set_window(
+            struct ggml_tensor * attn,
+            struct ggml_tensor * window);
 
     GGML_API struct ggml_tensor * ggml_kvarn_attn_mixed(
             struct ggml_context * ctx,

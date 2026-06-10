@@ -3379,7 +3379,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             kq_mask ? kq_mask->nb[0] : 0,
                             kq_mask_type,
                             params.scale,
-                            ctx.stream());
+                            ctx.stream(),
+                            dst->src[11] != nullptr ? (const int32_t *) dst->src[11]->data : nullptr);
                 }
             } break;
         case GGML_OP_TURBO_WHT:
@@ -3864,9 +3865,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
         }
 
-        if (node->op == GGML_OP_KVARN_ATTN_MIXED) {
+        if (node->op == GGML_OP_KVARN_ATTN_MIXED && node->src[11] == nullptr) {
             // KVarN decode reuses the llama graph while updating the active KV window
-            // through op_params. CUDA graph replay would keep stale kernel arguments.
+            // through op_params; CUDA graph replay would keep stale kernel arguments.
+            // When src[11] (device-side window tensor) is attached, op_params are
+            // frozen and kernels read the live window from device memory, so the
+            // node is replay-safe and capture stays enabled.
             use_cuda_graph = false;
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: disabling CUDA graphs due to dynamic KVarN attention params\n", __func__);
@@ -5970,7 +5974,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         op->src[5]->type != GGML_TYPE_F32 || op->src[6]->type != GGML_TYPE_F32 ||
                         op->src[7]->type != GGML_TYPE_F32 || op->src[8]->type != GGML_TYPE_F32 ||
                         op->src[9]->type != GGML_TYPE_F32 ||
-                        (op->src[10] != nullptr && op->src[10]->type != GGML_TYPE_F32 && op->src[10]->type != GGML_TYPE_F16)) {
+                        (op->src[10] != nullptr && op->src[10]->type != GGML_TYPE_F32 && op->src[10]->type != GGML_TYPE_F16) ||
+                        (op->src[11] != nullptr && (op->src[11]->type != GGML_TYPE_I32 || ggml_nelements(op->src[11]) < 5))) {
                     return false;
                 }
                 if (params.n_sink < 0 || params.n_records < 0 || params.n_pending < 0 || params.n_tail < 0 ||

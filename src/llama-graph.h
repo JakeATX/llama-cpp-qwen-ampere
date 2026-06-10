@@ -501,6 +501,11 @@ public:
     ggml_tensor * base_body_plan = nullptr;      // I64 [record, offset, seal_record; n_tail_evict]
     ggml_tensor * base_body_offsets = nullptr;   // I64 [n_tail_evict]
     ggml_tensor * base_tail_evict_idxs = nullptr;// I32 [n_tail_evict]
+    // CUDA-graph-safe decode: live window [n_sink, n_records, n_pending,
+    // n_tail, tail_start] streamed via this input; mixed-attn op_params stay
+    // frozen at regime caps so node properties are replay-stable.
+    ggml_tensor * base_kvarn_window = nullptr;   // I32 [8]
+    bool base_window_indirect = false;
     std::vector<ggml_tensor *> base_mixed_attn_nodes;
     bool base_has_body_store_ops = false;
     std::vector<uint32_t> base_baked_seal_records;
@@ -780,6 +785,16 @@ public:
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
+
+    // Clear stale scheduler allocations (buffer/data) from every tensor owned
+    // by this result's compute context. Required before re-allocating a cached
+    // graph on a scheduler that has since allocated a different topology:
+    // stale buffer pointers otherwise make the scheduler treat intermediates
+    // as pre-allocated, which can mis-assign or abort
+    // ("pre-allocated tensor ... cannot run the operation"). External tensors
+    // (weights, KV cache) are only referenced via src pointers from other
+    // contexts and are untouched.
+    void prepare_rebind();
 
     int64_t get_max_nodes() const;
 

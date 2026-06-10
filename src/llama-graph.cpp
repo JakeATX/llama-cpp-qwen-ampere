@@ -965,8 +965,20 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
         const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, *ubatch, base_ctx->get_size());
         GGML_ASSERT(window.valid);
-        for (ggml_tensor * node : base_mixed_attn_nodes) {
-            kvarn_graph_update_mixed_attn_params(node, window);
+        if (base_window_indirect && base_kvarn_window != nullptr && base_kvarn_window->buffer != nullptr) {
+            // Frozen op_params + device-side live window: never rewrite the
+            // node params here, or CUDA graph node properties change and the
+            // captured decode graph re-captures every token.
+            GGML_ASSERT(window.n_records == 0 && window.n_pending == 0);
+            const int32_t win[8] = {
+                int32_t(window.n_sink), int32_t(window.n_records), int32_t(window.n_pending),
+                int32_t(window.n_tail), int32_t(window.tail_start), 0, 0, 0,
+            };
+            ggml_backend_tensor_set(base_kvarn_window, win, 0, sizeof(win));
+        } else {
+            for (ggml_tensor * node : base_mixed_attn_nodes) {
+                kvarn_graph_update_mixed_attn_params(node, window);
+            }
         }
 
         const auto * swa_ctx = mctx_kvarn_iswa->get_swa();
@@ -1064,6 +1076,15 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
             }
             res &= ok;
         };
+
+        // A window-indirect graph carries frozen op_params and dispatches the
+        // pure sink/tail branch unconditionally; it must never be reused for
+        // a ubatch whose live window has body records or pending tokens.
+        if (base_window_indirect) {
+            check(kvarn_graph_decode_stable_topology(params.ubatch) &&
+                    window.n_records == 0 && window.n_pending == 0,
+                    "window-indirect graph vs non-sink/tail regime");
+        }
 
         check(base_sink_tail_idxs->ne[0] == params.ubatch.n_tokens,
                 "base_sink_tail_idxs.ne[0] != ubatch.n_tokens");
@@ -1445,6 +1466,17 @@ llm_graph_result::llm_graph_result(int64_t max_nodes) : max_nodes(max_nodes) {
 
     const char * LLAMA_GRAPH_RESULT_DEBUG = getenv("LLAMA_GRAPH_RESULT_DEBUG");
     debug = LLAMA_GRAPH_RESULT_DEBUG ? atoi(LLAMA_GRAPH_RESULT_DEBUG) : 0;
+}
+
+void llm_graph_result::prepare_rebind() {
+    ggml_context * ctx = ctx_compute.get();
+    if (ctx == nullptr) {
+        return;
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        t->buffer = nullptr;
+        t->data   = nullptr;
+    }
 }
 
 int64_t llm_graph_result::get_max_nodes() const {
@@ -3458,12 +3490,39 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
         ggml_set_name(scores, "kvarn_iswa_attn_scores");
 
+        // CUDA-graph-replay-safe decode: in the pure sink/tail regime
+        // (n_tokens==1, no body records, no pending) the op is built with
+        // frozen worst-case op_params and the live window is streamed through
+        // a shared I32 input tensor (src[11]). Node properties then stay
+        // bit-stable across decode tokens, so the CUDA backend can capture
+        // the decode graph once and replay it instead of paying per-kernel
+        // launch overhead on all ~48 layers every token.
+        const bool window_indirect = kvarn_graph_decode_stable_topology(ubatch) &&
+                window.n_records == 0 && window.n_pending == 0 &&
+                !inp->base_has_body_store_ops;
+
+        if (window_indirect && inp->base_kvarn_window == nullptr) {
+            inp->base_kvarn_window = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 8);
+            ggml_set_input(inp->base_kvarn_window);
+            ggml_set_name(inp->base_kvarn_window, "kvarn_iswa_window");
+            inp->base_window_indirect = true;
+        }
+
+        const int32_t op_n_sink     = window_indirect ? int32_t(cparams.kvarn.sink_tokens) : int32_t(window.n_sink);
+        const int32_t op_n_records  = window_indirect ? 0 : int32_t(window.n_records);
+        const int32_t op_n_pending  = window_indirect ? 0 : int32_t(window.n_pending);
+        const int32_t op_n_tail     = window_indirect ? int32_t(cparams.kvarn.tail_tokens) : int32_t(window.n_tail);
+        const int32_t op_tail_start = window_indirect ? 0 : int32_t(window.tail_start);
+
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
                 ctx0, q_cur, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
                 layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask(),
-                window.n_sink, window.n_records, window.n_pending, window.n_tail, window.tail_start,
+                op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                 int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
                 int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);
+        if (window_indirect) {
+            ggml_kvarn_attn_mixed_set_window(cur, inp->base_kvarn_window);
+        }
         inp->base_mixed_attn_nodes.push_back(cur);
         cb(cur, "kvarn_iswa_kqv_out", il);
         cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
