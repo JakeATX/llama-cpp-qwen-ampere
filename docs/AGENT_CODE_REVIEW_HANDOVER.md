@@ -6,7 +6,7 @@
 **HEAD:** [`8b369f7e6`](https://github.com/JakeATX/llama.cpp/commit/8b369f7e6) (code @ [`95390d5b1`](https://github.com/JakeATX/llama.cpp/commit/95390d5b1))  
 **Review tree:** [github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration](https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration)
 
-**Round 2 (measured, token-major patch):** [`KVARN_ARCHITECT_HANDOVER_ROUND2.md`](KVARN_ARCHITECT_HANDOVER_ROUND2.md)
+**Round 2–5 (measured):** [`KVARN_ARCHITECT_HANDOVER_ROUND2.md`](KVARN_ARCHITECT_HANDOVER_ROUND2.md) — **tg64 gate PASS @ 100.9%** after R10; pp512 still open @ 71%.
 
 ---
 
