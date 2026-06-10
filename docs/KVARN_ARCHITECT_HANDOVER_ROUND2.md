@@ -13,7 +13,7 @@ This doc is the **measured follow-up** to the token-major K scratch patch (`0001
 
 | Track | Status | Action |
 |-------|--------|--------|
-| **Gemma true KVarN+ISWA** (experimental) | **Mixed** — tg64 **PASS** (100.9%), pp512 **FAIL** (71%) | Round 6: Q-tiled warpqk + ping-pong rebind part 2 |
+| **Gemma true KVarN+ISWA** (experimental) | **Mixed** — tg64 **PASS** (101%), pp512 **FAIL** (84.9%) | Round 7: `kvarn_iswa_kqv_out` rebind supports_op + ~5pp pp512 |
 | **Gemma production fallback** (default policy) | **PASS** (~111% pp512, ~101% tg64) | Do not flip `llama-model.cpp` until experimental passes |
 | **Qwen3.6 MTP 128d** (`-ncmoe 34`) | **Mixed** — tg64 97.1% PASS, pp512 83.0% FAIL | Investigate MoE/memory variance; 512d patch should not touch 128d path |
 | **Tier 0 CUDA tests** | **PASS** | — |
@@ -375,3 +375,28 @@ that fails for that node is then the targeted fix).
    (shared-memory budget doubles to ~41 KB — needs the >48 KB opt-in check
    in `kvarn_cuda_dynamic_shmem_fits`), then seal launch fusion, then
    extending R10 window indirection to the pending>0 regime.
+
+### Round 6 measured (RTX 5070, Gemma Q4_XL, experimental ISWA, r=5, iters=4)
+
+| Case | Round 5 | Round 6 @ `0f66be14f` | Gate (≥90%) |
+|------|--------:|----------------------:|:-----------:|
+| **tg64** | 100.9% | **101.0%** (61.7 / 61.1 t/s) | **PASS** |
+| **pp512** | 71.0% | **84.9%** (2135 / 2517 t/s) | FAIL (−5.1 pp) |
+
+Tier 0 + Gemma logits: **PASS**. R12 delivered **+356 KVarN t/s** on pp512 (+13.9 pp
+ratio) with tg64 held.
+
+**R13 trace (ping-pong on):** no crash; every 128-token slot logs
+`graph rebind rejected: node 'kvarn_iswa_kqv_out-5' (op KVARN_ATTN_MIXED)
+unsupported by every backend after rebind; rebuilding instead` — ping-pong
+falls back to full rebuild (pp512 **88.6%** with ping-pong vs 84.9% off; delta
+within noise until rebind actually sticks).
+
+**Do not flip `llama-model.cpp`** — pp512 still ~5pp short of gate.
+
+### Round 7 (next agent)
+
+1. Fix `kvarn_iswa_kqv_out-*` `supports_op` / backend assignment after
+   `prepare_rebind()` so ping-pong slot swap reuses (trace already names the node).
+2. If still <90%: QT=8 f16 q-staging, seal fusion, or host prefill graph reuse.
+3. Qwen Q4_K_M split `-ncmoe 34` warmup regression (not run this pass).
