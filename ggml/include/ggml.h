@@ -703,7 +703,8 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[16];
+        // Keep sizeof(ggml_tensor) 16-byte aligned when GGML_MAX_SRC grows.
+        char padding[GGML_MAX_SRC > 11 ? 8 : 16];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

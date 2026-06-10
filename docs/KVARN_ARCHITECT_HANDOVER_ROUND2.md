@@ -13,7 +13,7 @@ This doc is the **measured follow-up** to the token-major K scratch patch (`0001
 
 | Track | Status | Action |
 |-------|--------|--------|
-| **Gemma true KVarN+ISWA** (experimental) | **FAIL** gate (pp512 70.3%, tg64 74.9%) | Keep patch; next: seal launch count, f16 dequant scratch, graph reuse |
+| **Gemma true KVarN+ISWA** (experimental) | **Mixed** — tg64 **PASS** (100.9%), pp512 **FAIL** (71%) | Round 6: Q-tiled warpqk + ping-pong rebind part 2 |
 | **Gemma production fallback** (default policy) | **PASS** (~111% pp512, ~101% tg64) | Do not flip `llama-model.cpp` until experimental passes |
 | **Qwen3.6 MTP 128d** (`-ncmoe 34`) | **Mixed** — tg64 97.1% PASS, pp512 83.0% FAIL | Investigate MoE/memory variance; 512d patch should not touch 128d path |
 | **Tier 0 CUDA tests** | **PASS** | — |
@@ -292,3 +292,32 @@ benched, then default-on.
    dequant pre-pass record count host-side: bake worst-case records and make
    the dequant grid self-limiting from window_dev).
 3. Sinkhorn row+col fusion via cooperative launch (only if seals still show).
+
+### Round 5 measured (RTX 5070, Gemma Q4_XL, experimental ISWA, r=5, iters=4)
+
+| Case | Round 4 | Round 5 @ `caba1918a`+refine | Gate (≥90%) |
+|------|--------:|-----------------------------:|:-----------:|
+| **tg64** | 75.7% | **100.9%** (63.1 / 62.6 t/s) | **PASS** |
+| **pp512** | 76.1%* | 71.0% (1780 / 2505 t/s) | FAIL |
+
+\*Round 4 used iters=16; gate uses iters=4. KVarN abs pp512 **improved** (+95 t/s vs
+round-4 iters=16 run); ratio dipped because normal KV also got faster.
+
+**R10 validated:** tg64 with `GGML_CUDA_DISABLE_GRAPHS=1` still ~102% — window
+indirection is numerics-neutral; the win is CUDA graph replay on the default path.
+
+**R11 partial:** `prepare_rebind()` removes the old `kvarn_iswa_kqv_out` abort, but
+pp512 ping-pong still asserts in `ggml-backend.cpp` (`cur_backend_id != -1`) on the
+128-token slot. Keep ping-pong **opt-in**; next fix: re-pin `GGML_TENSOR_FLAG_INPUT`
+tensors after `prepare_rebind()`.
+
+**Production fallback** (default policy, no `FORCE_EXPERIMENTAL_ISWA`): pp512
+**114%**, tg64 **101%** — unchanged PASS.
+
+**Do not flip `llama-model.cpp` yet** — experimental pp512 still ~19pp short of gate.
+
+### Round 6 (next agent — pp512 gate)
+
+1. **Q-tiled warpqk (QT=4)** — primary pp512 kernel gap (spec in §Designed-but-not-landed).
+2. **Ping-pong rebind part 2** — INPUT tensor backend pinning after slot swap.
+3. Qwen Q4_K_M split regression with `-ncmoe 34` + `-Warmup`.

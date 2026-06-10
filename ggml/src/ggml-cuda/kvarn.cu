@@ -3019,13 +3019,24 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
         size_t sink_tail_stride_token_f16,
         size_t kq_mask_stride_token_bytes,
         uint32_t kq_mask_type,
-        float scale) {
+        float scale,
+        const int32_t * __restrict__ window_dev) {
     // One CTA per query head. The previous version launched a single CTA
     // with one warp per head, leaving all but one SM idle during decode —
     // the primary tg64 throughput ceiling for Gemma 512d sink/tail decode.
     const uint32_t ih = blockIdx.x;
     if (ih >= n_head) {
         return;
+    }
+
+    uint32_t eff_sink = n_sink;
+    uint32_t eff_tail = n_tail;
+    uint32_t eff_tail_start = tail_start;
+    if (window_dev != nullptr) {
+        // Host args are frozen caps for grid/shmem; live window via src[11].
+        eff_sink       = static_cast<uint32_t>(window_dev[0]);
+        eff_tail       = static_cast<uint32_t>(window_dev[3]);
+        eff_tail_start = static_cast<uint32_t>(window_dev[4]);
     }
 
     const uint32_t n_gqa = n_head/n_head_kv;
@@ -3037,11 +3048,14 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
     const void * kq_mask_row = kq_mask;
 
     extern __shared__ float shared[];
-    const uint32_t n_tokens = n_sink + n_tail;
-    // Layout: q_sh[head_dim] | probs[n_tokens] | reduce[blockDim.x]
+    // Host n_sink/n_tail are frozen caps when window_dev is set; shmem is sized
+    // for caps while loops iterate the live window read from device memory.
+    const uint32_t cap_tokens = n_sink + n_tail;
+    const uint32_t n_tokens   = eff_sink + eff_tail;
+    // Layout: q_sh[head_dim] | probs[cap_tokens] | reduce[blockDim.x]
     float * q_sh = shared;
     float * probs = shared + head_dim;
-    float * reduce = probs + n_tokens;
+    float * reduce = probs + cap_tokens;
 
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         q_sh[d] = q_row[d];
@@ -3053,7 +3067,7 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
     const uint32_t n_warps = blockDim.x >> 5;
 
     for (uint32_t t = warp; t < n_tokens; t += n_warps) {
-        const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+        const uint32_t slot = t < eff_sink ? t : eff_sink + ((eff_tail_start + (t - eff_sink))%eff_tail);
         const uint16_t * k = k_st + size_t(slot)*sink_tail_stride_token_f16;
 
         float sum = 0.0f;
@@ -3109,7 +3123,7 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float sum = 0.0f;
         for (uint32_t t = 0; t < n_tokens; ++t) {
-            const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+            const uint32_t slot = t < eff_sink ? t : eff_sink + ((eff_tail_start + (t - eff_sink))%eff_tail);
             const uint16_t * v = v_st + size_t(slot)*sink_tail_stride_token_f16;
             sum += probs[t]*__half2float(reinterpret_cast<const __half *>(v)[d]);
         }
@@ -3616,7 +3630,8 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             n_sink, n_tail, tail_start, head_dim,
                             q_stride_head_floats, out_stride_head_floats,
                             sink_tail_stride_head_f16, sink_tail_stride_token_f16,
-                            kq_mask_stride_token_bytes, kq_mask_type, scale);
+                            kq_mask_stride_token_bytes, kq_mask_type, scale,
+                            window_dev);
                     return;
                 }
             }
