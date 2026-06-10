@@ -1336,7 +1336,46 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         (cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN || kvarn_pingpong_enable);
 
     auto can_reuse_graph = [&](llm_graph_result * candidate) {
-        return !graph_reuse_disable && candidate && candidate->get_gf() && candidate->can_reuse(gparams);
+        if (graph_reuse_disable || !candidate || !candidate->get_gf() || !candidate->can_reuse(gparams)) {
+            return false;
+        }
+        // Rebinding a cached graph onto a scheduler that has since hosted a
+        // different topology requires clearing stale allocations and then
+        // proving every node still has a backend willing to run it —
+        // otherwise the scheduler split aborts (GGML_ASSERT(cur_backend_id
+        // != -1)). Validate up front and fall back to a rebuild instead of
+        // crashing; the offending node is logged so the root cause can be
+        // fixed rather than guessed.
+        if (candidate != gf_res_sched) {
+            candidate->prepare_rebind();
+            ggml_cgraph * cg = candidate->get_gf();
+            const int n_nodes = ggml_graph_n_nodes(cg);
+            for (int i = 0; i < n_nodes; ++i) {
+                ggml_tensor * node = ggml_graph_node(cg, i);
+                if (node->op == GGML_OP_NONE ||
+                    node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
+                    node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+                    continue;
+                }
+                bool supported = false;
+                for (const auto & backend : backends) {
+                    if (ggml_backend_supports_op(backend.get(), node)) {
+                        supported = true;
+                        break;
+                    }
+                }
+                if (!supported) {
+                    static const bool kvarn_trace = llama_kvarn_parse_env_flag("LLAMA_KVARN_GRAPH_REUSE_TRACE");
+                    if (kvarn_trace) {
+                        std::fprintf(stderr,
+                                "%s: graph rebind rejected: node '%s' (op %s) unsupported by every backend after rebind; rebuilding instead\n",
+                                __func__, node->name, ggml_op_name(node->op));
+                    }
+                    return false;
+                }
+            }
+        }
+        return true;
     };
 
     llm_graph_result * res = gf_res_prev.get();
@@ -1392,12 +1431,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (res != gf_res_sched) {
             ggml_backend_sched_reset(sched.get());
-            // The cached graph's intermediates still carry buffer/data from a
-            // previous scheduler epoch; clear them so the re-split assigns
-            // them fresh instead of treating them as pre-allocated (root
-            // cause of the kvarn_iswa_kqv_out "cannot run the operation"
-            // abort when ping-ponging KVarN+ISWA prefill graphs).
-            res->prepare_rebind();
+            // Stale allocations were already cleared (and node support
+            // validated) by can_reuse_graph -> prepare_rebind() above.
             if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
                 LLAMA_LOG_ERROR("%s: failed to rebind reused graph\n", __func__);
                 ret = GGML_STATUS_ALLOC_FAILED;

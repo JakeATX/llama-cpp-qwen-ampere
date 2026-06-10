@@ -321,3 +321,57 @@ tensors after `prepare_rebind()`.
 1. **Q-tiled warpqk (QT=4)** — primary pp512 kernel gap (spec in §Designed-but-not-landed).
 2. **Ping-pong rebind part 2** — INPUT tensor backend pinning after slot swap.
 3. Qwen Q4_K_M split regression with `-ncmoe 34` + `-Warmup`.
+
+---
+
+## Round 6 patches (architect, 2026-06-10) — Q-tiled warpqk + rebind validation
+
+### R12 — Q-tiled warpqk (QT=4), the pp512 kernel patch
+
+`kvarn.cu`: `kvarn_attn_mixed_f16_fused_batch_warpqk_kernel` is now
+`template<int QT>`. Each CTA computes **4 query rows for one head**: the query
+tile is staged in shared memory (rows past the tile edge zero-filled so the
+unrolled accumulation needs no bounds checks), every K element fans into 4
+score accumulators, per-row block softmax (rows past the edge zeroed so AV
+runs unguarded), and every V element fans into 4 output accumulators held in
+registers. Effect: 4× fewer CTAs, 4× K/V read amortization, 4× FMA reuse —
+attacking the scalar kernel's zero cross-query reuse, the dominant remaining
+kernel gap vs the normal path's cuBLAS GEMM attention.
+
+Dispatch selects QT=4 when `n_queries > 1` and the tiled shared layout
+(`4*head_dim + 4*n_tokens + block + pad` floats ≈ 20.5 KB at pp512) fits;
+otherwise the QT=1 instantiation runs, which is behavior-identical to the
+previous scalar kernel (decode shapes and shmem-constrained windows are
+untouched). Trace label unchanged (`warpqk-f16` / `warpqk-f16-dequant`).
+
+### R13 — rebind part 2: validate instead of abort
+
+Round 5 left ping-pong asserting in `ggml-backend.cpp`
+(`GGML_ASSERT(cur_backend_id != -1)`) on the 128-token slot — i.e. after
+`prepare_rebind()`, some node had **no backend willing to run it** at
+re-split. `llama-context.cpp` now performs the rebind work inside
+`can_reuse_graph`: when a candidate would need a slot rebind it (a) runs
+`prepare_rebind()` and (b) walks every non-view node checking
+`ggml_backend_supports_op` across all backends. Any unsupported node →
+candidate rejected, normal rebuild path taken (no crash), and with
+`LLAMA_KVARN_GRAPH_REUSE_TRACE=1` the **exact node name + op** is printed.
+This makes pp512 ping-pong safe to enable for measurement and converts the
+remaining mystery into a one-line trace for round 7 (the supports_op check
+that fails for that node is then the targeted fix).
+
+### Validation order (human/CI)
+
+1. ctest Tier 0; Gemma logits repeat/split/scratch — R12 reorders FP
+   accumulation across queries (same per-row math); expect NMSE noise-level.
+2. Gemma experimental pp512 + tg64 (default env). pp512 vs 71.0% is the R12
+   measurement. tg64 must hold ≥100% (QT=1 path untouched; verify).
+3. pp512 with `LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1` +
+   `LLAMA_KVARN_GRAPH_REUSE_TRACE=1`: either it now reuses both slots
+   (measure the delta) or the trace names the unsupported node — paste that
+   into round 7.
+4. Qwen3.6 Q4_K_M split, `-ncmoe 34`, **with warmup**, pp512+tg64: R12 is
+   inside the `head_dim>=512` branch; Qwen must be unchanged within noise.
+5. If pp512 still <90% after R12: next levers are QT=8 with f16 q_sh
+   (shared-memory budget doubles to ~41 KB — needs the >48 KB opt-in check
+   in `kvarn_cuda_dynamic_shmem_fits`), then seal launch fusion, then
+   extending R10 window indirection to the pending>0 regime.
