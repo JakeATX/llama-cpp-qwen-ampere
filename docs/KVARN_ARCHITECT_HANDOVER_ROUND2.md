@@ -13,7 +13,7 @@ This doc is the **measured follow-up** to the token-major K scratch patch (`0001
 
 | Track | Status | Action |
 |-------|--------|--------|
-| **Gemma true KVarN+ISWA** (experimental) | **Mixed** — tg64 **PASS** (101%), pp512 **89.6%** (−0.4pp) | Round 8: scratch `src[9]` buffer after rebind; ping-pong |
+| **Gemma true KVarN+ISWA** (experimental) | **Mixed** — tg64 **PASS** (100.4%), pp512 **86.0%** (gate open) | Round 9: cross-slot ping-pong rebind (`LLAMA_KVARN_ENABLE_PREFILL_PINGPONG_CROSS_REBIND`) |
 | **Gemma production fallback** (default policy) | **PASS** (~111% pp512, ~101% tg64) | Do not flip `llama-model.cpp` until experimental passes |
 | **Qwen3.6 MTP 128d** (`-ncmoe 34`) | **Mixed** — tg64 97.1% PASS, pp512 83.0% FAIL | Investigate MoE/memory variance; 512d patch should not touch 128d path |
 | **Tier 0 CUDA tests** | **PASS** | — |
@@ -454,9 +454,36 @@ op_params alone. Round 8: preserve or re-allocate scratch sizing across slot swa
 **Gate:** pp512 needs ~10 more KVarN t/s at this normal baseline (or ping-pong
 reuse once rebind works). **Do not flip `llama-model.cpp` yet** (strict ≥90%).
 
-### Round 8 (next agent)
+### Round 8 measured (RTX 5070, Gemma Q4_XL, experimental ISWA, r=5, iters=4)
 
-1. Fix `kvarn_iswa_attn_scores` / mixed-attn scratch (`src[9]`) backend assignment
-   after `prepare_rebind()` on ping-pong slot swap (dump proves `buffer=null`).
-2. Re-run pp512 with ping-pong — should stack host graph-reuse gain on R14.
+| Case | Round 7 | Round 8 (local) | Gate (≥90%) |
+|------|--------:|----------------:|:-----------:|
+| **tg64** | 101.1% | **100.4%** (66.44 / 66.15 t/s) | **PASS** |
+| **pp512** | 89.6% | **86.0%** (2324 / 2703 t/s) | FAIL |
+
+Tier 0 + Gemma logits: **PASS**. KVarN abs pp512 **+96 t/s** vs Round 7 (2228→2324);
+ratio dipped because normal baseline also rose (2486→2703).
+
+**Round 8 landed (R16):**
+
+1. **Persistent layer-owned mixed-attn scratch** (`kvarn_attn_mixed_scratch_l*`) —
+   worst-case sized in KV cache; graph uses views instead of compute-context scratch.
+2. **KVarN input rewire** — restores `src[9]`/`src[10]` after scheduler buffer
+   pooling retargets mask tensors across 384/128 slot swaps.
+3. **Ping-pong slot picker** — build into the non-matching slot instead of
+   swap-then-reset (which destroyed the cached 384-token graph).
+4. **CUDA `supports_op` scratch budget** — align 512d body-dequant element count
+   with graph sizing (`head_dim >= 512`).
+5. **Cross-slot rebind gated** — default ping-pong caches both topologies but does
+   not cross-rebind (`LLAMA_KVARN_ENABLE_PREFILL_PINGPONG_CROSS_REBIND=1` for
+   experiments). Enabling cross-rebind without the gate still CUDA-errors on Gemma
+   after `sched_reset`/`prepare_rebind`.
+
+**Do not flip `llama-model.cpp`** — pp512 ratio still ~4pp short of gate.
+
+### Round 9 (next agent)
+
+1. Dual-graph scheduler residency or fix cross-slot rebind post-`prepare_rebind`
+   (CUDA error on reused 384 graph when `CROSS_REBIND=1`).
+2. Re-measure pp512 with working cross-slot reuse — target stacked gain on R14.
 3. Qwen Q4_K_M warmup regression.

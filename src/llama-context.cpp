@@ -1347,13 +1347,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // crashing; the offending node is logged so the root cause can be
         // fixed rather than guessed.
         if (candidate != gf_res_sched) {
-            candidate->prepare_rebind();
-            // The candidate's op_params reflect its last set_input, which can
-            // belong to a different ubatch than the one it is being reused
-            // for; supports_op checks op_params against baked shapes, so
-            // re-sync them with the current ubatch's window first (idempotent
-            // with the set_input that follows on successful reuse).
-            candidate->refresh_kvarn_params(ubatch);
+            // Cross-slot scheduler rebind still hits CUDA errors on Gemma after
+            // sched_reset/prepare_rebind; keep both topologies cached but rebuild
+            // until dual-graph scheduler residency is sorted out.
+            static const bool kvarn_pingpong_cross_rebind =
+                llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_PREFILL_PINGPONG_CROSS_REBIND");
+            if (!kvarn_pingpong_cross_rebind) {
+                return false;
+            }
+            // Do not prepare_rebind() here — clearing buffers during a probe
+            // corrupts the cached slot if the probe fails. Re-wire mask src[10]
+            // pointers (scheduler buffer pooling can retarget them to the other
+            // slot's smaller mask) and validate supports_op with baked op_params.
+            candidate->rewire_kvarn_mixed_attn_inputs();
             ggml_cgraph * cg = candidate->get_gf();
             const int n_nodes = ggml_graph_n_nodes(cg);
             for (int i = 0; i < n_nodes; ++i) {
@@ -1415,11 +1421,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res = gf_res_alt.get();
         reused = true;
     } else {
-        // Keep the last graph in the alternate slot so alternating prefill ubatches
-        // (for example 384 + 128 prompt chunks) can reuse both topologies across reps.
-        if (!graph_reuse_disable && use_alt_slot && res->get_gf()) {
-            std::swap(gf_res_prev, gf_res_alt);
-            res = gf_res_prev.get();
+        // Ping-pong: keep both 384- and 128-token topologies resident. Build into
+        // the slot that does not already cache this ubatch.n_tokens instead of
+        // swap-then-reset (which destroyed the matching cached graph).
+        if (!graph_reuse_disable && use_alt_slot && gf_res_alt) {
+            llm_graph_result * build_res = gf_res_prev.get();
+            llm_graph_result * prev_slot  = gf_res_prev.get();
+            llm_graph_result * alt_slot   = gf_res_alt.get();
+            const uint32_t ntok = ubatch.n_tokens;
+            const bool prev_has = prev_slot->get_gf() != nullptr;
+            const bool alt_has  = alt_slot->get_gf()  != nullptr;
+            if (!prev_has && alt_has) {
+                build_res = prev_slot;
+            } else if (prev_has && !alt_has) {
+                build_res = alt_slot;
+            } else if (prev_has && alt_has) {
+                const bool prev_match = prev_slot->cached_ubatch_n_tokens() == ntok;
+                const bool alt_match  = alt_slot->cached_ubatch_n_tokens()  == ntok;
+                if (prev_match && !alt_match) {
+                    build_res = alt_slot;
+                } else if (alt_match && !prev_match) {
+                    build_res = prev_slot;
+                } else if (gf_res_sched != prev_slot) {
+                    build_res = prev_slot;
+                } else {
+                    build_res = alt_slot;
+                }
+            }
+            res = build_res;
         }
 
         res->reset();
@@ -1458,8 +1487,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         if (res != gf_res_sched) {
             ggml_backend_sched_reset(sched.get());
-            // Stale allocations were already cleared (and node support
-            // validated) by can_reuse_graph -> prepare_rebind() above.
+            res->prepare_rebind();
+            res->rewire_kvarn_mixed_attn_inputs();
+            res->refresh_kvarn_params(ubatch);
             if (!ggml_backend_sched_alloc_graph(sched.get(), res->get_gf())) {
                 LLAMA_LOG_ERROR("%s: failed to rebind reused graph\n", __func__);
                 ret = GGML_STATUS_ALLOC_FAILED;

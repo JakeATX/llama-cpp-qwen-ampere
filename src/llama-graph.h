@@ -373,6 +373,8 @@ public:
 
     const llama_kv_cache_kvarn_context * mctx_kvarn;
     std::vector<ggml_tensor *> mixed_attn_nodes;
+    std::vector<ggml_tensor *> mixed_attn_scores;
+    void rewire_kvarn_mixed_attn_inputs();
     bool has_body_store_ops = false;
     std::vector<uint32_t> baked_seal_records;
 };
@@ -507,6 +509,8 @@ public:
     ggml_tensor * base_kvarn_window = nullptr;   // I32 [8]
     bool base_window_indirect = false;
     std::vector<ggml_tensor *> base_mixed_attn_nodes;
+    std::vector<ggml_tensor *> base_mixed_attn_scores;
+    void rewire_kvarn_mixed_attn_inputs();
     void refresh_kvarn_params(const llama_ubatch & ubatch);
     bool base_has_body_store_ops = false;
     std::vector<uint32_t> base_baked_seal_records;
@@ -787,6 +791,11 @@ public:
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
+    // n_tokens of the ubatch that built the cached graph (0 if empty).
+    uint32_t cached_ubatch_n_tokens() const {
+        return gf ? params.ubatch.n_tokens : 0;
+    }
+
     // Clear stale scheduler allocations (buffer/data) from every tensor owned
     // by this result's compute context. Required before re-allocating a cached
     // graph on a scheduler that has since allocated a different topology:
@@ -804,6 +813,7 @@ public:
     // supports_op evaluates op_params against baked shapes. Idempotent with
     // the set_input that follows a successful reuse.
     void refresh_kvarn_params(const llama_ubatch & ubatch);
+    void rewire_kvarn_mixed_attn_inputs();
 
     int64_t get_max_nodes() const;
 

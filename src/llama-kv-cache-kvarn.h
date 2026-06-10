@@ -146,6 +146,7 @@ struct llama_kvarn_layer_view {
     ggml_tensor * scales_v;
     ggml_tensor * pending_k;
     ggml_tensor * pending_v;
+    ggml_tensor * attn_mixed_scratch; // F32 [worst-case mixed-attn scratch]
 };
 
 class llama_kv_cache_kvarn;
@@ -195,6 +196,8 @@ public:
     llama_kvarn_layer_view get_layer_view(int32_t il) const;
     size_t body_store_scratch_floats(int32_t il) const;
     ggml_tensor * build_body_store_scratch(ggml_context * ctx, int32_t il) const;
+    int64_t attn_mixed_scratch_floats_worst(int32_t il) const;
+    ggml_tensor * build_attn_mixed_scratch(ggml_context * ctx, int32_t il, int64_t n_floats) const;
     ggml_tensor * view_k_body_record    (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_v_body_record    (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_k_scales_record  (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
@@ -305,6 +308,8 @@ public:
     llama_kvarn_layer_view get_layer_view(int32_t il) const;
     size_t body_store_scratch_floats(int32_t il) const;
     ggml_tensor * build_body_store_scratch(ggml_context * ctx, int32_t il) const;
+    int64_t attn_mixed_scratch_floats_worst(int32_t il) const;
+    ggml_tensor * build_attn_mixed_scratch(ggml_context * ctx, int32_t il, int64_t n_floats) const;
     ggml_tensor * view_k_body_record    (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_v_body_record    (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_k_scales_record  (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
@@ -349,6 +354,7 @@ private:
         ggml_tensor * scales_v    = nullptr; // F32 [v_scale_floats, n_records, n_head_kv]
         ggml_tensor * pending_k   = nullptr; // F32 [head_dim, n_head_kv, group_size]
         ggml_tensor * pending_v   = nullptr; // F32 [head_dim, n_head_kv, group_size]
+        ggml_tensor * attn_mixed_scratch = nullptr; // F32 [worst-case mixed-attn scratch]
     };
 
     const llama_model * model = nullptr;

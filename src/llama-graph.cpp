@@ -1034,6 +1034,38 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_attn_kvarn::rewire_kvarn_mixed_attn_inputs() {
+    const size_t n = mixed_attn_nodes.size();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_tensor * node = mixed_attn_nodes[i];
+        if (node == nullptr || node->op != GGML_OP_KVARN_ATTN_MIXED) {
+            continue;
+        }
+        if (i < mixed_attn_scores.size() && mixed_attn_scores[i] != nullptr) {
+            node->src[9] = mixed_attn_scores[i];
+        }
+        if (self_kq_mask_cnv != nullptr) {
+            node->src[10] = self_kq_mask_cnv;
+        }
+    }
+}
+
+void llm_graph_input_attn_kv_iswa::rewire_kvarn_mixed_attn_inputs() {
+    const size_t n = base_mixed_attn_nodes.size();
+    for (size_t i = 0; i < n; ++i) {
+        ggml_tensor * node = base_mixed_attn_nodes[i];
+        if (node == nullptr || node->op != GGML_OP_KVARN_ATTN_MIXED) {
+            continue;
+        }
+        if (i < base_mixed_attn_scores.size() && base_mixed_attn_scores[i] != nullptr) {
+            node->src[9] = base_mixed_attn_scores[i];
+        }
+        if (self_kq_mask_cnv != nullptr) {
+            node->src[10] = self_kq_mask_cnv;
+        }
+    }
+}
+
 void llm_graph_input_attn_kv_iswa::refresh_kvarn_params(const llama_ubatch & ubatch) {
     if (mctx_kvarn_iswa == nullptr || base_mixed_attn_nodes.empty()) {
         return;
@@ -1502,6 +1534,16 @@ void llm_graph_result::refresh_kvarn_params(const llama_ubatch & ubatch) {
     for (auto & input : inputs) {
         if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(input.get())) {
             iswa->refresh_kvarn_params(ubatch);
+        }
+    }
+}
+
+void llm_graph_result::rewire_kvarn_mixed_attn_inputs() {
+    for (auto & input : inputs) {
+        if (auto * kvarn = dynamic_cast<llm_graph_input_attn_kvarn *>(input.get())) {
+            kvarn->rewire_kvarn_mixed_attn_inputs();
+        } else if (auto * iswa = dynamic_cast<llm_graph_input_attn_kv_iswa *>(input.get())) {
+            iswa->rewire_kvarn_mixed_attn_inputs();
         }
     }
 }
@@ -3055,8 +3097,8 @@ ggml_tensor * llm_graph_context::build_attn(
                 window, cparams.kvarn, inp_kvarn->mctx_kvarn->get_size(), ubatch);
         const int64_t scores_floats = kvarn_graph_attn_scratch_floats(
                 scratch_window, layer.n_head_kv, scratch_window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
-        ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
-        ggml_set_name(scores, "kvarn_attn_scores");
+        ggml_tensor * scores = inp_kvarn->mctx_kvarn->build_attn_mixed_scratch(ctx0, il, scores_floats);
+        inp_kvarn->mixed_attn_scores.push_back(scores);
 
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
                 ctx0, q_cur, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
@@ -3514,8 +3556,8 @@ ggml_tensor * llm_graph_context::build_attn(
                 window, cparams.kvarn, mctx_kvarn->get_size(), ubatch);
         const int64_t scores_floats = kvarn_graph_attn_scratch_floats(
                 scratch_window, layer.n_head_kv, scratch_window.n_records, layer.head_dim_k, cparams.kvarn.group_size);
-        ggml_tensor * scores = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, scores_floats);
-        ggml_set_name(scores, "kvarn_iswa_attn_scores");
+        ggml_tensor * scores = mctx_kvarn->build_attn_mixed_scratch(ctx0, il, scores_floats);
+        inp->base_mixed_attn_scores.push_back(scores);
 
         // CUDA-graph-replay-safe decode: in the pure sink/tail regime
         // (n_tokens==1, no body records, no pending) the op is built with

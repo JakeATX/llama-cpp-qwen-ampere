@@ -6008,7 +6008,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 int64_t scratch_floats = n_kv;
-                if (ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH") && params.n_records > 0) {
+                if (params.n_records > 0 &&
+                        (params.head_dim >= 512 || ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH"))) {
                     scratch_floats += 2*op->src[1]->ne[1]*int64_t(params.n_records)*params.head_dim*params.group_size;
                 }
                 const int64_t k_body_bytes = (int64_t)(((size_t) params.head_dim*params.group_size*params.key_bits + 7)/8);

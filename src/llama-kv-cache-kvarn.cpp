@@ -721,6 +721,17 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_body_store_scratch(ggml_contex
     return kv->build_body_store_scratch(ctx, il);
 }
 
+int64_t llama_kv_cache_kvarn_context::attn_mixed_scratch_floats_worst(int32_t il) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->attn_mixed_scratch_floats_worst(il);
+}
+
+ggml_tensor * llama_kv_cache_kvarn_context::build_attn_mixed_scratch(
+        ggml_context * ctx, int32_t il, int64_t n_floats) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->build_attn_mixed_scratch(ctx, il, n_floats);
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::view_k_body_record(
         ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
@@ -854,7 +865,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params init_params = {
-                /*.mem_size   =*/ size_t(8u*hparams.n_layer_all*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(9u*hparams.n_layer_all*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ nullptr,
                 /*.no_alloc   =*/ true,
             };
@@ -919,6 +930,26 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         st.scales_v    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, layout_v.v_scale_floats, n_records_alloc, n_head_kv);
         st.pending_k   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_k, n_head_kv, params.group_size);
         st.pending_v   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_v, n_head_kv, params.group_size);
+
+        {
+            const uint32_t n_seen = kv_size;
+            const uint32_t n_sink = std::min(n_seen, params.sink_tokens);
+            const uint32_t n_after_sink = n_seen - n_sink;
+            const uint32_t n_tail = std::min(n_after_sink, params.tail_tokens);
+            const uint32_t n_body = n_after_sink - n_tail;
+            const uint32_t n_records_w = std::min(n_body/params.group_size, n_records_alloc);
+            const uint32_t n_pending = n_body%params.group_size;
+            int64_t scratch_floats = int64_t(n_sink) + int64_t(n_records_w)*params.group_size + n_pending + n_tail;
+            static const bool ref_scratch = []() {
+                const char * env = std::getenv("LLAMA_KVARN_ATTN_REF_SCRATCH");
+                return env && env[0] == '1';
+            }();
+            if (n_records_alloc > 0 && (head_k >= 512 || ref_scratch)) {
+                scratch_floats += 2*int64_t(n_head_kv)*int64_t(n_records_alloc)*int64_t(head_k)*int64_t(params.group_size);
+            }
+            st.attn_mixed_scratch = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scratch_floats);
+            ggml_format_name(st.attn_mixed_scratch, "kvarn_attn_mixed_scratch_l%d", il);
+        }
 
         ggml_format_name(st.sink_tail_k, "kvarn_sink_tail_k_l%d", il);
         ggml_format_name(st.sink_tail_v, "kvarn_sink_tail_v_l%d", il);
@@ -1335,6 +1366,7 @@ size_t llama_kv_cache_kvarn::backend_tensor_bytes() const {
         result += ggml_nbytes(layer.scales_v);
         result += ggml_nbytes(layer.pending_k);
         result += ggml_nbytes(layer.pending_v);
+        result += ggml_nbytes(layer.attn_mixed_scratch);
     }
 
     return result;
@@ -1376,7 +1408,30 @@ llama_kvarn_layer_view llama_kv_cache_kvarn::get_layer_view(int32_t il) const {
         /*.scales_v    =*/ st.scales_v,
         /*.pending_k   =*/ st.pending_k,
         /*.pending_v   =*/ st.pending_v,
+        /*.attn_mixed_scratch =*/ st.attn_mixed_scratch,
     };
+}
+
+int64_t llama_kv_cache_kvarn::attn_mixed_scratch_floats_worst(int32_t il) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    return view.attn_mixed_scratch ? ggml_nelements(view.attn_mixed_scratch) : 0;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::build_attn_mixed_scratch(
+        ggml_context * ctx, int32_t il, int64_t n_floats) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (view.attn_mixed_scratch == nullptr) {
+        throw std::runtime_error("KVarN mixed-attn scratch is not allocated for this layer");
+    }
+    if (ggml_nelements(view.attn_mixed_scratch) < n_floats) {
+        throw std::runtime_error("KVarN mixed-attn scratch is smaller than the active attention window requires");
+    }
+    ggml_tensor * scratch = view.attn_mixed_scratch;
+    if (ggml_nelements(scratch) > n_floats) {
+        scratch = ggml_view_1d(ctx, scratch, n_floats, 0);
+        ggml_format_name(scratch, "kvarn_attn_mixed_scratch_view_l%d", il);
+    }
+    return scratch;
 }
 
 size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
