@@ -10,6 +10,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-kvarn-iswa.h"
 #include "llama.h"
 
 #include <cerrno>
@@ -1323,12 +1324,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // KVarN+ISWA prefill ping-pong is opt-in only: enabling it without fixing
     // scheduler buffer assignment for kvarn_iswa_kqv_out-* tensors aborts on
     // the 384+128 pp512 path (pre-allocated tensor in CUDA0 cannot run
-    // KVARN_ATTN_MIXED). Set LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1 for A/B once
-    // the ISWA reuse path re-binds mixed-attn outputs across slot swaps.
+    // KVARN_ATTN_MIXED). Keep that crash behind a second explicit unsafe env
+    // until the ISWA reuse path re-binds mixed-attn outputs across slot swaps.
     static const bool kvarn_pingpong_enable = llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_PREFILL_PINGPONG");
+    static const bool kvarn_iswa_pingpong_unsafe =
+        llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_ISWA_PREFILL_PINGPONG_UNSAFE");
+
+    const bool is_kvarn_iswa_mctx =
+        dynamic_cast<const llama_kv_cache_kvarn_iswa_context *>(mctx) != nullptr;
+
+    static bool warned_kvarn_iswa_pingpong_blocked = false;
+    if (kvarn_pingpong_enable && is_kvarn_iswa_mctx && !kvarn_iswa_pingpong_unsafe &&
+            !warned_kvarn_iswa_pingpong_blocked) {
+        std::fprintf(stderr,
+                "%s: LLAMA_KVARN_ENABLE_PREFILL_PINGPONG=1 requested, but KVarN+ISWA prefill "
+                "ping-pong is still blocked by the known mixed-attn output rebind crash; "
+                "set LLAMA_KVARN_ENABLE_ISWA_PREFILL_PINGPONG_UNSAFE=1 only for crash reproduction.\n",
+                __func__);
+        warned_kvarn_iswa_pingpong_blocked = true;
+    }
+
     const bool use_alt_slot = gf_res_alt &&
         ubatch.n_tokens > 1 &&
-        (cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN || kvarn_pingpong_enable);
+        (cparams.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN ||
+         (kvarn_pingpong_enable && (!is_kvarn_iswa_mctx || kvarn_iswa_pingpong_unsafe)));
 
     auto can_reuse_graph = [&](llm_graph_result * candidate) {
         return !graph_reuse_disable && candidate && candidate->get_gf() && candidate->can_reuse(gparams);
@@ -1404,7 +1423,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // ping-pong should show reused=1 for both chunk sizes after warmup.
     static const bool kvarn_reuse_trace = llama_kvarn_parse_env_flag("LLAMA_KVARN_GRAPH_REUSE_TRACE");
     if (kvarn_reuse_trace && cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
-        LLAMA_LOG_INFO("%s: KVarN graph reuse trace: n_tokens=%u reused=%d slot=%s n_reused_total=%d\n",
+        std::fprintf(stderr, "%s: KVarN graph reuse trace: n_tokens=%u reused=%d slot=%s n_reused_total=%d\n",
                 __func__, ubatch.n_tokens, reused ? 1 : 0,
                 res == gf_res_prev.get() ? "prev" : "alt", n_reused);
     }

@@ -202,3 +202,15 @@ R5 with default ping-pong-on **crashes** every pp512 run — do not enable until
 **Still deferred:** cross-ubatch seal batching (pending-window contract),
 runtime seal indices (op-interface change; only needed if prefill reuse via
 R5 proves insufficient), full Sinkhorn iteration fusion (grid sync).
+
+---
+
+## Round 4 (diagnostic safety, 2026-06-10)
+
+| Change | Status |
+|--------|--------|
+| ISWA ping-pong requires `LLAMA_KVARN_ENABLE_ISWA_PREFILL_PINGPONG_UNSAFE=1` | Landed — generic `ENABLE_PREFILL_PINGPONG=1` no longer crashes Gemma pp512 |
+| `can_reuse` miss attribution under `LLAMA_KVARN_GRAPH_REUSE_TRACE=1` | Landed — logs to stderr (llama-bench nulls `LLAMA_LOG_*`) |
+| tg64 decode graph reuse | **Confirmed** — trace shows `reused=1` on every token after the first |
+
+Round 4 does **not** improve throughput. Gemma experimental @ r=3: pp512 **76.1%**, tg64 **75.7%**. Gate remains open (≥90%).

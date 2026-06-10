@@ -96,6 +96,15 @@ static void kvarn_graph_attn_trace_tensor(const char * name, const ggml_tensor *
             t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
 }
 
+static bool kvarn_graph_reuse_trace_enabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_GRAPH_REUSE_TRACE");
+}
+
+static void kvarn_graph_reuse_trace_miss(const char * where, const char * check) {
+    // llama-bench installs a null log callback; mirror kvarn cache instrumentation.
+    std::fprintf(stderr, "%s: KVarN graph reuse miss: %s\n", where, check);
+}
+
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         uint32_t n_kv,
@@ -1017,38 +1026,69 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     if (const auto * mctx = dynamic_cast<const llama_kv_cache_kvarn_iswa_context *>(params.mctx)) {
         this->mctx_kvarn_iswa = mctx;
         this->mctx = nullptr;
+        const bool reuse_trace = kvarn_graph_reuse_trace_enabled();
 
         const auto * base_ctx = mctx->get_base();
         const kvarn_active_window window = kvarn_graph_active_window(params.cparams.kvarn, params.ubatch, base_ctx->get_size());
         if (!window.valid) {
+            if (reuse_trace) {
+                kvarn_graph_reuse_trace_miss(__func__, "kvarn-active-window-invalid");
+            }
             return false;
         }
 
         const std::vector<uint32_t> cur_seal_records = kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch);
         if (base_has_body_store_ops) {
             if (cur_seal_records != base_baked_seal_records) {
+                if (reuse_trace) {
+                    std::fprintf(stderr,
+                            "%s: KVarN graph reuse miss: seal-records mismatch baked=%zu current=%zu\n",
+                            __func__, base_baked_seal_records.size(), cur_seal_records.size());
+                }
                 return false;
             }
         } else if (!cur_seal_records.empty()) {
+            if (reuse_trace) {
+                std::fprintf(stderr,
+                        "%s: KVarN graph reuse miss: graph has no baked body-store ops but current ubatch seals %zu record(s)\n",
+                        __func__, cur_seal_records.size());
+            }
             return false;
         }
 
         const uint32_t n_tail_evict = kvarn_graph_count_tail_evictions(params.cparams.kvarn, params.ubatch);
         bool res = true;
-        res &= base_sink_tail_idxs->ne[0] == params.ubatch.n_tokens;
-        res &= base_body_plan->ne[1] == n_tail_evict;
-        res &= base_body_offsets->ne[0] == n_tail_evict;
-        res &= base_tail_evict_idxs->ne[0] == n_tail_evict;
-        res &= can_reuse_kq_mask(
+        auto check = [&](bool ok, const char * name) {
+            if (!ok && reuse_trace) {
+                kvarn_graph_reuse_trace_miss(__func__, name);
+            }
+            res &= ok;
+        };
+
+        check(base_sink_tail_idxs->ne[0] == params.ubatch.n_tokens,
+                "base_sink_tail_idxs.ne[0] != ubatch.n_tokens");
+        check(base_body_plan->ne[1] == n_tail_evict,
+                "base_body_plan.ne[1] != n_tail_evict");
+        check(base_body_offsets->ne[0] == n_tail_evict,
+                "base_body_offsets.ne[0] != n_tail_evict");
+        check(base_tail_evict_idxs->ne[0] == n_tail_evict,
+                "base_tail_evict_idxs.ne[0] != n_tail_evict");
+        check(can_reuse_kq_mask(
                 self_kq_mask,
                 kvarn_graph_reuse_mask_n_kv(window, base_ctx->get_size(), params.ubatch),
                 params.ubatch,
-                params.cparams);
-        res &= !base_mixed_attn_nodes.empty();
+                params.cparams),
+                "base self_kq_mask shape mismatch");
+        check(!base_mixed_attn_nodes.empty(),
+                "base_mixed_attn_nodes empty");
 
         for (const ggml_tensor * node : base_mixed_attn_nodes) {
-            res &= node->op == GGML_OP_KVARN_ATTN_MIXED;
+            check(node->op == GGML_OP_KVARN_ATTN_MIXED,
+                    "base mixed-attn node op mismatch");
             if (kvarn_graph_reuse_unsafe_forced_512_fused(window, node)) {
+                if (reuse_trace) {
+                    kvarn_graph_reuse_trace_miss(__func__, "unsafe forced 512 fused disables reuse");
+                }
                 return false;
             }
             const int64_t n_head_kv = node->src[1] ? node->src[1]->ne[1] : 0;
@@ -1056,13 +1096,16 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
                     window, params.cparams.kvarn, base_ctx->get_size(), params.ubatch);
             const int64_t required_scratch = kvarn_graph_attn_scratch_floats(
                     scratch_window, n_head_kv, scratch_window.n_records, node->op_params[5], node->op_params[6]);
-            res &= node->src[9] != nullptr && ggml_nelements(node->src[9]) >= required_scratch;
+            check(node->src[9] != nullptr && ggml_nelements(node->src[9]) >= required_scratch,
+                    "base mixed-attn scratch too small/null");
         }
 
         const auto * swa_ctx = mctx->get_swa();
         if (self_k_idxs_swa && self_k_idxs_swa->buffer) {
-            res &= self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
-            res &= can_reuse_kq_mask(self_kq_mask_swa, swa_ctx, params.ubatch, params.cparams);
+            check(self_k_idxs_swa->ne[0] == params.ubatch.n_tokens,
+                    "self_k_idxs_swa.ne[0] != ubatch.n_tokens");
+            check(can_reuse_kq_mask(self_kq_mask_swa, swa_ctx, params.ubatch, params.cparams),
+                    "SWA self_kq_mask_swa shape mismatch");
         }
 
         return res;
