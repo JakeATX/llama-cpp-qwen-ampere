@@ -13,7 +13,7 @@ This doc is the **measured follow-up** to the token-major K scratch patch (`0001
 
 | Track | Status | Action |
 |-------|--------|--------|
-| **Gemma true KVarN+ISWA** (experimental) | **Mixed** — tg64 **PASS** (101%), pp512 **FAIL** (84.9%) | Round 7: `kvarn_iswa_kqv_out` rebind supports_op + ~5pp pp512 |
+| **Gemma true KVarN+ISWA** (experimental) | **Mixed** — tg64 **PASS** (101%), pp512 **89.6%** (−0.4pp) | Round 8: scratch `src[9]` buffer after rebind; ping-pong |
 | **Gemma production fallback** (default policy) | **PASS** (~111% pp512, ~101% tg64) | Do not flip `llama-model.cpp` until experimental passes |
 | **Qwen3.6 MTP 128d** (`-ncmoe 34`) | **Mixed** — tg64 97.1% PASS, pp512 83.0% FAIL | Investigate MoE/memory variance; 512d patch should not touch 128d path |
 | **Tier 0 CUDA tests** | **PASS** | — |
@@ -436,3 +436,27 @@ computable from the log — no more guessing.
    paste the numeric dump into round 8.
 4. Qwen3.6 Q4_K_M split `-ncmoe 34` with warmup (QT change is head_dim>=512
    only).
+
+### Round 7 measured (RTX 5070, Gemma Q4_XL, experimental ISWA, r=5, iters=4)
+
+| Case | Round 6 | Round 7 @ `d6b3be186` | Gate (≥90%) |
+|------|--------:|----------------------:|:-----------:|
+| **tg64** | 101.0% | **101.1%** (63.7 / 63.0 t/s) | **PASS** |
+| **pp512** | 84.9% | **89.6%** (2228 / 2486 t/s) | **−0.4 pp** (~10 t/s short) |
+
+Tier 0 + Gemma logits: **PASS**. R14 QT=8: **+92 KVarN t/s** pp512 (+4.7 pp).
+
+**R15 ping-pong:** re-sync did not fix 128-slot rebind. Numeric dump shows
+`src[9] kvarn_iswa_attn_scores buffer=(null)` after `prepare_rebind()` while
+KV tensors retain CUDA0 — `supports_op` fails on null scratch buffer, not stale
+op_params alone. Round 8: preserve or re-allocate scratch sizing across slot swap.
+
+**Gate:** pp512 needs ~10 more KVarN t/s at this normal baseline (or ping-pong
+reuse once rebind works). **Do not flip `llama-model.cpp` yet** (strict ≥90%).
+
+### Round 8 (next agent)
+
+1. Fix `kvarn_iswa_attn_scores` / mixed-attn scratch (`src[9]`) backend assignment
+   after `prepare_rebind()` on ping-pong slot swap (dump proves `buffer=null`).
+2. Re-run pp512 with ping-pong — should stack host graph-reuse gain on R14.
+3. Qwen Q4_K_M warmup regression.
