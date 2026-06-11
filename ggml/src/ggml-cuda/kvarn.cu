@@ -12,6 +12,22 @@
 // dynamic shared allocation.
 static constexpr size_t KVARN_ATTN_SHMEM_PAD_FLOATS = 8;
 
+// Monotonic counter bumped by every body-store/seal entry point. Used to
+// invalidate the per-scratch dequant cache: dequantized K records in the
+// persistent attn scratch remain valid until a new seal (or a re-seal after
+// a cache clear) changes the packed body.
+#include <atomic>
+#include <unordered_map>
+static std::atomic<uint64_t> g_kvarn_body_store_epoch{1};
+
+struct kvarn_dequant_cache_entry {
+    const void * k_body    = nullptr;
+    uint32_t     n_records = 0;
+    uint64_t     epoch     = 0;
+};
+// Host dispatch for a given context is single-threaded; no mutex on the hot path.
+static std::unordered_map<const void *, kvarn_dequant_cache_entry> g_kvarn_dequant_cache;
+
 static bool kvarn_env_flag(const char * name) {
     const char * env = std::getenv(name);
     if (env == nullptr) {
@@ -691,6 +707,7 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
+    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -742,6 +759,7 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
+    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -802,6 +820,7 @@ static void ggml_cuda_kvarn_store_kv_body_512_pipelined(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
+    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
@@ -952,6 +971,7 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
         void * stream) {
+    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
     const size_t tile_floats = size_t(head_dim)*group_size;
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
@@ -1017,6 +1037,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
         void * stream) {
+    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
     const size_t tile_floats = size_t(head_dim)*group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
     float * k_tile = scratch;
@@ -1075,6 +1096,7 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
+    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
     if (head_dim >= 512) {
         ggml_cuda_kvarn_store_kv_body_512_pipelined(
                 k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
@@ -1189,7 +1211,7 @@ static __global__ void kvarn_dequant_n_kernel(
     const float * k_record_scales = k_scales + size_t(r)*k_scale_stride_floats;
     const float * v_record_scales = v_scales + size_t(r)*v_scale_stride_floats;
     T * k_record_out = k_out + size_t(r)*k_out_stride_floats;
-    T * v_record_out = v_out + size_t(r)*v_out_stride_floats;
+    T * v_record_out = v_out == nullptr ? nullptr : v_out + size_t(r)*v_out_stride_floats;
 
     // The persistent packed K layout is always record/dim-major
     // (i_packed = d*group_size + g). When k_token_major is set, the f32
@@ -1221,8 +1243,10 @@ static __global__ void kvarn_dequant_n_kernel(
     const float * v_s_row = v_record_scales + head_dim;
     const float * v_zp    = v_record_scales + head_dim + group_size;
 
-    const uint32_t vq = kvarn_unpack_one(v_record, value_bits, i);
-    v_record_out[i] = kvarn_dequant_store_cast<T>((float(vq)*v_s_row[g_v] + v_zp[g_v])*v_s_col[d_v]);
+    if (v_record_out != nullptr) {
+        const uint32_t vq = kvarn_unpack_one(v_record, value_bits, i);
+        v_record_out[i] = kvarn_dequant_store_cast<T>((float(vq)*v_s_row[g_v] + v_zp[g_v])*v_s_col[d_v]);
+    }
 }
 
 void ggml_cuda_kvarn_dequant_body_n(
@@ -3604,7 +3628,9 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         uint32_t kq_mask_type,
         float scale,
         void * stream,
-        const int32_t * window_dev) {
+        const int32_t * window_dev,
+        int64_t scores_nelems,
+        int64_t k_body_records_cap) {
     const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
     const uint32_t n_gqa = n_head/n_head_kv;
     (void) kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
@@ -3726,36 +3752,60 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 if (n_records > 0 && scores != nullptr) {
                     const size_t n_per_record = size_t(group_size)*head_dim;
                     const size_t n_per_head = size_t(n_records)*n_per_record;
-                    const size_t dequant_base = size_t(n_tokens);
-                    // Carve the f16 K/V regions out of the float scores
-                    // scratch after the probs area. Element budget: the
-                    // scratch is sized for 2*n_head_kv*n_per_head FLOATS, and
-                    // the same count of HALVES occupies half the bytes, so
-                    // capacity checks in can_reuse remain valid.
-                    __half * k_dequant = reinterpret_cast<__half *>(scores + dequant_base);
-                    __half * v_dequant = k_dequant + size_t(n_head_kv)*n_per_head;
+                    // K/V f16 mirrors are END-ANCHORED in the persistent attn scratch
+                    // (capacity-sized region whose base does not move as the window
+                    // grows). A host-side cache keyed by (scratch ptr -> k_body ptr,
+                    // n_records, store-epoch) refills incrementally on seal only.
+                    // Packed V in-kernel is cheaper in theory but measured slower on
+                    // 512d Gemma warpqk AV; keep the f16 V mirror.
+                    const size_t cap_records = size_t(k_body_records_cap > 0 ? k_body_records_cap : n_records);
+                    const size_t cap_elems_per_head = cap_records*n_per_record;
+                    const size_t cap_halves_kv = 2*size_t(n_head_kv)*cap_elems_per_head;
+                    const size_t cap_floats = (cap_halves_kv + 1)/2;
+                    const bool anchored = scores_nelems > 0 &&
+                            size_t(scores_nelems) >= size_t(n_tokens) + cap_floats &&
+                            cap_records >= size_t(n_records);
 
-                    for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
-                        // K dequantized token-major f16: coalesced per-lane
-                        // loads at half the read traffic of f32 scratch. The
-                        // persistent packed layout is unchanged.
-                        ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
-                                k_body + size_t(ikh)*k_body_stride_head_bytes,
-                                v_body + size_t(ikh)*v_body_stride_head_bytes,
-                                k_scales + size_t(ikh)*k_scale_stride_head_floats,
-                                v_scales + size_t(ikh)*v_scale_stride_head_floats,
-                                k_dequant + size_t(ikh)*n_per_head,
-                                v_dequant + size_t(ikh)*n_per_head,
-                                n_records, head_dim, group_size, key_bits, value_bits,
-                                k_body_stride_record_bytes, v_body_stride_record_bytes,
-                                k_scale_stride_record_floats, v_scale_stride_record_floats,
-                                n_per_record, n_per_record,
-                                cuda_stream);
+                    __half * k_dequant = anchored ?
+                        reinterpret_cast<__half *>(scores + (size_t(scores_nelems) - cap_floats)) :
+                        reinterpret_cast<__half *>(scores + size_t(n_tokens));
+                    __half * v_dequant = k_dequant + size_t(n_head_kv)*(anchored ? cap_elems_per_head : n_per_head);
+
+                    uint32_t dequant_from = 0;
+                    if (anchored) {
+                        const uint64_t epoch = g_kvarn_body_store_epoch.load(std::memory_order_relaxed);
+                        kvarn_dequant_cache_entry & e = g_kvarn_dequant_cache[(const void *) scores];
+                        if (e.k_body == (const void *) k_body && e.epoch == epoch && e.n_records <= n_records) {
+                            dequant_from = e.n_records;
+                        }
+                        if (dequant_from < n_records) {
+                            e.k_body = (const void *) k_body;
+                            e.n_records = n_records;
+                            e.epoch = epoch;
+                        }
+                    }
+
+                    if (dequant_from < n_records) {
+                        const size_t head_stride_elems = anchored ? cap_elems_per_head : n_per_head;
+                        for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+                            ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
+                                    k_body + size_t(ikh)*k_body_stride_head_bytes + size_t(dequant_from)*k_body_stride_record_bytes,
+                                    v_body + size_t(ikh)*v_body_stride_head_bytes + size_t(dequant_from)*v_body_stride_record_bytes,
+                                    k_scales + size_t(ikh)*k_scale_stride_head_floats + size_t(dequant_from)*k_scale_stride_record_floats,
+                                    v_scales + size_t(ikh)*v_scale_stride_head_floats + size_t(dequant_from)*v_scale_stride_record_floats,
+                                    k_dequant + size_t(ikh)*head_stride_elems + size_t(dequant_from)*n_per_record,
+                                    v_dequant + size_t(ikh)*head_stride_elems + size_t(dequant_from)*n_per_record,
+                                    n_records - dequant_from, head_dim, group_size, key_bits, value_bits,
+                                    k_body_stride_record_bytes, v_body_stride_record_bytes,
+                                    k_scale_stride_record_floats, v_scale_stride_record_floats,
+                                    n_per_record, n_per_record,
+                                    cuda_stream);
+                        }
                     }
 
                     body_k_f16 = k_dequant;
                     body_v_f16 = v_dequant;
-                    body_f16_stride_head_elems = n_per_head;
+                    body_f16_stride_head_elems = anchored ? cap_elems_per_head : n_per_head;
                 }
 
                 const int warpqk_grid = warpqk_q8 ? int(((n_queries + 7)/8)*n_head) :

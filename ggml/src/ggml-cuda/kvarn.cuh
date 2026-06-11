@@ -388,4 +388,10 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         // sink/tail decode regime, kernels read the window from device memory
         // (CUDA-graph-replay-safe; host args carry frozen caps for sizing)
         void * stream,
-        const int32_t * window_dev = nullptr);
+        const int32_t * window_dev = nullptr,
+        // worst-case persistent scratch capacity (parent tensor floats, not
+        // the active view size) and packed body record capacity; when
+        // provided, the K dequant region is end-anchored in the scratch and
+        // cached across calls (re-filled incrementally on seal-epoch change only)
+        int64_t scores_nelems = 0,
+        int64_t k_body_records_cap = 0);

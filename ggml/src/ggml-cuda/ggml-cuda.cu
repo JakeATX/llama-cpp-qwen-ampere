@@ -3380,7 +3380,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             kq_mask_type,
                             params.scale,
                             ctx.stream(),
-                            dst->src[11] != nullptr ? (const int32_t *) dst->src[11]->data : nullptr);
+                            dst->src[11] != nullptr ? (const int32_t *) dst->src[11]->data : nullptr,
+                            [&]() {
+                                const ggml_tensor * scratch = dst->src[9];
+                                while (scratch != nullptr && scratch->view_src != nullptr) {
+                                    scratch = scratch->view_src;
+                                }
+                                return scratch != nullptr ? ggml_nelements(scratch) : int64_t(0);
+                            }(),
+                            dst->src[3]->ne[1]);
                 }
             } break;
         case GGML_OP_TURBO_WHT:

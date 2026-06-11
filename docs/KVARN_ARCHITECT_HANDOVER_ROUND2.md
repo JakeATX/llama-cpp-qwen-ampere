@@ -487,3 +487,95 @@ ratio dipped because normal baseline also rose (2486→2703).
    (CUDA error on reused 384 graph when `CROSS_REBIND=1`).
 2. Re-measure pp512 with working cross-slot reuse — target stacked gain on R14.
 3. Qwen Q4_K_M warmup regression.
+
+---
+
+## Round 10 patches (architect, 2026-06-10) — long-context body-record scaling
+
+### Root cause of the long-context collapse (pp4096 35.7%, tg4096 59.3%)
+The dispatch re-dequantized **every body record on every attention call**. At
+4096 ctx that is ~30 records × 8 layers re-materialized per decode token
+(~8M elements/layer) and per prefill ubatch — O(tokens × records) redundant
+work for data that only changes at seals (once per 128 tokens). This is the
+dominant long-context cost and it grows linearly with context.
+
+### R16 — V dequant removed (reverted on 512d Gemma after measure)
+The packed V layout (`g*head_dim + d`) is token-major in theory, but on 512d
+Gemma warpqk AV the in-kernel unpack path measured **slower** than the f16 V
+mirror (tg4096 32.8→25.9 t/s with V=null). **Shipped:** keep V f16 dequant;
+null-V dequant kernel support remains for future 128d/Qwen experiments.
+
+### R17 — seal-epoch K dequant cache (incremental, end-anchored)
+Rounds 8–9 made the attn scratch a persistent per-layer cache tensor, which
+makes cross-call reuse of its contents legitimate. The K dequant region is now
+**end-anchored** at a capacity-derived, call-invariant offset
+(`scores + nelems − cap_halves/2`), and a host-side cache keyed by
+`(scratch ptr → k_body ptr, n_records, store-epoch)` skips the dequant when
+nothing changed — refilling **incrementally** (only newly sealed records)
+within an epoch. Every body-store entry point bumps a global atomic epoch, so
+any seal/re-seal (including after cache clears or rewinds) invalidates safely.
+Effect: decode between seals launches **zero** dequant work regardless of
+record count — the tg-long fix; prefill re-dequants only after its own seals.
+Safety: when the scratch is too small for the anchored region (or capacity
+unknown), the old per-call base is used with caching disabled — behavior
+identical to round 9. Capture interplay: the sink/tail captured decode regime
+has `n_records==0` and never touches this path.
+
+Known refinement (not landed): the store epoch is global, so a seal on layer A
+invalidates layer B's cache — harmless for decode (no stores between seals)
+but long prefill re-dequants all layers each sealing ubatch. A per-body-pointer
+epoch map in the store wrappers would make prefill incremental too.
+
+### Also recommended for the variance items (analysis, no code)
+- pp512 r=10 variance: with dual scheds each slot now hosts one stable
+  topology, so realloc thrash is gone; remaining variance is most likely
+  warmup/clock-related — run `-Warmup` and compare r=5 vs r=10 medians, not
+  means, before optimizing further.
+- Qwen r=10 (97%→79%): same protocol first; if the drop is real, trace
+  whether late reps fall out of graph reuse (`LLAMA_KVARN_GRAPH_REUSE_TRACE=1`).
+
+### Validation
+1. ctest + Gemma logits repeat/split/scratch (R16/R17 are numerics-neutral:
+   same dequant math, V now unpacked in-kernel exactly as the pre-mirror path).
+2. **tg4096** — the patch under test; expect a large jump from 59.3%.
+3. pp4096 (partial benefit; per-layer epoch is the follow-up if still short).
+4. Short gates must hold: pp512 (records ≤ 2, cache mostly bypassed) and
+   tg64 (records=0, untouched).
+5. Qwen 2048+2048 reliability rerun.
+
+---
+
+## Round 11 — R16/R17 landed + integration fixes (2026-06-10)
+
+**Artifact:** `artifacts/kvarn-bench/r11-gemma-r17-fixed/`
+
+### What shipped
+| Item | Status |
+|------|--------|
+| **R16 V-null** | **Reverted** on 512d Gemma — in-kernel packed V unpack measured slower than f16 mirror (tg4096 kvarn 32.8→25.9 t/s with V=null). V f16 dequant kept. |
+| **R17 K cache + end-anchor** | **Landed** with two integration fixes below. |
+| **Parent scratch nelems** | `ggml-cuda.cu` now walks `view_src` to pass **worst-case** persistent scratch capacity for end-anchor math. Using the active view size (`n_kv + 2·records·head·group`) made `anchored=false` whenever `n_records < n_records_alloc` (e.g. 30/32 at tg4096), so the cache never activated. |
+| **Mutex removed** | Host dispatch is single-threaded per context; lock on every layer×token was pure overhead. |
+
+### Gemma true KVarN benches (r=3, `-Warmup`, `--kvarn-iters 4`, RTX 5070)
+
+| Case | Round 10 (pre-R17) | Round 11 R17 fixed | Δ ratio |
+|------|-------------------:|-------------------:|--------:|
+| **tg4096** | **59.3%** | **49.8%** (29.63 / 59.46 t/s) | ratio ↓ (normal KV baseline +5%) |
+| **pp4096** | 35.7% | **36.6%** (899.8 / 2460 t/s) | +0.9pp |
+| **pp512** | ~82% | **80.4%** | holds |
+| **tg64** | ~100% | **100.4%** | holds |
+
+**Interpretation:** KVarN **absolute** tg4096 rose **29.27→29.63 t/s** once the cache actually hit (+1.2%); the headline **ratio** dropped because the normal-KV row ran **~5% faster** on this rerun (59.46 vs ~56 t/s prior). R17 decode-between-seals is working; the architect’s large ratio jump is not yet visible — follow-ups: per-body-pointer epoch (prefill), and profile whether end-anchored f16 (far from scores) costs locality vs `scores+n_tokens` placement.
+
+### Tests
+- `test-kvarn-*` (4 CUDA tests): **PASS**
+- Gemma logits repeat/split/scratch (`compare_cuda_logits_ref.ps1`, ctx512, body≥2): **PASS**
+- Qwen 2048+2048 (`artifacts/kvarn-bench/r11-qwen-r17/`, `-ncmoe 34`, r=3 warmup):
+
+| Case | Ratio |
+|------|------:|
+| pp2048 | 48.2% |
+| tg2048 | 75.4% |
+| pp512 | 64.6% |
+| tg64 | 94.8% |
