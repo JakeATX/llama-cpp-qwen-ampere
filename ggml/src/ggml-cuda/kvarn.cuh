@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 
+void ggml_cuda_kvarn_mark_body_store(const void * k_body);
+
 void ggml_cuda_kvarn_store_body_reference_minmax(
         const float * k_tile,
         const float * v_tile,

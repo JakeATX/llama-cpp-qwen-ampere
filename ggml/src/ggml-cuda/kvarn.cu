@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <cinttypes>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -12,13 +13,13 @@
 // dynamic shared allocation.
 static constexpr size_t KVARN_ATTN_SHMEM_PAD_FLOATS = 8;
 
-// Monotonic counter bumped by every body-store/seal entry point. Used to
-// invalidate the per-scratch dequant cache: dequantized K records in the
-// persistent attn scratch remain valid until a new seal (or a re-seal after
-// a cache clear) changes the packed body.
+// Monotonic epoch allocator for packed-body store invalidation. The active
+// epoch is tracked per packed K-body pointer so one layer sealing a record does
+// not invalidate every other layer's persistent dequant mirror.
 #include <atomic>
 #include <unordered_map>
-static std::atomic<uint64_t> g_kvarn_body_store_epoch{1};
+static std::atomic<uint64_t> g_kvarn_body_store_epoch_next{1};
+static std::atomic<uint64_t> g_kvarn_dequant_cache_trace_count{0};
 
 struct kvarn_dequant_cache_entry {
     const void * k_body    = nullptr;
@@ -26,7 +27,24 @@ struct kvarn_dequant_cache_entry {
     uint64_t     epoch     = 0;
 };
 // Host dispatch for a given context is single-threaded; no mutex on the hot path.
+static std::unordered_map<const void *, uint64_t> g_kvarn_body_store_epochs;
 static std::unordered_map<const void *, kvarn_dequant_cache_entry> g_kvarn_dequant_cache;
+
+void ggml_cuda_kvarn_mark_body_store(const void * k_body) {
+    if (k_body == nullptr) {
+        return;
+    }
+    const uint64_t epoch = g_kvarn_body_store_epoch_next.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_kvarn_body_store_epochs[k_body] = epoch;
+}
+
+static uint64_t kvarn_body_store_epoch(const void * k_body) {
+    auto it = g_kvarn_body_store_epochs.find(k_body);
+    if (it != g_kvarn_body_store_epochs.end()) {
+        return it->second;
+    }
+    return 0;
+}
 
 static bool kvarn_env_flag(const char * name) {
     const char * env = std::getenv(name);
@@ -43,6 +61,11 @@ static bool kvarn_env_flag(const char * name) {
         std::abort();
     }
     return value != 0;
+}
+
+static bool kvarn_dequant_cache_trace_enabled() {
+    static const bool enabled = kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
+    return enabled;
 }
 
 struct kvarn_aux_cuda_state {
@@ -707,7 +730,7 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
-    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
+    ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -759,7 +782,6 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
-    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -820,7 +842,7 @@ static void ggml_cuda_kvarn_store_kv_body_512_pipelined(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
-    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
+    ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
@@ -971,7 +993,7 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
         void * stream) {
-    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
+    ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t tile_floats = size_t(head_dim)*group_size;
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
@@ -1037,7 +1059,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
         void * stream) {
-    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
+    ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t tile_floats = size_t(head_dim)*group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
     float * k_tile = scratch;
@@ -1096,7 +1118,7 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         void * stream) {
-    g_kvarn_body_store_epoch.fetch_add(1, std::memory_order_relaxed);
+    ggml_cuda_kvarn_mark_body_store(k_body);
     if (head_dim >= 512) {
         ggml_cuda_kvarn_store_kv_body_512_pipelined(
                 k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
@@ -3634,6 +3656,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
     const uint32_t n_gqa = n_head/n_head_kv;
     (void) kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
+    (void) kvarn_dequant_cache_trace_enabled();
     const bool force_serial_fused = kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
     const bool use_split_kernels = kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
     const bool use_serial_fused = force_serial_fused && !use_split_kernels;
@@ -3773,10 +3796,21 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
 
                     uint32_t dequant_from = 0;
                     if (anchored) {
-                        const uint64_t epoch = g_kvarn_body_store_epoch.load(std::memory_order_relaxed);
+                        const uint64_t epoch = kvarn_body_store_epoch((const void *) k_body);
                         kvarn_dequant_cache_entry & e = g_kvarn_dequant_cache[(const void *) scores];
                         if (e.k_body == (const void *) k_body && e.epoch == epoch && e.n_records <= n_records) {
                             dequant_from = e.n_records;
+                        }
+                        if (kvarn_dequant_cache_trace_enabled()) {
+                            const uint64_t trace_i = g_kvarn_dequant_cache_trace_count.fetch_add(1, std::memory_order_relaxed);
+                            if (trace_i < 256) {
+                                std::fprintf(stderr,
+                                        "KVarN CUDA dequant-cache trace: %s scratch=%p k_body=%p epoch=%" PRIu64
+                                        " cached_records=%u active_records=%u refill_from=%u anchored=%d\n",
+                                        dequant_from == n_records ? "hit" : (dequant_from == 0 ? "miss" : "partial"),
+                                        (const void *) scores, (const void *) k_body, epoch,
+                                        e.n_records, n_records, dequant_from, anchored ? 1 : 0);
+                            }
                         }
                         if (dequant_from < n_records) {
                             e.k_body = (const void *) k_body;

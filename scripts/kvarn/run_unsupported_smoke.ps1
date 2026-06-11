@@ -140,14 +140,14 @@ try {
         $results `
         $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "bogus" } `
-        "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=bogus" `
+        "invalid KVarN( CUDA)? environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=bogus" `
         "KVarN invalid scratch-reference env rejection"
 
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_REF_SCRATCH" = "2" } `
-        "invalid KVarN environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=2" `
+        "invalid KVarN( CUDA)? environment flag LLAMA_KVARN_ATTN_REF_SCRATCH=2" `
         "KVarN out-of-range scratch-reference env rejection"
 
     Invoke-ExpectFailure `
@@ -201,9 +201,16 @@ try {
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
-        @{ "LLAMA_KVARN_DEBUG_UBATCH" = "129" } `
-        "KVarN debug ubatch override exceeds tail-ring safety limit" `
-        "KVarN unsafe debug ubatch rejection"
+        @{ "LLAMA_KVARN_DEQUANT_CACHE_TRACE" = "bogus" } `
+        "invalid KVarN CUDA environment flag LLAMA_KVARN_DEQUANT_CACHE_TRACE=bogus" `
+        "KVarN invalid dequant-cache trace env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_DEBUG_UBATCH" = "4294967296" } `
+        "KVarN debug ubatch override must be a positive integer" `
+        "KVarN out-of-range debug ubatch rejection"
 
     Invoke-ExpectFailure `
         $results `

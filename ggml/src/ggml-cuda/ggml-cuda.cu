@@ -3016,6 +3016,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * tile    = dst->src[0];
                 const ggml_tensor * scales  = dst->src[1];
                 const ggml_tensor * scratch = dst->src[2];
+                if (!params.is_v) {
+                    ggml_cuda_kvarn_mark_body_store(dst->data);
+                }
                 const int64_t n_values = int64_t(params.head_dim)*params.group_size;
                 const int64_t body_bytes = (n_values*params.bits + 7)/8;
                 const int64_t scale_floats = params.is_v ? params.head_dim + 2*params.group_size : 2*params.head_dim + params.group_size;
@@ -3077,6 +3080,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * scratch  = dst->src[4];
                 const ggml_tensor * k_body   = dst->src[5];
                 const ggml_tensor * v_body   = dst->src[6];
+                ggml_cuda_kvarn_mark_body_store(k_body ? k_body->data : dst->data);
                 const int64_t n_values = int64_t(params.head_dim)*params.group_size;
                 const int64_t k_body_bytes = (n_values*params.key_bits   + 7)/8;
                 const int64_t v_body_bytes = (n_values*params.value_bits + 7)/8;
