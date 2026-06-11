@@ -63,9 +63,31 @@ static bool kvarn_env_flag(const char * name) {
     return value != 0;
 }
 
+static int kvarn_env_int(const char * name, int default_value) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            value <= 0 || value > 1000000) {
+        std::fprintf(stderr, "invalid KVarN CUDA environment integer %s=%s; expected integer in [1,1000000]\n", name, env);
+        std::abort();
+    }
+    return int(value);
+}
+
 static bool kvarn_dequant_cache_trace_enabled() {
     static const bool enabled = kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
     return enabled;
+}
+
+static int kvarn_dequant_cache_trace_limit() {
+    static const int limit = kvarn_env_int("LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT", 256);
+    return limit;
 }
 
 struct kvarn_aux_cuda_state {
@@ -3657,6 +3679,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const uint32_t n_gqa = n_head/n_head_kv;
     (void) kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
     (void) kvarn_dequant_cache_trace_enabled();
+    (void) kvarn_dequant_cache_trace_limit();
     const bool force_serial_fused = kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
     const bool use_split_kernels = kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
     const bool use_serial_fused = force_serial_fused && !use_split_kernels;
@@ -3705,14 +3728,13 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             return;
         }
 
-        // Gemma decode and short contexts often have no quantized body records
-        // yet (tg64: n_records=0, n_pending=0). The generic 512d warpqk path is
-        // built for mixed sink/body/tail windows and pays branch + packed-body
-        // overhead even when all K/V are plain f16 sink/tail entries. Use a
-        // dedicated sink/tail f16 path in that case. It keeps the fused-batch
-        // launch shape (one CTA per query-head) and does not affect the passing
-        // 128/256d Qwen path.
-        if (head_dim >= 512 && n_records == 0 && n_pending == 0) {
+        // Short decode often has no quantized body records yet
+        // (n_records=0, n_pending=0). The generic mixed path pays branch and
+        // packed-body address overhead even when all K/V are plain f16
+        // sink/tail entries. Use one CTA per query head for decode across all
+        // supported head dimensions; keep the batch sink/tail specialization
+        // scoped to the 512d path where it was validated.
+        if (n_records == 0 && n_pending == 0) {
             if (n_queries == 1) {
                 // One CTA per head spreads decode attention across SMs.
                 // shared = q_sh[head_dim] + probs[n_tokens] + reduce[block]
@@ -3731,19 +3753,21 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 }
             }
 
-            const int sinktail_block = n_tokens <= 128 ? 256 : 512;
-            const size_t sinktail_shmem = (size_t(n_tokens) + size_t(sinktail_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
-            if (kvarn_cuda_dynamic_shmem_fits(sinktail_shmem)) {
-                kvarn_attn_mixed_f16_sinktail_batch_kernel<<<int(n_queries*n_head), sinktail_block, sinktail_shmem, cuda_stream>>>(
-                        q, sink_tail_k, sink_tail_v, kq_mask, out,
-                        n_queries, n_head, n_head_kv,
-                        n_sink, n_tail, tail_start, head_dim,
-                        q_stride_head_floats, q_stride_query_floats,
-                        out_stride_head_floats, out_stride_query_floats,
-                        sink_tail_stride_head_f16, sink_tail_stride_token_f16,
-                        kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
-                        kq_mask_type, scale);
-                return;
+            if (head_dim >= 512) {
+                const int sinktail_block = n_tokens <= 128 ? 256 : 512;
+                const size_t sinktail_shmem = (size_t(n_tokens) + size_t(sinktail_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+                if (kvarn_cuda_dynamic_shmem_fits(sinktail_shmem)) {
+                    kvarn_attn_mixed_f16_sinktail_batch_kernel<<<int(n_queries*n_head), sinktail_block, sinktail_shmem, cuda_stream>>>(
+                            q, sink_tail_k, sink_tail_v, kq_mask, out,
+                            n_queries, n_head, n_head_kv,
+                            n_sink, n_tail, tail_start, head_dim,
+                            q_stride_head_floats, q_stride_query_floats,
+                            out_stride_head_floats, out_stride_query_floats,
+                            sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                            kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
+                            kq_mask_type, scale);
+                    return;
+                }
             }
         }
 
@@ -3803,7 +3827,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         }
                         if (kvarn_dequant_cache_trace_enabled()) {
                             const uint64_t trace_i = g_kvarn_dequant_cache_trace_count.fetch_add(1, std::memory_order_relaxed);
-                            if (trace_i < 256) {
+                            if (trace_i < uint64_t(kvarn_dequant_cache_trace_limit())) {
                                 std::fprintf(stderr,
                                         "KVarN CUDA dequant-cache trace: %s scratch=%p k_body=%p epoch=%" PRIu64
                                         " cached_records=%u active_records=%u refill_from=%u anchored=%d\n",

@@ -208,6 +208,16 @@ try {
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
+        @{
+            "LLAMA_KVARN_DEQUANT_CACHE_TRACE" = "1"
+            "LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT" = "bogus"
+        } `
+        "invalid KVarN CUDA environment integer LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT=bogus" `
+        "KVarN invalid dequant-cache trace-limit env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
         @{ "LLAMA_KVARN_DEBUG_UBATCH" = "4294967296" } `
         "KVarN debug ubatch override must be a positive integer" `
         "KVarN out-of-range debug ubatch rejection"

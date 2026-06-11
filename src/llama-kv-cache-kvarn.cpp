@@ -858,6 +858,17 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     if (kv_size == 0 || n_seq_max == 0) {
         throw std::invalid_argument("KVarN cache requires non-zero kv_size and n_seq_max");
     }
+    if (uint64_t(params.sink_tokens) + uint64_t(params.tail_tokens) > kv_size) {
+        if (params.sink_tokens >= kv_size) {
+            throw std::invalid_argument("KVarN sink tokens must be smaller than the KV cache size");
+        }
+        const uint32_t clamped_tail = kv_size - params.sink_tokens;
+        std::fprintf(stderr,
+                "%s: clamping KVarN tail tokens from %u to %u because sink+tail exceeds kv_size=%u\n",
+                __func__, params.tail_tokens, clamped_tail, kv_size);
+        params.tail_tokens = clamped_tail;
+        this->params.tail_tokens = clamped_tail;
+    }
 
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 

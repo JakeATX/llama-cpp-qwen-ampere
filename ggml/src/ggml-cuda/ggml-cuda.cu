@@ -3213,7 +3213,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     const bool split_runtime = use_scratch_ref || forced_split;
                     const bool serial_runtime = !split_runtime && forced_serial;
                     const bool sinktail_decode = !split_runtime && !serial_runtime &&
-                        params.head_dim >= 512 && params.n_records == 0 && params.n_pending == 0 &&
+                        params.n_records == 0 && params.n_pending == 0 &&
                         dst->ne[2] == 1;
                     const bool sinktail_f16 = !split_runtime && !serial_runtime &&
                         params.head_dim >= 512 && params.n_records == 0 && params.n_pending == 0 &&

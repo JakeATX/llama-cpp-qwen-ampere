@@ -16,6 +16,12 @@ param(
     [int] $MinKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
     [string] $OutputDir = "",
+    [switch] $TraceAttn,
+    [switch] $TraceStore,
+    [switch] $TraceDequantCache,
+    [int] $TraceLimit = 64,
+    [int] $TraceStoreLimit = 64,
+    [int] $TraceDequantCacheLimit = 256,
     [string[]] $ExtraArgs = @(),
     [string[]] $KvarnExtraArgs = @()
 )
@@ -33,6 +39,9 @@ if ($MinKvarnLayerLogs -lt 0) {
 }
 if ($MinKvarnBodyRecords -lt 0) {
     throw "MinKvarnBodyRecords must be non-negative"
+}
+if ($TraceLimit -le 0 -or $TraceStoreLimit -le 0 -or $TraceDequantCacheLimit -le 0) {
+    throw "Trace limits must be positive"
 }
 if (-not (Test-Path -LiteralPath $Model)) {
     throw "Model not found at $Model"
@@ -121,6 +130,108 @@ function Get-CudaDeviceSummary([string] $text) {
     return ($devices -join "; ")
 }
 
+function Get-MaxKvarnBodyRecords([string] $text) {
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    return $maxRecords
+}
+
+function Get-KvarnTraceSummary([string] $text) {
+    $modeCounts = @{}
+    $shapeCounts = @{}
+
+    foreach ($m in [regex]::Matches(
+            $text,
+            "KVarN CUDA mixed-attn trace: mode=([^\s]+)\s+n_queries=([0-9]+)\s+n_head=([0-9]+)\s+n_head_kv=([0-9]+)\s+n_sink=([0-9]+)\s+n_records=([0-9]+)\s+n_pending=([0-9]+)\s+n_tail=([0-9]+).*?head_dim=([0-9]+)",
+            [System.Text.RegularExpressions.RegexOptions]::Singleline)) {
+        $mode = $m.Groups[1].Value
+        if (-not $modeCounts.ContainsKey($mode)) {
+            $modeCounts[$mode] = 0
+        }
+        $modeCounts[$mode]++
+
+        $shape = "{0}:q{1}/h{2}/hkv{3}/sink{4}/rec{5}/pend{6}/tail{7}/dim{8}" -f `
+            $mode,
+            $m.Groups[2].Value,
+            $m.Groups[3].Value,
+            $m.Groups[4].Value,
+            $m.Groups[5].Value,
+            $m.Groups[6].Value,
+            $m.Groups[7].Value,
+            $m.Groups[8].Value,
+            $m.Groups[9].Value
+        if (-not $shapeCounts.ContainsKey($shape)) {
+            $shapeCounts[$shape] = 0
+        }
+        $shapeCounts[$shape]++
+    }
+
+    $modes = $modeCounts.GetEnumerator() |
+        Sort-Object Name |
+        ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }
+    $shapes = $shapeCounts.GetEnumerator() |
+        Sort-Object @{ Expression = { -$_.Value } }, Name |
+        Select-Object -First 8 |
+        ForEach-Object { "{0}x {1}" -f $_.Value, $_.Key }
+
+    return [pscustomobject]@{
+        Modes = ($modes -join "; ")
+        Shapes = ($shapes -join "; ")
+    }
+}
+
+function Get-KvarnStoreTraceSummary([string] $text) {
+    $kindCounts = @{}
+    $shapeCounts = @{}
+
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA store-body trace: kind=([^\s]+)\s+head_dim=([0-9]+)\s+group_size=([0-9]+).*?scratch_floats=([0-9]+)")) {
+        $kind = $m.Groups[1].Value
+        if (-not $kindCounts.ContainsKey($kind)) {
+            $kindCounts[$kind] = 0
+        }
+        $kindCounts[$kind]++
+
+        $shape = "{0}:dim{1}/g{2}" -f $kind, $m.Groups[2].Value, $m.Groups[3].Value
+        if (-not $shapeCounts.ContainsKey($shape)) {
+            $shapeCounts[$shape] = 0
+        }
+        $shapeCounts[$shape]++
+    }
+
+    $kinds = $kindCounts.GetEnumerator() |
+        Sort-Object Name |
+        ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }
+    $shapes = $shapeCounts.GetEnumerator() |
+        Sort-Object @{ Expression = { -$_.Value } }, Name |
+        Select-Object -First 8 |
+        ForEach-Object { "{0}x {1}" -f $_.Value, $_.Key }
+
+    return [pscustomobject]@{
+        Kinds = ($kinds -join "; ")
+        Shapes = ($shapes -join "; ")
+    }
+}
+
+function Get-KvarnDequantCacheTraceSummary([string] $text) {
+    $counts = @{}
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA dequant-cache trace:\s+([^\s]+)")) {
+        $kind = $m.Groups[1].Value
+        if (-not $counts.ContainsKey($kind)) {
+            $counts[$kind] = 0
+        }
+        $counts[$kind]++
+    }
+
+    return ($counts.GetEnumerator() |
+        Sort-Object Name |
+        ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }) -join "; "
+}
+
 function Get-ExpectedKvarnLayerIds([string] $layers) {
     if ([string]::IsNullOrWhiteSpace($layers)) {
         return @()
@@ -202,7 +313,8 @@ function Invoke-BenchRow {
         [string] $BenchExe,
         [string] $ModelPath,
         [object] $Case,
-        [string[]] $Argv
+        [string[]] $Argv,
+        [hashtable] $EnvSet = @{}
     )
 
     $stem = Convert-ToFileStem $Case.Name
@@ -216,6 +328,12 @@ function Invoke-BenchRow {
     Write-Host "== $Label case $($Case.Name) p=$($Case.PromptTokens) n=$($Case.GenTokens)"
     Write-Host $commandLine
 
+    $oldEnv = @{}
+    foreach ($key in $EnvSet.Keys) {
+        $oldEnv[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+        [Environment]::SetEnvironmentVariable($key, $EnvSet[$key], "Process")
+    }
+
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
@@ -223,6 +341,9 @@ function Invoke-BenchRow {
         $exit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $oldErrorActionPreference
+        foreach ($key in $EnvSet.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $oldEnv[$key], "Process")
+        }
     }
 
     $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
@@ -241,6 +362,10 @@ function Invoke-BenchRow {
         Log = (Split-Path -Leaf $logPath)
         Text = $text
         CudaDevice = Get-CudaDeviceSummary $text
+        MaxBodyRecords = Get-MaxKvarnBodyRecords $text
+        AttnTrace = Get-KvarnTraceSummary $text
+        StoreTrace = Get-KvarnStoreTraceSummary $text
+        DequantCacheTrace = Get-KvarnDequantCacheTraceSummary $text
     }
 }
 
@@ -279,6 +404,12 @@ $manifest = @(
     "min_kvarn_layer_logs=$MinKvarnLayerLogs",
     "min_kvarn_body_records=$MinKvarnBodyRecords",
     "expected_kvarn_layers=$ExpectedKvarnLayers",
+    "trace_attn=$($TraceAttn.IsPresent)",
+    "trace_store=$($TraceStore.IsPresent)",
+    "trace_dequant_cache=$($TraceDequantCache.IsPresent)",
+    "trace_limit=$TraceLimit",
+    "trace_store_limit=$TraceStoreLimit",
+    "trace_dequant_cache_limit=$TraceDequantCacheLimit",
     "extra_args=$($ExtraArgs -join ' ')",
     "kvarn_extra_args=$($KvarnExtraArgs -join ' ')"
 )
@@ -306,7 +437,20 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         "--kvarn-iters", [string] $KvarnIters,
         "--kvarn-rtn-quantile", $rtnQuantileArg
     ) + $KvarnExtraArgs
-    $kvarnRow = Invoke-BenchRow -Label "kvarn" -BenchExe $kvarnBench -ModelPath $modelPath -Case $case -Argv $kvarnArgv
+    $kvarnEnv = @{}
+    if ($TraceAttn.IsPresent) {
+        $kvarnEnv["LLAMA_KVARN_ATTN_TRACE"] = "1"
+        $kvarnEnv["LLAMA_KVARN_ATTN_TRACE_LIMIT"] = [string] $TraceLimit
+    }
+    if ($TraceStore.IsPresent) {
+        $kvarnEnv["LLAMA_KVARN_STORE_TRACE"] = "1"
+        $kvarnEnv["LLAMA_KVARN_STORE_TRACE_LIMIT"] = [string] $TraceStoreLimit
+    }
+    if ($TraceDequantCache.IsPresent) {
+        $kvarnEnv["LLAMA_KVARN_DEQUANT_CACHE_TRACE"] = "1"
+        $kvarnEnv["LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT"] = [string] $TraceDequantCacheLimit
+    }
+    $kvarnRow = Invoke-BenchRow -Label "kvarn" -BenchExe $kvarnBench -ModelPath $modelPath -Case $case -Argv $kvarnArgv -EnvSet $kvarnEnv
 
     if ($MinKvarnLayerLogs -gt 0) {
         $kvarnLayerLogs = ([regex]::Matches($kvarnRow.Text, "llama_kv_cache_kvarn: KVarN layer")).Count
@@ -342,6 +486,12 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         GateThreshold = $MinParityRatio
         GatePass = $gatePass
         CudaDevice = if (-not [string]::IsNullOrWhiteSpace($kvarnRow.CudaDevice)) { $kvarnRow.CudaDevice } else { $mainlineRow.CudaDevice }
+        MaxKvarnBodyRecords = $kvarnRow.MaxBodyRecords
+        TraceModes = $kvarnRow.AttnTrace.Modes
+        TraceShapes = $kvarnRow.AttnTrace.Shapes
+        StoreTraceKinds = $kvarnRow.StoreTrace.Kinds
+        StoreTraceShapes = $kvarnRow.StoreTrace.Shapes
+        DequantCacheTrace = $kvarnRow.DequantCacheTrace
         MainlineLog = $mainlineRow.Log
         KvarnLog = $kvarnRow.Log
     }
