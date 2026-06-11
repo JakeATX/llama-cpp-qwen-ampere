@@ -1,5 +1,137 @@
 # KVarN production patch handoff for coding agent
 
+## Latest handoff for external review - 2026-06-11
+
+Repo: `JakeATX/llama.cpp`
+Branch: `kvarn-atx-integration`
+Current pushed HEAD: [`d8787b7a9`](https://github.com/JakeATX/llama.cpp/commit/d8787b7a919d5352d579cdcfd788f0efae6e3c7b) - `kvarn: trace parity and broaden sinktail decode`
+Prior pushed baseline for this round: [`2c61f9c67`](https://github.com/JakeATX/llama.cpp/commit/2c61f9c67) - `kvarn: add mainline parity harness and per-body dequant epochs`
+Review tree: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
+
+This is the current entry point for a 5.5 Pro / external architecture review. Older sections below are retained for history, but the current production target is mainline parity against upstream `llama.cpp`, not fork normal-KV parity.
+
+### Current production gate
+
+Required models:
+
+| Model | Path | KVarN layers | Extra args |
+|---|---|---:|---|
+| Gemma 4 12B | `C:\Users\sjake\OneDrive\Documents\New project\models\gemma-4-12b-it-GGUF\gemma-4-12b-it-UD-Q4_K_XL.gguf` | `5-47:6` | none |
+| Qwen3.6 35B A3B MTP | `C:\Users\sjake\OneDrive\Documents\New project\models\Qwen3.6-35B-A3B-MTP-GGUF\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` | `3-39:4` | `-ncmoe 34` |
+
+First production threshold: KVarN throughput must be at least 90% of upstream/mainline for both:
+
+- `pp512:512:0`
+- `tg64:0:64`
+
+Long-context cases remain diagnostic until short parity is stable.
+
+Default KVarN settings for parity:
+
+```powershell
+--kv-cache-quant kvarn --kvarn-preset kvarn_k4v2_g128 --kvarn-iters 4 --kvarn-rtn-quantile 1.0 -fa off
+```
+
+### What just landed
+
+Commit [`2c61f9c67`](https://github.com/JakeATX/llama.cpp/commit/2c61f9c67):
+
+- Repaired `scripts/kvarn/run_mainline_parity_matrix.ps1` so Markdown `llama-bench` throughput parses correctly.
+- Added summary artifacts: `summary.csv`, `summary.md`, command files, git SHAs, model/build paths, CUDA device info, and pass/fail per case.
+- Added KVarN evidence checks for expected layer logs, expected layer IDs, and optional body-record minimum.
+- Replaced global KVarN body-store dequant epoch invalidation with per-body/per-layer epochs.
+- Hardened unsupported-mode smoke coverage.
+
+Commit [`d8787b7a9`](https://github.com/JakeATX/llama.cpp/commit/d8787b7a919d5352d579cdcfd788f0efae6e3c7b):
+
+- Added bounded trace support to `run_mainline_parity_matrix.ps1`:
+  - `-TraceAttn`
+  - `-TraceStore`
+  - `-TraceDequantCache`
+  - trace limit controls
+- Summary CSV now includes mixed-attn modes/shapes, store trace kinds/shapes, dequant-cache hit/miss/partial counts, and max body records.
+- Broadened no-body decode sink/tail CUDA fast path to 128/256d decode when `n_queries == 1 && n_records == 0 && n_pending == 0`.
+- Added `LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT` validation.
+- Added effective sink/tail policy clamping so oversized requested sink+tail cannot trip `sink_tail_k->ne[2] >= n_sink + n_tail` graph assertions.
+
+### Validation from 2026-06-11
+
+Build:
+
+```powershell
+cmake --build build-kvarn-cuda-static-vs --config Release --target llama-bench llama-cli llama-results llama-server test-kvarn-kv test-kvarn-cuda-scratch-ref test-kvarn-cuda-mixed-tail test-kvarn-server-load-failure -j 8
+```
+
+Result: PASS. Existing MSVC/CUDA warnings only.
+
+Runnable correctness gates:
+
+| Gate | Result | Notes |
+|---|---:|---|
+| `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS |  |
+| Qwen2.5 CUDA smoke, contexts `256 512`, expected layers `0-27` | PASS |  |
+| Qwen2.5 logits repeat/split/scratch | PASS | NMSE `0` |
+| Gemma logits repeat/split/scratch | PASS | Script reports `NaN` NMSE for existing zero-reference comparisons |
+| Qwen3.6 MTP logits repeat/split | PASS | NMSE `0`, body-record and layer checks pass |
+| Unsupported smoke | PASS | Includes invalid dequant trace-limit env |
+
+Blocked local test:
+
+- `ctest` could not start `test-kvarn-kv.exe`.
+- Direct execution and a copied temp executable both failed with: `An Application Control policy has blocked this file`.
+- This was an OS policy block before process start, not a KVarN assertion or test failure.
+
+### Mainline parity results
+
+No-trace production measurements:
+
+| Model | Case | Mainline t/s | KVarN t/s | Ratio | Gate |
+|---|---:|---:|---:|---:|---:|
+| Gemma 4 12B | `pp512` | 2105.17 | 1824.41 | 86.7% | FAIL |
+| Gemma 4 12B | `tg64` | 61.36 | 61.09 | 99.6% | PASS |
+| Qwen3.6 MTP | `pp512` | 235.80 | 203.14 | 86.1% | FAIL |
+| Qwen3.6 MTP | `tg64` | 29.72 | 29.45 | 99.1% | PASS |
+
+Traced diagnostic measurements:
+
+| Model | Case | Ratio | Trace evidence |
+|---|---:|---:|---|
+| Gemma 4 12B | `pp512` | 87.3% | `warpqk-f16-dequant=48`, store `kv=48`, dequant `miss=24; partial=24` |
+| Gemma 4 12B | `tg64` | 99.6% | `sinktail-decode=16` |
+| Qwen3.6 MTP | `pp512` | 81.4% | `fused-batch=60`, store `kv=64` |
+| Qwen3.6 MTP | `tg64` | 85.4% under trace, 99.1% no-trace | `sinktail-decode=64`; trace overhead/noise is material |
+
+Artifacts:
+
+| Run | Path |
+|---|---|
+| Gemma traced short | `artifacts/kvarn-mainline-parity/20260611-143201` |
+| Qwen traced short | `artifacts/kvarn-mainline-parity/20260611-143248` |
+| Qwen no-trace `tg64` | `artifacts/kvarn-mainline-parity/20260611-143405` |
+| Qwen no-trace `pp512` | `artifacts/kvarn-mainline-parity/20260611-143442` |
+| Gemma no-trace `pp512` | `artifacts/kvarn-mainline-parity/20260611-143523` |
+
+### Review questions for 5.5 Pro
+
+1. Prefill is now the blocker. Decode short parity is effectively passing without trace. Review should focus on `pp512` body-store, body attention, and dequant-cache behavior.
+2. Gemma `pp512` trace shows dequant-cache `miss=24; partial=24` and no full hit reuse. Determine whether graph/scratch identity or active-record keying prevents reuse across repetitions.
+3. Qwen `pp512` uses 256d `fused-batch` body attention with no dequant-cache trace summary. Assess whether a 256d f16 body-dequant mirror, similar to the 512d cache path, is the right next patch.
+4. Store/seal work is still visible in both Gemma and Qwen prefill traces. Review `GGML_OP_KVARN_STORE_KV_BODY`, Sinkhorn iterations, seal batching, and redundant K/V staging.
+5. The 128/256d no-body decode sink/tail specialization is correct under logits and passes no-trace Qwen `tg64`, but traced throughput is noisy. Keep it unless a cleaner microbenchmark proves a regression.
+6. Sink/tail policy now clamps tail when requested sink+tail exceeds `kv_size`. Review whether this should be a warning-only clamp, a CLI validation error for explicit user policy, or both.
+
+### Recommended next patch sequence
+
+1. Add lower-noise microbench or trace aggregation for prefill body-store vs mixed-attn time without printing inside the hot path.
+2. Fix Gemma dequant-cache full-hit reuse if the trace confirms cache identity/key churn.
+3. Prototype Qwen 256d f16 body-dequant mirror for `pp512`.
+4. Optimize store/seal cost after separating Sinkhorn cost from K/V staging and metadata sealing.
+5. Only after short `pp512` passes for both models, rerun diagnostics:
+   - Gemma `pp4096,tg4096`, `-r 1`
+   - Qwen `pp2048,tg2048`, `-r 1`, `-ncmoe 34`
+
+---
+
 Repo: `JakeATX/llama.cpp`
 Branch: `kvarn-atx-integration`
 Code anchor reviewed: `f5bdd5b6c` (`cuda: Gemma 512d sinktail, pipelined body-store, and batch seal path`)  
