@@ -243,7 +243,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, ggml_backend_sched_t sched_compute = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -257,6 +257,12 @@ private:
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const;
+
+    ggml_backend_sched_t sched_for_result(const llm_graph_result * res) const;
+
+    bool kvarn_prefill_pingpong_enabled() const;
+
+    bool kvarn_dual_sched_pingpong() const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -340,6 +346,16 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // Second scheduler for KVarN prefill ping-pong (gf_res_alt slot). Each slot
+    // keeps its own allocation state so 384/128 graphs alternate without rebind.
+    ggml_backend_sched_ptr sched_alt;
+
+    // Scheduler that last ran process_ubatch; used for output tensor backend lookup.
+    mutable ggml_backend_sched_t sched_last = nullptr;
+
+    // Scheduler passed to graph_get_cb during build (may differ from sched).
+    mutable ggml_backend_sched_t sched_build = nullptr;
 
     bool sched_need_reserve = true;
 

@@ -2069,10 +2069,6 @@ static bool llama_kvarn_env_flag(const char * name) {
     return value != 0;
 }
 
-static bool llama_kvarn_force_experimental_iswa() {
-    return llama_kvarn_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA");
-}
-
 static bool llama_kvarn_force_normal_iswa_fallback() {
     // Legacy override kept so existing production wrappers can force the safe path.
     return llama_kvarn_env_flag("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK");
@@ -2214,11 +2210,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
 
         if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-            if (arch == LLM_ARCH_GEMMA4 &&
-                    (!llama_kvarn_force_experimental_iswa() || llama_kvarn_force_normal_iswa_fallback())) {
+            if (arch == LLM_ARCH_GEMMA4 && llama_kvarn_force_normal_iswa_fallback()) {
                 LLAMA_LOG_WARN(
-                        "%s: Gemma 4 KVarN+ISWA is experimental; "
-                        "using normal ISWA KV cache. Set LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 to opt in.\n",
+                        "%s: Gemma 4 KVarN+ISWA fallback enabled; "
+                        "using normal ISWA KV cache. Unset LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK for true KVarN.\n",
                         __func__);
 
                 return llama_kvarn_create_normal_iswa_fallback(*this, params, cparams);

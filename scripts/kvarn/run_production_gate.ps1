@@ -124,34 +124,27 @@ Invoke-Logged "tier1 qwen kvarn" {
         -ExtraArgs @($QwenExtraArgs)
 }
 
-$oldForceIswa = [Environment]::GetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", "Process")
-try {
-    [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", $null, "Process")
-    Invoke-Logged "tier1 gemma production fallback" {
-        & $benchScript `
-            -Model $GemmaModel `
-            -BuildDir $BuildDir `
-            -CaseList "pp512:512:0,tg64:0:64" `
-            -FlashAttn off `
-            -Repetitions $GemmaRepetitions `
-            -KvarnIters 4 `
-            -MinKvarnRatio $Tier1MinRatio `
-            -FailBelowMinKvarnRatio `
-            -AllowKvarnFallback `
-            -OutputDir (Join-Path $OutputDir "gemma-tier1-production-fallback") `
-            -GpuLayers 99
-    }
-} finally {
-    [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", $oldForceIswa, "Process")
+Invoke-Logged "tier1 gemma true kvarn iswa" {
+    & $benchScript `
+        -Model $GemmaModel `
+        -BuildDir $BuildDir `
+        -CaseList "pp512:512:0,tg64:0:64" `
+        -FlashAttn off `
+        -Repetitions $GemmaRepetitions `
+        -KvarnIters 4 `
+        -MinKvarnRatio $Tier1MinRatio `
+        -FailBelowMinKvarnRatio `
+        -MinKvarnLayerLogs 8 `
+        -ExpectedKvarnLayers "5-47:6" `
+        -OutputDir (Join-Path $OutputDir "gemma-tier1-true-kvarn-iswa") `
+        -GpuLayers 99
 }
 
 if ($RunGemmaExperimental.IsPresent) {
-    $oldForceIswa = [Environment]::GetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", "Process")
     $oldForceNormalIswa = [Environment]::GetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", "Process")
     try {
-        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", "1", "Process")
-        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", $null, "Process")
-        Invoke-Logged "tier1 gemma experimental kvarn iswa" {
+        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", "1", "Process")
+        Invoke-Logged "tier1 gemma normal iswa fallback" {
             & $benchScript `
                 -Model $GemmaModel `
                 -BuildDir $BuildDir `
@@ -159,13 +152,11 @@ if ($RunGemmaExperimental.IsPresent) {
                 -FlashAttn off `
                 -Repetitions $GemmaRepetitions `
                 -KvarnIters 4 `
-                -MinKvarnLayerLogs 8 `
-                -ExpectedKvarnLayers "5-47:6" `
-                -OutputDir (Join-Path $OutputDir "gemma-tier1-experimental-kvarn-iswa") `
+                -AllowKvarnFallback `
+                -OutputDir (Join-Path $OutputDir "gemma-tier1-normal-iswa-fallback") `
                 -GpuLayers 99
         }
     } finally {
-        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA", $oldForceIswa, "Process")
         [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", $oldForceNormalIswa, "Process")
     }
 }
