@@ -1,5 +1,83 @@
 # KVarN production patch handoff for coding agent
 
+## Latest handoff for external review - 2026-06-12 Round 12
+
+Repo: `JakeATX/llama.cpp`
+Branch: `kvarn-atx-integration`
+Current branch target: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
+Latest pushed baseline before this round: [`e5596d6ea`](https://github.com/JakeATX/llama.cpp/commit/e5596d6ea) - `kvarn: add round11 diagnostics and fallback parity`
+
+This is the current entry point for 5.5 Pro / external architecture review. Older sections below are retained for history. The current production target is still mainline parity against upstream `llama.cpp`, not fork normal-KV parity.
+
+### Round 12 implementation status
+
+Accepted for push:
+
+- `tests/test-kvarn-kv.cpp`
+  - Added `LLAMA_KVARN_TEST_PHASE_TRACE=1` phase tracing and exception capture so future Windows fast-fail reports can be mapped to the exact test phase.
+  - Fixed the local failure: `test_runtime_metadata()` used default `sink_tokens=128` with a 16-token test KV cache. The fixture now sets `sink_tokens=8` and `tail_tokens=8`.
+  - Result: the prior `0xc0000409` report is no longer treated as an unexplained Windows policy issue in this checkout.
+- `scripts/kvarn/run_production_gate.ps1`
+  - Added `-MainlineBuildDir`.
+  - Enforced `Tier1MinRatio >= 0.90`; low-threshold diagnostics must call the lower-level matrix scripts directly.
+  - Qwen Tier 1 now uses `run_mainline_parity_matrix.ps1`, not same-build `run_bench_matrix.ps1`.
+  - Qwen Tier 1 now enforces `-ncmoe 34` and expected KVarN layers `3-39:4`.
+  - Gemma Tier 1 now measures the production normal-ISWA fallback against upstream/mainline using `-AllowKvarnFallback`.
+  - `-RunGemmaExperimental` is a true KVarN+ISWA diagnostic and scopes `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` only to that subprocess.
+- `tests/test-kvarn-cuda-dequant.cpp`
+  - Added `LLAMA_KVARN_TEST_256D_WARPQK_REPRO=1` so the synthetic Qwen3.6-shaped 256d warpqk test runs first in a fresh process before cached env decisions can hide the diagnostic path.
+  - Added worst-difference reporting for the Qwen3.6-shaped split/fused comparison.
+- `ggml/src/ggml-cuda/kvarn.cu`
+  - Added `LLAMA_KVARN_ATTN_TRACE=1` with `LLAMA_KVARN_ATTN_TRACE_LIMIT` for bounded host-side dispatch traces.
+  - Trace records selected mixed-attention mode, `head_dim`, query/head counts, sink/body/tail topology, q-tiling, launch dimensions, scratch size, body mirror usage, and mask strides.
+- `scripts/kvarn/README.md`
+  - Updated the CUDA production gate text to describe true KVarN/mainline parity, Qwen `-ncmoe 34`, Gemma production fallback, and Gemma experimental diagnostic behavior.
+
+Round 12 validation:
+
+| Gate | Result | Notes |
+|---|---:|---|
+| Build `llama-bench`, `llama-cli`, `llama-results`, `test-kvarn-kv`, `test-kvarn-cuda-scratch-ref`, `test-kvarn-cuda-mixed-tail`, `test-kvarn-server-load-failure` | PASS | CUDA warnings only |
+| `ctest -R "test-kvarn-kv|test-kvarn-cuda|test-batch-split|test-arg-parser|test-kvarn-server-load-failure"` | PASS | 7/7 |
+| `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS | |
+| Qwen2.5 CUDA smoke `256 512` | PASS | expected layers `0-27` |
+| Qwen2.5 logits repeat/split/scratch | PASS | NMSE `0` |
+| Qwen3.6 MTP default logits | PASS | packed repeat NMSE `0`, packed-vs-split NMSE `0`, expected layers `3-39:4`, `-ncmoe 34` |
+| Qwen3.6 MTP 256d diagnostic full model | FAIL as expected | `LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK=1`, `QT=1`, no 256d body mirror, packed-vs-split NMSE `6.196e-03` |
+| Synthetic 256d warpqk repro QT=1/4/8 | PASS | does not reproduce the full Qwen3.6 MTP logits failure |
+
+Round 12 short mainline parity, no trace, warmup enabled, `r=3`:
+
+| Model/mode | Case | Mainline t/s | KVarN t/s | Ratio | Artifact |
+|---|---:|---:|---:|---:|---|
+| Qwen3.6 MTP true KVarN, `-ncmoe 34` | `pp512` | 292.33 | 232.42 | 79.5% | `artifacts/kvarn-mainline-parity/round12-qwen-short-r3` |
+| Qwen3.6 MTP true KVarN, `-ncmoe 34` | `tg64` | 36.24 | 29.58 | 81.6% | `artifacts/kvarn-mainline-parity/round12-qwen-short-r3` |
+| Gemma 4 production normal-ISWA fallback | `pp512` | 2485.14 | 2614.54 | 105.2% | `artifacts/kvarn-mainline-parity/round12-gemma-fallback-r3` |
+| Gemma 4 production normal-ISWA fallback | `tg64` | 60.11 | 61.42 | 102.2% | `artifacts/kvarn-mainline-parity/round12-gemma-fallback-r3` |
+
+Interpretation:
+
+- Gemma production fallback is currently over the short production gate. This is fallback parity, not true KVarN+ISWA parity.
+- Qwen true KVarN remains below the short production gate on both prefill and decode. The next production blocker is Qwen, not Gemma fallback.
+- The synthetic 256d low-level test passing while full Qwen3.6 MTP fails means the existing synthetic shape is still missing at least one real-model factor: graph topology, mask layout/content, token position ordering, recurrent/MTP interaction, or exact packed-vs-split boundary state.
+- Do not enable 256d warpqk by default. Keep the 256d switches diagnostic-only until full Qwen3.6 MTP packed-vs-split NMSE is `0`.
+
+Recent upstream risk review:
+
+- `gh` CLI was not available in this environment, so the review used GitHub web pages and `git ls-remote`.
+- Latest upstream release observed on 2026-06-12: [`b9608`](https://github.com/ggml-org/llama.cpp/releases/tag/b9608), vendor cpp-httplib update.
+- Relevant recent upstream release: [`b9606`](https://github.com/ggml-org/llama.cpp/releases/tag/b9606), EAGLE3 speculative decoding support with Gemma-related changes.
+- Relevant recent upstream release: [`b9605`](https://github.com/ggml-org/llama.cpp/releases/tag/b9605), CUDA scalar concat support.
+- High-risk PR for this branch: [`ggml-org/llama.cpp#24086`](https://github.com/ggml-org/llama.cpp/pull/24086), "Remove padding and multiple D2D copies for MTP", merged 2026-06-10. This touches MTP/recurrent behavior adjacent to the Qwen3.6 MTP failure surface and should be reviewed before any upstream rebase.
+
+Immediate next coding target:
+
+1. Capture full-model Qwen3.6 packed-run attention boundary evidence before split output is discarded by `compare_cuda_logits_ref.ps1`.
+2. Add an opt-in dump for one failing Qwen layer/head/query that records score/prob/output boundaries for split vs 256d warpqk.
+3. Extend the synthetic 256d unit to replay that real boundary dump, then fix mask/order/scaling/value accumulation until synthetic and full-model packed-vs-split NMSE are both `0`.
+4. Re-run Qwen short mainline parity only after correctness is restored.
+5. Keep Gemma fallback default. Run true Gemma KVarN+ISWA only as an explicit diagnostic via `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` or `-RunGemmaExperimental`.
+
 ## Latest handoff for external review - 2026-06-11
 
 Repo: `JakeATX/llama.cpp`

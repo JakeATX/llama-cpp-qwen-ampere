@@ -25,15 +25,18 @@ matrix on `kvarn-atx-integration`; Mac parity does not transfer automatically.
 
 ## CUDA production gate (this machine)
 
-Tier 1: KVarN/normal ratio **≥ 90%** on both prefill (`pp*`) and decode (`tg*`)
-per model×config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
+Tier 1: KVarN/mainline ratio **>= 90%** on both prefill (`pp*`) and decode (`tg*`)
+per model/config cell. Tier 2: logits NMSE gates + KV memory savings. Tier 3
 (output quality) deferred.
 
 **One-command acceptance:** `scripts/kvarn/run_production_gate.ps1` builds, runs
-KVarN unit tests, gates Qwen on true KVarN (≥90%), and gates Gemma on production
-ISWA fallback (≥90%). Gemma experimental KVarN+ISWA is opt-in via
-`-RunGemmaExperimental` or `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` (known below
-gate; for CUDA work only). Tier 2: `-RunTier2 -LogitsModel <small.gguf>`.
+KVarN unit tests, gates Qwen on true KVarN (>=90%, exact layers `3-39:4` with
+`-ncmoe 34`), and gates Gemma on production normal-ISWA fallback (>=90%) through
+`run_mainline_parity_matrix.ps1 -AllowKvarnFallback`. `-RunGemmaExperimental`
+runs the true Gemma KVarN+ISWA diagnostic and scopes
+`LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` to that subprocess only. Low-threshold
+diagnostics should use `run_bench_matrix.ps1` directly. Tier 2:
+`-RunTier2 -LogitsModel <small.gguf>`.
 
 **Hardware:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, branch
 `kvarn-atx-integration`, `-fa off`, `--kvarn-preset kvarn_k4v2_g128`.

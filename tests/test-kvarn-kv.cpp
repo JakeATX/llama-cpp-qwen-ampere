@@ -5,6 +5,7 @@
 #include "ggml-backend.h"
 
 #include <cmath>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,36 @@ static void require(bool ok, const char * msg) {
         std::fprintf(stderr, "FAIL: %s\n", msg);
         std::exit(1);
     }
+}
+
+static bool phase_trace_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("LLAMA_KVARN_TEST_PHASE_TRACE");
+        return env != nullptr && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void trace_phase(const char * name, const char * state) {
+    if (!phase_trace_enabled()) {
+        return;
+    }
+    std::fprintf(stderr, "KVarN test phase: %s %s\n", name, state);
+    std::fflush(stderr);
+}
+
+static void run_phase(const char * name, void (*fn)()) {
+    trace_phase(name, "start");
+    try {
+        fn();
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "FAIL: %s threw std::exception: %s\n", name, e.what());
+        std::exit(1);
+    } catch (...) {
+        std::fprintf(stderr, "FAIL: %s threw unknown exception\n", name);
+        std::exit(1);
+    }
+    trace_phase(name, "pass");
 }
 
 static void test_layout() {
@@ -263,6 +294,8 @@ static void test_memory_estimate() {
 
 static void test_runtime_metadata() {
     llama_kvarn_params params = llama_kvarn_default_params();
+    params.sink_tokens = 8;
+    params.tail_tokens = 8;
     llama_hparams hparams = make_test_hparams();
     llama_kv_cache_kvarn cache(nullptr, hparams, params, false, 16, 4, 1, nullptr);
 
@@ -974,25 +1007,29 @@ static void test_cpu_backend_rejects_kvarn_ops() {
 }
 
 int main() {
+    trace_phase("llama_backend_init", "start");
     llama_backend_init();
+    trace_phase("llama_backend_init", "pass");
 
-    test_layout();
-    test_pack_roundtrip();
-    test_hadamard_inverse();
-    test_reference_store_dequant();
-    test_reference_cache_sealing();
-    test_memory_estimate();
-    test_runtime_metadata();
-    test_runtime_storage_sealing();
-    test_runtime_sink_tail_graph_api();
-    test_runtime_body_plan_graph_api();
-    test_runtime_body_plan_multi_record_seals();
-    test_runtime_kq_mask_graph_api();
-    test_runtime_body_record_graph_api();
-    test_kvarn_store_body_ggml_ops();
-    test_kvarn_mixed_attention_ggml_op();
-    test_cpu_backend_rejects_kvarn_ops();
+    run_phase("test_layout", test_layout);
+    run_phase("test_pack_roundtrip", test_pack_roundtrip);
+    run_phase("test_hadamard_inverse", test_hadamard_inverse);
+    run_phase("test_reference_store_dequant", test_reference_store_dequant);
+    run_phase("test_reference_cache_sealing", test_reference_cache_sealing);
+    run_phase("test_memory_estimate", test_memory_estimate);
+    run_phase("test_runtime_metadata", test_runtime_metadata);
+    run_phase("test_runtime_storage_sealing", test_runtime_storage_sealing);
+    run_phase("test_runtime_sink_tail_graph_api", test_runtime_sink_tail_graph_api);
+    run_phase("test_runtime_body_plan_graph_api", test_runtime_body_plan_graph_api);
+    run_phase("test_runtime_body_plan_multi_record_seals", test_runtime_body_plan_multi_record_seals);
+    run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
+    run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);
+    run_phase("test_kvarn_store_body_ggml_ops", test_kvarn_store_body_ggml_ops);
+    run_phase("test_kvarn_mixed_attention_ggml_op", test_kvarn_mixed_attention_ggml_op);
+    run_phase("test_cpu_backend_rejects_kvarn_ops", test_cpu_backend_rejects_kvarn_ops);
 
+    trace_phase("llama_backend_free", "start");
     llama_backend_free();
+    trace_phase("llama_backend_free", "pass");
     return 0;
 }

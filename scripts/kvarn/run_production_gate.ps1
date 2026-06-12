@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $QwenModel,
     [Parameter(Mandatory = $true)] [string] $GemmaModel,
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-static-vs"),
+    [string] $MainlineBuildDir = (Join-Path (Get-Location) "..\llama.cpp-mainline\build-cuda-static-vs"),
     [string] $OutputDir = "",
     [double] $Tier1MinRatio = 0.90,
     [int] $QwenRepetitions = 5,
@@ -19,6 +20,9 @@ $ErrorActionPreference = "Stop"
 
 if ($Tier1MinRatio -le 0.0 -or $Tier1MinRatio -gt 1.0) {
     throw "Tier1MinRatio must be in (0, 1]"
+}
+if ($Tier1MinRatio -lt 0.90) {
+    throw "Tier1MinRatio is the production gate threshold and must be >= 0.90. Use run_bench_matrix.ps1 directly for low-threshold diagnostics."
 }
 if ($QwenRepetitions -le 0) {
     throw "QwenRepetitions must be positive"
@@ -47,12 +51,32 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 
 $benchScript = Join-Path (Get-Location) "scripts/kvarn/run_bench_matrix.ps1"
+$mainlineParityScript = Join-Path (Get-Location) "scripts/kvarn/run_mainline_parity_matrix.ps1"
 $logitsScript = Join-Path (Get-Location) "scripts/kvarn/compare_cuda_logits_ref.ps1"
 if (-not (Test-Path -LiteralPath $benchScript)) {
     throw "Missing $benchScript"
 }
+if (-not (Test-Path -LiteralPath $mainlineParityScript)) {
+    throw "Missing $mainlineParityScript"
+}
 if ($RunTier2.IsPresent -and -not (Test-Path -LiteralPath $logitsScript)) {
     throw "Missing $logitsScript"
+}
+
+function Invoke-WithProcessEnvironment([hashtable] $Env, [scriptblock] $Body) {
+    $oldEnv = @{}
+    foreach ($key in $Env.Keys) {
+        $oldEnv[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+        [Environment]::SetEnvironmentVariable($key, $Env[$key], "Process")
+    }
+
+    try {
+        & $Body
+    } finally {
+        foreach ($key in $Env.Keys) {
+            [Environment]::SetEnvironmentVariable($key, $oldEnv[$key], "Process")
+        }
+    }
 }
 
 function Invoke-Logged([string] $Name, [scriptblock] $Body) {
@@ -78,17 +102,29 @@ function Invoke-Logged([string] $Name, [scriptblock] $Body) {
     }
 }
 
+$qwenEffectiveExtraArgs = @($QwenExtraArgs)
+$qwenNcmoeIdx = [Array]::IndexOf($qwenEffectiveExtraArgs, "-ncmoe")
+if ($qwenNcmoeIdx -lt 0) {
+    $qwenEffectiveExtraArgs += @("-ncmoe", "34")
+} elseif ($qwenNcmoeIdx -ge ($qwenEffectiveExtraArgs.Count - 1) -or $qwenEffectiveExtraArgs[$qwenNcmoeIdx + 1] -ne "34") {
+    throw "Qwen production gate requires -ncmoe 34 so the expected KVarN layer set remains 3-39:4"
+}
+
 $manifest = @(
     "qwen_model=$((Resolve-Path -LiteralPath $QwenModel).Path)",
     "gemma_model=$((Resolve-Path -LiteralPath $GemmaModel).Path)",
     "build_dir=$BuildDir",
+    "mainline_build_dir=$MainlineBuildDir",
     "tier1_min_ratio=$Tier1MinRatio",
     "qwen_repetitions=$QwenRepetitions",
     "gemma_repetitions=$GemmaRepetitions",
     "run_gemma_experimental=$($RunGemmaExperimental.IsPresent)",
     "run_tier2=$($RunTier2.IsPresent)",
     "tier2_model=$Tier2Model",
-    "qwen_extra_args=$($QwenExtraArgs -join ' ')"
+    "qwen_extra_args=$($qwenEffectiveExtraArgs -join ' ')",
+    "qwen_expected_kvarn_layers=3-39:4",
+    "gemma_production_mode=normal-iswa-fallback",
+    "gemma_experimental_mode=true-kvarn-iswa-diagnostic"
 )
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
 
@@ -107,44 +143,51 @@ if (-not $SkipTests.IsPresent) {
     }
 }
 
-Invoke-Logged "tier1 qwen kvarn" {
-    & $benchScript `
+Invoke-Logged "tier1 qwen mainline parity" {
+    & $mainlineParityScript `
         -Model $QwenModel `
-        -BuildDir $BuildDir `
+        -MainlineBuildDir $MainlineBuildDir `
+        -KvarnBuildDir $BuildDir `
         -CaseList "pp512:512:0,tg64:0:64" `
         -FlashAttn off `
         -Repetitions $QwenRepetitions `
         -KvarnIters 4 `
-        -MinKvarnRatio $Tier1MinRatio `
-        -FailBelowMinKvarnRatio `
+        -MinParityRatio $Tier1MinRatio `
+        -FailBelowMinParityRatio `
         -MinKvarnLayerLogs 10 `
         -ExpectedKvarnLayers "3-39:4" `
-        -OutputDir (Join-Path $OutputDir "qwen-tier1") `
+        -OutputDir (Join-Path $OutputDir "qwen-tier1-mainline-parity") `
         -GpuLayers 99 `
-        -ExtraArgs @($QwenExtraArgs)
+        -ExtraArgs @($qwenEffectiveExtraArgs)
 }
 
-Invoke-Logged "tier1 gemma true kvarn iswa" {
-    & $benchScript `
-        -Model $GemmaModel `
-        -BuildDir $BuildDir `
-        -CaseList "pp512:512:0,tg64:0:64" `
-        -FlashAttn off `
-        -Repetitions $GemmaRepetitions `
-        -KvarnIters 4 `
-        -MinKvarnRatio $Tier1MinRatio `
-        -FailBelowMinKvarnRatio `
-        -MinKvarnLayerLogs 8 `
-        -ExpectedKvarnLayers "5-47:6" `
-        -OutputDir (Join-Path $OutputDir "gemma-tier1-true-kvarn-iswa") `
-        -GpuLayers 99
+Invoke-Logged "tier1 gemma production iswa fallback" {
+    Invoke-WithProcessEnvironment @{
+        "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = $null
+        "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = "1"
+    } {
+        & $mainlineParityScript `
+            -Model $GemmaModel `
+            -MainlineBuildDir $MainlineBuildDir `
+            -KvarnBuildDir $BuildDir `
+            -CaseList "pp512:512:0,tg64:0:64" `
+            -FlashAttn off `
+            -Repetitions $GemmaRepetitions `
+            -KvarnIters 4 `
+            -MinParityRatio $Tier1MinRatio `
+            -FailBelowMinParityRatio `
+            -AllowKvarnFallback `
+            -OutputDir (Join-Path $OutputDir "gemma-tier1-production-iswa-fallback") `
+            -GpuLayers 99
+    }
 }
 
 if ($RunGemmaExperimental.IsPresent) {
-    $oldForceNormalIswa = [Environment]::GetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", "Process")
-    try {
-        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", "1", "Process")
-        Invoke-Logged "tier1 gemma normal iswa fallback" {
+    Invoke-Logged "tier1 gemma experimental true kvarn iswa diagnostic" {
+        Invoke-WithProcessEnvironment @{
+            "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = "1"
+            "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = $null
+        } {
             & $benchScript `
                 -Model $GemmaModel `
                 -BuildDir $BuildDir `
@@ -152,12 +195,13 @@ if ($RunGemmaExperimental.IsPresent) {
                 -FlashAttn off `
                 -Repetitions $GemmaRepetitions `
                 -KvarnIters 4 `
-                -AllowKvarnFallback `
-                -OutputDir (Join-Path $OutputDir "gemma-tier1-normal-iswa-fallback") `
+                -MinKvarnRatio $Tier1MinRatio `
+                -FailBelowMinKvarnRatio `
+                -MinKvarnLayerLogs 8 `
+                -ExpectedKvarnLayers "5-47:6" `
+                -OutputDir (Join-Path $OutputDir "gemma-tier1-experimental-true-kvarn-iswa-diagnostic") `
                 -GpuLayers 99
         }
-    } finally {
-        [Environment]::SetEnvironmentVariable("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK", $oldForceNormalIswa, "Process")
     }
 }
 

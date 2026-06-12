@@ -20,6 +20,7 @@ static constexpr size_t KVARN_ATTN_SHMEM_PAD_FLOATS = 8;
 #include <unordered_map>
 static std::atomic<uint64_t> g_kvarn_body_store_epoch_next{1};
 static std::atomic<uint64_t> g_kvarn_dequant_cache_trace_count{0};
+static std::atomic<uint64_t> g_kvarn_attn_trace_count{0};
 
 struct kvarn_dequant_cache_entry {
     const void * k_body    = nullptr;
@@ -107,6 +108,18 @@ static bool kvarn_enable_256d_warpqk() {
 static bool kvarn_dequant_cache_trace_enabled() {
     static const bool enabled = kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
     return enabled;
+}
+
+static bool kvarn_attn_trace_enabled() {
+    return kvarn_env_flag("LLAMA_KVARN_ATTN_TRACE");
+}
+
+static bool kvarn_attn_trace_claim() {
+    if (!kvarn_attn_trace_enabled()) {
+        return false;
+    }
+    const int limit = kvarn_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
+    return g_kvarn_attn_trace_count.fetch_add(1, std::memory_order_relaxed) < uint64_t(limit);
 }
 
 static int kvarn_dequant_cache_trace_limit() {
@@ -3827,6 +3840,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
 
                 const bool allow_f16_body_mirror =
                     head_dim >= 512 || kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR");
+                bool used_f16_body_mirror = false;
 
                 if (n_records > 0 && scores != nullptr && allow_f16_body_mirror) {
                     const size_t n_per_record = size_t(group_size)*head_dim;
@@ -3898,11 +3912,26 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         body_k_f16 = k_dequant;
                         body_v_f16 = v_dequant;
                         body_f16_stride_head_elems = anchored ? cap_elems_per_head : n_per_head;
+                        used_f16_body_mirror = true;
                     }
                 }
 
                 const int warpqk_grid = warpqk_q8 ? int(((n_queries + 7)/8)*n_head) :
                     (warpqk_q4 ? int(((n_queries + 3)/4)*n_head) : int(n_queries*n_head));
+                if (kvarn_attn_trace_claim()) {
+                    const int selected_qt = warpqk_q8 ? 8 : (warpqk_q4 ? 4 : 1);
+                    std::fprintf(stderr,
+                            "KVarN CUDA mixed-attn inner trace: mode=warpqk-f16 head_dim=%u n_queries=%u n_head=%u"
+                            " n_head_kv=%u n_gqa=%u sink=%u records=%u pending=%u tail=%u tail_start=%u"
+                            " tokens=%u qt=%d block=%d grid=%d shmem=%zu scores_nelems=%" PRId64
+                            " body_records_cap=%" PRId64 " body_mirror_allowed=%d body_mirror_used=%d"
+                            " kq_mask_type=%u kq_mask_stride_query_bytes=%zu kq_mask_stride_token_bytes=%zu\n",
+                            head_dim, n_queries, n_head, n_head_kv, n_gqa,
+                            n_sink, n_records, n_pending, n_tail, tail_start, n_tokens,
+                            selected_qt, warpqk_block, warpqk_grid, warpqk_shmem, scores_nelems,
+                            k_body_records_cap, allow_f16_body_mirror ? 1 : 0, used_f16_body_mirror ? 1 : 0,
+                            kq_mask_type, kq_mask_stride_query_bytes, kq_mask_stride_token_bytes);
+                }
                 if (warpqk_q8) {
                 kvarn_attn_mixed_f16_fused_batch_warpqk_kernel<8><<<warpqk_grid, warpqk_block, warpqk_shmem, cuda_stream>>>(
                         q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -1595,10 +1596,47 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
         float q36_split_err = 0.0f;
         float q36_fused_err = 0.0f;
         float q36_fused_vs_split_err = 0.0f;
+        size_t q36_split_worst = 0;
+        size_t q36_fused_worst = 0;
+        size_t q36_fused_vs_split_worst = 0;
         for (size_t i = 0; i < q36_ref.size(); ++i) {
-            q36_split_err = std::max(q36_split_err, std::fabs(q36_ref[i] - q36_split[i]));
-            q36_fused_err = std::max(q36_fused_err, std::fabs(q36_ref[i] - q36_fused[i]));
-            q36_fused_vs_split_err = std::max(q36_fused_vs_split_err, std::fabs(q36_split[i] - q36_fused[i]));
+            const float split_err = std::fabs(q36_ref[i] - q36_split[i]);
+            const float fused_err = std::fabs(q36_ref[i] - q36_fused[i]);
+            const float fused_vs_split_err = std::fabs(q36_split[i] - q36_fused[i]);
+            if (split_err > q36_split_err) {
+                q36_split_err = split_err;
+                q36_split_worst = i;
+            }
+            if (fused_err > q36_fused_err) {
+                q36_fused_err = fused_err;
+                q36_fused_worst = i;
+            }
+            if (fused_vs_split_err > q36_fused_vs_split_err) {
+                q36_fused_vs_split_err = fused_vs_split_err;
+                q36_fused_vs_split_worst = i;
+            }
+        }
+        auto print_q36_worst = [&](const char * label, size_t idx, float err) {
+            const uint32_t d = uint32_t(idx%head_dim);
+            const uint32_t ih = uint32_t((idx/head_dim)%n_head);
+            const uint32_t iq = uint32_t(idx/(size_t(head_dim)*n_head));
+            std::fprintf(stderr,
+                    "Qwen3.6-shaped 256d %s worst: err=%g iq=%u ih=%u ikh=%u d=%u"
+                    " ref=%g split=%g fused=%g sink=%u body=[%u,%u) tail=[%u,%u) mask_stride=%u tail_start=%u\n",
+                    label, err, iq, ih, ih/(n_head/n_head_kv), d,
+                    q36_ref[idx], q36_split[idx], q36_fused[idx],
+                    n_q36_sink, n_q36_sink, n_q36_sink + n_q36_records*group,
+                    n_q36_sink + n_q36_records*group, n_q36_tokens,
+                    q36_mask_stride_tokens, q36_tail_start);
+        };
+        if (q36_split_err >= 1.0e-5f) {
+            print_q36_worst("split-vs-ref", q36_split_worst, q36_split_err);
+        }
+        if (q36_fused_err >= 1.0e-5f) {
+            print_q36_worst("fused-vs-ref", q36_fused_worst, q36_fused_err);
+        }
+        if (q36_fused_vs_split_err >= 1.0e-6f) {
+            print_q36_worst("fused-vs-split", q36_fused_vs_split_worst, q36_fused_vs_split_err);
         }
         require(q36_split_err < 1.0e-5f, "CUDA Qwen3.6-shaped 49-query split mixed attention matches CPU reference");
         require(q36_fused_err < 1.0e-5f, "CUDA Qwen3.6-shaped 49-query forced fused mixed attention matches CPU reference");
@@ -2797,6 +2835,16 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
 }
 
 int main() {
+    const char * repro = std::getenv("LLAMA_KVARN_TEST_256D_WARPQK_REPRO");
+    if (repro != nullptr && std::strcmp(repro, "0") != 0) {
+        set_env_var("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK", "1");
+        if (std::getenv("LLAMA_KVARN_ATTN_WARPQK_FORCE_QT") == nullptr) {
+            set_env_var("LLAMA_KVARN_ATTN_WARPQK_FORCE_QT", "1");
+        }
+        run_case(256, 0.95f);
+        return 0;
+    }
+
     for (float rtn_quantile : { 0.95f, 1.0f }) {
         run_case(128, rtn_quantile);
         run_case(256, rtn_quantile);
