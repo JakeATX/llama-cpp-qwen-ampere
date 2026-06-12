@@ -191,6 +191,44 @@ static int ggml_cuda_kvarn_env_nonneg_int(const char * name, int default_value) 
     return int(value);
 }
 
+static int ggml_cuda_kvarn_env_optional_nonneg_int(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+    return ggml_cuda_kvarn_env_nonneg_int(name, -1);
+}
+
+static int ggml_cuda_kvarn_parse_layer_from_tensor_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return -1;
+    }
+
+    const std::string s(name);
+    size_t end = s.size();
+    while (end > 0 && (s[end - 1] < '0' || s[end - 1] > '9')) {
+        --end;
+    }
+    if (end == 0) {
+        return -1;
+    }
+
+    size_t start = end;
+    while (start > 0 && s[start - 1] >= '0' && s[start - 1] <= '9') {
+        --start;
+    }
+
+    const std::string digits = s.substr(start, end - start);
+    char * parse_end = nullptr;
+    errno = 0;
+    const long value = std::strtol(digits.c_str(), &parse_end, 10);
+    if (parse_end == nullptr || *parse_end != '\0' || errno == ERANGE ||
+            value < 0 || value > std::numeric_limits<int>::max()) {
+        return -1;
+    }
+    return int(value);
+}
+
 static void ggml_cuda_kvarn_write_binary_file(const std::filesystem::path & path, const void * data, size_t nbytes) {
     std::ofstream f(path, std::ios::binary);
     if (!f) {
@@ -251,20 +289,39 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
         int32_t value_bits,
         uint32_t kq_mask_type,
         float scale,
+        int64_t scores_nelems,
+        int64_t k_body_records_cap,
         cudaStream_t stream) {
     if (!ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_BOUNDARY_DUMP") || head_dim != 256) {
         return;
     }
-    GGML_UNUSED(value_bits);
     const uint32_t n_tokens = uint32_t(n_sink + n_records*group_size + n_pending + n_tail);
+    if (ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_FIRST_256D") && n_records <= 0) {
+        return;
+    }
     const int min_tokens = ggml_cuda_kvarn_env_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_MIN_TOKENS", 0);
     if (n_tokens < uint32_t(min_tokens)) {
         return;
     }
 
+    const int layer_filter = ggml_cuda_kvarn_env_optional_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_LAYER");
+    const int inferred_layer = ggml_cuda_kvarn_parse_layer_from_tensor_name(out->name);
+    if (layer_filter >= 0) {
+        if (inferred_layer < 0) {
+            GGML_ABORT("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_LAYER was set, but layer id could not be inferred from tensor name '%s'", out->name);
+        }
+        if (inferred_layer != layer_filter) {
+            return;
+        }
+    }
+
     const uint64_t call_index = g_ggml_cuda_kvarn_boundary_dump_count.fetch_add(1, std::memory_order_relaxed);
+    const int call_filter = ggml_cuda_kvarn_env_optional_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_CALL");
+    if (call_filter >= 0 && call_index != uint64_t(call_filter)) {
+        return;
+    }
     const int limit = ggml_cuda_kvarn_env_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_LIMIT", 1);
-    if (limit >= 0 && call_index >= uint64_t(limit)) {
+    if (call_filter < 0 && limit >= 0 && call_index >= uint64_t(limit)) {
         return;
     }
 
@@ -280,6 +337,19 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
     const uint32_t n_head = uint32_t(out->ne[1]);
     const uint32_t n_head_kv = uint32_t(sink_tail_k->ne[1]);
     const uint32_t n_gqa = n_head/n_head_kv;
+    const int qt_override = ggml_cuda_kvarn_env_int("LLAMA_KVARN_ATTN_WARPQK_FORCE_QT", 0);
+    const bool body_mirror_allowed = head_dim >= 512 ||
+        ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR");
+    const size_t active_body_f16_floats = (2*size_t(n_head_kv)*size_t(n_records)*size_t(group_size)*size_t(head_dim) + 1)/2;
+    const bool body_mirror_used = n_records > 0 && body_mirror_allowed &&
+        scores_nelems > int64_t(n_tokens) &&
+        size_t(scores_nelems) >= size_t(n_tokens) + active_body_f16_floats;
+    const bool experimental_256_warpqk = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK");
+    const char * cuda_trace_mode = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH") ? "scratch-ref" :
+        (ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS") ? "split" :
+            (n_records == 0 && n_pending == 0 && n_queries == 1 ? "sinktail-decode" :
+                ((head_dim >= 512 || (head_dim == 256 && experimental_256_warpqk)) && n_records > 0 ?
+                    "warpqk-f16-dequant" : "fused-batch")));
     const uint32_t selected_iq = std::min<uint32_t>(uint32_t(ggml_cuda_kvarn_env_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_IQ", 0)), n_queries - 1);
     const uint32_t selected_ih = std::min<uint32_t>(uint32_t(ggml_cuda_kvarn_env_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_IH", 0)), n_head - 1);
     const uint32_t selected_ikh = selected_ih/n_gqa;
@@ -351,6 +421,7 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
     json << "  \"n_queries\": " << n_queries << ",\n";
     json << "  \"n_head\": " << n_head << ",\n";
     json << "  \"n_head_kv\": " << n_head_kv << ",\n";
+    json << "  \"n_gqa\": " << n_gqa << ",\n";
     json << "  \"selected_iq\": " << selected_iq << ",\n";
     json << "  \"selected_ih\": " << selected_ih << ",\n";
     json << "  \"selected_ikh\": " << selected_ikh << ",\n";
@@ -362,7 +433,32 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
     json << "  \"n_tokens\": " << n_tokens << ",\n";
     json << "  \"scale\": " << std::setprecision(9) << scale << ",\n";
     json << "  \"mask_type\": " << kq_mask_type << ",\n";
-    json << "  \"call_index\": " << call_index << "\n";
+    json << "  \"mask_stride_query_bytes\": " << (kq_mask ? kq_mask->nb[1] : 0) << ",\n";
+    json << "  \"mask_stride_token_bytes\": " << (kq_mask ? kq_mask->nb[0] : 0) << ",\n";
+    json << "  \"q_stride_head_floats\": " << q->nb[1]/sizeof(float) << ",\n";
+    json << "  \"q_stride_query_floats\": " << q->nb[2]/sizeof(float) << ",\n";
+    json << "  \"out_stride_head_floats\": " << out->nb[1]/sizeof(float) << ",\n";
+    json << "  \"out_stride_query_floats\": " << out->nb[2]/sizeof(float) << ",\n";
+    json << "  \"sink_tail_stride_head_f16\": " << sink_tail_k->nb[1]/sizeof(uint16_t) << ",\n";
+    json << "  \"sink_tail_stride_token_f16\": " << sink_tail_k->nb[2]/sizeof(uint16_t) << ",\n";
+    json << "  \"pending_stride_head_floats\": " << pending_k->nb[1]/sizeof(float) << ",\n";
+    json << "  \"pending_stride_token_floats\": " << pending_k->nb[2]/sizeof(float) << ",\n";
+    json << "  \"k_body_stride_record_bytes\": " << body_k->nb[1] << ",\n";
+    json << "  \"v_body_stride_record_bytes\": " << body_v->nb[1] << ",\n";
+    json << "  \"k_body_stride_head_bytes\": " << body_k->nb[2] << ",\n";
+    json << "  \"v_body_stride_head_bytes\": " << body_v->nb[2] << ",\n";
+    json << "  \"k_scale_stride_record_floats\": " << scales_k->nb[1]/sizeof(float) << ",\n";
+    json << "  \"v_scale_stride_record_floats\": " << scales_v->nb[1]/sizeof(float) << ",\n";
+    json << "  \"k_scale_stride_head_floats\": " << scales_k->nb[2]/sizeof(float) << ",\n";
+    json << "  \"v_scale_stride_head_floats\": " << scales_v->nb[2]/sizeof(float) << ",\n";
+    json << "  \"scores_nelems\": " << scores_nelems << ",\n";
+    json << "  \"body_records_cap\": " << k_body_records_cap << ",\n";
+    json << "  \"qt\": " << qt_override << ",\n";
+    json << "  \"body_mirror_allowed\": " << (body_mirror_allowed ? "true" : "false") << ",\n";
+    json << "  \"body_mirror_used\": " << (body_mirror_used ? "true" : "false") << ",\n";
+    json << "  \"inferred_layer\": " << inferred_layer << ",\n";
+    json << "  \"call_index\": " << call_index << ",\n";
+    json << "  \"cuda_trace_mode\": \"" << cuda_trace_mode << "\"\n";
     json << "}\n";
     json.close();
 
@@ -3390,6 +3486,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
                 const int64_t n_kv = int64_t(params.n_sink) + int64_t(params.n_records)*params.group_size + params.n_pending + params.n_tail;
                 const uint32_t kq_mask_type = kq_mask == nullptr ? 0u : (kq_mask->type == GGML_TYPE_F32 ? 1u : 2u);
+                const int64_t scratch_nelems = [&]() {
+                    const ggml_tensor * root = scratch;
+                    while (root != nullptr && root->view_src != nullptr) {
+                        root = root->view_src;
+                    }
+                    return root != nullptr ? ggml_nelements(root) : int64_t(0);
+                }();
                 const bool use_scratch_ref = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
                 const bool forced_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
                 const bool forced_split = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
@@ -3577,13 +3680,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             params.scale,
                             ctx.stream(),
                             dst->src[11] != nullptr ? (const int32_t *) dst->src[11]->data : nullptr,
-                            [&]() {
-                                const ggml_tensor * scratch = dst->src[9];
-                                while (scratch != nullptr && scratch->view_src != nullptr) {
-                                    scratch = scratch->view_src;
-                                }
-                                return scratch != nullptr ? ggml_nelements(scratch) : int64_t(0);
-                            }(),
+                            scratch_nelems,
                             dst->src[3]->ne[1]);
                 }
                 ggml_cuda_kvarn_maybe_dump_boundary(
@@ -3592,6 +3689,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                         params.n_sink, params.n_records, params.n_pending, params.n_tail,
                         params.tail_start, params.head_dim, params.group_size,
                         params.key_bits, params.value_bits, kq_mask_type, params.scale,
+                        scratch_nelems, dst->src[3]->ne[1],
                         ctx.stream());
             } break;
         case GGML_OP_TURBO_WHT:

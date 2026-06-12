@@ -175,6 +175,24 @@ function Assert-ExpectedPackedTraceMode([string] $text, [string] $expected, [str
     Write-Host ("KVarN packed trace mode check: PASS, mode = {0}" -f $expected)
 }
 
+function Assert-InnerTracePresent([string] $text, [string] $label) {
+    if (-not $TraceAttn) {
+        return
+    }
+
+    $inner = @()
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA mixed-attn inner trace:\s+mode=([^\s]+).*?\s+qt=([0-9]+).*?\s+body_mirror_allowed=([01])\s+body_mirror_used=([01])")) {
+        $inner += ("mode={0},qt={1},mirror_allowed={2},mirror_used={3}" -f
+            $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value, $m.Groups[4].Value)
+    }
+
+    if ($inner.Count -gt 0) {
+        Write-Host ("KVarN inner trace evidence: {0}" -f (($inner | Select-Object -Unique) -join "; "))
+    } else {
+        Write-Host "$label emitted no KVarN CUDA mixed-attn inner trace lines"
+    }
+}
+
 function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
     if ($minimum -le 0) {
         return
@@ -347,6 +365,7 @@ try {
     Write-Host "== Saving packed KVarN logits"
     $packedText = Invoke-Results $results $commonArgs $packedEnv
     Assert-ExpectedPackedTraceMode $packedText $ExpectedPackedTraceMode "packed KVarN logits"
+    Assert-InnerTracePresent $packedText "packed KVarN logits"
     if ($TraceAttn) {
         Write-Host $packedText
     }

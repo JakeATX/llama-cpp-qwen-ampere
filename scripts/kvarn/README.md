@@ -41,6 +41,27 @@ diagnostics should use `run_bench_matrix.ps1` directly. Tier 2:
 **Hardware:** RTX 5070 12 GB, build `build-kvarn-cuda-static-vs`, branch
 `kvarn-atx-integration`, `-fa off`, `--kvarn-preset kvarn_k4v2_g128`.
 
+**Gate hardening:** production gate runs refuse leaked diagnostic environment
+variables by default, including forced 256d warpqk/body-mirror, split/scratch
+attention paths, fused-batch overrides, debug ubatch, Gemma experimental ISWA,
+trace controls, and boundary-dump controls. Use `-AllowDiagnosticEnv` only for
+explicit diagnostics. Qwen Tier 2 logits inherit production `-ncmoe 34`, exact
+layers `3-39:4`, stronger layer-log evidence, and body-record evidence when the
+Tier 2 model is the Qwen3.6 MTP production model.
+
+`run_mainline_parity_matrix.ps1` writes a manifest, command files, `summary.csv`,
+and `summary.md` with KVarN-vs-mainline metadata: SHAs, dirty flags, build paths,
+GPU/runtime, run order, warmup, flash-attn, KVarN preset/iters/quantile, expected
+and actual KVarN layers, fallback allowed/observed, and exact command filenames.
+With `-TraceAttn`, it also summarizes inner CUDA trace fields such as mode, QT,
+body-mirror allowed/used, head dimension, token counts, grid, shmem, mask strides,
+and score scratch size.
+
+For Qwen3.6 256d diagnostics, `capture_qwen_boundary.ps1` captures a bounded
+full-model attention boundary under explicit env flags, and
+`replay_qwen_boundary.ps1` validates capture completeness. The current capture is
+an input/output diagnostic artifact, not yet a CUDA split-vs-warpqk replay test.
+
 ### P0 CUDA matrix (2026-06-07)
 
 Qwen rows from `c43744da1` (hybrid `split_equal` fix); Gemma rows from

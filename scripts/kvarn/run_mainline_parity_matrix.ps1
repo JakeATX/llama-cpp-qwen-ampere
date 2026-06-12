@@ -132,6 +132,23 @@ function Get-CudaDeviceSummary([string] $text) {
     return ($devices -join "; ")
 }
 
+function Get-GpuRuntimeSummary() {
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($null -eq $nvidiaSmi) {
+        return "nvidia-smi unavailable"
+    }
+
+    try {
+        $rows = & $nvidiaSmi.Path --query-gpu=name,driver_version,cuda_version --format=csv,noheader 2>$null
+        if ($LASTEXITCODE -ne 0 -or $null -eq $rows) {
+            return "nvidia-smi query failed"
+        }
+        return (($rows | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ }) -join "; ")
+    } catch {
+        return "nvidia-smi query failed: $($_.Exception.Message)"
+    }
+}
+
 function Get-MaxKvarnBodyRecords([string] $text) {
     $maxRecords = -1
     foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
@@ -512,6 +529,7 @@ $manifest = @(
     "kvarn_build=$KvarnBuildDir",
     "mainline_bench=$mainlineBench",
     "kvarn_bench=$kvarnBench",
+    "gpu_runtime=$(Get-GpuRuntimeSummary)",
     "case_list=$CaseList",
     "min_parity_ratio=$MinParityRatio",
     "repetitions=$Repetitions",
@@ -663,13 +681,25 @@ $summaries | Export-Csv -NoTypeInformation -LiteralPath $summaryCsv
 $summaryLines = @(
     "# KVarN vs mainline llama.cpp parity",
     "",
-    "| case | prompt | gen | mainline t/s | KVarN t/s | KVarN/mainline | gate (>=$([int]($MinParityRatio*100))%) |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | --- |"
+    ("- Model: ``{0}``" -f $modelPath),
+    ("- Mainline SHA: ``{0}`` dirty=``{1}``" -f (Get-GitHead $mainlineRoot), (Get-GitDirty $mainlineRoot)),
+    ("- KVarN SHA: ``{0}`` dirty=``{1}``" -f (Get-GitHead $repoRoot), (Get-GitDirty $repoRoot)),
+    ("- Run order: ``{0}``; warmup: ``{1}``; flash-attn: ``{2}``" -f $RunOrder, $Warmup.IsPresent, $FlashAttn),
+    ("- KVarN preset: ``{0}``; iters: ``{1}``; RTN quantile: ``{2}``" -f $KvarnPreset, $KvarnIters, $rtnQuantileArg),
+    ("- Expected KVarN layers: ``{0}``; fallback allowed: ``{1}``" -f $ExpectedKvarnLayers, $AllowKvarnFallback.IsPresent),
+    ("- GPU/runtime: ``{0}``" -f (Get-GpuRuntimeSummary)),
+    ("- Extra args: ``{0}``; KVarN extra args: ``{1}``" -f ($ExtraArgs -join ' '), ($KvarnExtraArgs -join ' ')),
+    "",
+    "| case | prompt | gen | mainline t/s | KVarN t/s | KVarN/mainline | gate (>=$([int]($MinParityRatio*100))%) | fallback observed | actual layers | max body records | commands |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | --- |"
 )
 foreach ($s in $summaries) {
     $gateText = if ($s.GatePass) { "PASS" } else { "**FAIL**" }
-    $summaryLines += "| {0} | {1} | {2} | {3:F2} | {4:F2} | {5:P1} | {6} |" -f `
-        $s.Case, $s.PromptTokens, $s.GenTokens, $s.MainlineTps, $s.KvarnTps, $s.KvarnVsMainline, $gateText
+    $commands = "{0}; {1}" -f $s.MainlineCommand, $s.KvarnCommand
+    $actualLayers = if ([string]::IsNullOrWhiteSpace($s.ActualKvarnLayers)) { "(none)" } else { $s.ActualKvarnLayers }
+    $summaryLines += "| {0} | {1} | {2} | {3:F2} | {4:F2} | {5:P1} | {6} | {7} | {8} | {9} | {10} |" -f `
+        $s.Case, $s.PromptTokens, $s.GenTokens, $s.MainlineTps, $s.KvarnTps, $s.KvarnVsMainline, $gateText,
+        $s.KvarnFallbackObserved, $actualLayers, $s.MaxKvarnBodyRecords, $commands
 }
 [System.IO.File]::WriteAllText($summaryMd, ($summaryLines -join "`n") + "`n")
 

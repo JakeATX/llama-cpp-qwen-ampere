@@ -728,3 +728,74 @@ Recommended next implementation target:
   - Use existing K/V body store kernels first; only fuse further after traces show it is still material.
   - Then relax `kvarn_tail_safe_ubatch_limit()` only for the direct-current-ubatch-safe case.
 - Keep the scratch/split reference paths as correctness oracles for every change.
+
+---
+
+## Round 15 production patchset pass - 2026-06-12
+
+Scope:
+
+- Implemented the low-risk parts of `KVARN_PRODUCTION_PATCHSET_DEV_AGENT.md` without enabling any experimental 256d warpqk or 256d body-mirror path by default.
+- Did not run 4k/4k benchmarks in this pass because the patchset was limited to production-gate hardening and diagnostics. Keep long-context performance work behind the short correctness and parity gates.
+
+Implemented locally:
+
+- Hardened `scripts/kvarn/run_production_gate.ps1` to reject boundary-dump diagnostic environment variables in production-gate runs unless `-AllowDiagnosticEnv` is explicitly used.
+- Expanded `scripts/kvarn/run_mainline_parity_matrix.ps1` Markdown output so `summary.md` now includes SHAs, dirty flags, model path, GPU/runtime, run order, warmup, flash-attn, KVarN preset/iters/quantile, expected layers, fallback policy, actual layers, max body records, fallback observed, and exact command filenames. CSV still carries the full trace fields.
+- Added inner-trace evidence reporting to `scripts/kvarn/compare_cuda_logits_ref.ps1` when `-TraceAttn` is enabled.
+- Extended the Qwen 256d boundary-dump metadata in `ggml/src/ggml-cuda/ggml-cuda.cu` with exact-call/layer/body-active filters plus stride, scratch-capacity, mirror, QT, inferred layer, and CUDA-mode fields. The dump remains off unless `LLAMA_KVARN_ATTN_BOUNDARY_DUMP=1`.
+- Added helper scripts:
+  - `scripts/kvarn/capture_qwen_boundary.ps1`
+  - `scripts/kvarn/replay_qwen_boundary.ps1`
+- Documented the gate hardening and boundary-capture limitations in `scripts/kvarn/README.md`.
+
+Validation completed:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-bench llama-results test-kvarn-cuda-scratch-ref -j 8`
+- `llama-cli` build passed.
+- PowerShell syntax checks passed for the edited KVarN scripts.
+- `git diff --check` passed.
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator self-test passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- Qwen2.5 CUDA smoke passed for contexts `256 512`, exact layers `0-27`.
+- Qwen2.5 traced logits passed packed repeat, packed-vs-split, and packed-vs-scratch at NMSE `0`.
+- Qwen3.6 boundary capture produced and validated after rebuilding `llama-results`:
+  `artifacts/kvarn-boundary/round15-qwen36-default-first-body-passing/call_000000`
+  - `head_dim=256`
+  - `n_queries=384`
+  - `n_head=16`
+  - `n_head_kv=2`
+  - `n_sink=128`
+  - `n_records=1`
+  - `n_pending=0`
+  - `n_tail=128`
+  - `mask_stride_query_bytes=1536`
+  - `scores_nelems=512`
+  - `body_records_cap=2`
+  - `cuda_trace_mode=split`
+  - `body_mirror_allowed=false`
+  - `body_mirror_used=false`
+  - `inferred_layer=3`
+
+Transient Qwen correctness false alarm resolved:
+
+- Before rebuilding `llama-results`, current dirty `kvarn-atx-integration` produced Qwen3.6 MTP packed-repeat failures at `Repeat=450` (`1.300e-04`) and `Repeat=384` (`1.245e-04`). No diagnostic environment variables were leaked.
+- A detached same-session A/B worktree at `63fa0bbd0` passed Qwen3.6 MTP `Repeat=384` packed-repeat and packed-vs-split with NMSE `0`.
+- After rebuilding current `llama-results`, current dirty `kvarn-atx-integration` passed Qwen3.6 MTP at both `Repeat=384` and `Repeat=450` with packed-repeat and packed-vs-split NMSE `0`, expected layers `3-39:4`, body-record checks enabled, and `-ncmoe 34 -fit off`.
+- Conclusion: the observed Qwen failures were a stale or inconsistent local build artifact, not a Round 15 diagnostic-code regression.
+
+Current status:
+
+- No experimental 256d warpqk or 256d body mirror path is enabled by default.
+- Qwen3.6 MTP default true KVarN correctness is clean again for the active-body short diagnostic cases tested.
+- This pass did not include a new mainline parity benchmark. The last recorded production blocker remains short prefill parity, especially Qwen3.6 `pp512` and true-KVarN Gemma `pp512`.
+
+Recommended next step:
+
+- Run short mainline parity again with the hardened harness and no diagnostic env:
+  - Qwen3.6 MTP `pp512,tg64`, `-r 3`, `-ncmoe 34`, expected layers `3-39:4`.
+  - Gemma 4 12B true KVarN `pp512,tg64`, `-r 3`, expected layers `5-47:6`, force experimental ISWA only when intentionally measuring true KVarN instead of fallback.
+- Use the new boundary capture only to debug correctness-equivalent 256d experiments. Do not enable 256d warpqk or 256d body mirror for production until full Qwen3.6 MTP packed-repeat and packed-vs-split are both NMSE `0`.
