@@ -4,11 +4,75 @@
 
 Repo: `JakeATX/llama.cpp`
 Branch: `kvarn-atx-integration`
-Current pushed HEAD: [`d8787b7a9`](https://github.com/JakeATX/llama.cpp/commit/d8787b7a919d5352d579cdcfd788f0efae6e3c7b) - `kvarn: trace parity and broaden sinktail decode`
+Current pushed HEAD: [`8e35bce0c`](https://github.com/JakeATX/llama.cpp/commit/8e35bce0c) - `kvarn: restore Gemma fallback default`
 Prior pushed baseline for this round: [`2c61f9c67`](https://github.com/JakeATX/llama.cpp/commit/2c61f9c67) - `kvarn: add mainline parity harness and per-body dequant epochs`
 Review tree: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
 
 This is the current entry point for a 5.5 Pro / external architecture review. Older sections below are retained for history, but the current production target is mainline parity against upstream `llama.cpp`, not fork normal-KV parity.
+
+### Round 10 implementation status
+
+Accepted and pushed:
+
+Commit [`8e35bce0c`](https://github.com/JakeATX/llama.cpp/commit/8e35bce0c):
+
+- Restored production-safe Gemma 4 behavior:
+  - default Gemma 4 + `--kv-cache-quant kvarn` + ISWA uses normal ISWA fallback.
+  - `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` opts into true KVarN+ISWA for benchmarking/development.
+  - `LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK=1` remains a hard safe-path override.
+- Added a scratch-capacity guard around the existing 512d f16 body mirror path so low-level callers that pass only score-buffer scratch cannot overrun into undeclared mirror storage.
+
+Rejected after test:
+
+- `0002-round10-qwen256-warpqk-dequant-cache-prototype.patch` was applied manually, tested, and backed out.
+- Initial form failed `test-kvarn-cuda-scratch-ref`:
+  - `FAIL: CUDA Qwen3.6-shaped 49-query forced fused mixed attention matches split output`
+- After adding a scratch-capacity guard, the low-level CUDA unit passed, but real Qwen3.6 MTP logits failed:
+  - packed repeat: PASS, NMSE `0`
+  - packed-vs-split: FAIL, NMSE `6.196e-03`
+- Narrowing the prototype to 256d warpqk without the f16 mirror still failed the same Qwen3.6 MTP packed-vs-split logits check.
+- The 256d dispatch was backed out. Qwen3.6 MTP logits then passed again:
+  - packed repeat: PASS, NMSE `0`
+  - packed-vs-split: PASS, NMSE `0`
+
+Current architect fix target:
+
+1. Do not re-submit the simple `head_dim >= 256` warpqk threshold patch as-is; it is not logits-equivalent to split for Qwen3.6 MTP.
+2. Debug why the 256d warpqk path diverges from split before any performance benchmarking:
+   - first reproduce with the low-level Qwen3.6-shaped 49-query test;
+   - then reproduce with full Qwen3.6 MTP logits at `Context=512`, `Batch=512`, `-ncmoe 34`;
+   - require packed-vs-split NMSE `0` before measuring throughput.
+3. Keep Gemma fallback default in place until true Gemma KVarN+ISWA short parity passes.
+4. Keep 4k/long-context diagnostics blocked until both short production cells pass.
+
+Round 10 validation notes:
+
+| Gate | Result | Notes |
+|---|---:|---|
+| Build of CUDA libs, `llama-bench`, `llama-results`, KVarN CUDA tests | PASS | Aggregate `llama-server` target hit unrelated UI asset generation failure |
+| `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS | |
+| Qwen2.5 CUDA smoke `256 512` | PASS | expected layers `0-27` |
+| Qwen2.5 logits repeat/split/scratch | PASS | NMSE `0` |
+| Qwen3.6 MTP logits after backing out 256d dispatch | PASS | repeat/split NMSE `0` |
+| `test-kvarn-cuda-scratch-ref` after guard/backout | PASS | |
+| `test-kvarn-kv` | LOCAL BLOCKER | exits `0xc0000409` in this environment |
+
+Latest short parity status:
+
+| Model | Case | Mainline t/s | KVarN/fallback t/s | Ratio | Gate |
+|---|---:|---:|---:|---:|---:|
+| Qwen3.6 MTP, `-ncmoe 34`, `r=5` | `pp512` | 284.47 | 126.23 | 44.4% | FAIL |
+| Qwen3.6 MTP, `-ncmoe 34`, `r=5` | `tg64` | 40.37 | 34.06 | 84.4% | FAIL |
+| Gemma 4 fallback, `r=5` | `pp512` | 2284.38 | 2410.95 | 105.5% | PASS |
+
+Qwen `r=5` artifact:
+
+- `artifacts/kvarn-mainline-parity/20260611-201128`
+
+Gemma fallback note:
+
+- The current parity harness expects KVarN cache logs and aborts on Gemma fallback because fallback intentionally emits no KVarN cache initialization lines.
+- For Gemma fallback parity, either run manual `llama-bench` pairs or update the harness with an explicit fallback-allowed mode.
 
 ### Current production gate
 
@@ -115,7 +179,7 @@ Artifacts:
 
 1. Prefill is now the blocker. Decode short parity is effectively passing without trace. Review should focus on `pp512` body-store, body attention, and dequant-cache behavior.
 2. Gemma `pp512` trace shows dequant-cache `miss=24; partial=24` and no full hit reuse. Determine whether graph/scratch identity or active-record keying prevents reuse across repetitions.
-3. Qwen `pp512` uses 256d `fused-batch` body attention with no dequant-cache trace summary. Assess whether a 256d f16 body-dequant mirror, similar to the 512d cache path, is the right next patch.
+3. Qwen `pp512` uses 256d `fused-batch` body attention with no dequant-cache trace summary. A simple 256d warpqk/f16-mirror threshold patch was tested and rejected because it failed Qwen3.6 MTP packed-vs-split logits with NMSE `6.196e-03`; fix correctness before measuring performance.
 4. Store/seal work is still visible in both Gemma and Qwen prefill traces. Review `GGML_OP_KVARN_STORE_KV_BODY`, Sinkhorn iterations, seal batching, and redundant K/V staging.
 5. The 128/256d no-body decode sink/tail specialization is correct under logits and passes no-trace Qwen `tg64`, but traced throughput is noisy. Keep it unless a cleaner microbenchmark proves a regression.
 6. Sink/tail policy now clamps tail when requested sink+tail exceeds `kv_size`. Review whether this should be a warning-only clamp, a CLI validation error for explicit user policy, or both.
@@ -124,7 +188,7 @@ Artifacts:
 
 1. Add lower-noise microbench or trace aggregation for prefill body-store vs mixed-attn time without printing inside the hot path.
 2. Fix Gemma dequant-cache full-hit reuse if the trace confirms cache identity/key churn.
-3. Prototype Qwen 256d f16 body-dequant mirror for `pp512`.
+3. Debug and fix Qwen 256d warpqk/mirror correctness for `pp512`; require low-level CUDA split equivalence and full Qwen3.6 MTP packed-vs-split NMSE `0` before benchmarking.
 4. Optimize store/seal cost after separating Sinkhorn cost from K/V staging and metadata sealing.
 5. Only after short `pp512` passes for both models, rerun diagnostics:
    - Gemma `pp4096,tg4096`, `-r 1`
