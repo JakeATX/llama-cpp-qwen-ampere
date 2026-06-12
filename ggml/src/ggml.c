@@ -4267,7 +4267,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_records(
     GGML_ASSERT(k_scales->type == GGML_TYPE_F32);
     GGML_ASSERT(v_scales->type == GGML_TYPE_F32);
     GGML_ASSERT(scratch->type == GGML_TYPE_F32);
-    GGML_ASSERT(n_record_batch > 1 && n_record_batch <= 4);
+    GGML_ASSERT(n_record_batch >= 1 && n_record_batch <= 4);
     GGML_ASSERT(records != NULL);
     GGML_ASSERT(head_dim > 0);
     GGML_ASSERT(group_size > 0);

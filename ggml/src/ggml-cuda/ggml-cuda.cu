@@ -3276,7 +3276,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
 
                 if (ggml_cuda_kvarn_store_trace_enabled() && ggml_cuda_kvarn_store_trace_claim()) {
-                    if (params.n_record_batch > 1) {
+                    if (params.n_record_batch > 0) {
                         std::fprintf(stderr,
                                 "KVarN CUDA store-body trace: kind=kv-records head_dim=%d group_size=%d"
                                 " n_record_batch=%d records=%d,%d,%d,%d scratch_floats=%" PRId64 "\n",
@@ -3296,7 +3296,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     }
                 }
 
-                if (params.n_record_batch > 1) {
+                if (params.n_record_batch > 0) {
                     const int32_t records[4] = {
                         params.record_0, params.record_1, params.record_2, params.record_3,
                     };
@@ -6127,7 +6127,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int64_t pipeline_scratch_floats = params.head_dim >= 512 ? 2*per_pipeline : per_pipeline;
                 const int64_t batch_scratch_floats = 2*n + pipeline_scratch_floats;
 
-                if (params.n_record_batch > 1) {
+                if (params.n_record_batch > 0) {
                     return op->src[0]->ne[0] == params.head_dim &&
                            op->src[1]->ne[0] == params.head_dim &&
                            op->src[0]->ne[2] == params.group_size &&

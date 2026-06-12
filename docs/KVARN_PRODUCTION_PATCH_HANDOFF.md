@@ -668,3 +668,63 @@ Recommended next patches:
 - Qwen `tg64`: specialize or further tune `sinktail-decode` for the 256d, no-body, sink-only decode shape. Current traces show `sinktail-decode` only and zero body records.
 - Qwen `pp512`: repeat `r=5` no-trace and warmup/no-warmup A/B to confirm the 256d all-head store batching improvement survives variance.
 - Gemma true KVarN+ISWA `pp512`: continue the existing plan to batch multiple seal records for `n_head_kv == 1`, because Gemma still records two body seals per KVarN layer.
+
+---
+
+## Round 14 true Gemma KVarN investigation - 2026-06-12
+
+Scope:
+
+- Focus was corrected to true Gemma 4 12B KVarN+ISWA, not fallback. All true Gemma runs below used `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` and expected layers `5-47:6`.
+- The production-safe Gemma fallback remains valid default behavior, but fallback is not counted as a true KVarN data point.
+
+Implemented locally:
+
+- Routed 512d, `n_head_kv == 1` single-record seals through the existing pending-record store op instead of the per-record fallback path.
+  - `src/llama-graph.cpp`: both standalone KVarN and KVarN+ISWA now call `store_kv_body_records_from_pending()` for non-empty `seal_records`.
+  - `ggml/src/ggml.c` and `ggml/src/ggml-cuda/ggml-cuda.cu`: `GGML_OP_KVARN_STORE_KV_BODY` pending-record mode now accepts `n_record_batch == 1`.
+  - Store trace confirms Gemma pp512 now emits `kind=kv-records ... n_record_batch=1` for all 16 body stores.
+- Hardened graph-side sink/tail clamping so policy experiments like `--kvarn-tail-tokens 256` no longer crash decode when the cache constructor clamps effective tail capacity.
+  - Fixed the `sink_tail_k->ne[2] >= n_sink + n_tail` assert by using effective clamped KVarN params in graph active windows, seal-record decisions, reuse checks, and stable decode op params.
+
+Rejected experiments:
+
+- A 512d warpqk causal-mask skip path was logits-equivalent on Gemma but did not produce a useful speedup and made the default kernel shape more complex. It was removed.
+- `--kvarn-tail-tokens 256` improved Gemma pp512 only slightly and did not clear the gate; `--kvarn-tail-tokens 384` removed body records for pp512 but still did not clear the gate. Larger-tail policy is not a production fix.
+
+Validation completed after Round 14 changes:
+
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator self-test passed.
+- Qwen2.5 CUDA smoke passed for contexts `256 512`, exact expected layers `0-27`.
+- Gemma true KVarN+ISWA logits passed packed repeat, packed-vs-split, and packed-vs-scratch with expected layers `5-47:6`.
+- Qwen2.5 logits passed packed repeat, packed-vs-split, and packed-vs-scratch with NMSE `0`.
+- Qwen3.6 MTP logits passed packed repeat and packed-vs-split with NMSE `0`, expected layers `3-39:4`, `-ncmoe 34`.
+- Unsupported smoke passed.
+- Tail clamp regression check passed: Gemma true KVarN `tg64` with `--kvarn-tail-tokens 256` now clamps and runs instead of asserting.
+
+Current short parity after Round 14:
+
+- Gemma 4 12B true KVarN+ISWA, artifact `artifacts/kvarn-mainline-parity/round13-final-gemma-true-kvarn-r3`:
+  - `pp512`: mainline `2286.81 t/s`, KVarN `2015.14 t/s`, `88.1%` FAIL.
+  - `tg64`: mainline `66.38 t/s`, KVarN `65.88 t/s`, `99.2%` PASS.
+- Qwen3.6 MTP, artifact `artifacts/kvarn-mainline-parity/round13-final-qwen-mtp-r3`:
+  - `pp512`: mainline `249.78 t/s`, KVarN `219.41 t/s`, `87.8%` FAIL.
+  - `tg64`: mainline `41.60 t/s`, KVarN `35.78 t/s`, `86.0%` FAIL.
+
+Updated diagnosis:
+
+- Gemma pp512 is not primarily blocked by body-store dispatch overhead. Store routing changed correctly, but pp512 remained below gate.
+- Tail expansion showed the same: removing body records for pp512 with `--kvarn-tail-tokens 384` still stayed around the low 80% range.
+- The remaining Gemma short-prefill gap is therefore mostly in KVarN attention/topology versus mainline attention, plus the structural 384+128 ubatch split.
+- The high-impact Gemma patch is a direct current-ubatch body-store path for contiguous prefill. That would allow a single q512 graph to seal records whose source tokens are in `k_cur/v_cur`, instead of forcing the safe 384+128 split that exists because record 1's source tokens are produced inside the same ubatch.
+
+Recommended next implementation target:
+
+- Add direct current-ubatch record sealing for contiguous prefill:
+  - Detect single-sequence contiguous prompt chunks where full body records are fully contained in `k_cur/v_cur`.
+  - Build K/V tiles directly from `k_cur/v_cur` for those records.
+  - Use existing K/V body store kernels first; only fuse further after traces show it is still material.
+  - Then relax `kvarn_tail_safe_ubatch_limit()` only for the direct-current-ubatch-safe case.
+- Keep the scratch/split reference paths as correctness oracles for every change.

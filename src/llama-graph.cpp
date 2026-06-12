@@ -620,33 +620,46 @@ struct kvarn_active_window {
     bool valid = false;
 };
 
-static uint32_t kvarn_graph_count_tail_evictions(const llama_kvarn_params & params, const llama_ubatch & ubatch) {
+static llama_kvarn_params kvarn_graph_effective_params(llama_kvarn_params params, uint32_t kv_size) {
+    if (kv_size != 0 && uint64_t(params.sink_tokens) + uint64_t(params.tail_tokens) > kv_size) {
+        if (params.sink_tokens >= kv_size) {
+            params.tail_tokens = 0;
+        } else {
+            params.tail_tokens = kv_size - params.sink_tokens;
+        }
+    }
+    return params;
+}
+
+static uint32_t kvarn_graph_count_tail_evictions(const llama_kvarn_params & params, const llama_ubatch & ubatch, uint32_t kv_size) {
+    const llama_kvarn_params p = kvarn_graph_effective_params(params, kv_size);
     uint32_t n = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         const llama_pos pos = ubatch.pos ? ubatch.pos[i] : llama_pos(i);
-        if (pos >= 0 && uint32_t(pos) >= params.sink_tokens + params.tail_tokens) {
+        if (pos >= 0 && uint32_t(pos) >= p.sink_tokens + p.tail_tokens) {
             ++n;
         }
     }
     return n;
 }
 
-static std::vector<uint32_t> kvarn_graph_seal_records(const llama_kvarn_params & params, const llama_ubatch & ubatch) {
+static std::vector<uint32_t> kvarn_graph_seal_records(const llama_kvarn_params & params, const llama_ubatch & ubatch, uint32_t kv_size) {
+    const llama_kvarn_params p = kvarn_graph_effective_params(params, kv_size);
     std::vector<uint32_t> records;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
         const llama_pos pos = ubatch.pos ? ubatch.pos[i] : llama_pos(i);
-        if (pos < 0 || uint32_t(pos) < params.sink_tokens + params.tail_tokens) {
+        if (pos < 0 || uint32_t(pos) < p.sink_tokens + p.tail_tokens) {
             continue;
         }
 
-        const uint32_t evicted_pos = uint32_t(pos) - params.tail_tokens;
-        const uint32_t body_pos = evicted_pos - params.sink_tokens;
-        const uint32_t offset = body_pos%params.group_size;
-        if (offset + 1 != params.group_size) {
+        const uint32_t evicted_pos = uint32_t(pos) - p.tail_tokens;
+        const uint32_t body_pos = evicted_pos - p.sink_tokens;
+        const uint32_t offset = body_pos%p.group_size;
+        if (offset + 1 != p.group_size) {
             continue;
         }
 
-        const uint32_t record = body_pos/params.group_size;
+        const uint32_t record = body_pos/p.group_size;
         if (std::find(records.begin(), records.end(), record) == records.end()) {
             records.push_back(record);
         }
@@ -655,6 +668,7 @@ static std::vector<uint32_t> kvarn_graph_seal_records(const llama_kvarn_params &
 }
 
 static kvarn_active_window kvarn_graph_active_window(const llama_kvarn_params & params, const llama_ubatch & ubatch, uint32_t kv_size) {
+    const llama_kvarn_params p = kvarn_graph_effective_params(params, kv_size);
     kvarn_active_window result;
     if (ubatch.n_tokens == 0) {
         return result;
@@ -671,20 +685,20 @@ static kvarn_active_window kvarn_graph_active_window(const llama_kvarn_params & 
         return result;
     }
 
-    const uint32_t n_sink = std::min<uint32_t>(n_seen, params.sink_tokens);
+    const uint32_t n_sink = std::min<uint32_t>(n_seen, p.sink_tokens);
     const uint32_t n_after_sink = n_seen - n_sink;
-    const uint32_t n_tail = std::min<uint32_t>(n_after_sink, params.tail_tokens);
+    const uint32_t n_tail = std::min<uint32_t>(n_after_sink, p.tail_tokens);
     const uint32_t n_body_pending = n_after_sink - n_tail;
-    const uint32_t n_records = n_body_pending/params.group_size;
-    const uint32_t n_pending = n_body_pending%params.group_size;
-    const uint32_t tail_start = n_tail == 0 ? 0 : (n_body_pending%params.tail_tokens);
+    const uint32_t n_records = n_body_pending/p.group_size;
+    const uint32_t n_pending = n_body_pending%p.group_size;
+    const uint32_t tail_start = n_tail == 0 ? 0 : (n_body_pending%p.tail_tokens);
 
     result.n_sink = int32_t(n_sink);
     result.n_records = int32_t(n_records);
     result.n_pending = int32_t(n_pending);
     result.n_tail = int32_t(n_tail);
     result.tail_start = int32_t(tail_start);
-    result.n_kv = int64_t(n_sink) + int64_t(n_records)*params.group_size + n_pending + n_tail;
+    result.n_kv = int64_t(n_sink) + int64_t(n_records)*p.group_size + n_pending + n_tail;
     result.valid = true;
     return result;
 }
@@ -875,7 +889,7 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
-    const std::vector<uint32_t> cur_seal_records = kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch);
+    const std::vector<uint32_t> cur_seal_records = kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch, mctx->get_size());
     if (has_body_store_ops) {
         if (cur_seal_records != baked_seal_records) {
             return false;
@@ -884,7 +898,7 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
         return false;
     }
 
-    const uint32_t n_tail_evict = kvarn_graph_count_tail_evictions(params.cparams.kvarn, params.ubatch);
+    const uint32_t n_tail_evict = kvarn_graph_count_tail_evictions(params.cparams.kvarn, params.ubatch, mctx->get_size());
 
     bool res = true;
     res &= sink_tail_idxs->ne[0] == params.ubatch.n_tokens;
@@ -1108,7 +1122,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
             return false;
         }
 
-        const std::vector<uint32_t> cur_seal_records = kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch);
+        const std::vector<uint32_t> cur_seal_records = kvarn_graph_seal_records(params.cparams.kvarn, params.ubatch, base_ctx->get_size());
         if (base_has_body_store_ops) {
             if (cur_seal_records != base_baked_seal_records) {
                 if (reuse_trace) {
@@ -1127,7 +1141,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
             return false;
         }
 
-        const uint32_t n_tail_evict = kvarn_graph_count_tail_evictions(params.cparams.kvarn, params.ubatch);
+        const uint32_t n_tail_evict = kvarn_graph_count_tail_evictions(params.cparams.kvarn, params.ubatch, base_ctx->get_size());
         bool res = true;
         auto check = [&](bool ok, const char * name) {
             if (!ok && reuse_trace) {
@@ -3056,7 +3070,7 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
             ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
 
-            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
+            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size());
             inp_kvarn->has_body_store_ops = !seal_records.empty();
             inp_kvarn->baked_seal_records = seal_records;
 
@@ -3065,7 +3079,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 body_store_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
 
-            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && seal_records.size() > 1) {
+            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
                 ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_records_from_pending(
                             ctx0, body_store_scratch, il, seal_records));
             } else {
@@ -3516,7 +3530,7 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
             ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
 
-            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch);
+            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, mctx_kvarn->get_size());
             inp->base_has_body_store_ops = !seal_records.empty();
             inp->base_baked_seal_records = seal_records;
 
@@ -3525,7 +3539,7 @@ ggml_tensor * llm_graph_context::build_attn(
                 body_store_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
 
-            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && seal_records.size() > 1) {
+            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
                 ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_records_from_pending(
                             ctx0, body_store_scratch, il, seal_records));
             } else {
@@ -3585,10 +3599,12 @@ ggml_tensor * llm_graph_context::build_attn(
             inp->base_window_indirect = true;
         }
 
-        const int32_t op_n_sink     = window_indirect ? int32_t(cparams.kvarn.sink_tokens) : int32_t(window.n_sink);
+        const llama_kvarn_params effective_kvarn =
+            kvarn_graph_effective_params(cparams.kvarn, mctx_kvarn->get_size());
+        const int32_t op_n_sink     = window_indirect ? int32_t(effective_kvarn.sink_tokens) : int32_t(window.n_sink);
         const int32_t op_n_records  = window_indirect ? 0 : int32_t(window.n_records);
         const int32_t op_n_pending  = window_indirect ? 0 : int32_t(window.n_pending);
-        const int32_t op_n_tail     = window_indirect ? int32_t(cparams.kvarn.tail_tokens) : int32_t(window.n_tail);
+        const int32_t op_n_tail     = window_indirect ? int32_t(effective_kvarn.tail_tokens) : int32_t(window.n_tail);
         const int32_t op_tail_start = window_indirect ? 0 : int32_t(window.tail_start);
 
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
