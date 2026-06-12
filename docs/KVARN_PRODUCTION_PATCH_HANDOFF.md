@@ -620,3 +620,51 @@ Do not flip `src/llama-model.cpp` Gemma fallback until all of these are true:
 - Qwen regression passes after CUDA changes.
 
 Use the existing fallback unless `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` is explicitly set.
+
+---
+
+## Round 13 implementation update - 2026-06-12
+
+Implemented and validated in the local working tree:
+
+- Hardened `scripts/kvarn/run_production_gate.ps1` with explicit diagnostic-env rejection, Tier 2 Qwen arg/layer/body-record propagation, and manifest fields for Tier 2 topology.
+- Hardened `scripts/kvarn/run_mainline_parity_matrix.ps1` with dirty-state/build metadata, exact command filenames, fallback-observed fields, KVarN layer set extraction, and expanded mixed-attn inner trace summary fields.
+- Made diagnostic KVarN CUDA env flags dynamic instead of cached for 256d warpqk/body-mirror and dequant-cache tracing.
+- Added 256d body-mirror scratch sizing across graph/runtime/test paths, but kept 256d body mirror disabled by default.
+- Added first-pass Qwen 256d boundary input dumping. Captured failing forced-256d call was `head_dim=256`, `n_queries=193`, `n_sink=128`, `n_records=0`, `n_pending=0`, `n_tail=65`, `mask_type=F32`; this is a no-body sink/tail batch shape, not a body-record dequant shape.
+- Tried broadening the no-body sink/tail batch kernel to 256d. Full Qwen3.6 packed-vs-split failed with NMSE `2.354e-02`, so this route was reverted and must remain disabled until a split-equivalent implementation exists.
+- Added 256d all-head pending-store routing for Qwen-style `n_head_kv=2`, including larger scratch sizing and backend support for strided body/scale destination views. Store trace now shows `n_heads=2` and 20 store ops for Qwen `pp512` instead of 40 per-head store ops.
+- Tuned Qwen 256d sinktail decode CTA size to 512 threads. This did not conclusively clear the `tg64` gate; keep measuring against variance.
+
+Validation completed:
+
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator self-test passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- Qwen2.5 CUDA smoke passed for contexts `256 512`, expected layers `0-27`.
+- Qwen3.6 MTP default true KVarN logits passed:
+  packed repeat NMSE `0`; packed-vs-split NMSE `0`; expected layers `3-39:4`; max body records `2`; `-ncmoe 34`.
+
+Current short parity measurements:
+
+- Qwen3.6 MTP true KVarN, no trace, `r=3`, `-ncmoe 34`, artifact `artifacts/kvarn-mainline-parity/20260612-115825`:
+  - `pp512`: mainline `206.39 t/s`, KVarN `213.05 t/s`, `103.2%` PASS in this run.
+  - `tg64`: mainline `42.31 t/s`, KVarN `36.06 t/s`, `85.2%` FAIL.
+- Qwen trace run, artifact `artifacts/kvarn-mainline-parity/20260612-115751`:
+  - `pp512` store trace shows 20 `kv:dim256/g128` store ops with `n_heads=2`.
+- Gemma 4 12B true KVarN+ISWA, forced with `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`, no trace, `r=3`, expected layers `5-47:6`, artifact `artifacts/kvarn-mainline-parity/20260612-115930`:
+  - `pp512`: mainline `2313.96 t/s`, KVarN `2035.20 t/s`, `88.0%` FAIL.
+  - `tg64`: mainline `66.42 t/s`, KVarN `66.32 t/s`, `99.8%` PASS.
+
+Current blockers:
+
+- Do not run 4k/4k production diagnostics yet. Qwen `tg64` and Gemma true KVarN+ISWA `pp512` are still below the 90% short gate.
+- Do not enable 256d warpqk or 256d no-body sink/tail batch by default. Forced 256d paths are still not packed-vs-split equivalent for full Qwen3.6 MTP.
+- Gemma fallback remains the production-safe default, but it is not a true KVarN+ISWA performance data point. True Gemma KVarN data requires `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`.
+
+Recommended next patches:
+
+- Qwen `tg64`: specialize or further tune `sinktail-decode` for the 256d, no-body, sink-only decode shape. Current traces show `sinktail-decode` only and zero body records.
+- Qwen `pp512`: repeat `r=5` no-trace and warmup/no-warmup A/B to confirm the 256d all-head store batching improvement survives variance.
+- Gemma true KVarN+ISWA `pp512`: continue the existing plan to batch multiple seal records for `n_head_kv == 1`, because Gemma still records two body seals per KVarN layer.

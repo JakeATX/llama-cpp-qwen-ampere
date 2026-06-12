@@ -38,8 +38,13 @@ static void require_cuda(cudaError_t err, const char * msg) {
     }
 }
 
-// Matches llama-graph kvarn_graph_attn_scratch_floats: the 512d warpqk path
-// dequantizes body K/V into the tail of the scores buffer.
+static bool env_enabled(const char * name) {
+    const char * env = std::getenv(name);
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+// Matches llama-graph kvarn_graph_attn_scratch_floats: the warpqk body-mirror
+// path dequantizes body K/V into the tail of the scores buffer.
 static size_t kvarn_test_attn_scores_floats(
         uint32_t n_tokens,
         uint32_t n_head_kv,
@@ -47,7 +52,7 @@ static size_t kvarn_test_attn_scores_floats(
         uint32_t head_dim,
         uint32_t group_size) {
     size_t result = n_tokens;
-    if (n_records > 0 && head_dim >= 512) {
+    if (n_records > 0 && (head_dim >= 512 || env_enabled("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR"))) {
         result += 2 * size_t(n_head_kv) * n_records * head_dim * group_size;
     }
     return result;

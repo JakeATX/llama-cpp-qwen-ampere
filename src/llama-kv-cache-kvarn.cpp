@@ -25,6 +25,11 @@ static bool is_power_of_2(uint32_t n) {
     return n != 0 && (n & (n - 1)) == 0;
 }
 
+static bool kvarn_env_flag_enabled(const char * name) {
+    const char * env = std::getenv(name);
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 #ifdef LLAMA_BUILD
 static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_override) {
     invalid_debug_override = false;
@@ -951,11 +956,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             const uint32_t n_records_w = std::min(n_body/params.group_size, n_records_alloc);
             const uint32_t n_pending = n_body%params.group_size;
             int64_t scratch_floats = int64_t(n_sink) + int64_t(n_records_w)*params.group_size + n_pending + n_tail;
-            static const bool ref_scratch = []() {
-                const char * env = std::getenv("LLAMA_KVARN_ATTN_REF_SCRATCH");
-                return env && env[0] == '1';
-            }();
-            if (n_records_alloc > 0 && (head_k >= 512 || ref_scratch)) {
+            const bool mirror_scratch = head_k >= 512 ||
+                kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_REF_SCRATCH") ||
+                (head_k == 256 && kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR"));
+            if (n_records_alloc > 0 && mirror_scratch) {
                 scratch_floats += 2*int64_t(n_head_kv)*int64_t(n_records_alloc)*int64_t(head_k)*int64_t(params.group_size);
             }
             st.attn_mixed_scratch = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, scratch_floats);
@@ -1455,8 +1459,9 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
     const size_t per_pipeline =
         tile_floats + 2*std::max<uint32_t>(view.head_dim_k, params.group_size);
     const size_t pipeline_scratch = view.head_dim_k >= 512 ? 2*per_pipeline : per_pipeline;
-    // 512d batch seal keeps transpose tiles plus pipelined K/V scratch in one buffer.
-    return view.head_dim_k >= 512 ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
+    // Batched pending-head seals keep transpose tiles plus K/V scratch in one buffer.
+    const bool needs_pending_head_tiles = view.head_dim_k >= 512 || (view.head_dim_k >= 256 && view.n_head_kv > 1);
+    return needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::build_body_store_scratch(ggml_context * ctx, int32_t il) const {

@@ -101,13 +101,11 @@ static int kvarn_env_qt_override() {
 }
 
 static bool kvarn_enable_256d_warpqk() {
-    static const bool enabled = kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK");
-    return enabled;
+    return kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK");
 }
 
 static bool kvarn_dequant_cache_trace_enabled() {
-    static const bool enabled = kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
-    return enabled;
+    return kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
 }
 
 static bool kvarn_attn_trace_enabled() {
@@ -123,8 +121,7 @@ static bool kvarn_attn_trace_claim() {
 }
 
 static int kvarn_dequant_cache_trace_limit() {
-    static const int limit = kvarn_env_int("LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT", 256);
-    return limit;
+    return kvarn_env_int("LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT", 256);
 }
 
 struct kvarn_aux_cuda_state {
@@ -3770,12 +3767,12 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         // packed-body address overhead even when all K/V are plain f16
         // sink/tail entries. Use one CTA per query head for decode across all
         // supported head dimensions; keep the batch sink/tail specialization
-        // scoped to the 512d path where it was validated.
+        // scoped to the 512d path where it is logits-equivalent to split.
         if (n_records == 0 && n_pending == 0) {
             if (n_queries == 1) {
                 // One CTA per head spreads decode attention across SMs.
                 // shared = q_sh[head_dim] + probs[n_tokens] + reduce[block]
-                const int decode_block = 128;
+                const int decode_block = head_dim <= 256 ? 512 : 128;
                 const size_t decode_shmem = (size_t(head_dim) + size_t(n_tokens) + size_t(decode_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
                 if (kvarn_cuda_dynamic_shmem_fits(decode_shmem)) {
                     kvarn_attn_mixed_f16_sinktail_decode_kernel<<<int(n_head), decode_block, decode_shmem, cuda_stream>>>(
@@ -3914,6 +3911,18 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         body_f16_stride_head_elems = anchored ? cap_elems_per_head : n_per_head;
                         used_f16_body_mirror = true;
                     }
+                }
+
+                if (head_dim == 256 && n_records > 0 &&
+                        kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR") &&
+                        scores_nelems > 0 &&
+                        !used_f16_body_mirror) {
+                    std::fprintf(stderr,
+                            "KVarN CUDA mixed-attn diagnostic error: LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR=1"
+                            " but body_mirror_used=0 (scores_nelems=%" PRId64 ", required_body_f16_elems=%zu)\n",
+                            scores_nelems,
+                            2*size_t(n_head_kv)*size_t(n_records)*size_t(group_size)*size_t(head_dim));
+                    std::abort();
                 }
 
                 const int warpqk_grid = warpqk_q8 ? int(((n_queries + 7)/8)*n_head) :

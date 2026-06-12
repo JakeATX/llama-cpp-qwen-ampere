@@ -365,7 +365,7 @@ static void test_runtime_metadata() {
     require(view256.layout_v.v_body_bytes == 8192, "256-dim KVarN layer view V body bytes");
     require(view256.scales_k->ne[0] == 640, "256-dim KVarN layer view scale K shape");
     require(view256.scales_v->ne[0] == 512, "256-dim KVarN layer view scale V shape");
-    require(cache256.body_store_scratch_floats(0) == 256*128 + 2*256, "256-dim KVarN body store scratch floats");
+    require(cache256.body_store_scratch_floats(0) == 2*256*128 + (256*128 + 2*256), "256-dim KVarN body store scratch floats");
 
     llama_hparams hparams512 = make_test_hparams(512);
     llama_kv_cache_kvarn cache512(nullptr, hparams512, params, false, 16, 4, 1, nullptr);

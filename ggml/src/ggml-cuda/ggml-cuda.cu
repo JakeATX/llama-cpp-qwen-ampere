@@ -87,6 +87,10 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -169,6 +173,47 @@ static bool ggml_cuda_kvarn_store_trace_claim() {
     return n_trace.fetch_add(1, std::memory_order_relaxed) < limit;
 }
 
+static std::atomic<uint64_t> g_ggml_cuda_kvarn_boundary_dump_count{0};
+
+static int ggml_cuda_kvarn_env_nonneg_int(const char * name, int default_value) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE || value < 0 ||
+            value > std::numeric_limits<int>::max()) {
+        GGML_ABORT("invalid KVarN CUDA environment integer %s=%s; expected non-negative integer", name, env);
+    }
+    return int(value);
+}
+
+static void ggml_cuda_kvarn_write_binary_file(const std::filesystem::path & path, const void * data, size_t nbytes) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        GGML_ABORT("failed to open KVarN boundary dump file %s", path.string().c_str());
+    }
+    f.write(reinterpret_cast<const char *>(data), std::streamsize(nbytes));
+    if (!f) {
+        GGML_ABORT("failed to write KVarN boundary dump file %s", path.string().c_str());
+    }
+}
+
+static void ggml_cuda_kvarn_copy_strided_rows(
+        std::vector<uint8_t> & dst,
+        const uint8_t * base,
+        size_t row_bytes,
+        size_t row_stride_bytes,
+        uint32_t n_rows) {
+    dst.assign(size_t(n_rows)*row_bytes, uint8_t(0));
+    for (uint32_t r = 0; r < n_rows; ++r) {
+        CUDA_CHECK(cudaMemcpy(dst.data() + size_t(r)*row_bytes, base + size_t(r)*row_stride_bytes, row_bytes, cudaMemcpyDeviceToHost));
+    }
+}
+
 static void ggml_cuda_kvarn_attn_trace_tensor(const char * name, const ggml_tensor * t) {
     if (t == nullptr) {
         std::fprintf(stderr, "  %-12s: null\n", name);
@@ -181,6 +226,149 @@ static void ggml_cuda_kvarn_attn_trace_tensor(const char * name, const ggml_tens
             t->ne[0], t->ne[1], t->ne[2], t->ne[3],
             t->nb[0], t->nb[1], t->nb[2], t->nb[3],
             t->data);
+}
+
+static void ggml_cuda_kvarn_maybe_dump_boundary(
+        const ggml_tensor * q,
+        const ggml_tensor * sink_tail_k,
+        const ggml_tensor * sink_tail_v,
+        const ggml_tensor * body_k,
+        const ggml_tensor * body_v,
+        const ggml_tensor * scales_k,
+        const ggml_tensor * scales_v,
+        const ggml_tensor * pending_k,
+        const ggml_tensor * pending_v,
+        const ggml_tensor * kq_mask,
+        const ggml_tensor * out,
+        int32_t n_sink,
+        int32_t n_records,
+        int32_t n_pending,
+        int32_t n_tail,
+        int32_t tail_start,
+        int32_t head_dim,
+        int32_t group_size,
+        int32_t key_bits,
+        int32_t value_bits,
+        uint32_t kq_mask_type,
+        float scale,
+        cudaStream_t stream) {
+    if (!ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_BOUNDARY_DUMP") || head_dim != 256) {
+        return;
+    }
+    GGML_UNUSED(value_bits);
+    const uint32_t n_tokens = uint32_t(n_sink + n_records*group_size + n_pending + n_tail);
+    const int min_tokens = ggml_cuda_kvarn_env_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_MIN_TOKENS", 0);
+    if (n_tokens < uint32_t(min_tokens)) {
+        return;
+    }
+
+    const uint64_t call_index = g_ggml_cuda_kvarn_boundary_dump_count.fetch_add(1, std::memory_order_relaxed);
+    const int limit = ggml_cuda_kvarn_env_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_LIMIT", 1);
+    if (limit >= 0 && call_index >= uint64_t(limit)) {
+        return;
+    }
+
+    const char * dir_env = std::getenv("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_DIR");
+    const std::filesystem::path root = dir_env != nullptr && dir_env[0] != '\0' ?
+        std::filesystem::path(dir_env) : std::filesystem::path("artifacts/kvarn-boundary/default");
+    std::ostringstream stem;
+    stem << "call_" << std::setw(6) << std::setfill('0') << call_index;
+    const std::filesystem::path dir = root / stem.str();
+    std::filesystem::create_directories(dir);
+
+    const uint32_t n_queries = uint32_t(out->ne[2]);
+    const uint32_t n_head = uint32_t(out->ne[1]);
+    const uint32_t n_head_kv = uint32_t(sink_tail_k->ne[1]);
+    const uint32_t n_gqa = n_head/n_head_kv;
+    const uint32_t selected_iq = std::min<uint32_t>(uint32_t(ggml_cuda_kvarn_env_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_IQ", 0)), n_queries - 1);
+    const uint32_t selected_ih = std::min<uint32_t>(uint32_t(ggml_cuda_kvarn_env_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_IH", 0)), n_head - 1);
+    const uint32_t selected_ikh = selected_ih/n_gqa;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<uint8_t> bytes;
+    const uint8_t * q_row = reinterpret_cast<const uint8_t *>(q->data) + size_t(selected_iq)*q->nb[2] + size_t(selected_ih)*q->nb[1];
+    ggml_cuda_kvarn_copy_strided_rows(bytes, q_row, size_t(head_dim)*sizeof(float), q->nb[0], 1);
+    ggml_cuda_kvarn_write_binary_file(dir / "q.bin", bytes.data(), bytes.size());
+
+    const uint8_t * out_row = reinterpret_cast<const uint8_t *>(out->data) + size_t(selected_iq)*out->nb[2] + size_t(selected_ih)*out->nb[1];
+    ggml_cuda_kvarn_copy_strided_rows(bytes, out_row, size_t(head_dim)*sizeof(float), out->nb[0], 1);
+    ggml_cuda_kvarn_write_binary_file(dir / "warpqk_out.bin", bytes.data(), bytes.size());
+
+    ggml_cuda_kvarn_copy_strided_rows(bytes, reinterpret_cast<const uint8_t *>(body_k->data) + size_t(selected_ikh)*body_k->nb[2], size_t(body_k->ne[0]), body_k->nb[1], uint32_t(n_records));
+    ggml_cuda_kvarn_write_binary_file(dir / "body_k.bin", bytes.data(), bytes.size());
+    ggml_cuda_kvarn_copy_strided_rows(bytes, reinterpret_cast<const uint8_t *>(body_v->data) + size_t(selected_ikh)*body_v->nb[2], size_t(body_v->ne[0]), body_v->nb[1], uint32_t(n_records));
+    ggml_cuda_kvarn_write_binary_file(dir / "body_v.bin", bytes.data(), bytes.size());
+    ggml_cuda_kvarn_copy_strided_rows(bytes, reinterpret_cast<const uint8_t *>(scales_k->data) + size_t(selected_ikh)*scales_k->nb[2], size_t(scales_k->ne[0])*sizeof(float), scales_k->nb[1], uint32_t(n_records));
+    ggml_cuda_kvarn_write_binary_file(dir / "scales_k.bin", bytes.data(), bytes.size());
+    ggml_cuda_kvarn_copy_strided_rows(bytes, reinterpret_cast<const uint8_t *>(scales_v->data) + size_t(selected_ikh)*scales_v->nb[2], size_t(scales_v->ne[0])*sizeof(float), scales_v->nb[1], uint32_t(n_records));
+    ggml_cuda_kvarn_write_binary_file(dir / "scales_v.bin", bytes.data(), bytes.size());
+    ggml_cuda_kvarn_copy_strided_rows(bytes, reinterpret_cast<const uint8_t *>(pending_k->data) + size_t(selected_ikh)*pending_k->nb[1], size_t(head_dim)*sizeof(float), pending_k->nb[2], uint32_t(n_pending));
+    ggml_cuda_kvarn_write_binary_file(dir / "pending_k.bin", bytes.data(), bytes.size());
+    ggml_cuda_kvarn_copy_strided_rows(bytes, reinterpret_cast<const uint8_t *>(pending_v->data) + size_t(selected_ikh)*pending_v->nb[1], size_t(head_dim)*sizeof(float), pending_v->nb[2], uint32_t(n_pending));
+    ggml_cuda_kvarn_write_binary_file(dir / "pending_v.bin", bytes.data(), bytes.size());
+
+    const size_t f16_row_bytes = size_t(head_dim)*sizeof(uint16_t);
+    std::vector<uint8_t> sink_tail_bytes(size_t(uint32_t(n_sink) + uint32_t(n_tail))*f16_row_bytes, uint8_t(0));
+    for (uint32_t t = 0; t < uint32_t(n_sink); ++t) {
+        const uint8_t * src = reinterpret_cast<const uint8_t *>(sink_tail_k->data) + size_t(selected_ikh)*sink_tail_k->nb[1] + size_t(t)*sink_tail_k->nb[2];
+        CUDA_CHECK(cudaMemcpy(sink_tail_bytes.data() + size_t(t)*f16_row_bytes, src, f16_row_bytes, cudaMemcpyDeviceToHost));
+    }
+    for (uint32_t t = 0; t < uint32_t(n_tail); ++t) {
+        const uint32_t tail_slot = uint32_t(n_tail) == 0 ? 0 : (uint32_t(tail_start) + t)%uint32_t(n_tail);
+        const uint8_t * src = reinterpret_cast<const uint8_t *>(sink_tail_k->data) + size_t(selected_ikh)*sink_tail_k->nb[1] + size_t(uint32_t(n_sink) + tail_slot)*sink_tail_k->nb[2];
+        CUDA_CHECK(cudaMemcpy(sink_tail_bytes.data() + size_t(uint32_t(n_sink) + t)*f16_row_bytes, src, f16_row_bytes, cudaMemcpyDeviceToHost));
+    }
+    ggml_cuda_kvarn_write_binary_file(dir / "sink_tail_k_f16.bin", sink_tail_bytes.data(), sink_tail_bytes.size());
+    for (uint32_t t = 0; t < uint32_t(n_sink); ++t) {
+        const uint8_t * src = reinterpret_cast<const uint8_t *>(sink_tail_v->data) + size_t(selected_ikh)*sink_tail_v->nb[1] + size_t(t)*sink_tail_v->nb[2];
+        CUDA_CHECK(cudaMemcpy(sink_tail_bytes.data() + size_t(t)*f16_row_bytes, src, f16_row_bytes, cudaMemcpyDeviceToHost));
+    }
+    for (uint32_t t = 0; t < uint32_t(n_tail); ++t) {
+        const uint32_t tail_slot = uint32_t(n_tail) == 0 ? 0 : (uint32_t(tail_start) + t)%uint32_t(n_tail);
+        const uint8_t * src = reinterpret_cast<const uint8_t *>(sink_tail_v->data) + size_t(selected_ikh)*sink_tail_v->nb[1] + size_t(uint32_t(n_sink) + tail_slot)*sink_tail_v->nb[2];
+        CUDA_CHECK(cudaMemcpy(sink_tail_bytes.data() + size_t(uint32_t(n_sink) + t)*f16_row_bytes, src, f16_row_bytes, cudaMemcpyDeviceToHost));
+    }
+    ggml_cuda_kvarn_write_binary_file(dir / "sink_tail_v_f16.bin", sink_tail_bytes.data(), sink_tail_bytes.size());
+
+    if (kq_mask != nullptr) {
+        const size_t mask_elem_bytes = kq_mask->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+        bytes.assign(size_t(n_tokens)*mask_elem_bytes, uint8_t(0));
+        const uint8_t * mask_row = reinterpret_cast<const uint8_t *>(kq_mask->data) + size_t(selected_iq)*kq_mask->nb[1];
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            CUDA_CHECK(cudaMemcpy(bytes.data() + size_t(t)*mask_elem_bytes, mask_row + size_t(t)*kq_mask->nb[0], mask_elem_bytes, cudaMemcpyDeviceToHost));
+        }
+        ggml_cuda_kvarn_write_binary_file(dir / "mask.bin", bytes.data(), bytes.size());
+    }
+
+    std::ofstream json(dir / "boundary.json");
+    json << "{\n";
+    json << "  \"version\": 1,\n";
+    json << "  \"mode\": \"qwen36-256d-boundary-input\",\n";
+    json << "  \"head_dim\": " << head_dim << ",\n";
+    json << "  \"group_size\": " << group_size << ",\n";
+    json << "  \"key_bits\": " << key_bits << ",\n";
+    json << "  \"value_bits\": " << value_bits << ",\n";
+    json << "  \"n_queries\": " << n_queries << ",\n";
+    json << "  \"n_head\": " << n_head << ",\n";
+    json << "  \"n_head_kv\": " << n_head_kv << ",\n";
+    json << "  \"selected_iq\": " << selected_iq << ",\n";
+    json << "  \"selected_ih\": " << selected_ih << ",\n";
+    json << "  \"selected_ikh\": " << selected_ikh << ",\n";
+    json << "  \"n_sink\": " << n_sink << ",\n";
+    json << "  \"n_records\": " << n_records << ",\n";
+    json << "  \"n_pending\": " << n_pending << ",\n";
+    json << "  \"n_tail\": " << n_tail << ",\n";
+    json << "  \"tail_start\": " << tail_start << ",\n";
+    json << "  \"n_tokens\": " << n_tokens << ",\n";
+    json << "  \"scale\": " << std::setprecision(9) << scale << ",\n";
+    json << "  \"mask_type\": " << kq_mask_type << ",\n";
+    json << "  \"call_index\": " << call_index << "\n";
+    json << "}\n";
+    json.close();
+
+    std::fprintf(stderr,
+            "KVarN boundary dump: call=%" PRIu64 " iq=%u ih=%u ikh=%u tokens=%u records=%d path=%s\n",
+            call_index, selected_iq, selected_ih, selected_ikh, n_tokens, n_records, dir.string().c_str());
 }
 
 [[noreturn]]
@@ -3398,6 +3586,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             }(),
                             dst->src[3]->ne[1]);
                 }
+                ggml_cuda_kvarn_maybe_dump_boundary(
+                        q, sink_tail_k, sink_tail_v, body_k, body_v, scales_k, scales_v,
+                        pending_k, pending_v, kq_mask, dst,
+                        params.n_sink, params.n_records, params.n_pending, params.n_tail,
+                        params.tail_start, params.head_dim, params.group_size,
+                        params.key_bits, params.value_bits, kq_mask_type, params.scale,
+                        ctx.stream());
             } break;
         case GGML_OP_TURBO_WHT:
             ggml_cuda_turbo_wht(ctx, dst);
@@ -5914,9 +6109,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) ||
-                        !ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[2]) ||
-                        !ggml_is_contiguous(op->src[3]) || !ggml_is_contiguous(op->src[4]) ||
-                        !ggml_is_contiguous(op->src[5]) || !ggml_is_contiguous(op->src[6])) {
+                        !ggml_is_contiguous(op->src[4])) {
+                    return false;
+                }
+                if (params.n_heads <= 1 && (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[2]) ||
+                        !ggml_is_contiguous(op->src[3]) || !ggml_is_contiguous(op->src[5]) ||
+                        !ggml_is_contiguous(op->src[6]))) {
                     return false;
                 }
 
@@ -6025,7 +6223,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 int64_t scratch_floats = n_kv;
                 if (params.n_records > 0 &&
-                        (params.head_dim >= 512 || ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH"))) {
+                        (params.head_dim >= 512 ||
+                         ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH") ||
+                         (params.head_dim == 256 && ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR")))) {
                     scratch_floats += 2*op->src[1]->ne[1]*int64_t(params.n_records)*params.head_dim*params.group_size;
                 }
                 const int64_t k_body_bytes = (int64_t)(((size_t) params.head_dim*params.group_size*params.key_bits + 7)/8);

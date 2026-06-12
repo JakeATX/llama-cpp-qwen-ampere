@@ -143,9 +143,40 @@ function Get-MaxKvarnBodyRecords([string] $text) {
     return $maxRecords
 }
 
+function Get-KvarnLayerSet([string] $text) {
+    $actual = New-Object 'System.Collections.Generic.SortedSet[int]'
+    foreach ($m in [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer\s+([0-9]+)")) {
+        [void] $actual.Add([int] $m.Groups[1].Value)
+    }
+    return (($actual | ForEach-Object { [string] $_ }) -join ",")
+}
+
 function Get-KvarnTraceSummary([string] $text) {
     $modeCounts = @{}
     $shapeCounts = @{}
+    $innerModeCounts = @{}
+    $innerQtCounts = @{}
+    $innerMirrorAllowedCounts = @{}
+    $innerMirrorUsedCounts = @{}
+    $innerQueryCounts = @{}
+    $innerHeadCounts = @{}
+    $innerHeadKvCounts = @{}
+    $innerGqaCounts = @{}
+    $innerSinkCounts = @{}
+    $innerRecordCounts = @{}
+    $innerPendingCounts = @{}
+    $innerTailCounts = @{}
+    $innerTailStartCounts = @{}
+    $innerHeadDimCounts = @{}
+    $innerTokenCounts = @{}
+    $innerBlockCounts = @{}
+    $innerGridCounts = @{}
+    $innerShmemCounts = @{}
+    $innerBodyRecordsCapCounts = @{}
+    $innerMaskTypeCounts = @{}
+    $innerMaskStrideQueryCounts = @{}
+    $innerMaskStrideTokenCounts = @{}
+    $innerScoresElemsCounts = @{}
 
     foreach ($m in [regex]::Matches(
             $text,
@@ -173,6 +204,50 @@ function Get-KvarnTraceSummary([string] $text) {
         $shapeCounts[$shape]++
     }
 
+    foreach ($m in [regex]::Matches(
+            $text,
+            "KVarN CUDA mixed-attn inner trace:\s+mode=([^\s]+)\s+head_dim=([0-9]+)\s+n_queries=([0-9]+)\s+n_head=([0-9]+)\s+n_head_kv=([0-9]+)\s+n_gqa=([0-9]+)\s+sink=([0-9]+)\s+records=([0-9]+)\s+pending=([0-9]+)\s+tail=([0-9]+)\s+tail_start=([0-9]+)\s+tokens=([0-9]+)\s+qt=([0-9]+)\s+block=([0-9]+)\s+grid=([0-9]+)\s+shmem=([0-9]+)\s+scores_nelems=([0-9]+)\s+body_records_cap=([0-9-]+)\s+body_mirror_allowed=([01])\s+body_mirror_used=([01])\s+kq_mask_type=([0-9]+)\s+kq_mask_stride_query_bytes=([0-9]+)\s+kq_mask_stride_token_bytes=([0-9]+)")) {
+        $fields = @(
+            @($innerModeCounts, $m.Groups[1].Value),
+            @($innerQueryCounts, $m.Groups[3].Value),
+            @($innerHeadCounts, $m.Groups[4].Value),
+            @($innerHeadKvCounts, $m.Groups[5].Value),
+            @($innerGqaCounts, $m.Groups[6].Value),
+            @($innerSinkCounts, $m.Groups[7].Value),
+            @($innerRecordCounts, $m.Groups[8].Value),
+            @($innerPendingCounts, $m.Groups[9].Value),
+            @($innerTailCounts, $m.Groups[10].Value),
+            @($innerTailStartCounts, $m.Groups[11].Value),
+            @($innerHeadDimCounts, $m.Groups[2].Value),
+            @($innerTokenCounts, $m.Groups[12].Value),
+            @($innerQtCounts, $m.Groups[13].Value),
+            @($innerBlockCounts, $m.Groups[14].Value),
+            @($innerGridCounts, $m.Groups[15].Value),
+            @($innerShmemCounts, $m.Groups[16].Value),
+            @($innerScoresElemsCounts, $m.Groups[17].Value),
+            @($innerBodyRecordsCapCounts, $m.Groups[18].Value),
+            @($innerMirrorAllowedCounts, $m.Groups[19].Value),
+            @($innerMirrorUsedCounts, $m.Groups[20].Value),
+            @($innerMaskTypeCounts, $m.Groups[21].Value),
+            @($innerMaskStrideQueryCounts, $m.Groups[22].Value),
+            @($innerMaskStrideTokenCounts, $m.Groups[23].Value)
+        )
+        foreach ($field in $fields) {
+            $table = $field[0]
+            $key = $field[1]
+            if (-not $table.ContainsKey($key)) {
+                $table[$key] = 0
+            }
+            $table[$key]++
+        }
+    }
+
+    function Format-Counts([hashtable] $counts) {
+        return ($counts.GetEnumerator() |
+            Sort-Object Name |
+            ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }) -join "; "
+    }
+
     $modes = $modeCounts.GetEnumerator() |
         Sort-Object Name |
         ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }
@@ -184,6 +259,42 @@ function Get-KvarnTraceSummary([string] $text) {
     return [pscustomobject]@{
         Modes = ($modes -join "; ")
         Shapes = ($shapes -join "; ")
+        InnerModes = Format-Counts $innerModeCounts
+        InnerNQueries = Format-Counts $innerQueryCounts
+        InnerNHead = Format-Counts $innerHeadCounts
+        InnerNHeadKv = Format-Counts $innerHeadKvCounts
+        InnerNGqa = Format-Counts $innerGqaCounts
+        InnerSink = Format-Counts $innerSinkCounts
+        InnerRecords = Format-Counts $innerRecordCounts
+        InnerPending = Format-Counts $innerPendingCounts
+        InnerTail = Format-Counts $innerTailCounts
+        InnerTailStart = Format-Counts $innerTailStartCounts
+        InnerQT = Format-Counts $innerQtCounts
+        InnerBodyMirrorAllowed = Format-Counts $innerMirrorAllowedCounts
+        InnerBodyMirrorUsed = Format-Counts $innerMirrorUsedCounts
+        InnerHeadDim = Format-Counts $innerHeadDimCounts
+        InnerTokens = Format-Counts $innerTokenCounts
+        InnerBlock = Format-Counts $innerBlockCounts
+        InnerGrid = Format-Counts $innerGridCounts
+        InnerShmem = Format-Counts $innerShmemCounts
+        InnerBodyRecordsCap = Format-Counts $innerBodyRecordsCapCounts
+        InnerMaskType = Format-Counts $innerMaskTypeCounts
+        InnerMaskStrideQuery = Format-Counts $innerMaskStrideQueryCounts
+        InnerMaskStrideToken = Format-Counts $innerMaskStrideTokenCounts
+        InnerScoresElems = Format-Counts $innerScoresElemsCounts
+    }
+}
+
+function Get-GitDirty([string] $RepoRoot) {
+    if (-not (Test-Path -LiteralPath $RepoRoot)) {
+        return "unknown"
+    }
+    Push-Location $RepoRoot
+    try {
+        $status = git status --porcelain 2>$null
+        return ($(if ($status) { "true" } else { "false" }))
+    } finally {
+        Pop-Location
     }
 }
 
@@ -362,6 +473,7 @@ function Invoke-BenchRow {
     return [pscustomobject]@{
         Throughput = $tps
         Log = (Split-Path -Leaf $logPath)
+        Command = (Split-Path -Leaf $cmdPath)
         Text = $text
         CudaDevice = Get-CudaDeviceSummary $text
         MaxBodyRecords = Get-MaxKvarnBodyRecords $text
@@ -392,13 +504,18 @@ $manifest = @(
     "model=$modelPath",
     "mainline_repo=$mainlineRoot",
     "mainline_head=$(Get-GitHead $mainlineRoot)",
+    "mainline_dirty=$(Get-GitDirty $mainlineRoot)",
     "kvarn_repo=$repoRoot",
     "kvarn_head=$(Get-GitHead $repoRoot)",
+    "kvarn_dirty=$(Get-GitDirty $repoRoot)",
     "mainline_build=$MainlineBuildDir",
     "kvarn_build=$KvarnBuildDir",
+    "mainline_bench=$mainlineBench",
+    "kvarn_bench=$kvarnBench",
     "case_list=$CaseList",
     "min_parity_ratio=$MinParityRatio",
     "repetitions=$Repetitions",
+    "warmup=$($Warmup.IsPresent)",
     "flash_attn=$FlashAttn",
     "kvarn_preset=$KvarnPreset",
     "kvarn_iters=$KvarnIters",
@@ -497,17 +614,45 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         KvarnTps = $kvarnRow.Throughput
         KvarnVsMainline = $ratio
         GateThreshold = $MinParityRatio
-        KvarnFallbackAllowed = $AllowKvarnFallback.IsPresent -and -not $hasKvarnCache
+        KvarnFallbackAllowed = $AllowKvarnFallback.IsPresent
+        KvarnFallbackObserved = -not $hasKvarnCache
         GatePass = $gatePass
         CudaDevice = if (-not [string]::IsNullOrWhiteSpace($kvarnRow.CudaDevice)) { $kvarnRow.CudaDevice } else { $mainlineRow.CudaDevice }
         MaxKvarnBodyRecords = $kvarnRow.MaxBodyRecords
+        ExpectedKvarnLayers = $ExpectedKvarnLayers
+        ActualKvarnLayers = Get-KvarnLayerSet $kvarnRow.Text
         TraceModes = $kvarnRow.AttnTrace.Modes
         TraceShapes = $kvarnRow.AttnTrace.Shapes
+        InnerTraceModes = $kvarnRow.AttnTrace.InnerModes
+        InnerTraceNQueries = $kvarnRow.AttnTrace.InnerNQueries
+        InnerTraceNHead = $kvarnRow.AttnTrace.InnerNHead
+        InnerTraceNHeadKv = $kvarnRow.AttnTrace.InnerNHeadKv
+        InnerTraceNGqa = $kvarnRow.AttnTrace.InnerNGqa
+        InnerTraceSink = $kvarnRow.AttnTrace.InnerSink
+        InnerTraceRecords = $kvarnRow.AttnTrace.InnerRecords
+        InnerTracePending = $kvarnRow.AttnTrace.InnerPending
+        InnerTraceTail = $kvarnRow.AttnTrace.InnerTail
+        InnerTraceTailStart = $kvarnRow.AttnTrace.InnerTailStart
+        InnerTraceQT = $kvarnRow.AttnTrace.InnerQT
+        InnerTraceBodyMirrorAllowed = $kvarnRow.AttnTrace.InnerBodyMirrorAllowed
+        InnerTraceBodyMirrorUsed = $kvarnRow.AttnTrace.InnerBodyMirrorUsed
+        InnerTraceHeadDim = $kvarnRow.AttnTrace.InnerHeadDim
+        InnerTraceTokens = $kvarnRow.AttnTrace.InnerTokens
+        InnerTraceBlock = $kvarnRow.AttnTrace.InnerBlock
+        InnerTraceGrid = $kvarnRow.AttnTrace.InnerGrid
+        InnerTraceShmem = $kvarnRow.AttnTrace.InnerShmem
+        InnerTraceBodyRecordsCap = $kvarnRow.AttnTrace.InnerBodyRecordsCap
+        InnerTraceMaskType = $kvarnRow.AttnTrace.InnerMaskType
+        InnerTraceMaskStrideQuery = $kvarnRow.AttnTrace.InnerMaskStrideQuery
+        InnerTraceMaskStrideToken = $kvarnRow.AttnTrace.InnerMaskStrideToken
+        InnerTraceScoresElems = $kvarnRow.AttnTrace.InnerScoresElems
         StoreTraceKinds = $kvarnRow.StoreTrace.Kinds
         StoreTraceShapes = $kvarnRow.StoreTrace.Shapes
         DequantCacheTrace = $kvarnRow.DequantCacheTrace
         MainlineLog = $mainlineRow.Log
         KvarnLog = $kvarnRow.Log
+        MainlineCommand = $mainlineRow.Command
+        KvarnCommand = $kvarnRow.Command
     }
 }
 

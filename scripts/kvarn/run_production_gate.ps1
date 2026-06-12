@@ -13,7 +13,12 @@ param(
     [switch] $RunTier2,
     [Alias("LogitsModel")]
     [string] $Tier2Model = "",
-    [string[]] $QwenExtraArgs = @("-ncmoe", "34")
+    [string[]] $Tier2ExtraArgs = @(),
+    [int] $Tier2MinKvarnLayerLogs = -1,
+    [string] $Tier2ExpectedKvarnLayers = "",
+    [string[]] $QwenExtraArgs = @("-ncmoe", "34"),
+    [int] $Tier2MinKvarnBodyRecords = 1,
+    [switch] $AllowDiagnosticEnv
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +46,45 @@ if ($RunTier2.IsPresent -and [string]::IsNullOrWhiteSpace($Tier2Model)) {
 }
 if ($RunTier2.IsPresent -and -not (Test-Path -LiteralPath $Tier2Model)) {
     throw "Tier2Model not found at $Tier2Model"
+}
+if ($Tier2MinKvarnBodyRecords -lt 0) {
+    throw "Tier2MinKvarnBodyRecords must be non-negative"
+}
+if ($Tier2MinKvarnLayerLogs -lt -1) {
+    throw "Tier2MinKvarnLayerLogs must be -1 for auto or non-negative"
+}
+
+$unsafeDiagnosticEnv = @(
+    "LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK",
+    "LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR",
+    "LLAMA_KVARN_ATTN_WARPQK_FORCE_QT",
+    "LLAMA_KVARN_ATTN_SPLIT_KERNELS",
+    "LLAMA_KVARN_ATTN_SERIAL_FUSED",
+    "LLAMA_KVARN_ATTN_REF_SCRATCH",
+    "LLAMA_KVARN_ATTN_FUSED_BATCH",
+    "LLAMA_KVARN_ATTN_DECODE_PER_HEAD",
+    "LLAMA_KVARN_ATTN_TRACE",
+    "LLAMA_KVARN_ATTN_TRACE_LIMIT",
+    "LLAMA_KVARN_STORE_TRACE",
+    "LLAMA_KVARN_STORE_TRACE_LIMIT",
+    "LLAMA_KVARN_DEQUANT_CACHE_TRACE",
+    "LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT",
+    "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK",
+    "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH",
+    "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA",
+    "LLAMA_KVARN_DEBUG_UBATCH"
+)
+if (-not $AllowDiagnosticEnv.IsPresent) {
+    $leaked = @()
+    foreach ($name in $unsafeDiagnosticEnv) {
+        $value = [Environment]::GetEnvironmentVariable($name, "Process")
+        if (-not [string]::IsNullOrEmpty($value)) {
+            $leaked += ("{0}={1}" -f $name, $value)
+        }
+    }
+    if ($leaked.Count -gt 0) {
+        throw ("Production gate refuses to run with diagnostic env vars set. Clear them or pass -AllowDiagnosticEnv for an explicit diagnostic run:`n" + ($leaked -join "`n"))
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
@@ -110,6 +154,25 @@ if ($qwenNcmoeIdx -lt 0) {
     throw "Qwen production gate requires -ncmoe 34 so the expected KVarN layer set remains 3-39:4"
 }
 
+$tier2EffectiveExtraArgs = @($Tier2ExtraArgs)
+$tier2EffectiveExpectedLayers = $Tier2ExpectedKvarnLayers
+$tier2EffectiveMinLayerLogs = $Tier2MinKvarnLayerLogs
+$tier2ResolvedModel = if ($RunTier2.IsPresent) { (Resolve-Path -LiteralPath $Tier2Model).Path } else { "" }
+$qwenResolvedModel = (Resolve-Path -LiteralPath $QwenModel).Path
+if ($RunTier2.IsPresent -and $tier2ResolvedModel -eq $qwenResolvedModel) {
+    if ($tier2EffectiveExtraArgs.Count -eq 0) {
+        $tier2EffectiveExtraArgs = @($qwenEffectiveExtraArgs)
+    }
+    if ([string]::IsNullOrWhiteSpace($tier2EffectiveExpectedLayers)) {
+        $tier2EffectiveExpectedLayers = "3-39:4"
+    }
+    if ($tier2EffectiveMinLayerLogs -lt 0) {
+        $tier2EffectiveMinLayerLogs = 10
+    }
+} elseif ($tier2EffectiveMinLayerLogs -lt 0) {
+    $tier2EffectiveMinLayerLogs = 1
+}
+
 $manifest = @(
     "qwen_model=$((Resolve-Path -LiteralPath $QwenModel).Path)",
     "gemma_model=$((Resolve-Path -LiteralPath $GemmaModel).Path)",
@@ -121,6 +184,11 @@ $manifest = @(
     "run_gemma_experimental=$($RunGemmaExperimental.IsPresent)",
     "run_tier2=$($RunTier2.IsPresent)",
     "tier2_model=$Tier2Model",
+    "tier2_extra_args=$($tier2EffectiveExtraArgs -join ' ')",
+    "tier2_expected_kvarn_layers=$tier2EffectiveExpectedLayers",
+    "tier2_min_kvarn_layer_logs=$tier2EffectiveMinLayerLogs",
+    "tier2_min_kvarn_body_records=$Tier2MinKvarnBodyRecords",
+    "allow_diagnostic_env=$($AllowDiagnosticEnv.IsPresent)",
     "qwen_extra_args=$($qwenEffectiveExtraArgs -join ' ')",
     "qwen_expected_kvarn_layers=3-39:4",
     "gemma_production_mode=normal-iswa-fallback",
@@ -219,7 +287,11 @@ if ($RunTier2.IsPresent) {
             -ScratchMaxNmse 1e-5 `
             -SplitMaxNmse 1e-5 `
             -RepeatMaxNmse 1e-12 `
-            -FlashAttn off
+            -FlashAttn off `
+            -MinKvarnLayerLogs $tier2EffectiveMinLayerLogs `
+            -MinKvarnBodyRecords $Tier2MinKvarnBodyRecords `
+            -ExpectedKvarnLayers $tier2EffectiveExpectedLayers `
+            -ExtraArgs @($tier2EffectiveExtraArgs)
     }
 }
 

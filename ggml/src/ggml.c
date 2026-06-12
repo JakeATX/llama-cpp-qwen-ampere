@@ -4091,10 +4091,6 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
     GGML_ASSERT(rtn_quantile > 0.0f && rtn_quantile <= 1.0f);
     GGML_ASSERT(ggml_is_contiguous(k_tile));
     GGML_ASSERT(ggml_is_contiguous(v_tile));
-    GGML_ASSERT(ggml_is_contiguous(k_body));
-    GGML_ASSERT(ggml_is_contiguous(v_body));
-    GGML_ASSERT(ggml_is_contiguous(k_scales));
-    GGML_ASSERT(ggml_is_contiguous(v_scales));
     GGML_ASSERT(ggml_is_contiguous(scratch));
     GGML_ASSERT(ggml_nelements(k_tile) == (int64_t) head_dim*group_size);
     GGML_ASSERT(ggml_nelements(v_tile) == (int64_t) head_dim*group_size);
@@ -4181,10 +4177,6 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
     GGML_ASSERT(rtn_quantile > 0.0f && rtn_quantile <= 1.0f);
     GGML_ASSERT(ggml_is_contiguous(pending_k));
     GGML_ASSERT(ggml_is_contiguous(pending_v));
-    GGML_ASSERT(ggml_is_contiguous(k_body));
-    GGML_ASSERT(ggml_is_contiguous(v_body));
-    GGML_ASSERT(ggml_is_contiguous(k_scales));
-    GGML_ASSERT(ggml_is_contiguous(v_scales));
     GGML_ASSERT(ggml_is_contiguous(scratch));
     GGML_ASSERT(pending_k->ne[0] == head_dim);
     GGML_ASSERT(pending_v->ne[0] == head_dim);

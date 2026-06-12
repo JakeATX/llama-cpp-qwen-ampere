@@ -808,6 +808,14 @@ static bool kvarn_graph_use_attn_scratch_ref() {
     return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
 }
 
+static bool kvarn_graph_use_attn_f16_body_mirror(int64_t head_dim) {
+    if (head_dim >= 512) {
+        return true;
+    }
+    return head_dim == 256 &&
+        kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR");
+}
+
 static bool kvarn_graph_reuse_unsafe_forced_512_fused(
         const kvarn_active_window & window,
         const ggml_tensor * node) {
@@ -834,7 +842,7 @@ static int64_t kvarn_graph_attn_scratch_floats(
         int64_t group_size) {
     int64_t result = window.n_kv;
     if (n_records_scratch > 0 &&
-            (kvarn_graph_use_attn_scratch_ref() || head_dim >= 512)) {
+            (kvarn_graph_use_attn_scratch_ref() || kvarn_graph_use_attn_f16_body_mirror(head_dim))) {
         result += 2*n_head_kv*n_records_scratch*head_dim*group_size;
     }
     return result;
@@ -3066,7 +3074,7 @@ ggml_tensor * llm_graph_context::build_attn(
                         throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
                     }
 
-                    if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
+                    if (layer.head_dim_k >= 256 && layer.n_head_kv > 1) {
                         ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads_from_pending(
                                     ctx0, body_store_scratch, il, seal_record));
                     } else {
@@ -3526,7 +3534,7 @@ ggml_tensor * llm_graph_context::build_attn(
                         throw std::runtime_error("KVarN+ISWA graph backend attempted to seal a body record outside cache capacity");
                     }
 
-                    if (layer.head_dim_k >= 512 && layer.n_head_kv > 1) {
+                    if (layer.head_dim_k >= 256 && layer.n_head_kv > 1) {
                         ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads_from_pending(
                                     ctx0, body_store_scratch, il, seal_record));
                     } else {
