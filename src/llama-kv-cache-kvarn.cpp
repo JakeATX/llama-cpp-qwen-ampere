@@ -1458,7 +1458,7 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
     const size_t tile_floats = size_t(view.head_dim_k)*params.group_size;
     const size_t per_pipeline =
         tile_floats + 2*std::max<uint32_t>(view.head_dim_k, params.group_size);
-    const size_t pipeline_scratch = view.head_dim_k >= 512 ? 2*per_pipeline : per_pipeline;
+    const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
     // Batched pending-head seals keep transpose tiles plus K/V scratch in one buffer.
     const bool needs_pending_head_tiles = view.head_dim_k >= 512 || (view.head_dim_k >= 256 && view.n_head_kv > 1);
     return needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;

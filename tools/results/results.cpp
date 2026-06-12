@@ -7,6 +7,8 @@
 #include "log.h"
 
 #include <cstdint>
+#include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -20,8 +22,19 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
         float a_i = a[i];
         float b_i = b[i];
 
+        if (!std::isfinite(a_i) || !std::isfinite(b_i)) {
+            if (a_i == b_i) {
+                continue;
+            }
+            return std::numeric_limits<double>::infinity();
+        }
+
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
+    }
+
+    if (mse_a_0 == 0.0) {
+        return mse_a_b == 0.0 ? 0.0 : std::numeric_limits<double>::infinity();
     }
 
     return mse_a_b / mse_a_0;

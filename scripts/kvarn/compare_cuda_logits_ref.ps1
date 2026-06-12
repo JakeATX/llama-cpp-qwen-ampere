@@ -266,7 +266,7 @@ function Assert-NmseThreshold([double] $value, [double] $threshold, [string] $la
         return
     }
     if ([double]::IsNaN($value)) {
-        return
+        throw ("{0} logits produced NaN NMSE, threshold = {1:E3}" -f $label, $threshold)
     }
     if ([double]::IsInfinity($value) -or $value -gt $threshold) {
         throw ("{0} logits exceeded NMSE threshold: NMSE = {1:E3}, threshold = {2:E3}" -f $label, $value, $threshold)

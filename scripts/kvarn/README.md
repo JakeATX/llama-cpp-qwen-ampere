@@ -1561,3 +1561,65 @@ they do not match the production constraints. Expected guarded failures include
 K/V head dimensions other than 128, 256, or 512, asymmetric K/V head
 dimensions, MLA, non-Gemma SWA/ISWA, unsupported backend placement, attention
 rotations/KQ bias/sinks, and other explicit KVarN graph-backend guards.
+
+### Round 17 production-parity status
+
+Current required production targets remain Gemma 4 12B true KVarN+ISWA and
+Qwen3.6 35B A3B MTP KVarN, each at `>= 90%` of upstream/mainline for `pp512`
+and `tg64`. Do not count Gemma normal-ISWA fallback as a production KVarN data
+point.
+
+Accepted local changes in this round:
+- `llama-results` NMSE is now finite-aware. Matching `-inf` logits are skipped,
+  mismatched non-finite values fail as infinity, and all-zero denominators only
+  produce zero NMSE when the numerator is also zero.
+- `compare_cuda_logits_ref.ps1` now fails thresholded comparisons on `NaN`
+  NMSE instead of silently passing.
+- The CUDA K/V body-store pipeline now applies to `head_dim >= 256`, not only
+  `head_dim >= 512`; scratch sizing and `test-kvarn-kv` expectations were
+  updated accordingly.
+
+Rejected local experiments:
+- The direct-current seal prototype was logits-clean for Qwen but did not
+  improve Qwen pp512/tg64 and had already failed to improve Gemma pp512. It was
+  removed from the content diff.
+- 256d warp-QK remains non-production. With
+  `LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK=1`,
+  `LLAMA_KVARN_ATTN_WARPQK_FORCE_QT=1`, and no 256d body mirror, Qwen3.6
+  packed-vs-split failed at `NMSE = 4.185e-03`. Because QT=1 and no mirror
+  still fail, the first bug is in the 256d warp-QK math/mask/order path, not in
+  Q-tiling or the f16 mirror.
+
+Latest focused validation after cleanup:
+- `cmake --build build-kvarn-cuda-static-vs --config Release --target
+  llama-bench llama-results test-kvarn-cuda-scratch-ref test-kvarn-kv -j 8`
+  passed.
+- `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R
+  "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure"
+  --output-on-failure` passed all 6 tests.
+- `python scripts/kvarn/kv_memory_estimate.py --self-test` passed.
+- Qwen3.6 MTP strict logits after the 256d store patch passed exact KVarN
+  layers `3,7,11,15,19,23,27,31,35,39`, max body records `2`,
+  packed-repeat `NMSE = 0.000E+000`, and packed-vs-split
+  `NMSE = 0.000E+000`.
+
+Latest short parity measurements:
+- Gemma true KVarN+ISWA, `round17-gemma-true-pipelined256-r3`:
+  `pp512 = 2025.05 / 2282.45 = 88.7%` fail, `tg64 = 65.47 / 65.74 = 99.6%`
+  pass.
+- Qwen3.6 MTP, `round17-qwen-pipelined256-kvarnfirst-r5`:
+  `pp512 = 236.44 / 367.28 = 64.4%` fail, `tg64 = 37.66 / 44.26 = 85.1%`
+  fail. The Qwen no-warmup cells are high-variance, but they are still below
+  the production threshold in same-session KVarN-first measurements.
+
+Next production work:
+- Build a selected-row boundary replay for 256d warp-QK versus split so score,
+  probability, and output mismatches can be localized. Do not enable 256d
+  warp-QK in production until Qwen3.6 packed-vs-split is exact.
+- Profile and reduce Qwen 256d body-store cost further. The current 256d
+  pipelined K/V store is correct but insufficient; the remaining likely store
+  win is parallelizing the two KV heads or reducing per-head Sinkhorn launch
+  count.
+- For Gemma, focus on the 512d active-body pp512 store/attention overhead. The
+  gap is small enough that launch-count or graph/topology reuse improvements may
+  clear the short gate, but fallback must not be used as the true-KVarN answer.

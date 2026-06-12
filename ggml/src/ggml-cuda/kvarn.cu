@@ -883,7 +883,7 @@ static size_t kvarn_store_scratch_floats_one(uint32_t head_dim, uint32_t group_s
     return size_t(head_dim)*group_size + 2*tmp_rows;
 }
 
-static void ggml_cuda_kvarn_store_kv_body_512_pipelined(
+static void ggml_cuda_kvarn_store_kv_body_pipelined(
         const float * k_tile,
         const float * v_tile,
         uint8_t * k_body,
@@ -1067,8 +1067,8 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
 
     for (uint32_t bi = 0; bi < n_record_batch; ++bi) {
         const uint32_t record = uint32_t(records[bi]);
-        if (head_dim >= 512) {
-            ggml_cuda_kvarn_store_kv_body_512_pipelined(
+        if (head_dim >= 256) {
+            ggml_cuda_kvarn_store_kv_body_pipelined(
                     k_tile, v_tile,
                     k_body + size_t(record)*k_body_record_stride_bytes,
                     v_body + size_t(record)*v_body_record_stride_bytes,
@@ -1133,8 +1133,8 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         kvarn_gather_pending_v_head_kernel<<<grid, block, 0, cuda_stream>>>(
                 v_pending, v_tile, head_dim, group_size, uint32_t(pending_v_head_stride_floats));
 
-        if (head_dim >= 512) {
-            ggml_cuda_kvarn_store_kv_body_512_pipelined(
+        if (head_dim >= 256) {
+            ggml_cuda_kvarn_store_kv_body_pipelined(
                     k_tile, v_tile,
                     k_body + size_t(ih)*k_body_stride_bytes,
                     v_body + size_t(ih)*v_body_stride_bytes,
@@ -1175,8 +1175,8 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         float rtn_quantile,
         void * stream) {
     ggml_cuda_kvarn_mark_body_store(k_body);
-    if (head_dim >= 512) {
-        ggml_cuda_kvarn_store_kv_body_512_pipelined(
+    if (head_dim >= 256) {
+        ggml_cuda_kvarn_store_kv_body_pipelined(
                 k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
                 head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile, stream);
         return;

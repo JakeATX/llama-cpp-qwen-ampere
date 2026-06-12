@@ -6222,7 +6222,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int64_t k_scale_floats = 2*params.head_dim + params.group_size;
                 const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
                 const int64_t per_pipeline = n + 2*std::max(params.head_dim, params.group_size);
-                const int64_t pipeline_scratch_floats = params.head_dim >= 512 ? 2*per_pipeline : per_pipeline;
+                const int64_t pipeline_scratch_floats = params.head_dim >= 256 ? 2*per_pipeline : per_pipeline;
                 const int64_t batch_scratch_floats = 2*n + pipeline_scratch_floats;
 
                 if (params.n_record_batch > 0) {
