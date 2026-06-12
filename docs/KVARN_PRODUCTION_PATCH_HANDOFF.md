@@ -4,11 +4,64 @@
 
 Repo: `JakeATX/llama.cpp`
 Branch: `kvarn-atx-integration`
-Current pushed HEAD: [`8e35bce0c`](https://github.com/JakeATX/llama.cpp/commit/8e35bce0c) - `kvarn: restore Gemma fallback default`
+Current branch target: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
+Latest pushed baseline before Round 11: [`fa6361d78`](https://github.com/JakeATX/llama.cpp/commit/fa6361d78) - `docs: update KVarN Round 10 handoff`
 Prior pushed baseline for this round: [`2c61f9c67`](https://github.com/JakeATX/llama.cpp/commit/2c61f9c67) - `kvarn: add mainline parity harness and per-body dequant epochs`
-Review tree: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
 
 This is the current entry point for a 5.5 Pro / external architecture review. Older sections below are retained for history, but the current production target is mainline parity against upstream `llama.cpp`, not fork normal-KV parity.
+
+### Round 11 implementation status
+
+Accepted for push:
+
+- `scripts/kvarn/run_mainline_parity_matrix.ps1`
+  - Added `-AllowKvarnFallback` so Gemma production fallback can be measured without requiring `llama_kv_cache_kvarn:` logs.
+  - Added `-RunOrder mainline-first|kvarn-first` for same-session order-effect checks.
+  - Default behavior remains strict: missing KVarN cache logs still fail unless `-AllowKvarnFallback` is explicit.
+- `ggml/src/ggml-cuda/kvarn.cu`
+  - Added diagnostic-only 256d mixed-attention switches:
+    - `LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK=1`
+    - `LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR=1`
+    - `LLAMA_KVARN_ATTN_WARPQK_FORCE_QT=1|4|8`
+  - Default behavior remains unchanged. 512d warpqk/f16 mirror stays active; 256d warpqk and 256d f16 body mirror remain disabled unless explicitly requested.
+- `ggml/src/ggml-cuda/ggml-cuda.cu`
+  - Trace mode classification now reports the experimental 256d warpqk path correctly when the diagnostic env flag is set.
+
+Round 11 validation:
+
+| Gate | Result | Notes |
+|---|---:|---|
+| Build `llama-bench`, `llama-results`, `test-kvarn-cuda-scratch-ref` | PASS | CUDA warnings only |
+| `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS | |
+| Qwen2.5 CUDA smoke `256 512` | PASS | local model `Qwen2.5-1.5B-Instruct-GGUF`, expected layers `0-27` |
+| Qwen3.6 MTP default logits | PASS | packed repeat NMSE `0`, packed-vs-split NMSE `0`, expected layers `3-39:4` |
+| Gemma fallback harness | PASS | `-AllowKvarnFallback`, artifact `artifacts/kvarn-mainline-parity/20260611-223614` |
+| 256d diagnostic QT=1 without f16 mirror | FAIL as expected | Qwen3.6 MTP packed-vs-split NMSE `6.196e-03` |
+| Focused CTest regex | FAIL | only `test-kvarn-kv` fails, exit `0xc0000409` after CUDA device discovery |
+
+Round 11 Qwen no-trace order check, `r=5`, warmup enabled, `-ncmoe 34`:
+
+| Run order | Case | Mainline t/s | KVarN t/s | Ratio | Artifact |
+|---|---:|---:|---:|---:|---|
+| mainline-first | `pp512` | 443.65 | 291.28 | 65.7% | `artifacts/kvarn-mainline-parity/round11-qwen-r5-mainline-first` |
+| mainline-first | `tg64` | 44.27 | 38.21 | 86.3% | `artifacts/kvarn-mainline-parity/round11-qwen-r5-mainline-first` |
+| kvarn-first | `pp512` | 423.22 | 290.43 | 68.6% | `artifacts/kvarn-mainline-parity/round11-qwen-r5-kvarn-first` |
+| kvarn-first | `tg64` | 44.05 | 37.87 | 86.0% | `artifacts/kvarn-mainline-parity/round11-qwen-r5-kvarn-first` |
+
+Interpretation:
+
+- The earlier Qwen `pp512 44.4%` number was too pessimistic for the current clean run, but Qwen still fails the short production gate.
+- Run order does not explain the remaining short-gate gap in this session.
+- The 256d isolation result is decisive: `QT=1` with no f16 mirror still fails full Qwen3.6 MTP packed-vs-split logits, so the divergence is in the base 256d warpqk math/mask/order path, not q-tiling or the f16 body mirror.
+- Do not enable 256d warpqk by default, and do not benchmark it for production until Qwen3.6 MTP packed-vs-split NMSE is `0`.
+- Do not start 4k production diagnostics as the next gate; first fix Qwen short `pp512` and `tg64`, then run long-context diagnostics.
+
+Immediate next coding target:
+
+1. Add a low-level forced 256d warpqk-vs-split unit case that mirrors the full Qwen3.6 MTP failure shape closely enough to debug without loading the full model.
+2. Compare split and 256d warpqk at the score/prob/output boundaries to isolate mask/order/scaling vs value accumulation.
+3. Keep Gemma fallback default unless `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`.
+4. Re-run `test-kvarn-kv` in a clean path or separate machine; do not classify `0xc0000409` as the old Windows Application Control process-start block unless stderr proves it.
 
 ### Round 10 implementation status
 

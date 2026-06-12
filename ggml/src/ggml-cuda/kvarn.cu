@@ -80,6 +80,30 @@ static int kvarn_env_int(const char * name, int default_value) {
     return int(value);
 }
 
+static int kvarn_env_qt_override() {
+    const char * env = std::getenv("LLAMA_KVARN_ATTN_WARPQK_FORCE_QT");
+    if (env == nullptr) {
+        return 0;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            (value != 1 && value != 4 && value != 8)) {
+        std::fprintf(stderr,
+                "invalid KVarN CUDA environment integer LLAMA_KVARN_ATTN_WARPQK_FORCE_QT=%s; expected one of 1,4,8\n",
+                env);
+        std::abort();
+    }
+    return int(value);
+}
+
+static bool kvarn_enable_256d_warpqk() {
+    static const bool enabled = kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK");
+    return enabled;
+}
+
 static bool kvarn_dequant_cache_trace_enabled() {
     static const bool enabled = kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
     return enabled;
@@ -3771,15 +3795,13 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             }
         }
 
-        // Gemma 4 KVarN+ISWA has 512-dimensional K/V heads. The generic fused
-        // kernel maps one token score to one thread, which makes f16 sink/tail
-        // loads strided and serializes each 512-wide dot product within a lane.
-        // Use a warp-per-score variant for 512d heads: lanes cooperate across
-        // the head dimension and issue coalesced f16 sink/tail loads. Keep the
-        // 128/256d path on the legacy fused kernel until the 256d warpqk path is
-        // made logits-equivalent to split.
-        if (head_dim >= 512) {
-            const int warpqk_block = 512;
+        // Use a warp-per-score variant for 512d heads. 256d is diagnostic-only:
+        // the simple threshold patch failed Qwen3.6 packed-vs-split logits, so
+        // require LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK=1 while isolating QT/mirror.
+        const bool use_warpqk_body =
+            head_dim >= 512 || (head_dim == 256 && kvarn_enable_256d_warpqk());
+        if (use_warpqk_body) {
+            const int warpqk_block = head_dim >= 512 ? 512 : 256;
             // Q-tile selection: QT=4 amortizes every K/V load across 4 query
             // rows (4x fewer CTAs, 4x FMA reuse) whenever the tiled shared
             // layout fits; decode-shaped launches (n_queries==1) and
@@ -3789,15 +3811,24 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             const size_t warpqk_shmem_q1 = (size_t(head_dim) + size_t(n_tokens) + size_t(warpqk_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
             const size_t warpqk_shmem_q4 = (4*size_t(head_dim) + 4*size_t(n_tokens) + size_t(warpqk_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
             const size_t warpqk_shmem_q8 = (8*size_t(head_dim) + 8*size_t(n_tokens) + size_t(warpqk_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
-            const bool warpqk_q8 = n_queries > 4 && kvarn_cuda_dynamic_shmem_fits(warpqk_shmem_q8);
-            const bool warpqk_q4 = !warpqk_q8 && n_queries > 1 && kvarn_cuda_dynamic_shmem_fits(warpqk_shmem_q4);
+            const int qt_override = kvarn_env_qt_override();
+            const bool warpqk_q8 =
+                (qt_override == 8 && n_queries > 4 && kvarn_cuda_dynamic_shmem_fits(warpqk_shmem_q8)) ||
+                (qt_override == 0 && n_queries > 4 && kvarn_cuda_dynamic_shmem_fits(warpqk_shmem_q8));
+            const bool warpqk_q4 =
+                !warpqk_q8 &&
+                ((qt_override == 4 && n_queries > 1 && kvarn_cuda_dynamic_shmem_fits(warpqk_shmem_q4)) ||
+                 (qt_override == 0 && n_queries > 1 && kvarn_cuda_dynamic_shmem_fits(warpqk_shmem_q4)));
             const size_t warpqk_shmem = warpqk_q8 ? warpqk_shmem_q8 : (warpqk_q4 ? warpqk_shmem_q4 : warpqk_shmem_q1);
             if (kvarn_cuda_dynamic_shmem_fits(warpqk_shmem)) {
                 const __half * body_k_f16 = nullptr;
                 const __half * body_v_f16 = nullptr;
                 size_t body_f16_stride_head_elems = 0;
 
-                if (n_records > 0 && scores != nullptr) {
+                const bool allow_f16_body_mirror =
+                    head_dim >= 512 || kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR");
+
+                if (n_records > 0 && scores != nullptr && allow_f16_body_mirror) {
                     const size_t n_per_record = size_t(group_size)*head_dim;
                     const size_t n_per_head = size_t(n_records)*n_per_record;
                     // K/V f16 mirrors are END-ANCHORED in the persistent attn scratch

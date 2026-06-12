@@ -3206,6 +3206,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const bool forced_fused_batch = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
                 const bool forced_split = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
                 const bool forced_serial = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
+                const bool experimental_256_warpqk =
+                    ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK");
                 if (ggml_cuda_kvarn_store_trace_enabled()) {
                     (void) ggml_cuda_kvarn_env_int("LLAMA_KVARN_STORE_TRACE_LIMIT", 64);
                 }
@@ -3219,9 +3221,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                         params.head_dim >= 512 && params.n_records == 0 && params.n_pending == 0 &&
                         !sinktail_decode;
                     const bool warpqk_f16_dequant = !split_runtime && !serial_runtime &&
-                        params.head_dim >= 512 && params.n_records > 0;
+                        (params.head_dim >= 512 || (params.head_dim == 256 && experimental_256_warpqk)) &&
+                        params.n_records > 0;
                     const bool warpqk_f16 = !split_runtime && !serial_runtime &&
-                        params.head_dim >= 512 && !sinktail_f16 && !warpqk_f16_dequant;
+                        (params.head_dim >= 512 || (params.head_dim == 256 && experimental_256_warpqk)) &&
+                        !sinktail_f16 && !warpqk_f16_dequant;
                     const char * mode = use_scratch_ref ? "scratch-ref" :
                         (split_runtime ? "split" :
                             (serial_runtime ? "serial-fused" :

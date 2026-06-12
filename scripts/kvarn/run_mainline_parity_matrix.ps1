@@ -23,7 +23,9 @@ param(
     [int] $TraceStoreLimit = 64,
     [int] $TraceDequantCacheLimit = 256,
     [string[]] $ExtraArgs = @(),
-    [string[]] $KvarnExtraArgs = @()
+    [string[]] $KvarnExtraArgs = @(),
+    [switch] $AllowKvarnFallback,
+    [ValidateSet("mainline-first", "kvarn-first")] [string] $RunOrder = "mainline-first"
 )
 
 $ErrorActionPreference = "Stop"
@@ -411,7 +413,9 @@ $manifest = @(
     "trace_store_limit=$TraceStoreLimit",
     "trace_dequant_cache_limit=$TraceDequantCacheLimit",
     "extra_args=$($ExtraArgs -join ' ')",
-    "kvarn_extra_args=$($KvarnExtraArgs -join ' ')"
+    "kvarn_extra_args=$($KvarnExtraArgs -join ' ')",
+    "allow_kvarn_fallback=$($AllowKvarnFallback.IsPresent)",
+    "run_order=$RunOrder"
 )
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
 
@@ -428,8 +432,6 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         "-fa", $FlashAttn,
         "-o", "md"
     ) + $warmupArgv + $ExtraArgs
-
-    $mainlineRow = Invoke-BenchRow -Label "mainline" -BenchExe $mainlineBench -ModelPath $modelPath -Case $case -Argv $commonArgv
 
     $kvarnArgv = $commonArgv + @(
         "--kv-cache-quant", "kvarn",
@@ -450,20 +452,31 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         $kvarnEnv["LLAMA_KVARN_DEQUANT_CACHE_TRACE"] = "1"
         $kvarnEnv["LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT"] = [string] $TraceDequantCacheLimit
     }
-    $kvarnRow = Invoke-BenchRow -Label "kvarn" -BenchExe $kvarnBench -ModelPath $modelPath -Case $case -Argv $kvarnArgv -EnvSet $kvarnEnv
 
-    if ($MinKvarnLayerLogs -gt 0) {
-        $kvarnLayerLogs = ([regex]::Matches($kvarnRow.Text, "llama_kv_cache_kvarn: KVarN layer")).Count
-        if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
-            throw "KVarN case '$($case.Name)' showed only $kvarnLayerLogs layer lines, expected >= $MinKvarnLayerLogs"
+    if ($RunOrder -eq "kvarn-first") {
+        $kvarnRow = Invoke-BenchRow -Label "kvarn" -BenchExe $kvarnBench -ModelPath $modelPath -Case $case -Argv $kvarnArgv -EnvSet $kvarnEnv
+        $mainlineRow = Invoke-BenchRow -Label "mainline" -BenchExe $mainlineBench -ModelPath $modelPath -Case $case -Argv $commonArgv
+    } else {
+        $mainlineRow = Invoke-BenchRow -Label "mainline" -BenchExe $mainlineBench -ModelPath $modelPath -Case $case -Argv $commonArgv
+        $kvarnRow = Invoke-BenchRow -Label "kvarn" -BenchExe $kvarnBench -ModelPath $modelPath -Case $case -Argv $kvarnArgv -EnvSet $kvarnEnv
+    }
+
+    $hasKvarnCache = $kvarnRow.Text -match "llama_kv_cache_kvarn:"
+    if ($hasKvarnCache) {
+        if ($MinKvarnLayerLogs -gt 0) {
+            $kvarnLayerLogs = ([regex]::Matches($kvarnRow.Text, "llama_kv_cache_kvarn: KVarN layer")).Count
+            if ($kvarnLayerLogs -lt $MinKvarnLayerLogs) {
+                throw "KVarN case '$($case.Name)' showed only $kvarnLayerLogs layer lines, expected >= $MinKvarnLayerLogs"
+            }
+            Write-Host ("KVarN layer-log check: PASS, layer lines = {0}" -f $kvarnLayerLogs)
         }
-        Write-Host ("KVarN layer-log check: PASS, layer lines = {0}" -f $kvarnLayerLogs)
+        Assert-ExpectedKvarnLayers $kvarnRow.Text $expectedKvarnLayerIds "KVarN case '$($case.Name)'"
+        Assert-MinKvarnBodyRecords $kvarnRow.Text $MinKvarnBodyRecords "KVarN case '$($case.Name)'"
+    } elseif ($AllowKvarnFallback.IsPresent) {
+        Write-Warning ("KVarN case '{0}' emitted no KVarN cache logs; treating as allowed fallback path for parity accounting" -f $case.Name)
+    } else {
+        throw "KVarN case '$($case.Name)' succeeded but logs did not show KVarN cache initialization. If this is the intentional Gemma fallback cell, rerun with -AllowKvarnFallback."
     }
-    if ($kvarnRow.Text -notmatch "llama_kv_cache_kvarn:") {
-        throw "KVarN case '$($case.Name)' succeeded but logs did not show KVarN cache initialization"
-    }
-    Assert-ExpectedKvarnLayers $kvarnRow.Text $expectedKvarnLayerIds "KVarN case '$($case.Name)'"
-    Assert-MinKvarnBodyRecords $kvarnRow.Text $MinKvarnBodyRecords "KVarN case '$($case.Name)'"
 
     $ratio = $kvarnRow.Throughput / $mainlineRow.Throughput
     $gatePass = $ratio -ge $MinParityRatio
@@ -484,6 +497,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         KvarnTps = $kvarnRow.Throughput
         KvarnVsMainline = $ratio
         GateThreshold = $MinParityRatio
+        KvarnFallbackAllowed = $AllowKvarnFallback.IsPresent -and -not $hasKvarnCache
         GatePass = $gatePass
         CudaDevice = if (-not [string]::IsNullOrWhiteSpace($kvarnRow.CudaDevice)) { $kvarnRow.CudaDevice } else { $mainlineRow.CudaDevice }
         MaxKvarnBodyRecords = $kvarnRow.MaxBodyRecords
