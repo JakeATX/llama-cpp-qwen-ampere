@@ -372,6 +372,8 @@ public:
     ggml_tensor * tail_evict_idxs = nullptr;// I32 [n_tail_evict]
 
     const llama_kv_cache_kvarn_context * mctx_kvarn;
+    ggml_tensor * kvarn_window = nullptr;   // I32 [8]
+    bool window_indirect = false;
     std::vector<ggml_tensor *> mixed_attn_nodes;
     std::vector<ggml_tensor *> mixed_attn_scores;
     void rewire_kvarn_mixed_attn_inputs();

@@ -1623,3 +1623,71 @@ Next production work:
 - For Gemma, focus on the 512d active-body pp512 store/attention overhead. The
   gap is small enough that launch-count or graph/topology reuse improvements may
   clear the short gate, but fallback must not be used as the true-KVarN answer.
+
+### Round 20 true-KVarN production-path status
+
+Current safe production changes:
+- Regular KVarN decode now has the same replay-safe device-side window tensor
+  used by the KVarN+ISWA base path. For pure no-body decode, mixed-attn
+  op_params are frozen and the live `{sink, records, pending, tail, tail_start}`
+  window is streamed through `src[11]`, allowing CUDA graph replay instead of
+  disabling CUDA graphs for every decode token.
+- The no-body sink/tail decode CUDA path now fast-returns the single-token case
+  and avoids tail-ring modulo/branching when the live window is sink-only.
+- 512d active-body warp-QK is no longer a production default. It is
+  diagnostic-only behind `LLAMA_KVARN_ATTN_ENABLE_512D_WARPQK=1` because Gemma
+  4 true KVarN packed-vs-split failed at `NMSE = 1.261e-02` when warp-QK was
+  used. `LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK=1` remains diagnostic-only for the
+  same reason on Qwen.
+- A query-tiled scalar active-body path is now used for 256d and 512d prompt
+  batches. It preserves the serial QK accumulation order of the split/generic
+  oracle while reusing each loaded/dequantized K/V value across query rows.
+  QT=16 is available only as an explicit diagnostic override with
+  `LLAMA_KVARN_ATTN_WARPQK_FORCE_QT=16`; default 512d selection remains QT=8
+  because QT=16 was slower on Gemma.
+
+Rejected Round 20 experiments:
+- Treating body-store epoch changes as append-safe for the f16 dequant cache
+  failed Gemma packed-vs-split at `NMSE = 1.261e-02`; do not infer append reuse
+  from `cached_records < active_records` without per-record dirty tracking.
+- Reducing f16 body-mirror scratch sizing from f32-sized scratch to half-sized
+  scratch also failed Gemma packed-vs-split at `NMSE = 1.261e-02`; keep the
+  existing scratch sizing until the mirror layout is audited end to end.
+- `LLAMA_KVARN_ATTN_REF_SCRATCH=1` is correctness-clean on Gemma but unusably
+  slow for `pp512` (`~4%` of mainline in `round20-gemma-true-refscratch-r3`).
+
+Latest focused validation:
+- `cmake --build build-kvarn-cuda-static-vs --config Release --target
+  llama-bench llama-results test-kvarn-cuda-scratch-ref test-kvarn-kv -j 8`
+  passed after the Round 20 changes.
+- `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R
+  "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure"
+  --output-on-failure` passed all 6 tests.
+- Qwen3.6 MTP strict logits passed exact KVarN layers `3-39:4`, max body
+  records `2`, packed-repeat `NMSE = 0`, and packed-vs-split `NMSE = 0`.
+- Gemma 4 12B true KVarN+ISWA strict logits passed exact KVarN layers
+  `5-47:6`, max body records `2`, packed-repeat `NMSE = 0`, and
+  packed-vs-split `NMSE = 0`.
+
+Latest short parity measurements:
+- Qwen3.6 MTP, `round20-qwen-short-final-r5`:
+  `pp512 = 227.11 / 362.29 = 62.7%` fail,
+  `tg64 = 43.65 / 44.53 = 98.0%` pass.
+- Gemma 4 12B true KVarN+ISWA, `round20-gemma-true-scalarqt512-r3`:
+  `pp512 = 1870.75 / 2342.28 = 79.9%` fail,
+  `tg64 = 59.91 / 60.37 = 99.2%` pass.
+- Gemma QT=16 diagnostic, `round20-gemma-true-scalarqt16-r3`, was slower:
+  `pp512 = 1695.96 / 2411.66 = 70.3%`; keep QT=16 opt-in only.
+
+What remains to reach production parity:
+- The decode side is effectively handled for the short gate. The remaining
+  production blockers are both active-body prefill cells.
+- The old fast warp-QK family cannot be promoted until a boundary replay shows
+  exact score/prob/output equivalence. Current evidence says both 256d and 512d
+  warp-QK change numerics enough to fail strict packed-vs-split.
+- The next viable implementation should either make a warp-level kernel
+  bit-equivalent to the serial split oracle, or avoid QK-order changes and
+  instead reduce store/seal cost, launch count, and redundant dequant/staging.
+  For Gemma, per-record dirty tracking for dequant mirrors must be explicit; for
+  Qwen, parallelizing the two KV-head body store remains the highest-value store
+  target.

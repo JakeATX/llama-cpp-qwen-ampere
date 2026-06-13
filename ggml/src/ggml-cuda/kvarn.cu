@@ -91,9 +91,9 @@ static int kvarn_env_qt_override() {
     errno = 0;
     const long value = std::strtol(env, &end, 10);
     if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
-            (value != 1 && value != 4 && value != 8)) {
+            (value != 1 && value != 4 && value != 8 && value != 16)) {
         std::fprintf(stderr,
-                "invalid KVarN CUDA environment integer LLAMA_KVARN_ATTN_WARPQK_FORCE_QT=%s; expected one of 1,4,8\n",
+                "invalid KVarN CUDA environment integer LLAMA_KVARN_ATTN_WARPQK_FORCE_QT=%s; expected one of 1,4,8,16\n",
                 env);
         std::abort();
     }
@@ -102,6 +102,18 @@ static int kvarn_env_qt_override() {
 
 static bool kvarn_enable_256d_warpqk() {
     return kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK");
+}
+
+static bool kvarn_enable_512d_warpqk() {
+    return kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_512D_WARPQK");
+}
+
+static bool kvarn_disable_warpqk() {
+    return kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_WARPQK");
+}
+
+static bool kvarn_disable_body_mirror() {
+    return kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_BODY_MIRROR");
 }
 
 static bool kvarn_dequant_cache_trace_enabled() {
@@ -3159,6 +3171,14 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
     float * probs = shared + head_dim;
     float * reduce = probs + cap_tokens;
 
+    if (n_tokens == 1) {
+        const uint16_t * v = v_st;
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            out_row[d] = __half2float(reinterpret_cast<const __half *>(v)[d]);
+        }
+        return;
+    }
+
     for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
         q_sh[d] = q_row[d];
     }
@@ -3168,17 +3188,32 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
     const uint32_t warp = threadIdx.x >> 5;
     const uint32_t n_warps = blockDim.x >> 5;
 
-    for (uint32_t t = warp; t < n_tokens; t += n_warps) {
-        const uint32_t slot = t < eff_sink ? t : eff_sink + ((eff_tail_start + (t - eff_sink))%eff_tail);
-        const uint16_t * k = k_st + size_t(slot)*sink_tail_stride_token_f16;
+    if (eff_tail == 0) {
+        for (uint32_t t = warp; t < n_tokens; t += n_warps) {
+            const uint16_t * k = k_st + size_t(t)*sink_tail_stride_token_f16;
 
-        float sum = 0.0f;
-        for (uint32_t d = lane; d < head_dim; d += 32) {
-            sum += q_sh[d]*__half2float(reinterpret_cast<const __half *>(k)[d]);
+            float sum = 0.0f;
+            for (uint32_t d = lane; d < head_dim; d += 32) {
+                sum += q_sh[d]*__half2float(reinterpret_cast<const __half *>(k)[d]);
+            }
+            sum = kvarn_warp_reduce_sum(sum);
+            if (lane == 0) {
+                probs[t] = sum*scale + kvarn_kq_mask_bias(kq_mask_row, kq_mask_type, kq_mask_stride_token_bytes, t);
+            }
         }
-        sum = kvarn_warp_reduce_sum(sum);
-        if (lane == 0) {
-            probs[t] = sum*scale + kvarn_kq_mask_bias(kq_mask_row, kq_mask_type, kq_mask_stride_token_bytes, t);
+    } else {
+        for (uint32_t t = warp; t < n_tokens; t += n_warps) {
+            const uint32_t slot = t < eff_sink ? t : eff_sink + ((eff_tail_start + (t - eff_sink))%eff_tail);
+            const uint16_t * k = k_st + size_t(slot)*sink_tail_stride_token_f16;
+
+            float sum = 0.0f;
+            for (uint32_t d = lane; d < head_dim; d += 32) {
+                sum += q_sh[d]*__half2float(reinterpret_cast<const __half *>(k)[d]);
+            }
+            sum = kvarn_warp_reduce_sum(sum);
+            if (lane == 0) {
+                probs[t] = sum*scale + kvarn_kq_mask_bias(kq_mask_row, kq_mask_type, kq_mask_stride_token_bytes, t);
+            }
         }
     }
     __syncthreads();
@@ -3222,14 +3257,25 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
     }
     __syncthreads();
 
-    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        float sum = 0.0f;
-        for (uint32_t t = 0; t < n_tokens; ++t) {
-            const uint32_t slot = t < eff_sink ? t : eff_sink + ((eff_tail_start + (t - eff_sink))%eff_tail);
-            const uint16_t * v = v_st + size_t(slot)*sink_tail_stride_token_f16;
-            sum += probs[t]*__half2float(reinterpret_cast<const __half *>(v)[d]);
+    if (eff_tail == 0) {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float sum = 0.0f;
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                const uint16_t * v = v_st + size_t(t)*sink_tail_stride_token_f16;
+                sum += probs[t]*__half2float(reinterpret_cast<const __half *>(v)[d]);
+            }
+            out_row[d] = sum;
         }
-        out_row[d] = sum;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float sum = 0.0f;
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                const uint32_t slot = t < eff_sink ? t : eff_sink + ((eff_tail_start + (t - eff_sink))%eff_tail);
+                const uint16_t * v = v_st + size_t(slot)*sink_tail_stride_token_f16;
+                sum += probs[t]*__half2float(reinterpret_cast<const __half *>(v)[d]);
+            }
+            out_row[d] = sum;
+        }
     }
 }
 
@@ -3660,6 +3706,283 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_kernel(
     }
 }
 
+// Query-tiled scalar fused attention for active-body prompt batches.
+// Unlike the warpqk kernel, every QK dot product still accumulates dimensions
+// in the same serial order as kvarn_attn_mixed_f16_fused_batch_kernel. That
+// keeps packed-vs-split logits exact while reusing each loaded/dequantized K/V
+// value across QT query rows in the CTA.
+template<int QT>
+static __global__ void kvarn_attn_mixed_f16_fused_batch_scalar_qt_kernel(
+        const float * __restrict__ q,
+        const uint16_t * __restrict__ sink_tail_k,
+        const uint16_t * __restrict__ sink_tail_v,
+        const uint8_t * __restrict__ k_body,
+        const uint8_t * __restrict__ v_body,
+        const float * __restrict__ k_scales,
+        const float * __restrict__ v_scales,
+        const float * __restrict__ pending_k,
+        const float * __restrict__ pending_v,
+        const void * __restrict__ kq_mask,
+        float * __restrict__ out,
+        float * __restrict__ scores,
+        uint32_t n_queries,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t n_sink,
+        uint32_t n_records,
+        uint32_t n_pending,
+        uint32_t n_tail,
+        uint32_t tail_start,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        size_t q_stride_head_floats,
+        size_t q_stride_query_floats,
+        size_t out_stride_head_floats,
+        size_t out_stride_query_floats,
+        size_t sink_tail_stride_head_f16,
+        size_t sink_tail_stride_token_f16,
+        size_t pending_stride_head_floats,
+        size_t pending_stride_token_floats,
+        size_t k_body_stride_record_bytes,
+        size_t v_body_stride_record_bytes,
+        size_t k_body_stride_head_bytes,
+        size_t v_body_stride_head_bytes,
+        size_t k_scale_stride_record_floats,
+        size_t v_scale_stride_record_floats,
+        size_t k_scale_stride_head_floats,
+        size_t v_scale_stride_head_floats,
+        size_t kq_mask_stride_query_bytes,
+        size_t kq_mask_stride_token_bytes,
+        uint32_t kq_mask_type,
+        float scale) {
+    (void) scores;
+    const uint32_t n_tiles = (n_queries + QT - 1)/uint32_t(QT);
+    if (blockIdx.x >= n_tiles*n_head) {
+        return;
+    }
+
+    const uint32_t tile = blockIdx.x/n_head;
+    const uint32_t ih   = blockIdx.x - tile*n_head;
+    const uint32_t iq0  = tile*uint32_t(QT);
+    const uint32_t qt_n = min(uint32_t(QT), n_queries - iq0);
+    const uint32_t n_gqa = n_head/n_head_kv;
+    const uint32_t ikh = ih/n_gqa;
+
+    const float * q_tile = q + size_t(iq0)*q_stride_query_floats + size_t(ih)*q_stride_head_floats;
+    float * out_tile = out + size_t(iq0)*out_stride_query_floats + size_t(ih)*out_stride_head_floats;
+    const uint16_t * k_st = sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16;
+    const uint16_t * v_st = sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16;
+    const uint8_t * k_body_head = k_body + size_t(ikh)*k_body_stride_head_bytes;
+    const uint8_t * v_body_head = v_body + size_t(ikh)*v_body_stride_head_bytes;
+    const float * k_scales_head = k_scales + size_t(ikh)*k_scale_stride_head_floats;
+    const float * v_scales_head = v_scales + size_t(ikh)*v_scale_stride_head_floats;
+    const float * pending_k_head = pending_k + size_t(ikh)*pending_stride_head_floats;
+    const float * pending_v_head = pending_v + size_t(ikh)*pending_stride_head_floats;
+    const char * kq_mask_tile = kq_mask == nullptr ? nullptr :
+        (const char *) kq_mask + size_t(iq0)*kq_mask_stride_query_bytes;
+
+    const uint32_t n_body_tokens = n_records*group_size;
+    const uint32_t n_tokens = n_sink + n_body_tokens + n_pending + n_tail;
+
+    extern __shared__ float shared[];
+    float * q_sh = shared;
+    float * probs = shared + size_t(QT)*head_dim;
+    float * reduce = probs + size_t(QT)*n_tokens;
+
+    for (uint32_t i = threadIdx.x; i < qt_n*head_dim; i += blockDim.x) {
+        const uint32_t j = i/head_dim;
+        const uint32_t d = i - j*head_dim;
+        q_sh[i] = q_tile[size_t(j)*q_stride_query_floats + d];
+    }
+    __syncthreads();
+
+    for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+        float sum[QT];
+#pragma unroll
+        for (int j = 0; j < QT; ++j) {
+            sum[j] = 0.0f;
+        }
+
+        if (t < n_sink) {
+            const uint16_t * k = k_st + size_t(t)*sink_tail_stride_token_f16;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const float kv = __half2float(reinterpret_cast<const __half *>(k)[d]);
+#pragma unroll
+                for (int j = 0; j < QT; ++j) {
+                    if (uint32_t(j) < qt_n) {
+                        sum[j] += q_sh[size_t(j)*head_dim + d]*kv;
+                    }
+                }
+            }
+        } else if (t < n_sink + n_body_tokens) {
+            const uint32_t body_t = t - n_sink;
+            const uint32_t r = body_t/group_size;
+            const uint32_t g = body_t - r*group_size;
+            const uint8_t * k_record = k_body_head + size_t(r)*k_body_stride_record_bytes;
+            const float * k_record_scales = k_scales_head + size_t(r)*k_scale_stride_record_floats;
+            const float * k_s_col = k_record_scales;
+            const float * k_zp    = k_record_scales + head_dim;
+            const float * k_s_row = k_record_scales + 2*head_dim;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t i = size_t(d)*group_size + g;
+                const uint32_t kq = kvarn_unpack_one(k_record, key_bits, i);
+                const float kv = (float(kq)*k_s_col[d] + k_zp[d])*k_s_row[g];
+#pragma unroll
+                for (int j = 0; j < QT; ++j) {
+                    if (uint32_t(j) < qt_n) {
+                        sum[j] += q_sh[size_t(j)*head_dim + d]*kv;
+                    }
+                }
+            }
+        } else if (t < n_sink + n_body_tokens + n_pending) {
+            const uint32_t pending_t = t - n_sink - n_body_tokens;
+            const float * k = pending_k_head + size_t(pending_t)*pending_stride_token_floats;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const float kv = k[d];
+#pragma unroll
+                for (int j = 0; j < QT; ++j) {
+                    if (uint32_t(j) < qt_n) {
+                        sum[j] += q_sh[size_t(j)*head_dim + d]*kv;
+                    }
+                }
+            }
+        } else {
+            const uint32_t tail_t = t - n_sink - n_body_tokens - n_pending;
+            const uint32_t tail_slot = n_tail == 0 ? 0 : (tail_start + tail_t)%n_tail;
+            const uint16_t * k = k_st + size_t(n_sink + tail_slot)*sink_tail_stride_token_f16;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const float kv = __half2float(reinterpret_cast<const __half *>(k)[d]);
+#pragma unroll
+                for (int j = 0; j < QT; ++j) {
+                    if (uint32_t(j) < qt_n) {
+                        sum[j] += q_sh[size_t(j)*head_dim + d]*kv;
+                    }
+                }
+            }
+        }
+
+        for (uint32_t j = 0; j < qt_n; ++j) {
+            const void * mask_row = kq_mask_tile == nullptr ? nullptr :
+                (const void *) (kq_mask_tile + size_t(j)*kq_mask_stride_query_bytes);
+            probs[size_t(j)*n_tokens + t] =
+                sum[j]*scale + kvarn_kq_mask_bias(mask_row, kq_mask_type, kq_mask_stride_token_bytes, t);
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t j = 0; j < qt_n; ++j) {
+        float * row = probs + size_t(j)*n_tokens;
+
+        float local_max = -3.4028234663852886e38f;
+        for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+            local_max = fmaxf(local_max, row[t]);
+        }
+        reduce[threadIdx.x] = local_max;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+            }
+            __syncthreads();
+        }
+        const float max_score = reduce[0];
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+            const float p = expf(row[t] - max_score);
+            row[t] = p;
+            local_sum += p;
+        }
+        reduce[threadIdx.x] = local_sum;
+        __syncthreads();
+
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) {
+                reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+            }
+            __syncthreads();
+        }
+        const float inv_denom = 1.0f/reduce[0];
+
+        for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
+            row[t] *= inv_denom;
+        }
+        __syncthreads();
+    }
+
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc[QT];
+#pragma unroll
+        for (int j = 0; j < QT; ++j) {
+            acc[j] = 0.0f;
+        }
+
+        for (uint32_t t = 0; t < n_sink; ++t) {
+            const uint16_t * v = v_st + size_t(t)*sink_tail_stride_token_f16;
+            const float vv = __half2float(reinterpret_cast<const __half *>(v)[d]);
+#pragma unroll
+            for (int j = 0; j < QT; ++j) {
+                if (uint32_t(j) < qt_n) {
+                    acc[j] += probs[size_t(j)*n_tokens + t]*vv;
+                }
+            }
+        }
+
+        for (uint32_t r = 0; r < n_records; ++r) {
+            const uint8_t * v_record = v_body_head + size_t(r)*v_body_stride_record_bytes;
+            const float * v_record_scales = v_scales_head + size_t(r)*v_scale_stride_record_floats;
+            const float * v_s_col = v_record_scales;
+            const float * v_s_row = v_record_scales + head_dim;
+            const float * v_zp    = v_record_scales + head_dim + group_size;
+            for (uint32_t g = 0; g < group_size; ++g) {
+                const size_t i = size_t(g)*head_dim + d;
+                const uint32_t vq = kvarn_unpack_one(v_record, value_bits, i);
+                const float vv = (float(vq)*v_s_row[g] + v_zp[g])*v_s_col[d];
+                const uint32_t t = n_sink + r*group_size + g;
+#pragma unroll
+                for (int j = 0; j < QT; ++j) {
+                    if (uint32_t(j) < qt_n) {
+                        acc[j] += probs[size_t(j)*n_tokens + t]*vv;
+                    }
+                }
+            }
+        }
+
+        for (uint32_t t = 0; t < n_pending; ++t) {
+            const float * v = pending_v_head + size_t(t)*pending_stride_token_floats;
+            const float vv = v[d];
+            const uint32_t tok = n_sink + n_body_tokens + t;
+#pragma unroll
+            for (int j = 0; j < QT; ++j) {
+                if (uint32_t(j) < qt_n) {
+                    acc[j] += probs[size_t(j)*n_tokens + tok]*vv;
+                }
+            }
+        }
+
+        for (uint32_t t = 0; t < n_tail; ++t) {
+            const uint32_t tail_slot = (tail_start + t)%n_tail;
+            const uint16_t * v = v_st + size_t(n_sink + tail_slot)*sink_tail_stride_token_f16;
+            const float vv = __half2float(reinterpret_cast<const __half *>(v)[d]);
+            const uint32_t tok = n_sink + n_body_tokens + n_pending + t;
+#pragma unroll
+            for (int j = 0; j < QT; ++j) {
+                if (uint32_t(j) < qt_n) {
+                    acc[j] += probs[size_t(j)*n_tokens + tok]*vv;
+                }
+            }
+        }
+
+        for (uint32_t j = 0; j < qt_n; ++j) {
+            out_tile[size_t(j)*out_stride_query_floats + d] = acc[j];
+        }
+    }
+}
+
 void ggml_cuda_kvarn_attn_mixed_f16_batch(
         const float * q,
         const uint16_t * sink_tail_k,
@@ -3772,7 +4095,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             if (n_queries == 1) {
                 // One CTA per head spreads decode attention across SMs.
                 // shared = q_sh[head_dim] + probs[n_tokens] + reduce[block]
-                const int decode_block = head_dim <= 256 ? 512 : 128;
+                const int decode_block = head_dim <= 256 ? 256 : 128;
                 const size_t decode_shmem = (size_t(head_dim) + size_t(n_tokens) + size_t(decode_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
                 if (kvarn_cuda_dynamic_shmem_fits(decode_shmem)) {
                     kvarn_attn_mixed_f16_sinktail_decode_kernel<<<int(n_head), decode_block, decode_shmem, cuda_stream>>>(
@@ -3805,11 +4128,101 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             }
         }
 
-        // Use a warp-per-score variant for 512d heads. 256d is diagnostic-only:
-        // the simple threshold patch failed Qwen3.6 packed-vs-split logits, so
-        // require LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK=1 while isolating QT/mirror.
+        if ((head_dim == 256 || head_dim == 512) && n_records > 0 && n_queries > 1 &&
+                !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_256D_SCALAR_QT")) {
+            const int scalar_qt_block = 256;
+            const size_t scalar_qt_shmem_q4 =
+                (4*size_t(head_dim) + 4*size_t(n_tokens) + size_t(scalar_qt_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+            const size_t scalar_qt_shmem_q8 =
+                (8*size_t(head_dim) + 8*size_t(n_tokens) + size_t(scalar_qt_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+            const size_t scalar_qt_shmem_q16 =
+                (16*size_t(head_dim) + 16*size_t(n_tokens) + size_t(scalar_qt_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+            const int qt_override = kvarn_env_qt_override();
+            const bool scalar_qt16 =
+                qt_override == 16 && n_queries > 8 && kvarn_cuda_dynamic_shmem_fits(scalar_qt_shmem_q16);
+            const bool scalar_qt8 =
+                !scalar_qt16 &&
+                (qt_override == 8 && n_queries > 4 && kvarn_cuda_dynamic_shmem_fits(scalar_qt_shmem_q8)) ||
+                (!scalar_qt16 && qt_override == 0 && n_queries > 4 && kvarn_cuda_dynamic_shmem_fits(scalar_qt_shmem_q8));
+            const bool scalar_qt4 =
+                !scalar_qt16 && !scalar_qt8 &&
+                ((qt_override == 4 && kvarn_cuda_dynamic_shmem_fits(scalar_qt_shmem_q4)) ||
+                 (qt_override == 0 && kvarn_cuda_dynamic_shmem_fits(scalar_qt_shmem_q4)));
+            if (scalar_qt16 || scalar_qt8 || scalar_qt4) {
+                const int selected_qt = scalar_qt16 ? 16 : (scalar_qt8 ? 8 : 4);
+                const size_t scalar_qt_shmem = scalar_qt16 ? scalar_qt_shmem_q16 : (scalar_qt8 ? scalar_qt_shmem_q8 : scalar_qt_shmem_q4);
+                const int scalar_qt_grid = scalar_qt16 ? int(((n_queries + 15)/16)*n_head) :
+                    (scalar_qt8 ? int(((n_queries + 7)/8)*n_head) : int(((n_queries + 3)/4)*n_head));
+                if (kvarn_attn_trace_claim()) {
+                    std::fprintf(stderr,
+                            "KVarN CUDA mixed-attn inner trace: mode=scalar-qt head_dim=%u n_queries=%u n_head=%u"
+                            " n_head_kv=%u n_gqa=%u sink=%u records=%u pending=%u tail=%u tail_start=%u"
+                            " tokens=%u qt=%d block=%d grid=%d shmem=%zu scores_nelems=%" PRId64
+                            " body_records_cap=%" PRId64 " body_mirror_allowed=0 body_mirror_used=0"
+                            " kq_mask_type=%u kq_mask_stride_query_bytes=%zu kq_mask_stride_token_bytes=%zu\n",
+                            head_dim, n_queries, n_head, n_head_kv, n_gqa,
+                            n_sink, n_records, n_pending, n_tail, tail_start, n_tokens,
+                            selected_qt, scalar_qt_block, scalar_qt_grid, scalar_qt_shmem, scores_nelems,
+                            k_body_records_cap, kq_mask_type, kq_mask_stride_query_bytes, kq_mask_stride_token_bytes);
+                }
+                if (scalar_qt16) {
+                    kvarn_attn_mixed_f16_fused_batch_scalar_qt_kernel<16><<<scalar_qt_grid, scalar_qt_block, scalar_qt_shmem, cuda_stream>>>(
+                            q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                            kq_mask,
+                            out, scores, n_queries, n_head, n_head_kv,
+                            n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                            q_stride_head_floats, q_stride_query_floats,
+                            out_stride_head_floats, out_stride_query_floats,
+                            sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                            pending_stride_head_floats, pending_stride_token_floats,
+                            k_body_stride_record_bytes, v_body_stride_record_bytes,
+                            k_body_stride_head_bytes, v_body_stride_head_bytes,
+                            k_scale_stride_record_floats, v_scale_stride_record_floats,
+                            k_scale_stride_head_floats, v_scale_stride_head_floats,
+                            kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale);
+                } else if (scalar_qt8) {
+                    kvarn_attn_mixed_f16_fused_batch_scalar_qt_kernel<8><<<scalar_qt_grid, scalar_qt_block, scalar_qt_shmem, cuda_stream>>>(
+                            q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                            kq_mask,
+                            out, scores, n_queries, n_head, n_head_kv,
+                            n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                            q_stride_head_floats, q_stride_query_floats,
+                            out_stride_head_floats, out_stride_query_floats,
+                            sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                            pending_stride_head_floats, pending_stride_token_floats,
+                            k_body_stride_record_bytes, v_body_stride_record_bytes,
+                            k_body_stride_head_bytes, v_body_stride_head_bytes,
+                            k_scale_stride_record_floats, v_scale_stride_record_floats,
+                            k_scale_stride_head_floats, v_scale_stride_head_floats,
+                            kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale);
+                } else {
+                    kvarn_attn_mixed_f16_fused_batch_scalar_qt_kernel<4><<<scalar_qt_grid, scalar_qt_block, scalar_qt_shmem, cuda_stream>>>(
+                            q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                            kq_mask,
+                            out, scores, n_queries, n_head, n_head_kv,
+                            n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                            q_stride_head_floats, q_stride_query_floats,
+                            out_stride_head_floats, out_stride_query_floats,
+                            sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                            pending_stride_head_floats, pending_stride_token_floats,
+                            k_body_stride_record_bytes, v_body_stride_record_bytes,
+                            k_body_stride_head_bytes, v_body_stride_head_bytes,
+                            k_scale_stride_record_floats, v_scale_stride_record_floats,
+                            k_scale_stride_head_floats, v_scale_stride_head_floats,
+                            kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale);
+                }
+                return;
+            }
+        }
+
+        // Warp-QK is diagnostic-only for active-body paths: the 256d threshold
+        // patch failed Qwen3.6 packed-vs-split logits, and 512d warp-QK failed
+        // Gemma true-KVarN packed-vs-split. Keep production on exact scalar
+        // paths unless an explicit env opt-in is being isolated.
         const bool use_warpqk_body =
-            head_dim >= 512 || (head_dim == 256 && kvarn_enable_256d_warpqk());
+            !kvarn_disable_warpqk() &&
+            ((head_dim >= 512 && kvarn_enable_512d_warpqk()) ||
+             (head_dim == 256 && kvarn_enable_256d_warpqk()));
         if (use_warpqk_body) {
             const int warpqk_block = head_dim >= 512 ? 512 : 256;
             // Q-tile selection: QT=4 amortizes every K/V load across 4 query
@@ -3836,7 +4249,8 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 size_t body_f16_stride_head_elems = 0;
 
                 const bool allow_f16_body_mirror =
-                    head_dim >= 512 || kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR");
+                    !kvarn_disable_body_mirror() &&
+                    (head_dim >= 512 || kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR"));
                 bool used_f16_body_mirror = false;
 
                 if (n_records > 0 && scores != nullptr && allow_f16_body_mirror) {

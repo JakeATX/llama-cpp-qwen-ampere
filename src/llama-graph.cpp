@@ -871,8 +871,17 @@ void llm_graph_input_attn_kvarn::set_input(const llama_ubatch * ubatch) {
 
     const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, *ubatch, mctx_kvarn->get_size());
     GGML_ASSERT(window.valid);
-    for (ggml_tensor * node : mixed_attn_nodes) {
-        kvarn_graph_update_mixed_attn_params(node, window);
+    if (window_indirect && kvarn_window != nullptr && kvarn_window->buffer != nullptr) {
+        GGML_ASSERT(window.n_records == 0 && window.n_pending == 0);
+        const int32_t win[8] = {
+            int32_t(window.n_sink), int32_t(window.n_records), int32_t(window.n_pending),
+            int32_t(window.n_tail), int32_t(window.tail_start), 0, 0, 0,
+        };
+        ggml_backend_tensor_set(kvarn_window, win, 0, sizeof(win));
+    } else {
+        for (ggml_tensor * node : mixed_attn_nodes) {
+            kvarn_graph_update_mixed_attn_params(node, window);
+        }
     }
 }
 
@@ -911,6 +920,10 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
             params.ubatch,
             params.cparams);
     res &= !mixed_attn_nodes.empty();
+    if (window_indirect) {
+        res &= kvarn_graph_decode_stable_topology(params.ubatch) &&
+               window.n_records == 0 && window.n_pending == 0;
+    }
 
     for (const ggml_tensor * node : mixed_attn_nodes) {
         res &= node->op == GGML_OP_KVARN_ATTN_MIXED;
@@ -3122,12 +3135,34 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * scores = inp_kvarn->mctx_kvarn->build_attn_mixed_scratch(ctx0, il, scores_floats);
         inp_kvarn->mixed_attn_scores.push_back(scores);
 
+        const bool window_indirect = kvarn_graph_decode_stable_topology(ubatch) &&
+                window.n_records == 0 && window.n_pending == 0 &&
+                !inp_kvarn->has_body_store_ops;
+
+        if (window_indirect && inp_kvarn->kvarn_window == nullptr) {
+            inp_kvarn->kvarn_window = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 8);
+            ggml_set_input(inp_kvarn->kvarn_window);
+            ggml_set_name(inp_kvarn->kvarn_window, "kvarn_window");
+            inp_kvarn->window_indirect = true;
+        }
+
+        const llama_kvarn_params effective_kvarn =
+            kvarn_graph_effective_params(cparams.kvarn, inp_kvarn->mctx_kvarn->get_size());
+        const int32_t op_n_sink     = window_indirect ? int32_t(effective_kvarn.sink_tokens) : int32_t(window.n_sink);
+        const int32_t op_n_records  = window_indirect ? 0 : int32_t(window.n_records);
+        const int32_t op_n_pending  = window_indirect ? 0 : int32_t(window.n_pending);
+        const int32_t op_n_tail     = window_indirect ? int32_t(effective_kvarn.tail_tokens) : int32_t(window.n_tail);
+        const int32_t op_tail_start = window_indirect ? 0 : int32_t(window.tail_start);
+
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
                 ctx0, q_cur, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
                 layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask(),
-                window.n_sink, window.n_records, window.n_pending, window.n_tail, window.tail_start,
+                op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                 int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
                 int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);
+        if (window_indirect) {
+            ggml_kvarn_attn_mixed_set_window(cur, inp_kvarn->kvarn_window);
+        }
         inp_kvarn->mixed_attn_nodes.push_back(cur);
         cb(cur, "kvarn_kqv_out", il);
         cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
