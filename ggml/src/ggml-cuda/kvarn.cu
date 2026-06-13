@@ -21,6 +21,7 @@ static constexpr size_t KVARN_ATTN_SHMEM_PAD_FLOATS = 8;
 static std::atomic<uint64_t> g_kvarn_body_store_epoch_next{1};
 static std::atomic<uint64_t> g_kvarn_dequant_cache_trace_count{0};
 static std::atomic<uint64_t> g_kvarn_attn_trace_count{0};
+static std::atomic<uint64_t> g_kvarn_store_phase_trace_count{0};
 
 struct kvarn_dequant_cache_entry {
     const void * k_body    = nullptr;
@@ -31,27 +32,39 @@ struct kvarn_dequant_cache_entry {
     uint32_t     n_head_kv = 0;
     uint8_t      format    = 0;
 };
+struct kvarn_body_store_state {
+    uint64_t epoch      = 0;
+    uint64_t prev_epoch = 0;
+    uint32_t dirty_from = 0;
+};
 // Host dispatch for a given context is single-threaded; no mutex on the hot path.
-static std::unordered_map<const void *, uint64_t> g_kvarn_body_store_epochs;
+static std::unordered_map<const void *, kvarn_body_store_state> g_kvarn_body_store_states;
 static std::unordered_map<const void *, kvarn_dequant_cache_entry> g_kvarn_dequant_cache;
 
 static bool kvarn_dequant_cache_trace_enabled();
 static int  kvarn_dequant_cache_trace_limit();
 
-void ggml_cuda_kvarn_mark_body_store(const void * k_body) {
+void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first_record, uint32_t n_records) {
     if (k_body == nullptr) {
         return;
     }
     const uint64_t epoch = g_kvarn_body_store_epoch_next.fetch_add(1, std::memory_order_relaxed) + 1;
-    g_kvarn_body_store_epochs[k_body] = epoch;
+    kvarn_body_store_state & state = g_kvarn_body_store_states[k_body];
+    state.prev_epoch = state.epoch;
+    state.epoch = epoch;
+    state.dirty_from = n_records == 0 ? 0 : first_record;
 }
 
-static uint64_t kvarn_body_store_epoch(const void * k_body) {
-    auto it = g_kvarn_body_store_epochs.find(k_body);
-    if (it != g_kvarn_body_store_epochs.end()) {
+void ggml_cuda_kvarn_mark_body_store(const void * k_body) {
+    ggml_cuda_kvarn_mark_body_store_records(k_body, 0, 0);
+}
+
+static kvarn_body_store_state kvarn_body_store_state_for(const void * k_body) {
+    auto it = g_kvarn_body_store_states.find(k_body);
+    if (it != g_kvarn_body_store_states.end()) {
         return it->second;
     }
-    return 0;
+    return {};
 }
 
 static uint32_t kvarn_dequant_cache_refill_from(
@@ -66,13 +79,19 @@ static uint32_t kvarn_dequant_cache_refill_from(
         return 0;
     }
 
-    const uint64_t epoch = kvarn_body_store_epoch(k_body);
+    const kvarn_body_store_state store_state = kvarn_body_store_state_for(k_body);
+    const uint64_t epoch = store_state.epoch;
     kvarn_dequant_cache_entry & e = g_kvarn_dequant_cache[scratch_key];
     uint32_t dequant_from = 0;
-    if (e.k_body == k_body && e.epoch == epoch && e.head_dim == head_dim &&
-            e.group_size == group_size && e.n_head_kv == n_head_kv &&
-            e.format == format && e.n_records <= n_records) {
-        dequant_from = e.n_records;
+    bool compatible = false;
+    if (e.k_body == k_body && e.head_dim == head_dim && e.group_size == group_size &&
+            e.n_head_kv == n_head_kv && e.format == format && e.n_records <= n_records) {
+        compatible = true;
+        if (e.epoch == epoch) {
+            dequant_from = e.n_records;
+        } else if (e.epoch == store_state.prev_epoch) {
+            dequant_from = store_state.dirty_from < e.n_records ? store_state.dirty_from : e.n_records;
+        }
     }
 
     if (kvarn_dequant_cache_trace_enabled()) {
@@ -80,10 +99,11 @@ static uint32_t kvarn_dequant_cache_refill_from(
         if (trace_i < uint64_t(kvarn_dequant_cache_trace_limit())) {
             std::fprintf(stderr,
                     "KVarN CUDA dequant-cache trace: %s format=%s scratch=%p k_body=%p epoch=%" PRIu64
+                    " prev_epoch=%" PRIu64 " dirty_from=%u cached_epoch=%" PRIu64
                     " cached_records=%u active_records=%u refill_from=%u head_dim=%u n_head_kv=%u\n",
-                    dequant_from == n_records ? "hit" : (dequant_from == 0 ? "miss" : "partial"),
+                    compatible && dequant_from == n_records ? "hit" : (dequant_from == 0 ? "miss" : "partial"),
                     format == 1 ? "f32" : "f16",
-                    scratch_key, k_body, epoch,
+                    scratch_key, k_body, epoch, store_state.prev_epoch, store_state.dirty_from, e.epoch,
                     e.n_records, n_records, dequant_from, head_dim, n_head_kv);
         }
     }
@@ -188,6 +208,14 @@ static bool kvarn_attn_trace_claim() {
 
 static int kvarn_dequant_cache_trace_limit() {
     return kvarn_env_int("LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT", 256);
+}
+
+static bool kvarn_store_phase_trace_claim() {
+    if (!kvarn_env_flag("LLAMA_KVARN_STORE_TRACE")) {
+        return false;
+    }
+    const int limit = kvarn_env_int("LLAMA_KVARN_STORE_TRACE_LIMIT", 64);
+    return g_kvarn_store_phase_trace_count.fetch_add(1, std::memory_order_relaxed) < uint64_t(limit);
 }
 
 struct kvarn_aux_cuda_state {
@@ -869,6 +897,452 @@ static void kvarn_sinkhorn_variance_normalize_parallel(
     }
 }
 
+static __global__ void kvarn_direct_records_hadamard_k_batched_kernel(
+        const float * __restrict__ k_tiles,
+        float * __restrict__ k_data,
+        uint32_t n_heads,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        size_t k_tile_head_stride_floats,
+        size_t k_tile_group_stride_floats,
+        size_t k_tile_record_stride_floats) {
+    const uint32_t tile = blockIdx.x / group_size;
+    const uint32_t g = blockIdx.x - tile*group_size;
+    if (tile >= n_heads*n_records) {
+        return;
+    }
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+
+    extern __shared__ float shmem[];
+    float v = 0.0f;
+    if (threadIdx.x < head_dim) {
+        const float * src = k_tiles + size_t(record)*k_tile_record_stride_floats +
+            size_t(ih)*k_tile_head_stride_floats + size_t(g)*k_tile_group_stride_floats;
+        v = src[threadIdx.x];
+    }
+    shmem[threadIdx.x] = v;
+    __syncthreads();
+
+    for (uint32_t step = 1; step < head_dim; step <<= 1) {
+        const uint32_t pair = threadIdx.x ^ step;
+        const float other = shmem[pair];
+        __syncthreads();
+        if ((threadIdx.x & step) == 0) {
+            shmem[threadIdx.x] += other;
+        } else {
+            shmem[threadIdx.x] = other - shmem[threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x < head_dim) {
+        k_data[size_t(tile)*head_dim*group_size + size_t(threadIdx.x)*group_size + g] =
+            shmem[threadIdx.x] / sqrtf(float(head_dim));
+    }
+}
+
+static __global__ void kvarn_direct_records_hadamard_v_batched_kernel(
+        const float * __restrict__ v_tiles,
+        float * __restrict__ v_data,
+        uint32_t n_heads,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        size_t v_tile_head_stride_floats,
+        size_t v_tile_group_stride_floats,
+        size_t v_tile_record_stride_floats) {
+    const uint32_t tile = blockIdx.x / group_size;
+    const uint32_t g = blockIdx.x - tile*group_size;
+    if (tile >= n_heads*n_records) {
+        return;
+    }
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+
+    extern __shared__ float shmem[];
+    float v = 0.0f;
+    if (threadIdx.x < head_dim) {
+        const float * src = v_tiles + size_t(record)*v_tile_record_stride_floats +
+            size_t(ih)*v_tile_head_stride_floats + size_t(g)*v_tile_group_stride_floats;
+        v = src[threadIdx.x];
+    }
+    shmem[threadIdx.x] = v;
+    __syncthreads();
+
+    for (uint32_t step = 1; step < head_dim; step <<= 1) {
+        const uint32_t pair = threadIdx.x ^ step;
+        const float other = shmem[pair];
+        __syncthreads();
+        if ((threadIdx.x & step) == 0) {
+            shmem[threadIdx.x] += other;
+        } else {
+            shmem[threadIdx.x] = other - shmem[threadIdx.x];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x < head_dim) {
+        v_data[size_t(tile)*head_dim*group_size + size_t(g)*head_dim + threadIdx.x] =
+            shmem[threadIdx.x] / sqrtf(float(head_dim));
+    }
+}
+
+static __global__ void kvarn_sinkhorn_rows_batched_kernel(
+        float * __restrict__ data,
+        float * __restrict__ row_scale_base,
+        uint32_t n_heads,
+        uint32_t rows,
+        uint32_t cols,
+        size_t scale_record_stride_floats,
+        size_t scale_head_stride_floats,
+        uint32_t init_scale) {
+    const uint32_t tile = blockIdx.x / rows;
+    const uint32_t r = blockIdx.x - tile*rows;
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+    float * tile_data = data + size_t(tile)*rows*cols;
+    float * row_scale = row_scale_base + size_t(ih)*scale_head_stride_floats +
+        size_t(record)*scale_record_stride_floats;
+
+    constexpr float eps = 1.0e-6f;
+    float local_ss = 0.0f;
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float v = tile_data[size_t(r)*cols + c];
+        local_ss += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    shmem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shmem[threadIdx.x] += shmem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float rms = sqrtf(shmem[0]/float(cols) + eps);
+        row_scale[r] = init_scale != 0 ? rms : row_scale[r]*rms;
+        shmem[0] = rms;
+    }
+    __syncthreads();
+
+    const float inv_rms = 1.0f/shmem[0];
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        tile_data[size_t(r)*cols + c] *= inv_rms;
+    }
+}
+
+static __global__ void kvarn_sinkhorn_cols_batched_kernel(
+        float * __restrict__ data,
+        float * __restrict__ col_scale_base,
+        uint32_t n_heads,
+        uint32_t rows,
+        uint32_t cols,
+        size_t scale_record_stride_floats,
+        size_t scale_head_stride_floats,
+        uint32_t init_scale) {
+    const uint32_t tile = blockIdx.x / cols;
+    const uint32_t c = blockIdx.x - tile*cols;
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+    float * tile_data = data + size_t(tile)*rows*cols;
+    float * col_scale = col_scale_base + size_t(ih)*scale_head_stride_floats +
+        size_t(record)*scale_record_stride_floats;
+
+    constexpr float eps = 1.0e-6f;
+    float local_ss = 0.0f;
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        const float v = tile_data[size_t(r)*cols + c];
+        local_ss += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    shmem[threadIdx.x] = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shmem[threadIdx.x] += shmem[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float rms = sqrtf(shmem[0]/float(rows) + eps);
+        col_scale[c] = init_scale != 0 ? rms : col_scale[c]*rms;
+        shmem[0] = rms;
+    }
+    __syncthreads();
+
+    const float inv_rms = 1.0f/shmem[0];
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        tile_data[size_t(r)*cols + c] *= inv_rms;
+    }
+}
+
+static void kvarn_sinkhorn_variance_normalize_batched(
+        float * data,
+        float * row_scale_base,
+        float * col_scale_base,
+        uint32_t n_tiles,
+        uint32_t n_heads,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t iters,
+        size_t scale_record_stride_floats,
+        size_t scale_head_stride_floats,
+        cudaStream_t stream) {
+    const int block = 128;
+    const size_t shmem = size_t(block)*sizeof(float);
+    if (iters == 0) {
+        return;
+    }
+
+    for (uint32_t iter = 0; iter < iters; ++iter) {
+        const uint32_t init = iter == 0 ? 1u : 0u;
+        kvarn_sinkhorn_rows_batched_kernel<<<int(n_tiles*rows), block, shmem, stream>>>(
+                data, row_scale_base, n_heads, rows, cols,
+                scale_record_stride_floats, scale_head_stride_floats, init);
+        kvarn_sinkhorn_cols_batched_kernel<<<int(n_tiles*cols), block, shmem, stream>>>(
+                data, col_scale_base, n_heads, rows, cols,
+                scale_record_stride_floats, scale_head_stride_floats, init);
+    }
+}
+
+static __global__ void kvarn_quantize_k_fullrange_batched_kernel(
+        const float * __restrict__ data,
+        uint8_t * __restrict__ k_body,
+        float * __restrict__ k_scales,
+        uint32_t n_heads,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        size_t k_body_record_stride_bytes,
+        size_t k_body_head_stride_bytes,
+        size_t k_scale_record_stride_floats,
+        size_t k_scale_head_stride_floats) {
+    const uint32_t tile = blockIdx.x / head_dim;
+    const uint32_t d = blockIdx.x - tile*head_dim;
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+    const float * row = data + size_t(tile)*head_dim*group_size + size_t(d)*group_size;
+    uint8_t * body = k_body + size_t(ih)*k_body_head_stride_bytes + size_t(record)*k_body_record_stride_bytes;
+    float * scales = k_scales + size_t(ih)*k_scale_head_stride_floats + size_t(record)*k_scale_record_stride_floats;
+
+    extern __shared__ float shmem[];
+    float * mins = shmem;
+    float * maxs = shmem + blockDim.x;
+    float mn = 3.4028234663852886e38f;
+    float mx = -3.4028234663852886e38f;
+    for (uint32_t c = threadIdx.x; c < group_size; c += blockDim.x) {
+        const float v = row[c];
+        mn = fminf(mn, v);
+        mx = fmaxf(mx, v);
+    }
+    mins[threadIdx.x] = mn;
+    maxs[threadIdx.x] = mx;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            mins[threadIdx.x] = fminf(mins[threadIdx.x], mins[threadIdx.x + stride]);
+            maxs[threadIdx.x] = fmaxf(maxs[threadIdx.x], maxs[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const uint32_t qmax = (1u << key_bits) - 1u;
+    const float row_mn = mins[0];
+    const float row_mx = maxs[0];
+    const float s = (row_mx > row_mn) ? (row_mx - row_mn)/float(qmax) : 1.0f;
+    const float varn_row = scales[d];
+    if (threadIdx.x == 0) {
+        scales[d] = varn_row*s;
+        scales[head_dim + d] = varn_row*row_mn;
+    }
+
+    const size_t row_byte0 = (size_t(d)*group_size*key_bits) >> 3;
+    if (key_bits == 4) {
+        for (size_t b = threadIdx.x; b < (size_t(group_size)*4u >> 3); b += blockDim.x) {
+            const uint32_t c0 = uint32_t(2*b);
+            const uint32_t c1 = c0 + 1;
+            const float v0 = fminf(row_mx, fmaxf(row_mn, row[c0]));
+            const uint32_t q0 = min(qmax, uint32_t(llroundf((v0 - row_mn)/s)));
+            uint32_t q1 = 0;
+            if (c1 < group_size) {
+                const float v1 = fminf(row_mx, fmaxf(row_mn, row[c1]));
+                q1 = min(qmax, uint32_t(llroundf((v1 - row_mn)/s)));
+            }
+            body[row_byte0 + b] = uint8_t(q0 | (q1 << 4));
+        }
+    }
+}
+
+static __global__ void kvarn_quantize_v_fullrange_batched_kernel(
+        const float * __restrict__ data,
+        uint8_t * __restrict__ v_body,
+        float * __restrict__ v_scales,
+        uint32_t n_heads,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t value_bits,
+        size_t v_body_record_stride_bytes,
+        size_t v_body_head_stride_bytes,
+        size_t v_scale_record_stride_floats,
+        size_t v_scale_head_stride_floats) {
+    const uint32_t tile = blockIdx.x / group_size;
+    const uint32_t g = blockIdx.x - tile*group_size;
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+    const float * row = data + size_t(tile)*head_dim*group_size + size_t(g)*head_dim;
+    uint8_t * body = v_body + size_t(ih)*v_body_head_stride_bytes + size_t(record)*v_body_record_stride_bytes;
+    float * scales = v_scales + size_t(ih)*v_scale_head_stride_floats + size_t(record)*v_scale_record_stride_floats;
+
+    extern __shared__ float shmem[];
+    float * mins = shmem;
+    float * maxs = shmem + blockDim.x;
+    float mn = 3.4028234663852886e38f;
+    float mx = -3.4028234663852886e38f;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float v = row[d];
+        mn = fminf(mn, v);
+        mx = fmaxf(mx, v);
+    }
+    mins[threadIdx.x] = mn;
+    maxs[threadIdx.x] = mx;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            mins[threadIdx.x] = fminf(mins[threadIdx.x], mins[threadIdx.x + stride]);
+            maxs[threadIdx.x] = fmaxf(maxs[threadIdx.x], maxs[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const uint32_t qmax = (1u << value_bits) - 1u;
+    const float row_mn = mins[0];
+    const float row_mx = maxs[0];
+    const float s = (row_mx > row_mn) ? (row_mx - row_mn)/float(qmax) : 1.0f;
+    float * v_row_scale = scales + head_dim;
+    float * v_zp = scales + head_dim + group_size;
+    const float varn_row = v_row_scale[g];
+    if (threadIdx.x == 0) {
+        v_row_scale[g] = varn_row*s;
+        v_zp[g] = varn_row*row_mn;
+    }
+
+    const size_t row_byte0 = (size_t(g)*head_dim*value_bits) >> 3;
+    if (value_bits == 2) {
+        for (size_t b = threadIdx.x; b < (size_t(head_dim)*2u >> 3); b += blockDim.x) {
+            uint32_t packed = 0;
+            const uint32_t d_base = uint32_t(4*b);
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t d = d_base + j;
+                if (d < head_dim) {
+                    const float v = fminf(row_mx, fmaxf(row_mn, row[d]));
+                    const uint32_t q = min(qmax, uint32_t(llroundf((v - row_mn)/s)));
+                    packed |= q << (2*j);
+                }
+            }
+            body[row_byte0 + b] = uint8_t(packed);
+        }
+    }
+}
+
+static bool ggml_cuda_kvarn_store_body_direct_records_batched_fullrange(
+        const float * k_tiles,
+        const float * v_tiles,
+        uint8_t * k_body,
+        uint8_t * v_body,
+        float * k_scales,
+        float * v_scales,
+        float * scratch,
+        uint32_t n_heads,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        uint32_t sinkhorn_iters,
+        float rtn_quantile,
+        size_t scratch_floats,
+        size_t k_body_record_stride_bytes,
+        size_t v_body_record_stride_bytes,
+        size_t k_body_head_stride_bytes,
+        size_t v_body_head_stride_bytes,
+        size_t k_scale_record_stride_floats,
+        size_t v_scale_record_stride_floats,
+        size_t k_scale_head_stride_floats,
+        size_t v_scale_head_stride_floats,
+        size_t k_tile_head_stride_floats,
+        size_t v_tile_head_stride_floats,
+        size_t k_tile_group_stride_floats,
+        size_t v_tile_group_stride_floats,
+        size_t k_tile_record_stride_floats,
+        size_t v_tile_record_stride_floats,
+        cudaStream_t stream) {
+    const uint32_t total_tiles = n_heads*n_records;
+    const size_t tile_floats = size_t(head_dim)*group_size;
+    const size_t required = 2*size_t(total_tiles)*tile_floats;
+    if (total_tiles == 0 || scratch_floats < required || rtn_quantile < 1.0f ||
+            key_bits != 4 || value_bits != 2 || (head_dim & (head_dim - 1)) != 0 || head_dim > 1024) {
+        return false;
+    }
+
+    float * k_data = scratch;
+    float * v_data = scratch + size_t(total_tiles)*tile_floats;
+    const int hadamard_block = kvarn_pow2_block(head_dim);
+    if (hadamard_block <= 0 || hadamard_block > 1024) {
+        return false;
+    }
+
+    kvarn_aux_cuda_state & aux = kvarn_aux_cuda_state_get();
+    cudaStream_t aux_stream = aux.stream;
+    cudaEventRecord(aux.main_ready, stream);
+    cudaStreamWaitEvent(aux_stream, aux.main_ready, 0);
+
+    kvarn_direct_records_hadamard_k_batched_kernel<<<int(total_tiles*group_size), hadamard_block,
+            size_t(hadamard_block)*sizeof(float), stream>>>(
+            k_tiles, k_data, n_heads, n_records, head_dim, group_size,
+            k_tile_head_stride_floats, k_tile_group_stride_floats, k_tile_record_stride_floats);
+    kvarn_direct_records_hadamard_v_batched_kernel<<<int(total_tiles*group_size), hadamard_block,
+            size_t(hadamard_block)*sizeof(float), aux_stream>>>(
+            v_tiles, v_data, n_heads, n_records, head_dim, group_size,
+            v_tile_head_stride_floats, v_tile_group_stride_floats, v_tile_record_stride_floats);
+
+    kvarn_sinkhorn_variance_normalize_batched(
+            k_data, k_scales, k_scales + 2*head_dim,
+            total_tiles, n_heads, head_dim, group_size, sinkhorn_iters,
+            k_scale_record_stride_floats, k_scale_head_stride_floats, stream);
+    kvarn_sinkhorn_variance_normalize_batched(
+            v_data, v_scales + head_dim, v_scales,
+            total_tiles, n_heads, group_size, head_dim, sinkhorn_iters,
+            v_scale_record_stride_floats, v_scale_head_stride_floats, aux_stream);
+
+    const int k_quant_block = kvarn_pow2_block(group_size);
+    const int v_quant_block = kvarn_pow2_block(head_dim);
+    if (k_quant_block <= 0 || k_quant_block > 1024 || v_quant_block <= 0 || v_quant_block > 1024) {
+        return false;
+    }
+    kvarn_quantize_k_fullrange_batched_kernel<<<int(total_tiles*head_dim), k_quant_block,
+            size_t(k_quant_block)*2*sizeof(float), stream>>>(
+            k_data, k_body, k_scales, n_heads, head_dim, group_size, key_bits,
+            k_body_record_stride_bytes, k_body_head_stride_bytes,
+            k_scale_record_stride_floats, k_scale_head_stride_floats);
+    kvarn_quantize_v_fullrange_batched_kernel<<<int(total_tiles*group_size), v_quant_block,
+            size_t(v_quant_block)*2*sizeof(float), aux_stream>>>(
+            v_data, v_body, v_scales, n_heads, head_dim, group_size, value_bits,
+            v_body_record_stride_bytes, v_body_head_stride_bytes,
+            v_scale_record_stride_floats, v_scale_head_stride_floats);
+    cudaEventRecord(aux.aux_done, aux_stream);
+    cudaStreamWaitEvent(stream, aux.aux_done, 0);
+    return true;
+}
+
 static bool kvarn_fullrange_packer_overwrites_body(uint32_t cols, uint32_t bits) {
     if (bits != 2 && bits != 4) {
         return false;
@@ -1151,7 +1625,17 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
         void * stream) {
-    ggml_cuda_kvarn_mark_body_store(k_body);
+    uint32_t first_record = 0;
+    if (n_record_batch > 0) {
+        first_record = uint32_t(records[0]);
+        for (uint32_t bi = 1; bi < n_record_batch; ++bi) {
+            const uint32_t record = uint32_t(records[bi]);
+            if (record < first_record) {
+                first_record = record;
+            }
+        }
+    }
+    ggml_cuda_kvarn_mark_body_store_records(k_body, first_record, n_record_batch);
     const size_t tile_floats = size_t(head_dim)*group_size;
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
@@ -1291,8 +1775,9 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
         size_t v_tile_group_stride_floats,
         size_t k_tile_record_stride_floats,
         size_t v_tile_record_stride_floats,
+        size_t scratch_floats,
         void * stream) {
-    ggml_cuda_kvarn_mark_body_store(k_body);
+    ggml_cuda_kvarn_mark_body_store_records(k_body, 0, n_records);
     const size_t tile_floats = size_t(head_dim)*group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
     float * k_tile = scratch;
@@ -1301,6 +1786,33 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
     const int block = 256;
     const int grid = int((tile_floats + block - 1)/block);
+
+    const bool use_batched_phases = kvarn_env_flag("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES");
+    if (use_batched_phases &&
+            ggml_cuda_kvarn_store_body_direct_records_batched_fullrange(
+                k_tiles, v_tiles, k_body, v_body, k_scales, v_scales, scratch,
+                n_heads, n_records, head_dim, group_size, key_bits, value_bits,
+                sinkhorn_iters, rtn_quantile, scratch_floats,
+                k_body_record_stride_bytes, v_body_record_stride_bytes,
+                k_body_head_stride_bytes, v_body_head_stride_bytes,
+                k_scale_record_stride_floats, v_scale_record_stride_floats,
+                k_scale_head_stride_floats, v_scale_head_stride_floats,
+                k_tile_head_stride_floats, v_tile_head_stride_floats,
+                k_tile_group_stride_floats, v_tile_group_stride_floats,
+                k_tile_record_stride_floats, v_tile_record_stride_floats,
+                cuda_stream)) {
+        if (kvarn_store_phase_trace_claim()) {
+            std::fprintf(stderr,
+                    "KVarN CUDA store-body batched-phases trace: used=1 head_dim=%u group_size=%u n_records=%u n_heads=%u scratch_floats=%zu\n",
+                    head_dim, group_size, n_records, n_heads, scratch_floats);
+        }
+        return;
+    }
+    if (use_batched_phases && kvarn_store_phase_trace_claim()) {
+        std::fprintf(stderr,
+                "KVarN CUDA store-body batched-phases trace: used=0 head_dim=%u group_size=%u n_records=%u n_heads=%u scratch_floats=%zu\n",
+                head_dim, group_size, n_records, n_heads, scratch_floats);
+    }
 
     for (uint32_t record = 0; record < n_records; ++record) {
         for (uint32_t ih = 0; ih < n_heads; ++ih) {

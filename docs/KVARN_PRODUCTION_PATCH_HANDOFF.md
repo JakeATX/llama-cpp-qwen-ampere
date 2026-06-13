@@ -1052,3 +1052,89 @@ Stop conditions:
 - Do not lower production `--kvarn-iters` from 4.
 - Do not turn on `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH` by default until it is a true batched CUDA kernel and passes production accuracy.
 - Do not optimize for throughput before bounded f16-vs-KVarN production accuracy passes for both Qwen3.6 MTP and Gemma true KVarN+ISWA.
+
+---
+
+## Round 27 paper-shaped body-store prototype - 2026-06-13
+
+Current local branch before this commit:
+
+- Branch: `kvarn-atx-integration`
+- Previous pushed head: `b31b6cc1a kvarn: add paper fidelity audit and bounded accuracy sweeps`
+
+Implemented:
+
+- Added executable paper-frame CUDA checks in `tests/test-kvarn-cuda-dequant.cpp`:
+  - K body dequant is verified in the paper frame: `H(q) . K_rot_deq == q . H(K_rot_deq)`.
+  - V body dequant is verified in the paper frame: unrotating each dequantized value row before the weighted sum equals unrotating the weighted rotated-value sum.
+  - These run for 128d, Qwen-shaped 256d, and Gemma-shaped 512d cases.
+- Added an opt-in true batched direct-record body-store phase path:
+  - Env gates: `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH=1` and `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES=1`.
+  - CUDA phases now operate over `records * heads` tiles instead of calling the one-tile pipeline in an internal record/head loop.
+  - K phases run on the main stream and V phases on the existing auxiliary stream.
+  - The path is currently fullrange/default-preset only: `k4/v2`, `rtn_quantile=1.0`, power-of-two head dims.
+  - Added bounded trace evidence: `KVarN CUDA store-body batched-phases trace: used=1`.
+- Increased body-store scratch only when `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES=1`, so default memory behavior is unchanged.
+- Added append-aware anchored dequant-cache invalidation:
+  - Stores that know their record range call `ggml_cuda_kvarn_mark_body_store_records`.
+  - Anchored F32/F16 body mirrors can now refill from the first dirty record when the cache is only one store epoch behind.
+  - Caches older than the immediately previous store epoch still fall back to a conservative full refill.
+  - `ggml-cuda.cu` now marks the root K-body pointer with the specific record range before dispatch instead of doing an unconditional full-body mark.
+
+Validation:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-cli llama-bench test-kvarn-cuda-scratch-ref -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- Small Qwen3.5 smoke passed with the opt-in batched phase path and expected layers `3-23:4`.
+- Small Qwen3.5 logits passed with opt-in batched phases:
+  - packed repeat NMSE `0`
+  - packed-vs-split NMSE `0`
+  - packed-vs-scratch NMSE `0`
+- Qwen3.6 MTP logits passed with opt-in batched phases, expected layers `3-39:4`, `-ncmoe 34`:
+  - packed repeat NMSE `0`
+  - packed-vs-split NMSE `0`
+  - packed-vs-scratch NMSE `0`
+- Gemma 4 12B true KVarN+ISWA logits passed with opt-in batched phases, expected layers `5-47:6`, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`:
+  - packed repeat NMSE `0`
+  - packed-vs-split NMSE `0`
+  - packed-vs-scratch NMSE `0`
+
+Performance findings:
+
+- Small Qwen3.5 pp2048:
+  - default direct-record store: `6052.26 ± 138.33 t/s`
+  - batched phases: `5876.72 ± 253.18 t/s`
+  - result: regression/noise; not a win.
+- Small Qwen3.5 pp4096:
+  - default direct-record store: `4046.65 ± 62.53 t/s`
+  - batched phases after K/V stream overlap: `4073.22 ± 41.14 t/s`
+  - result: small `~0.7%` improvement, not decisive.
+- Qwen3.6 MTP pp4096, `-ncmoe 34`, r1:
+  - default direct-record store: `189.77 t/s`
+  - batched phases: `185.21 t/s`
+  - result: production regression. Keep batched phases opt-in only.
+- After the append-aware mark fix, Qwen3.6 MTP pp4096 with `LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE=1` traced `dirty_from=0` for the direct-record prefill path and measured `189.97 t/s`.
+  - Interpretation: this long-prefill graph is still storing direct-record spans from record 0, so append-only mirror reuse is not being exercised in this cell.
+  - The append-aware cache remains useful for append-only store layouts, but it is not the long pp4096 production fix by itself.
+- Small Qwen3.5 direct packed/no-F32-body-mirror A/B:
+  - default pp4096/tg512: `4047.27 t/s`, `188.99 t/s`
+  - `LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR=1`: `3786.53 t/s`, `189.46 t/s`
+  - result: direct packed load saves scratch memory but hurts 256d prefill and does not materially help decode. Do not change the default.
+
+Interpretation:
+
+- The branch now has an executable, paper-shaped batched VarN/body-store prototype, but the first implementation is not production faster on Qwen3.6.
+- The long pp4096 timing still shows mixed attention growing with active body records; body-store launch count is not the only long-context bottleneck.
+- The append-aware dequant-cache change removes avoidable scratch-dequant repeats only when store ranges are append-only; Qwen3.6 pp4096 currently does not hit that condition.
+- This strengthens the paper-steered conclusion: the next production work should focus on fused/occupancy-improved body-record attention, not iteration reduction and not enabling the current batched-store prototype by default.
+
+Immediate next work:
+
+1. Keep `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES` diagnostic-only.
+2. Use the new paper-frame unit as a hard regression test for any further fused dequant/attention work.
+3. Implement long decode/body-attention parallelism across record partitions per head/query, with reductions for max/sum/value.
+4. Revisit direct-record batched store after attention is no longer dominant; possible refinements are reducing scratch writes, fusing Hadamard+VarN more tightly, and avoiding one CTA per row/column for small tiles.

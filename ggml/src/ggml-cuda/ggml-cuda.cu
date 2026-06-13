@@ -3449,7 +3449,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 while (k_body_root != nullptr && k_body_root->view_src != nullptr) {
                     k_body_root = k_body_root->view_src;
                 }
-                ggml_cuda_kvarn_mark_body_store(k_body_root ? k_body_root->data : (k_body ? k_body->data : dst->data));
+                const void * k_body_store_key = k_body_root ? k_body_root->data : (k_body ? k_body->data : dst->data);
                 const int64_t n_values = int64_t(params.head_dim)*params.group_size;
                 const int64_t k_body_bytes = (n_values*params.key_bits   + 7)/8;
                 const int64_t v_body_bytes = (n_values*params.value_bits + 7)/8;
@@ -3488,6 +3488,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_cuda_kvarn_timing_scope timing(ctx.stream(), timing_label.str());
 
                 if (params.n_record_batch > 0 && params.src_layout == 1) {
+                    ggml_cuda_kvarn_mark_body_store_records(
+                            k_body_store_key, uint32_t(params.record_0), uint32_t(params.n_record_batch));
                     ggml_cuda_kvarn_store_body_direct_records_minmax(
                             (const float *) k_tile->data,
                             (const float *) v_tile->data,
@@ -3515,11 +3517,20 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             size_t(v_tile->nb[2]/sizeof(float)),
                             size_t(k_tile->nb[3]/sizeof(float)),
                             size_t(v_tile->nb[3]/sizeof(float)),
+                            size_t(ggml_nelements(scratch)),
                             ctx.stream());
                 } else if (params.n_record_batch > 0) {
                     const int32_t records[4] = {
                         params.record_0, params.record_1, params.record_2, params.record_3,
                     };
+                    int32_t first_record = records[0];
+                    for (int32_t i = 1; i < params.n_record_batch; ++i) {
+                        if (records[i] < first_record) {
+                            first_record = records[i];
+                        }
+                    }
+                    ggml_cuda_kvarn_mark_body_store_records(
+                            k_body_store_key, uint32_t(first_record), uint32_t(params.n_record_batch));
                     const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
                     ggml_cuda_kvarn_store_body_pending_records_minmax(
                             (const float *) k_tile->data,
@@ -3546,6 +3557,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             size_t(pending_group_stride),
                             ctx.stream());
                 } else if (params.n_heads > 1) {
+                    ggml_cuda_kvarn_mark_body_store(k_body_store_key);
                     const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
                     ggml_cuda_kvarn_store_body_pending_heads_minmax(
                             (const float *) k_tile->data,
@@ -3567,6 +3579,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             size_t(pending_group_stride),
                             ctx.stream());
                 } else {
+                    ggml_cuda_kvarn_mark_body_store(k_body_store_key);
                     ggml_cuda_kvarn_store_body_reference_minmax(
                             (const float *) k_tile->data,
                             (const float *) v_tile->data,

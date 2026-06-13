@@ -400,6 +400,284 @@ static void llama_kvarn_dequant_reference(
     }
 }
 
+static float nmse(
+        const std::vector<float> & ref,
+        const std::vector<float> & test) {
+    require(ref.size() == test.size(), "NMSE vectors have matching size");
+    double se = 0.0;
+    double ss = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double diff = double(ref[i]) - double(test[i]);
+        se += diff*diff;
+        ss += double(ref[i])*double(ref[i]);
+    }
+    return float(se/std::max(ss, 1.0e-30));
+}
+
+static std::vector<float> hadamard_vector(const std::vector<float> & src) {
+    std::vector<float> dst = src;
+    const uint32_t n = uint32_t(dst.size());
+    require(is_power_of_2(n), "Hadamard vector length is power-of-two");
+    for (uint32_t step = 1; step < n; step <<= 1) {
+        for (uint32_t base = 0; base < n; base += 2*step) {
+            for (uint32_t i = 0; i < step; ++i) {
+                const uint32_t i0 = base + i;
+                const uint32_t i1 = i0 + step;
+                const float a = dst[i0];
+                const float b = dst[i1];
+                dst[i0] = a + b;
+                dst[i1] = a - b;
+            }
+        }
+    }
+    const float norm = 1.0f/std::sqrt(float(n));
+    for (float & v : dst) {
+        v *= norm;
+    }
+    return dst;
+}
+
+static void test_paper_frame_contract(
+        uint32_t head_dim,
+        uint32_t group,
+        float scale,
+        const std::vector<float> & k_tile,
+        const std::vector<float> & v_tile,
+        const std::vector<float> & k_deq_rot,
+        const std::vector<float> & v_deq_rot,
+        const char * label) {
+    require(k_tile.size() == size_t(head_dim)*group, "paper-frame K source size");
+    require(v_tile.size() == size_t(head_dim)*group, "paper-frame V source size");
+    require(k_deq_rot.size() == k_tile.size(), "paper-frame K dequant size");
+    require(v_deq_rot.size() == v_tile.size(), "paper-frame V dequant size");
+
+    std::vector<float> q(head_dim);
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        q[d] =
+            0.37f*std::sin(float(d + 3)*0.071f) -
+            0.29f*std::cos(float(2*d + 5)*0.043f) +
+            0.11f*std::sin(float(5*d + 7)*0.019f);
+    }
+    const std::vector<float> q_rot = hadamard_vector(q);
+
+    std::vector<float> k_deq_unrot(size_t(head_dim)*group, 0.0f);
+    for (uint32_t g = 0; g < group; ++g) {
+        std::vector<float> col(head_dim);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            col[d] = k_deq_rot[size_t(d)*group + g];
+        }
+        col = hadamard_vector(col);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            k_deq_unrot[size_t(d)*group + g] = col[d];
+        }
+    }
+
+    std::vector<float> scores_rot(group, 0.0f);
+    std::vector<float> scores_unrot(group, 0.0f);
+    std::vector<float> scores_f16(group, 0.0f);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            scores_f16[g] += q[d]*k_tile[size_t(d)*group + g];
+            scores_rot[g] += q_rot[d]*k_deq_rot[size_t(d)*group + g];
+            scores_unrot[g] += q[d]*k_deq_unrot[size_t(d)*group + g];
+        }
+        scores_f16[g] *= scale;
+        scores_rot[g] *= scale;
+        scores_unrot[g] *= scale;
+    }
+
+    const float score_frame_nmse = nmse(scores_rot, scores_unrot);
+    if (score_frame_nmse >= 1.0e-10f) {
+        std::fprintf(stderr,
+                "paper-frame K contract failed: %s head_dim=%u frame_nmse=%g f16_nmse=%g\n",
+                label, head_dim, double(score_frame_nmse), double(nmse(scores_f16, scores_rot)));
+    }
+    require(score_frame_nmse < 1.0e-10f, "paper-frame rotated-query K score matches unrotated dequant reconstruction");
+
+    float max_score = scores_f16[0];
+    for (float s : scores_f16) {
+        max_score = std::max(max_score, s);
+    }
+    std::vector<float> probs(group);
+    float denom = 0.0f;
+    for (uint32_t g = 0; g < group; ++g) {
+        probs[g] = std::exp(scores_f16[g] - max_score);
+        denom += probs[g];
+    }
+    for (float & p : probs) {
+        p /= denom;
+    }
+
+    std::vector<float> out_f16(head_dim, 0.0f);
+    std::vector<float> out_rot(head_dim, 0.0f);
+    std::vector<float> out_unrot_tokens(head_dim, 0.0f);
+    for (uint32_t g = 0; g < group; ++g) {
+        std::vector<float> v_row(head_dim);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            v_row[d] = v_deq_rot[size_t(g)*head_dim + d];
+        }
+        v_row = hadamard_vector(v_row);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            out_f16[d] += probs[g]*v_tile[size_t(g)*head_dim + d];
+            out_rot[d] += probs[g]*v_deq_rot[size_t(g)*head_dim + d];
+            out_unrot_tokens[d] += probs[g]*v_row[d];
+        }
+    }
+    const std::vector<float> out_unrot = hadamard_vector(out_rot);
+    const float value_frame_nmse = nmse(out_unrot_tokens, out_unrot);
+    if (value_frame_nmse >= 1.0e-10f) {
+        std::fprintf(stderr,
+                "paper-frame V contract failed: %s head_dim=%u frame_nmse=%g f16_nmse=%g\n",
+                label, head_dim, double(value_frame_nmse), double(nmse(out_f16, out_unrot)));
+    }
+    require(value_frame_nmse < 1.0e-10f, "paper-frame V unrotation commutes with weighted value sum");
+}
+
+static void test_direct_record_batched_phases(
+        uint32_t head_dim,
+        const llama_kvarn_params & params) {
+    const uint32_t group = params.group_size;
+    const uint32_t n_heads = head_dim == 512 ? 1 : 2;
+    const uint32_t n_records = 2;
+    const size_t n = size_t(head_dim)*group;
+    const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+
+    std::vector<float> k_tiles(size_t(n_records)*group*n_heads*head_dim);
+    std::vector<float> v_tiles(k_tiles.size());
+    const size_t tile_head_stride = head_dim;
+    const size_t tile_group_stride = size_t(head_dim)*n_heads;
+    const size_t tile_record_stride = size_t(head_dim)*n_heads*group;
+    for (uint32_t r = 0; r < n_records; ++r) {
+        for (uint32_t g = 0; g < group; ++g) {
+            for (uint32_t ih = 0; ih < n_heads; ++ih) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t off = size_t(r)*tile_record_stride + size_t(g)*tile_group_stride +
+                        size_t(ih)*tile_head_stride + d;
+                    k_tiles[off] =
+                        0.041f*std::sin(float(d + 7*g + 11*ih + 13*r)*0.017f) -
+                        0.023f*std::cos(float(3*d + 5*g + 17*ih + 19*r)*0.011f);
+                    v_tiles[off] =
+                        0.037f*std::cos(float(5*d + 3*g + 7*ih + 23*r)*0.013f) +
+                        0.029f*std::sin(float(d + 11*g + 13*ih + 29*r)*0.019f);
+                }
+            }
+        }
+    }
+
+    const size_t k_body_record_stride = layout.k_body_bytes;
+    const size_t v_body_record_stride = layout.v_body_bytes;
+    const size_t k_body_head_stride = size_t(n_records)*layout.k_body_bytes;
+    const size_t v_body_head_stride = size_t(n_records)*layout.v_body_bytes;
+    const size_t k_scale_record_stride = layout.k_scale_floats;
+    const size_t v_scale_record_stride = layout.v_scale_floats;
+    const size_t k_scale_head_stride = size_t(n_records)*layout.k_scale_floats;
+    const size_t v_scale_head_stride = size_t(n_records)*layout.v_scale_floats;
+
+    std::vector<uint8_t> k_body_ref(size_t(n_heads)*n_records*layout.k_body_bytes);
+    std::vector<uint8_t> v_body_ref(size_t(n_heads)*n_records*layout.v_body_bytes);
+    std::vector<float> k_scales_ref(size_t(n_heads)*n_records*layout.k_scale_floats);
+    std::vector<float> v_scales_ref(size_t(n_heads)*n_records*layout.v_scale_floats);
+
+    for (uint32_t r = 0; r < n_records; ++r) {
+        for (uint32_t ih = 0; ih < n_heads; ++ih) {
+            std::vector<float> k_rec(n);
+            std::vector<float> v_rec(n);
+            for (uint32_t g = 0; g < group; ++g) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const size_t src = size_t(r)*tile_record_stride + size_t(g)*tile_group_stride +
+                        size_t(ih)*tile_head_stride + d;
+                    k_rec[size_t(d)*group + g] = k_tiles[src];
+                    v_rec[size_t(g)*head_dim + d] = v_tiles[src];
+                }
+            }
+            const llama_kvarn_body_record rec = llama_kvarn_store_reference(params, head_dim, k_rec, v_rec);
+            const size_t body_k_off = size_t(ih)*k_body_head_stride + size_t(r)*k_body_record_stride;
+            const size_t body_v_off = size_t(ih)*v_body_head_stride + size_t(r)*v_body_record_stride;
+            const size_t scale_k_off = size_t(ih)*k_scale_head_stride + size_t(r)*k_scale_record_stride;
+            const size_t scale_v_off = size_t(ih)*v_scale_head_stride + size_t(r)*v_scale_record_stride;
+            std::copy(rec.k_body.begin(), rec.k_body.end(), k_body_ref.begin() + body_k_off);
+            std::copy(rec.v_body.begin(), rec.v_body.end(), v_body_ref.begin() + body_v_off);
+            std::copy(rec.k_scales.begin(), rec.k_scales.end(), k_scales_ref.begin() + scale_k_off);
+            std::copy(rec.v_scales.begin(), rec.v_scales.end(), v_scales_ref.begin() + scale_v_off);
+        }
+    }
+
+    float * k_tiles_d = cuda_upload(k_tiles);
+    float * v_tiles_d = cuda_upload(v_tiles);
+    uint8_t * k_body_d = nullptr;
+    uint8_t * v_body_d = nullptr;
+    float * k_scales_d = nullptr;
+    float * v_scales_d = nullptr;
+    float * scratch_d = nullptr;
+    const size_t scratch_floats = 2*size_t(n_heads)*n_records*n;
+    require_cuda(cudaMalloc(&k_body_d, k_body_ref.size()), "cudaMalloc direct batched K body");
+    require_cuda(cudaMalloc(&v_body_d, v_body_ref.size()), "cudaMalloc direct batched V body");
+    require_cuda(cudaMalloc(&k_scales_d, k_scales_ref.size()*sizeof(float)), "cudaMalloc direct batched K scales");
+    require_cuda(cudaMalloc(&v_scales_d, v_scales_ref.size()*sizeof(float)), "cudaMalloc direct batched V scales");
+    require_cuda(cudaMalloc(&scratch_d, scratch_floats*sizeof(float)), "cudaMalloc direct batched scratch");
+
+    set_env_var("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES", "1");
+    ggml_cuda_kvarn_store_body_direct_records_minmax(
+            k_tiles_d, v_tiles_d,
+            k_body_d, v_body_d,
+            k_scales_d, v_scales_d,
+            scratch_d,
+            n_heads, n_records,
+            head_dim, group, params.key_bits, params.value_bits,
+            params.sinkhorn_iters, params.rtn_quantile,
+            k_body_record_stride, v_body_record_stride,
+            k_body_head_stride, v_body_head_stride,
+            k_scale_record_stride, v_scale_record_stride,
+            k_scale_head_stride, v_scale_head_stride,
+            tile_head_stride, tile_head_stride,
+            tile_group_stride, tile_group_stride,
+            tile_record_stride, tile_record_stride,
+            scratch_floats,
+            nullptr);
+    set_env_var("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES", "");
+    require_cuda(cudaGetLastError(), "KVarN CUDA direct-record batched phases launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA direct-record batched phases sync");
+
+    std::vector<uint8_t> k_body(k_body_ref.size());
+    std::vector<uint8_t> v_body(v_body_ref.size());
+    std::vector<float> k_scales(k_scales_ref.size());
+    std::vector<float> v_scales(v_scales_ref.size());
+    require_cuda(cudaMemcpy(k_body.data(), k_body_d, k_body.size(), cudaMemcpyDeviceToHost), "copy direct batched K body");
+    require_cuda(cudaMemcpy(v_body.data(), v_body_d, v_body.size(), cudaMemcpyDeviceToHost), "copy direct batched V body");
+    require_cuda(cudaMemcpy(k_scales.data(), k_scales_d, k_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct batched K scales");
+    require_cuda(cudaMemcpy(v_scales.data(), v_scales_d, v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct batched V scales");
+
+    size_t packed_diff = 0;
+    for (size_t i = 0; i < k_body.size(); ++i) {
+        packed_diff += k_body[i] != k_body_ref[i] ? 1 : 0;
+    }
+    for (size_t i = 0; i < v_body.size(); ++i) {
+        packed_diff += v_body[i] != v_body_ref[i] ? 1 : 0;
+    }
+    float scale_err = 0.0f;
+    for (size_t i = 0; i < k_scales.size(); ++i) {
+        scale_err = std::max(scale_err, std::fabs(k_scales[i] - k_scales_ref[i]));
+    }
+    for (size_t i = 0; i < v_scales.size(); ++i) {
+        scale_err = std::max(scale_err, std::fabs(v_scales[i] - v_scales_ref[i]));
+    }
+    if (packed_diff > 4 || scale_err >= 1.0e-5f) {
+        std::fprintf(stderr,
+                "direct-record batched phases diff: head_dim=%u heads=%u records=%u packed_diff=%zu scale_err=%g\n",
+                head_dim, n_heads, n_records, packed_diff, double(scale_err));
+    }
+    require(packed_diff <= 4, "CUDA direct-record batched phases packed bytes match CPU reference");
+    require(scale_err < 1.0e-5f, "CUDA direct-record batched phases scales match CPU reference");
+
+    cudaFree(k_tiles_d);
+    cudaFree(v_tiles_d);
+    cudaFree(k_body_d);
+    cudaFree(v_body_d);
+    cudaFree(k_scales_d);
+    cudaFree(v_scales_d);
+    cudaFree(scratch_d);
+}
+
 static void run_case(uint32_t head_dim, float rtn_quantile) {
     llama_kvarn_params params = llama_kvarn_default_params();
     params.sinkhorn_iters = 4;
@@ -523,7 +801,16 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     }
     require(store_deq_max_err < 1.0e-2f, "CUDA store-body dequant matches CPU reference");
 
+    const float scale = 1.0f/std::sqrt(float(head_dim));
+    test_paper_frame_contract(
+            head_dim, group, scale,
+            k_tile, v_tile,
+            k_store_deq, v_store_deq,
+            params.rtn_quantile < 1.0f ? "quantile-store" : "fullrange-store");
+
     if (params.rtn_quantile >= 1.0f) {
+        test_direct_record_batched_phases(head_dim, params);
+
         cudaFree(k_tile_d);
         cudaFree(v_tile_d);
         cudaFree(k_body_store_d);
@@ -578,7 +865,6 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
         q[d] = 0.02f*std::sin(float(d)*0.13f) - 0.03f*std::cos(float(d)*0.07f);
     }
 
-    const float scale = 1.0f/std::sqrt(float(head_dim));
     float * q_d = cuda_upload(q);
 
     ggml_cuda_kvarn_qk_body(

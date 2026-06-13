@@ -141,3 +141,61 @@ Updated priority:
 2. Then implement true batched records * heads VarN/body-store.
 3. Then implement fused dual-scale dequant/attention and long-decode occupancy.
 4. Only then revisit `--kvarn-iters`.
+
+## Round 27 Codex update
+
+The next paper-steered implementation slice is now in-tree as an opt-in diagnostic path.
+
+What changed:
+
+- `tests/test-kvarn-cuda-dequant.cpp` now has executable paper-frame checks for
+  the Hadamard placement/consumption contract:
+  - K attention is checked as `H(q) . K_rot_deq == q . H(K_rot_deq)`.
+  - V attention is checked as `H(sum p*V_rot_deq) == sum p*H(V_rot_deq)`.
+  - The checks cover 128d, Qwen-shaped 256d, and Gemma-shaped 512d.
+- `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES=1` adds a true
+  records-by-heads batched direct-record body-store phase path for the default
+  production format (`k4/v2`, `rtn_quantile=1.0`, power-of-two head dims).
+- The existing `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH=1` graph path is still
+  required. The new phase path is intentionally not enabled by default.
+- Anchored dequant-cache invalidation is now append-aware for one store epoch:
+  append-only body seals can refill from the first dirty record instead of
+  always rebuilding cached records `0..n-1`.
+  `ggml-cuda.cu` now marks the root body pointer with the dispatch branch's
+  record range, instead of pre-marking every store as dirty from record 0.
+
+Validation completed:
+
+- Build: `llama-cli`, `llama-bench`, and `test-kvarn-cuda-scratch-ref`.
+- Focused CTest: `test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure`.
+- `scripts/kvarn/kv_memory_estimate.py --self-test`.
+- Small Qwen3.5 CUDA smoke with opt-in batched phases.
+- Logits gates with opt-in batched phases:
+  - small Qwen3.5: repeat/split/scratch NMSE `0`.
+  - Qwen3.6 MTP: repeat/split/scratch NMSE `0`, expected layers `3-39:4`, `-ncmoe 34`.
+  - Gemma 4 12B true KVarN+ISWA: repeat/split/scratch NMSE `0`, expected layers `5-47:6`, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`.
+
+Performance result:
+
+- Small Qwen3.5 pp4096 improved only slightly after K/V stream overlap:
+  `4046.65 +/- 62.53 t/s` default vs `4073.22 +/- 41.14 t/s` batched phases.
+- Qwen3.6 MTP pp4096 regressed:
+  `189.77 t/s` default vs `185.21 t/s` batched phases.
+- Qwen3.6 MTP pp4096 with `LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE=1` after the
+  root mark fix measured `189.97 t/s` and traced `dirty_from=0`, so the current
+  direct-record prefill topology still does not get append-only dequant reuse.
+
+Conclusion:
+
+- The branch now follows the paper steer at the test-contract and first
+  systems-shape level, but this batched body-store prototype is not the
+  production performance fix.
+- The append-aware dequant-cache update is a production-shape infrastructure
+  fix, but Qwen3.6 pp4096 still needs a graph/store topology or attention-kernel
+  change before that reuse matters for the failing long cell.
+- Do not enable `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES` by default.
+- Do not lower production `--kvarn-iters`; the bounded production accuracy
+  evidence is still bad for that direction.
+- The next likely production patch is fused/occupancy-improved body-record
+  attention: split active body records across CTAs per head/query, reduce
+  score max/sum/value, and keep packed-vs-split/scratch as the oracle.

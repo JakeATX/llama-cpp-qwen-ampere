@@ -1484,7 +1484,15 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
     const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
     // Batched pending-head seals keep transpose tiles plus K/V scratch in one buffer.
     const bool needs_pending_head_tiles = view.head_dim_k >= 512 || (view.head_dim_k >= 256 && view.n_head_kv > 1);
-    return needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
+    size_t result = needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
+
+    if (kvarn_env_flag_enabled("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES")) {
+        constexpr uint32_t direct_record_batch_max = 8;
+        const size_t batched_phase_scratch =
+            2*tile_floats*size_t(view.n_head_kv)*direct_record_batch_max;
+        result = std::max(result, batched_phase_scratch);
+    }
+    return result;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::build_body_store_scratch(ggml_context * ctx, int32_t il) const {

@@ -4,6 +4,7 @@
 #include <cstdint>
 
 void ggml_cuda_kvarn_mark_body_store(const void * k_body);
+void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first_record, uint32_t n_records);
 
 void ggml_cuda_kvarn_store_body_reference_minmax(
         const float * k_tile,
@@ -102,6 +103,7 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
         size_t v_tile_group_stride_floats,
         size_t k_tile_record_stride_floats,
         size_t v_tile_record_stride_floats,
+        size_t scratch_floats,
         void * stream);
 
 void ggml_cuda_kvarn_store_k_body_reference_minmax(

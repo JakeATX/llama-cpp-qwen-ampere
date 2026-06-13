@@ -216,3 +216,14 @@ Interpretation:
   - packed-vs-split,
   - expected KVarN layer routing,
   - focused KVarN CTests.
+
+## Round 27 update
+
+The first paper-shaped implementation slice has landed as a diagnostic path, not a production default.
+
+- `tests/test-kvarn-cuda-dequant.cpp` now has executable paper-frame checks for K and V Hadamard consumption.
+- `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES=1` adds a true records * heads batched direct-record body-store path for default `k4/v2`, `rtn_quantile=1.0` cases.
+- The path is logits-clean on small Qwen3.5, Qwen3.6 MTP, and Gemma true KVarN+ISWA at the packed-repeat/split/scratch gates.
+- It does not yet improve production Qwen3.6 pp4096; keep it opt-in and continue with fused/parallel body attention work.
+- Anchored dequant mirrors now have append-aware invalidation for one-epoch append-only body stores, reducing redundant body scratch materialization in layouts that store only newly sealed records without changing the packed format or attention arithmetic.
+- Qwen3.6 pp4096 tracing still shows the current direct-record prefill graph dirtying from record 0, so the append-aware cache is a correctness-safe infrastructure fix, not the long-prefill production fix by itself.
