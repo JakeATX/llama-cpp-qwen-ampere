@@ -980,3 +980,75 @@ Recommended next implementation targets:
 5. Keep the short gate as a hard regression floor:
    - Gemma true KVarN+ISWA and Qwen MTP must remain `>=90%` on `pp512` and `tg64`.
    - Expected KVarN layer routing and logits NMSE `0` remain required.
+
+---
+
+## Round 26 paper-fidelity redirect - 2026-06-13
+
+Current local branch before this commit:
+
+- Branch: `kvarn-atx-integration`
+- Previous pushed head: `aafdb00f1 kvarn: add long-context diagnostics and accuracy gate`
+- Author reference clone used for comparison: `C:\Users\sjake\OneDrive\Documents\New project\KVarN-reference`, commit `a601d2a`
+- Paper source used for audit: <https://arxiv.org/html/2606.03458v1>
+
+Implemented in Round 26:
+
+- Applied the incoming next-patches handover and added `scripts/kvarn/run_iters_sweep.ps1`.
+- Hardened `run_iters_sweep.ps1`:
+  - runs each accuracy gate in a child PowerShell process so one candidate cannot terminate the whole sweep;
+  - stops after the first passing candidate by default, with `-ContinueAfterPass` for a full curve;
+  - requires both the gate summary status and the numeric threshold to pass before marking a candidate PASS.
+- Extended `scripts/kvarn/run_accuracy_gate.ps1` and the sweep with `-Chunks`, forwarded to `llama-perplexity --chunks`, so production accuracy checks can be bounded and repeatable.
+- Added `docs/KVARN_PAPER_FIDELITY_AUDIT.md`.
+- Added `docs/KVARN_NEXT_PATCHES_HANDOVER.md` from the incoming handover package.
+
+Key correction:
+
+- Do not treat lower `--kvarn-iters` as the main fix.
+- Sec. 3.3, Sec. 4.2, and Appendix I of the paper imply a batched/fused systems design. The paper's low overhead claim is not evidence that a serial per-record/per-head Sinkhorn implementation is cheap.
+- The branch has many correct conceptual parts, but the long path does not yet match the paper's optimized shape.
+
+Production accuracy results:
+
+- Qwen3.6 MTP, context 4096, batch 4096, `--chunks 2`, `-ncmoe 34`, expected layers `3-39:4`, artifact `artifacts/kvarn-iters-sweep/round26-qwen36-ctx4096-chunks2-fixed`:
+  - `iters=1`: f16 PPL `4.5843`, KVarN PPL `6.6577`, increase `45.23%`.
+  - `iters=2`: increase `47.21%`.
+  - `iters=3`: increase `45.28%`.
+  - `iters=4`: increase `46.71%`.
+  - Result: no candidate passed `MaxPplIncrease=5%`.
+- Gemma 4 12B true KVarN+ISWA, context 4096, batch 4096, `--chunks 2`, expected layers `5-47:6`, artifact `artifacts/kvarn-accuracy/round26-gemma-ctx4096-chunks2-iters4`:
+  - f16 PPL `418.2027`.
+  - KVarN PPL `137079490.9999`.
+  - Increase `32778141.51%`.
+  - Result: FAIL.
+
+Interpretation:
+
+- Long-context production accuracy is currently failing before performance tuning.
+- Existing KVarN-vs-KVarN logits checks are insufficient to prove f16 faithfulness.
+- Long-context throughput failures should now be interpreted as implementation-shape and correctness/fidelity failures, not proof that KVarN is inherently slow.
+
+Immediate next patch sequence:
+
+1. Add low-level tile-frame correctness tests for Qwen 256d and Gemma 512d:
+   - store one K/V body tile;
+   - dequant it;
+   - compare rotated-query dot dequantized-rotated-K against f16 score;
+   - compare output with dequantized V unrotated or otherwise transformed according to the production graph.
+2. Fix any Hadamard/Q/V/output-frame mismatch exposed by those tests.
+3. Implement true batched VarN/body-store over `records * heads` tiles:
+   - per-tile scratch slices;
+   - grid-strided Hadamard/Sinkhorn/quantize/finalize phases;
+   - no per-tile launch loop inside `ggml_cuda_kvarn_store_body_direct_records_minmax`.
+4. Implement fused dual-scale dequant/attention for long decode:
+   - apply RTN scale/zp and KVarN scale inside the attention/dequant kernel;
+   - avoid production F32/F16 body mirrors.
+5. Improve long decode occupancy by splitting body records across CTAs per head/query and reducing partials.
+6. Revisit `--kvarn-iters` only after production-model accuracy gates pass.
+
+Stop conditions:
+
+- Do not lower production `--kvarn-iters` from 4.
+- Do not turn on `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH` by default until it is a true batched CUDA kernel and passes production accuracy.
+- Do not optimize for throughput before bounded f16-vs-KVarN production accuracy passes for both Qwen3.6 MTP and Gemma true KVarN+ISWA.

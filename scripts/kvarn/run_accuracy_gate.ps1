@@ -52,6 +52,7 @@ param(
     [int]    $ContextSize = 0,
     [int]    $BatchSize = 0,
     [int]    $Parallel = 1,
+    [int]    $Chunks = 0,
     [double] $MaxPplIncrease = 0.05,
     [double] $MaxMeanKL = 0.02,
     [switch] $UseKLDivergence,
@@ -74,6 +75,9 @@ if ($Parallel -ne 1) {
 }
 if ($BatchSize -lt 0) {
     throw "BatchSize must be non-negative"
+}
+if ($Chunks -lt 0) {
+    throw "Chunks must be non-negative"
 }
 if ($Fit -ne "off") {
     throw "KVarN accuracy gate requires -Fit off because the auto-fit path can retry unsupported multi-sequence settings"
@@ -225,6 +229,8 @@ $dataPath  = (Resolve-Path -LiteralPath $Dataset).Path
 
 $ctxArgv = @()
 if ($ContextSize -gt 0) { $ctxArgv = @("-c", [string] $ContextSize) }
+$chunkArgv = @()
+if ($Chunks -gt 0) { $chunkArgv = @("--chunks", [string] $Chunks) }
 $effectiveCtx = if ($ContextSize -gt 0) { $ContextSize } else { 512 }
 $effectiveBatch = if ($BatchSize -gt 0) { $BatchSize } else { $effectiveCtx }
 if ($effectiveBatch -gt $effectiveCtx) {
@@ -239,7 +245,7 @@ $commonArgv = @(
     "-b", [string] $effectiveBatch,
     "-fit", $Fit,
     "-fa", $FlashAttn
-) + $ctxArgv + $ExtraArgs
+) + $ctxArgv + $chunkArgv + $ExtraArgs
 
 $rtnQuantileArg = ("{0}" -f $KvarnRtnQuantile)
 $kvarnCacheArgv = @(
@@ -335,6 +341,7 @@ $md += "- model: ``$modelPath``"
 $md += "- dataset: ``$dataPath``"
 $md += "- mode: $(if ($UseKLDivergence.IsPresent) { 'kl-divergence' } else { 'perplexity-delta' })"
 $md += "- preset: ``$KvarnPreset`` iters=$KvarnIters rtn-quantile=$KvarnRtnQuantile fa=$FlashAttn"
+$md += "- ctx: $effectiveCtx batch=$effectiveBatch chunks=$(if ($Chunks -gt 0) { $Chunks } else { 'all' })"
 $md += "- cuda: $($kvarnRun.CudaDevice)"
 $md += "- kvarn cache engaged: $hasKvarnCache"
 $md += ""
