@@ -1772,6 +1772,25 @@ extern "C" {
                    int32_t        sinkhorn_iters,
                    float          rtn_quantile);
 
+    GGML_API struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k_tiles,
+            struct ggml_tensor  * v_tiles,
+            struct ggml_tensor  * k_body,
+            struct ggml_tensor  * v_body,
+            struct ggml_tensor  * k_scales,
+            struct ggml_tensor  * v_scales,
+            struct ggml_tensor  * scratch,
+                   int32_t        n_heads,
+                   int32_t        record0,
+                   int32_t        n_records,
+                   int32_t        head_dim,
+                   int32_t        group_size,
+                   int32_t        key_bits,
+                   int32_t        value_bits,
+                   int32_t        sinkhorn_iters,
+                   float          rtn_quantile);
+
     // Attach an optional I32 window tensor (>= 5 elems: n_sink, n_records,
     // n_pending, n_tail, tail_start) as src[11]. When present, CUDA kernels
     // read the live attention window from device memory so the op is safe to

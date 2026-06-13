@@ -72,6 +72,38 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         size_t pending_v_head_stride_floats,
         void * stream);
 
+void ggml_cuda_kvarn_store_body_direct_records_minmax(
+        const float * k_tiles,
+        const float * v_tiles,
+        uint8_t * k_body,
+        uint8_t * v_body,
+        float * k_scales,
+        float * v_scales,
+        float * scratch,
+        uint32_t n_heads,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        uint32_t sinkhorn_iters,
+        float rtn_quantile,
+        size_t k_body_record_stride_bytes,
+        size_t v_body_record_stride_bytes,
+        size_t k_body_head_stride_bytes,
+        size_t v_body_head_stride_bytes,
+        size_t k_scale_record_stride_floats,
+        size_t v_scale_record_stride_floats,
+        size_t k_scale_head_stride_floats,
+        size_t v_scale_head_stride_floats,
+        size_t k_tile_head_stride_floats,
+        size_t v_tile_head_stride_floats,
+        size_t k_tile_group_stride_floats,
+        size_t v_tile_group_stride_floats,
+        size_t k_tile_record_stride_floats,
+        size_t v_tile_record_stride_floats,
+        void * stream);
+
 void ggml_cuda_kvarn_store_k_body_reference_minmax(
         const float * k_tile,
         uint8_t * k_body,

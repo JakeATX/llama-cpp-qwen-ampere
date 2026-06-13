@@ -806,6 +806,18 @@ ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_all_heads(
     return kv->store_kv_body_all_heads(ctx, k_tile, v_tile, scratch, il, record);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_records_all_heads(
+        ggml_context * ctx,
+        ggml_tensor * k_tiles,
+        ggml_tensor * v_tiles,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t record0,
+        uint32_t n_records) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->store_kv_body_records_all_heads(ctx, k_tiles, v_tiles, scratch, il, record0, n_records);
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::store_k_body_record_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
@@ -1610,6 +1622,40 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads(
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
 }
 
+ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_all_heads(
+        ggml_context * ctx,
+        ggml_tensor * k_tiles,
+        ggml_tensor * v_tiles,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t record0,
+        uint32_t n_records) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (n_records == 0) {
+        throw std::invalid_argument("KVarN direct record batch requires at least one record");
+    }
+    if (n_records > 16) {
+        throw std::invalid_argument("KVarN direct record batch supports at most sixteen records per op");
+    }
+    if (record0 + n_records > view.n_records) {
+        throw std::out_of_range("KVarN direct body record span is out of range");
+    }
+    if (view.head_dim_k != view.head_dim_v) {
+        throw std::runtime_error("KVarN fused K/V body store requires equal K and V head dimensions");
+    }
+
+    ggml_tensor * k_body   = view_k_body_record_span_heads(ctx, il, record0, n_records);
+    ggml_tensor * v_body   = view_v_body_record_span_heads(ctx, il, record0, n_records);
+    ggml_tensor * k_scales = view_k_scales_record_span_heads(ctx, il, record0, n_records);
+    ggml_tensor * v_scales = view_v_scales_record_span_heads(ctx, il, record0, n_records);
+    return ggml_kvarn_store_kv_body_direct_records(
+            ctx, k_tiles, v_tiles, k_body, v_body, k_scales, v_scales, scratch,
+            int32_t(view.n_head_kv), int32_t(record0), int32_t(n_records),
+            int32_t(view.head_dim_k), int32_t(params.group_size),
+            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(params.sinkhorn_iters), params.rtn_quantile);
+}
+
 ggml_tensor * llama_kv_cache_kvarn::store_k_body_record_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
@@ -1665,6 +1711,21 @@ ggml_tensor * llama_kv_cache_kvarn::view_k_body_record_heads(
     return result;
 }
 
+ggml_tensor * llama_kv_cache_kvarn::view_k_body_record_span_heads(
+        ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (n_records == 0 || record0 + n_records > view.n_records) {
+        throw std::out_of_range("KVarN body record span is out of range");
+    }
+
+    const size_t offset = size_t(record0)*view.body_k->nb[1];
+    ggml_tensor * result = ggml_view_3d(
+            ctx, view.body_k, view.layout_k.k_body_bytes, n_records, view.n_head_kv,
+            view.body_k->nb[1], view.body_k->nb[2], offset);
+    ggml_format_name(result, "kvarn_k_body_l%d_r%u_n%u_heads", il, record0, n_records);
+    return result;
+}
+
 ggml_tensor * llama_kv_cache_kvarn::view_v_body_record_heads(
         ggml_context * ctx, int32_t il, uint32_t record) const {
     const llama_kvarn_layer_view view = get_layer_view(il);
@@ -1677,6 +1738,21 @@ ggml_tensor * llama_kv_cache_kvarn::view_v_body_record_heads(
             ctx, view.body_v, view.layout_v.v_body_bytes, view.n_head_kv,
             view.body_v->nb[2], offset);
     ggml_format_name(result, "kvarn_v_body_l%d_r%u_heads", il, record);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::view_v_body_record_span_heads(
+        ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (n_records == 0 || record0 + n_records > view.n_records) {
+        throw std::out_of_range("KVarN body record span is out of range");
+    }
+
+    const size_t offset = size_t(record0)*view.body_v->nb[1];
+    ggml_tensor * result = ggml_view_3d(
+            ctx, view.body_v, view.layout_v.v_body_bytes, n_records, view.n_head_kv,
+            view.body_v->nb[1], view.body_v->nb[2], offset);
+    ggml_format_name(result, "kvarn_v_body_l%d_r%u_n%u_heads", il, record0, n_records);
     return result;
 }
 
@@ -1695,6 +1771,21 @@ ggml_tensor * llama_kv_cache_kvarn::view_k_scales_record_heads(
     return result;
 }
 
+ggml_tensor * llama_kv_cache_kvarn::view_k_scales_record_span_heads(
+        ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (n_records == 0 || record0 + n_records > view.n_records) {
+        throw std::out_of_range("KVarN scale record span is out of range");
+    }
+
+    const size_t offset = size_t(record0)*view.scales_k->nb[1];
+    ggml_tensor * result = ggml_view_3d(
+            ctx, view.scales_k, view.layout_k.k_scale_floats, n_records, view.n_head_kv,
+            view.scales_k->nb[1], view.scales_k->nb[2], offset);
+    ggml_format_name(result, "kvarn_k_scales_l%d_r%u_n%u_heads", il, record0, n_records);
+    return result;
+}
+
 ggml_tensor * llama_kv_cache_kvarn::view_v_scales_record_heads(
         ggml_context * ctx, int32_t il, uint32_t record) const {
     const llama_kvarn_layer_view view = get_layer_view(il);
@@ -1707,6 +1798,21 @@ ggml_tensor * llama_kv_cache_kvarn::view_v_scales_record_heads(
             ctx, view.scales_v, view.layout_v.v_scale_floats, view.n_head_kv,
             view.scales_v->nb[2], offset);
     ggml_format_name(result, "kvarn_v_scales_l%d_r%u_heads", il, record);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_kvarn::view_v_scales_record_span_heads(
+        ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (n_records == 0 || record0 + n_records > view.n_records) {
+        throw std::out_of_range("KVarN scale record span is out of range");
+    }
+
+    const size_t offset = size_t(record0)*view.scales_v->nb[1];
+    ggml_tensor * result = ggml_view_3d(
+            ctx, view.scales_v, view.layout_v.v_scale_floats, n_records, view.n_head_kv,
+            view.scales_v->nb[1], view.scales_v->nb[2], offset);
+    ggml_format_name(result, "kvarn_v_scales_l%d_r%u_n%u_heads", il, record0, n_records);
     return result;
 }
 

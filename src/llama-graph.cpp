@@ -3085,31 +3085,38 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.layout_k.key_bits == 4);
         GGML_ASSERT(layer.layout_v.value_bits == 2);
         GGML_ASSERT(inp_kvarn->mctx_kvarn->body_store_scratch_floats(il) > 0);
-        bool contiguous_initial_prefill = stores_kv &&
+        bool contiguous_prefill_chunk = stores_kv &&
             !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
             ubatch.pos != nullptr &&
-            ubatch.n_tokens > cparams.kvarn.sink_tokens + cparams.kvarn.tail_tokens &&
+            ubatch.n_tokens > 1 &&
             q_cur != nullptr && k_cur != nullptr && v_cur != nullptr &&
             q_cur->ne[2] == int64_t(ubatch.n_tokens) &&
             k_cur->ne[2] == int64_t(ubatch.n_tokens) &&
-            v_cur->ne[2] == int64_t(ubatch.n_tokens) &&
-            ubatch.pos[0] == 0;
-        if (contiguous_initial_prefill) {
+            v_cur->ne[2] == int64_t(ubatch.n_tokens);
+        if (contiguous_prefill_chunk) {
+            const llama_pos chunk_start = ubatch.pos[0];
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                if (ubatch.pos[i] != llama_pos(i)) {
-                    contiguous_initial_prefill = false;
+                if (ubatch.pos[i] != chunk_start + llama_pos(i)) {
+                    contiguous_prefill_chunk = false;
                     break;
                 }
             }
         }
-        const uint32_t direct_body_tokens = contiguous_initial_prefill ?
-            (ubatch.n_tokens - cparams.kvarn.sink_tokens - cparams.kvarn.tail_tokens) : 0;
-        const bool direct_prefill_store =
-            contiguous_initial_prefill &&
-            direct_body_tokens > 0 &&
-            direct_body_tokens%cparams.kvarn.group_size == 0 &&
-            direct_body_tokens/cparams.kvarn.group_size <= layer.n_records;
         if (stores_kv) {
+            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size());
+            bool direct_prefill_store = contiguous_prefill_chunk && !seal_records.empty();
+            if (direct_prefill_store) {
+                const llama_pos chunk_start = ubatch.pos[0];
+                const llama_pos chunk_end = chunk_start + llama_pos(ubatch.n_tokens);
+                for (const uint32_t record : seal_records) {
+                    const llama_pos record_start = llama_pos(cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size);
+                    const llama_pos record_end = record_start + llama_pos(cparams.kvarn.group_size);
+                    if (record >= layer.n_records || record_start < chunk_start || record_end > chunk_end) {
+                        direct_prefill_store = false;
+                        break;
+                    }
+                }
+            }
             ggml_build_forward_expand(gf, inp_kvarn->get_body_plan());
             ggml_build_forward_expand(gf, inp_kvarn->get_body_offsets());
             ggml_build_forward_expand(gf, inp_kvarn->get_tail_evict_idxs());
@@ -3122,7 +3129,6 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
             ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
 
-            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size());
             inp_kvarn->has_body_store_ops = !seal_records.empty();
             inp_kvarn->baked_seal_records = seal_records;
 
@@ -3132,19 +3138,54 @@ ggml_tensor * llm_graph_context::build_attn(
             }
 
             if (direct_prefill_store) {
-                const uint32_t n_direct_records = direct_body_tokens/cparams.kvarn.group_size;
-                for (uint32_t record = 0; record < n_direct_records; ++record) {
-                    const uint32_t pos0 = cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size;
-                    ggml_tensor * k_tile = ggml_view_3d(
-                            ctx0, k_cur,
-                            layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size,
-                            k_cur->nb[1], k_cur->nb[2], size_t(pos0)*k_cur->nb[2]);
-                    ggml_tensor * v_tile = ggml_view_3d(
-                            ctx0, v_cur,
-                            layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
-                            v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
-                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads(
-                                ctx0, k_tile, v_tile, body_store_scratch, il, record));
+                constexpr uint32_t direct_record_batch_max = 8;
+                const bool use_direct_record_batch =
+                    kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH");
+                if (kvarn_graph_prefill_direct_trace_enabled() && kvarn_graph_prefill_direct_trace_claim()) {
+                    std::fprintf(stderr,
+                            "KVarN graph prefill-direct-store trace: layer=%d head_dim=%u heads=%u direct_records=%u batch_enabled=%d batch_max=%u chunks=%u\n",
+                            il, layer.head_dim_k, layer.n_head_kv, uint32_t(seal_records.size()),
+                            use_direct_record_batch ? 1 : 0, direct_record_batch_max,
+                            (uint32_t(seal_records.size()) + direct_record_batch_max - 1)/direct_record_batch_max);
+                }
+                if (use_direct_record_batch) {
+                    for (uint32_t i_record = 0; i_record < seal_records.size();) {
+                        const uint32_t record0 = seal_records[i_record];
+                        uint32_t n_batch = 1;
+                        while (i_record + n_batch < seal_records.size() &&
+                                n_batch < direct_record_batch_max &&
+                                seal_records[i_record + n_batch] == record0 + n_batch) {
+                            ++n_batch;
+                        }
+                        const uint32_t pos0 = cparams.kvarn.sink_tokens + record0*cparams.kvarn.group_size - uint32_t(ubatch.pos[0]);
+                        ggml_tensor * k_tiles = ggml_view_4d(
+                                ctx0, k_cur,
+                                layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size, n_batch,
+                                k_cur->nb[1], k_cur->nb[2], size_t(cparams.kvarn.group_size)*k_cur->nb[2],
+                                size_t(pos0)*k_cur->nb[2]);
+                        ggml_tensor * v_tiles = ggml_view_4d(
+                                ctx0, v_cur,
+                                layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size, n_batch,
+                                v_cur->nb[1], v_cur->nb[2], size_t(cparams.kvarn.group_size)*v_cur->nb[2],
+                                size_t(pos0)*v_cur->nb[2]);
+                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_records_all_heads(
+                                    ctx0, k_tiles, v_tiles, body_store_scratch, il, record0, n_batch));
+                        i_record += n_batch;
+                    }
+                } else {
+                    for (const uint32_t record : seal_records) {
+                        const uint32_t pos0 = cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size - uint32_t(ubatch.pos[0]);
+                        ggml_tensor * k_tile = ggml_view_3d(
+                                ctx0, k_cur,
+                                layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size,
+                                k_cur->nb[1], k_cur->nb[2], size_t(pos0)*k_cur->nb[2]);
+                        ggml_tensor * v_tile = ggml_view_3d(
+                                ctx0, v_cur,
+                                layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
+                                v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
+                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads(
+                                    ctx0, k_tile, v_tile, body_store_scratch, il, record));
+                    }
                 }
             } else if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
                 ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_records_from_pending(
@@ -3651,32 +3692,39 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.layout_v.value_bits == 2);
         GGML_ASSERT(mctx_kvarn->body_store_scratch_floats(il) > 0);
 
-        bool contiguous_initial_prefill = stores_kv &&
+        bool contiguous_prefill_chunk = stores_kv &&
             !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
             ubatch.pos != nullptr &&
-            ubatch.n_tokens > cparams.kvarn.sink_tokens + cparams.kvarn.tail_tokens &&
+            ubatch.n_tokens > 1 &&
             q_cur != nullptr && k_cur != nullptr && v_cur != nullptr &&
             q_cur->ne[2] == int64_t(ubatch.n_tokens) &&
             k_cur->ne[2] == int64_t(ubatch.n_tokens) &&
-            v_cur->ne[2] == int64_t(ubatch.n_tokens) &&
-            ubatch.pos[0] == 0;
-        if (contiguous_initial_prefill) {
+            v_cur->ne[2] == int64_t(ubatch.n_tokens);
+        if (contiguous_prefill_chunk) {
+            const llama_pos chunk_start = ubatch.pos[0];
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                if (ubatch.pos[i] != llama_pos(i)) {
-                    contiguous_initial_prefill = false;
+                if (ubatch.pos[i] != chunk_start + llama_pos(i)) {
+                    contiguous_prefill_chunk = false;
                     break;
                 }
             }
         }
-        const uint32_t direct_body_tokens = contiguous_initial_prefill ?
-            (ubatch.n_tokens - cparams.kvarn.sink_tokens - cparams.kvarn.tail_tokens) : 0;
-        const bool direct_prefill_store =
-            contiguous_initial_prefill &&
-            direct_body_tokens > 0 &&
-            direct_body_tokens%cparams.kvarn.group_size == 0 &&
-            direct_body_tokens/cparams.kvarn.group_size <= layer.n_records;
 
         if (stores_kv) {
+            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, mctx_kvarn->get_size());
+            bool direct_prefill_store = contiguous_prefill_chunk && !seal_records.empty();
+            if (direct_prefill_store) {
+                const llama_pos chunk_start = ubatch.pos[0];
+                const llama_pos chunk_end = chunk_start + llama_pos(ubatch.n_tokens);
+                for (const uint32_t record : seal_records) {
+                    const llama_pos record_start = llama_pos(cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size);
+                    const llama_pos record_end = record_start + llama_pos(cparams.kvarn.group_size);
+                    if (record >= layer.n_records || record_start < chunk_start || record_end > chunk_end) {
+                        direct_prefill_store = false;
+                        break;
+                    }
+                }
+            }
             ggml_build_forward_expand(gf, inp->base_body_plan);
             ggml_build_forward_expand(gf, inp->base_body_offsets);
             ggml_build_forward_expand(gf, inp->base_tail_evict_idxs);
@@ -3689,7 +3737,6 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_k(ctx0, k_cur, idxs, il));
             ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_v(ctx0, v_cur, idxs, il));
 
-            const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, mctx_kvarn->get_size());
             inp->base_has_body_store_ops = !seal_records.empty();
             inp->base_baked_seal_records = seal_records;
 
@@ -3699,19 +3746,54 @@ ggml_tensor * llm_graph_context::build_attn(
             }
 
             if (direct_prefill_store) {
-                const uint32_t n_direct_records = direct_body_tokens/cparams.kvarn.group_size;
-                for (uint32_t record = 0; record < n_direct_records; ++record) {
-                    const uint32_t pos0 = cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size;
-                    ggml_tensor * k_tile = ggml_view_3d(
-                            ctx0, k_cur,
-                            layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size,
-                            k_cur->nb[1], k_cur->nb[2], size_t(pos0)*k_cur->nb[2]);
-                    ggml_tensor * v_tile = ggml_view_3d(
-                            ctx0, v_cur,
-                            layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
-                            v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
-                    ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads(
-                                ctx0, k_tile, v_tile, body_store_scratch, il, record));
+                constexpr uint32_t direct_record_batch_max = 8;
+                const bool use_direct_record_batch =
+                    kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH");
+                if (kvarn_graph_prefill_direct_trace_enabled() && kvarn_graph_prefill_direct_trace_claim()) {
+                    std::fprintf(stderr,
+                            "KVarN graph iswa prefill-direct-store trace: layer=%d head_dim=%u heads=%u direct_records=%u batch_enabled=%d batch_max=%u chunks=%u\n",
+                            il, layer.head_dim_k, layer.n_head_kv, uint32_t(seal_records.size()),
+                            use_direct_record_batch ? 1 : 0, direct_record_batch_max,
+                            (uint32_t(seal_records.size()) + direct_record_batch_max - 1)/direct_record_batch_max);
+                }
+                if (use_direct_record_batch) {
+                    for (uint32_t i_record = 0; i_record < seal_records.size();) {
+                        const uint32_t record0 = seal_records[i_record];
+                        uint32_t n_batch = 1;
+                        while (i_record + n_batch < seal_records.size() &&
+                                n_batch < direct_record_batch_max &&
+                                seal_records[i_record + n_batch] == record0 + n_batch) {
+                            ++n_batch;
+                        }
+                        const uint32_t pos0 = cparams.kvarn.sink_tokens + record0*cparams.kvarn.group_size - uint32_t(ubatch.pos[0]);
+                        ggml_tensor * k_tiles = ggml_view_4d(
+                                ctx0, k_cur,
+                                layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size, n_batch,
+                                k_cur->nb[1], k_cur->nb[2], size_t(cparams.kvarn.group_size)*k_cur->nb[2],
+                                size_t(pos0)*k_cur->nb[2]);
+                        ggml_tensor * v_tiles = ggml_view_4d(
+                                ctx0, v_cur,
+                                layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size, n_batch,
+                                v_cur->nb[1], v_cur->nb[2], size_t(cparams.kvarn.group_size)*v_cur->nb[2],
+                                size_t(pos0)*v_cur->nb[2]);
+                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_records_all_heads(
+                                    ctx0, k_tiles, v_tiles, body_store_scratch, il, record0, n_batch));
+                        i_record += n_batch;
+                    }
+                } else {
+                    for (const uint32_t record : seal_records) {
+                        const uint32_t pos0 = cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size - uint32_t(ubatch.pos[0]);
+                        ggml_tensor * k_tile = ggml_view_3d(
+                                ctx0, k_cur,
+                                layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size,
+                                k_cur->nb[1], k_cur->nb[2], size_t(pos0)*k_cur->nb[2]);
+                        ggml_tensor * v_tile = ggml_view_3d(
+                                ctx0, v_cur,
+                                layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
+                                v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
+                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads(
+                                    ctx0, k_tile, v_tile, body_store_scratch, il, record));
+                    }
                 }
             } else if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
                 ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_records_from_pending(

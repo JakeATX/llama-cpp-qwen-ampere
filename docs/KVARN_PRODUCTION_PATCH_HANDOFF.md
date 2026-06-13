@@ -874,3 +874,109 @@ Recommended next implementation targets:
 - Profile `GGML_OP_KVARN_STORE_KV_BODY` under `LLAMA_KVARN_CUDA_TIMING=1` on `pp4096` to split long prefill time into store, direct attention, and other graph costs before changing kernels.
 - Add/verify dequant-cache hit/miss summaries for `tg4096`; if hit rates are low, fix cache keying/epoch reuse before kernel work. If hit rates are high, focus on `ggml_kvarn_attn_mixed` body-record attention throughput.
 - Keep the Round 24 short gate as the regression floor: Gemma true KVarN and Qwen MTP must stay `>=90%` on `pp512` and `tg64`, with logits NMSE `0` and expected KVarN layer routing.
+
+---
+
+## Round 25 long-context and accuracy-gate handoff - 2026-06-13
+
+Current local branch before this commit:
+
+- Branch: `kvarn-atx-integration`
+- Previous pushed head: `e637347ed kvarn: add direct prefill production path`
+- Mainline baseline build SHA: `263cc04a5`
+- KVarN build SHA in benchmark logs: `e637347ed`; build contained the dirty Round 25 working tree during measurement.
+
+Implemented in Round 25:
+
+- Added an end-to-end f16-vs-KVarN accuracy gate:
+  - New doc: `docs/KVARN_ACCURACY_GATE.md`.
+  - New script: `scripts/kvarn/run_accuracy_gate.ps1`.
+  - The script runs `llama-perplexity` twice from the same binary: once with normal f16 KV and once with KVarN KV.
+  - The gate forces `-np 1`, `-fit off`, and `-b <= -c` because `llama-perplexity` derives its internal sequence count from `batch/context`, and KVarN currently supports only `n_seq_max = 1`.
+  - The script validates KVarN cache engagement and expected KVarN layer IDs.
+- Added a direct-current-ubatch body-record batch store path for contiguous prefill, but kept it diagnostic-only:
+  - Env gate: `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH=1`.
+  - Default production behavior remains the existing per-record all-head direct store.
+  - Reason: enabling the batch path regressed Qwen long prefill in local testing.
+- Added an F32 dequant-cache helper for the scalar/GQA body-attention path, but kept it diagnostic-only:
+  - Env gate: `LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE=1`.
+  - Default production behavior remains the prior scalar/GQA dequant path.
+  - Reason: enabling the cache path regressed Qwen `tg4096` in local testing.
+- Preserved the Round 24 production defaults:
+  - No rejected 256d warpqk production dispatch.
+  - No default F32 dequant cache.
+  - No default direct-record batch store.
+
+Introductory explanation:
+
+- Short prompts now work because KVarN only has a small amount of compressed body cache to manage.
+- Long prompts fail because KVarN creates many compressed body records. At `4096` tokens, each selected KVarN layer has `30` body records.
+- The current long path spends too much time either writing those body records, unpacking/dequantizing them, or running mixed attention over them.
+- The Round 25 experiments tried to batch record writes and cache dequantized body data, but both experiments were slower when enabled. They are useful diagnostics, not production fixes yet.
+- The Opus accuracy-gate review added an important missing check: the old gates compared KVarN path A against KVarN path B, which can miss a systematic KVarN-vs-f16 attention error. The new gate compares KVarN against normal f16 KV directly.
+
+Validation completed after Round 25 changes:
+
+- Build passed earlier in this pass:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-bench llama-results test-kvarn-kv test-kvarn-cuda-scratch-ref -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator self-test passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- Large-model logits correctness passed earlier in this pass:
+  - Gemma 4 12B true KVarN+ISWA packed repeat and packed-vs-split NMSE `0`, expected layers `5-47:6`.
+  - Qwen3.6 MTP packed repeat and packed-vs-split NMSE `0`, expected layers `3-39:4`, `-ncmoe 34`.
+- Accuracy-gate smoke passed on local Qwen3.5 0.8B:
+  - Artifact: `artifacts/kvarn-accuracy/round25-qwen35-smoke`.
+  - f16 PPL `17.4150`.
+  - KVarN PPL `17.4202`.
+  - Increase `0.03%` with `-MaxPplIncrease 0.10`.
+
+Current short production parity after Round 25 defaults:
+
+- Gemma 4 12B true KVarN+ISWA, artifact `artifacts/kvarn-mainline-parity/round25-gemma-short-default-r3`:
+  - `pp512`: mainline `2107.73 t/s`, KVarN `2131.22 t/s`, `101.1%` PASS.
+  - `tg64`: mainline `62.52 t/s`, KVarN `62.18 t/s`, `99.5%` PASS.
+- Qwen3.6 MTP, artifact `artifacts/kvarn-mainline-parity/round25-qwen-short-default-r3`:
+  - `pp512`: mainline `96.75 t/s`, KVarN `96.90 t/s`, `100.2%` PASS.
+  - `tg64`: mainline `27.44 t/s`, KVarN `38.18 t/s`, `139.1%` PASS.
+- Note: the Qwen short numbers are noisy in this environment, but this clean default run passed all short cells and showed expected KVarN layer routing.
+
+Current long-context diagnostics after Round 25 defaults:
+
+- Gemma 4 12B true KVarN+ISWA, artifact `artifacts/kvarn-mainline-parity/round25-gemma-long4096-default-r1`:
+  - `pp4096`: mainline `2120.02 t/s`, KVarN `842.66 t/s`, `39.7%` FAIL.
+  - `tg4096`: mainline `58.17 t/s`, KVarN `30.10 t/s`, `51.7%` FAIL.
+- Qwen3.6 MTP, artifact `artifacts/kvarn-mainline-parity/round25-qwen-long4096-default-r1`:
+  - `pp4096`: mainline `167.98 t/s`, KVarN `103.91 t/s`, `61.9%` FAIL.
+  - `tg4096`: mainline `45.28 t/s`, KVarN `29.73 t/s`, `65.7%` FAIL.
+
+Rejected or diagnostic-only Round 25 experiments:
+
+- `LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH=1`:
+  - Intended to reduce long prefill body-store graph overhead by storing multiple direct body records per op.
+  - Regressed Qwen `pp4096` locally, so it is not enabled by default.
+  - Important observation: `llama-bench pp4096` does not run as one single 4096-token ubatch; it emits multiple prompt chunks. The direct-batch path must handle real ubatch chunking, not only a synthetic single-chunk assumption.
+- `LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE=1`:
+  - Intended to reduce repeated scalar/GQA body dequantization.
+  - Regressed Qwen `tg4096` locally, so it is not enabled by default.
+  - Next review should inspect cache keying, scratch identity, active body span, and epoch invalidation before attempting to make this path production.
+
+Recommended next implementation targets:
+
+1. Run the new accuracy gate on the two production models with small but meaningful datasets before accepting any deeper performance change:
+   - Gemma true KVarN+ISWA with `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`, expected layers `5-47:6`.
+   - Qwen3.6 MTP with `-ncmoe 34`, expected layers `3-39:4`.
+2. Investigate the Opus Hadamard-rotation concern as a correctness hypothesis, not yet as a proven bug:
+   - Confirm whether body K/V rotation, Q rotation, sink/tail K/V rotation, and output rotation are mathematically consistent in the actual production graph.
+   - If KVarN-vs-f16 accuracy fails on production models, start here before further speed work.
+3. For long prefill, instrument body-store timing and graph topology without enabling the regressing direct-batch path by default:
+   - Count body-store ops per layer/chunk.
+   - Separate Sinkhorn/minmax cost from K/V staging and metadata sealing.
+   - Rework direct-record batching only after it beats the default path on Qwen and Gemma `pp4096`.
+4. For long decode, focus on body-record attention throughput:
+   - First fix or disprove F32/F16 dequant-cache reuse.
+   - If cache hit rates are already high, optimize `ggml_kvarn_attn_mixed` body attention itself.
+5. Keep the short gate as a hard regression floor:
+   - Gemma true KVarN+ISWA and Qwen MTP must remain `>=90%` on `pp512` and `tg64`.
+   - Expected KVarN layer routing and logits NMSE `0` remain required.

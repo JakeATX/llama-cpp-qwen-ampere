@@ -202,6 +202,10 @@ public:
     ggml_tensor * view_v_body_record    (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_k_scales_record  (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_v_scales_record  (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * view_k_body_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
+    ggml_tensor * view_v_body_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
+    ggml_tensor * view_k_scales_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
+    ggml_tensor * view_v_scales_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
     ggml_tensor * store_k_body_record(
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record(
@@ -210,6 +214,9 @@ public:
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_kv_body_all_heads(
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t record) const;
+    ggml_tensor * store_kv_body_records_all_heads(
+            ggml_context * ctx, ggml_tensor * k_tiles, ggml_tensor * v_tiles, ggml_tensor * scratch,
+            int32_t il, uint32_t record0, uint32_t n_records) const;
     ggml_tensor * store_k_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record_from_pending(
@@ -316,6 +323,10 @@ public:
     ggml_tensor * view_v_body_record    (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_k_scales_record  (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * view_v_scales_record  (ggml_context * ctx, int32_t il, uint32_t ih, uint32_t record) const;
+    ggml_tensor * view_k_body_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
+    ggml_tensor * view_v_body_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
+    ggml_tensor * view_k_scales_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
+    ggml_tensor * view_v_scales_record_span_heads(ggml_context * ctx, int32_t il, uint32_t record0, uint32_t n_records) const;
     ggml_tensor * store_k_body_record(
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record(
@@ -324,6 +335,9 @@ public:
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_kv_body_all_heads(
             ggml_context * ctx, ggml_tensor * k_tile, ggml_tensor * v_tile, ggml_tensor * scratch, int32_t il, uint32_t record) const;
+    ggml_tensor * store_kv_body_records_all_heads(
+            ggml_context * ctx, ggml_tensor * k_tiles, ggml_tensor * v_tiles, ggml_tensor * scratch,
+            int32_t il, uint32_t record0, uint32_t n_records) const;
     ggml_tensor * store_k_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_v_body_record_from_pending(

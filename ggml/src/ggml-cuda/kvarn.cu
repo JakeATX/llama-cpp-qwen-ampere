@@ -26,10 +26,17 @@ struct kvarn_dequant_cache_entry {
     const void * k_body    = nullptr;
     uint32_t     n_records = 0;
     uint64_t     epoch     = 0;
+    uint32_t     head_dim  = 0;
+    uint32_t     group_size = 0;
+    uint32_t     n_head_kv = 0;
+    uint8_t      format    = 0;
 };
 // Host dispatch for a given context is single-threaded; no mutex on the hot path.
 static std::unordered_map<const void *, uint64_t> g_kvarn_body_store_epochs;
 static std::unordered_map<const void *, kvarn_dequant_cache_entry> g_kvarn_dequant_cache;
+
+static bool kvarn_dequant_cache_trace_enabled();
+static int  kvarn_dequant_cache_trace_limit();
 
 void ggml_cuda_kvarn_mark_body_store(const void * k_body) {
     if (k_body == nullptr) {
@@ -45,6 +52,53 @@ static uint64_t kvarn_body_store_epoch(const void * k_body) {
         return it->second;
     }
     return 0;
+}
+
+static uint32_t kvarn_dequant_cache_refill_from(
+        const void * scratch_key,
+        const void * k_body,
+        uint32_t n_records,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint8_t format) {
+    if (scratch_key == nullptr || k_body == nullptr || n_records == 0) {
+        return 0;
+    }
+
+    const uint64_t epoch = kvarn_body_store_epoch(k_body);
+    kvarn_dequant_cache_entry & e = g_kvarn_dequant_cache[scratch_key];
+    uint32_t dequant_from = 0;
+    if (e.k_body == k_body && e.epoch == epoch && e.head_dim == head_dim &&
+            e.group_size == group_size && e.n_head_kv == n_head_kv &&
+            e.format == format && e.n_records <= n_records) {
+        dequant_from = e.n_records;
+    }
+
+    if (kvarn_dequant_cache_trace_enabled()) {
+        const uint64_t trace_i = g_kvarn_dequant_cache_trace_count.fetch_add(1, std::memory_order_relaxed);
+        if (trace_i < uint64_t(kvarn_dequant_cache_trace_limit())) {
+            std::fprintf(stderr,
+                    "KVarN CUDA dequant-cache trace: %s format=%s scratch=%p k_body=%p epoch=%" PRIu64
+                    " cached_records=%u active_records=%u refill_from=%u head_dim=%u n_head_kv=%u\n",
+                    dequant_from == n_records ? "hit" : (dequant_from == 0 ? "miss" : "partial"),
+                    format == 1 ? "f32" : "f16",
+                    scratch_key, k_body, epoch,
+                    e.n_records, n_records, dequant_from, head_dim, n_head_kv);
+        }
+    }
+
+    if (dequant_from < n_records) {
+        e.k_body = k_body;
+        e.n_records = n_records;
+        e.epoch = epoch;
+        e.head_dim = head_dim;
+        e.group_size = group_size;
+        e.n_head_kv = n_head_kv;
+        e.format = format;
+    }
+
+    return dequant_from;
 }
 
 static bool kvarn_env_flag(const char * name) {
@@ -1203,6 +1257,83 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
                     v_scales + size_t(ih)*v_scale_stride_floats,
                     pipeline,
                     head_dim, group_size, value_bits, sinkhorn_iters, rtn_quantile, stream);
+        }
+    }
+}
+
+void ggml_cuda_kvarn_store_body_direct_records_minmax(
+        const float * k_tiles,
+        const float * v_tiles,
+        uint8_t * k_body,
+        uint8_t * v_body,
+        float * k_scales,
+        float * v_scales,
+        float * scratch,
+        uint32_t n_heads,
+        uint32_t n_records,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        uint32_t sinkhorn_iters,
+        float rtn_quantile,
+        size_t k_body_record_stride_bytes,
+        size_t v_body_record_stride_bytes,
+        size_t k_body_head_stride_bytes,
+        size_t v_body_head_stride_bytes,
+        size_t k_scale_record_stride_floats,
+        size_t v_scale_record_stride_floats,
+        size_t k_scale_head_stride_floats,
+        size_t v_scale_head_stride_floats,
+        size_t k_tile_head_stride_floats,
+        size_t v_tile_head_stride_floats,
+        size_t k_tile_group_stride_floats,
+        size_t v_tile_group_stride_floats,
+        size_t k_tile_record_stride_floats,
+        size_t v_tile_record_stride_floats,
+        void * stream) {
+    ggml_cuda_kvarn_mark_body_store(k_body);
+    const size_t tile_floats = size_t(head_dim)*group_size;
+    const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
+    float * k_tile = scratch;
+    float * v_tile = scratch + tile_floats;
+    float * pipeline = scratch + 2*tile_floats;
+    cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    const int block = 256;
+    const int grid = int((tile_floats + block - 1)/block);
+
+    for (uint32_t record = 0; record < n_records; ++record) {
+        for (uint32_t ih = 0; ih < n_heads; ++ih) {
+            const float * k_src = k_tiles + size_t(record)*k_tile_record_stride_floats + size_t(ih)*k_tile_head_stride_floats;
+            const float * v_src = v_tiles + size_t(record)*v_tile_record_stride_floats + size_t(ih)*v_tile_head_stride_floats;
+            kvarn_transpose_pending_k_head_kernel<<<grid, block, 0, cuda_stream>>>(
+                    k_src, k_tile, head_dim, group_size, uint32_t(k_tile_group_stride_floats));
+            kvarn_gather_pending_v_head_kernel<<<grid, block, 0, cuda_stream>>>(
+                    v_src, v_tile, head_dim, group_size, uint32_t(v_tile_group_stride_floats));
+
+            if (head_dim >= 256) {
+                ggml_cuda_kvarn_store_kv_body_pipelined(
+                        k_tile, v_tile,
+                        k_body + size_t(ih)*k_body_head_stride_bytes + size_t(record)*k_body_record_stride_bytes,
+                        v_body + size_t(ih)*v_body_head_stride_bytes + size_t(record)*v_body_record_stride_bytes,
+                        k_scales + size_t(ih)*k_scale_head_stride_floats + size_t(record)*k_scale_record_stride_floats,
+                        v_scales + size_t(ih)*v_scale_head_stride_floats + size_t(record)*v_scale_record_stride_floats,
+                        pipeline,
+                        head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile, stream);
+            } else {
+                ggml_cuda_kvarn_store_k_body_reference_minmax(
+                        k_tile,
+                        k_body + size_t(ih)*k_body_head_stride_bytes + size_t(record)*k_body_record_stride_bytes,
+                        k_scales + size_t(ih)*k_scale_head_stride_floats + size_t(record)*k_scale_record_stride_floats,
+                        pipeline,
+                        head_dim, group_size, key_bits, sinkhorn_iters, rtn_quantile, stream);
+                ggml_cuda_kvarn_store_v_body_reference_minmax(
+                        v_tile,
+                        v_body + size_t(ih)*v_body_head_stride_bytes + size_t(record)*v_body_record_stride_bytes,
+                        v_scales + size_t(ih)*v_scale_head_stride_floats + size_t(record)*v_scale_record_stride_floats,
+                        pipeline,
+                        head_dim, group_size, value_bits, sinkhorn_iters, rtn_quantile, stream);
+            }
         }
     }
 }
@@ -4486,26 +4617,45 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             if (scalar_allow_f32_body_mirror) {
                 const size_t n_per_record = size_t(group_size)*head_dim;
                 const size_t n_per_head = size_t(n_records)*n_per_record;
-                const size_t required_floats = size_t(n_tokens) + 2*size_t(n_head_kv)*n_per_head;
-                if (scores_nelems > 0 && size_t(scores_nelems) >= required_floats) {
-                    float * k_dequant = scores + size_t(n_tokens);
-                    float * v_dequant = k_dequant + size_t(n_head_kv)*n_per_head;
-                    for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
-                        ggml_cuda_kvarn_dequant_body_n_k_token_major(
-                                k_body + size_t(ih)*k_body_stride_head_bytes,
-                                v_body + size_t(ih)*v_body_stride_head_bytes,
-                                k_scales + size_t(ih)*k_scale_stride_head_floats,
-                                v_scales + size_t(ih)*v_scale_stride_head_floats,
-                                k_dequant + size_t(ih)*n_per_head,
-                                v_dequant + size_t(ih)*n_per_head,
-                                n_records, head_dim, group_size, key_bits, value_bits,
-                                k_body_stride_record_bytes, v_body_stride_record_bytes,
-                                k_scale_stride_record_floats, v_scale_stride_record_floats,
-                                n_per_record, n_per_record, stream);
+                const size_t cap_records = size_t(k_body_records_cap > 0 ? k_body_records_cap : n_records);
+                const size_t cap_elems_per_head = cap_records*n_per_record;
+                const size_t cap_floats = 2*size_t(n_head_kv)*cap_elems_per_head;
+                const size_t active_floats = 2*size_t(n_head_kv)*n_per_head;
+                const bool enable_f32_dequant_cache =
+                    kvarn_env_flag("LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE");
+                const bool anchored = enable_f32_dequant_cache && scores_nelems > 0 &&
+                        size_t(scores_nelems) >= size_t(n_tokens) + cap_floats &&
+                        cap_records >= size_t(n_records);
+                const bool active_mirror_fits = scores_nelems > 0 &&
+                        size_t(scores_nelems) >= size_t(n_tokens) + active_floats;
+                if (anchored || active_mirror_fits) {
+                    float * k_dequant = anchored ? scores + (size_t(scores_nelems) - cap_floats) : scores + size_t(n_tokens);
+                    float * v_dequant = k_dequant + size_t(n_head_kv)*(anchored ? cap_elems_per_head : n_per_head);
+                    const size_t head_stride_elems = anchored ? cap_elems_per_head : n_per_head;
+                    uint32_t dequant_from = 0;
+                    if (anchored) {
+                        dequant_from = kvarn_dequant_cache_refill_from(
+                                (const void *) scores, (const void *) k_body, n_records, n_head_kv,
+                                head_dim, group_size, 1);
+                    }
+                    if (dequant_from < n_records) {
+                        for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+                            ggml_cuda_kvarn_dequant_body_n_k_token_major(
+                                    k_body + size_t(ih)*k_body_stride_head_bytes + size_t(dequant_from)*k_body_stride_record_bytes,
+                                    v_body + size_t(ih)*v_body_stride_head_bytes + size_t(dequant_from)*v_body_stride_record_bytes,
+                                    k_scales + size_t(ih)*k_scale_stride_head_floats + size_t(dequant_from)*k_scale_stride_record_floats,
+                                    v_scales + size_t(ih)*v_scale_stride_head_floats + size_t(dequant_from)*v_scale_stride_record_floats,
+                                    k_dequant + size_t(ih)*head_stride_elems + size_t(dequant_from)*n_per_record,
+                                    v_dequant + size_t(ih)*head_stride_elems + size_t(dequant_from)*n_per_record,
+                                    n_records - dequant_from, head_dim, group_size, key_bits, value_bits,
+                                    k_body_stride_record_bytes, v_body_stride_record_bytes,
+                                    k_scale_stride_record_floats, v_scale_stride_record_floats,
+                                    n_per_record, n_per_record, stream);
+                        }
                     }
                     scalar_body_k_f32 = k_dequant;
                     scalar_body_v_f32 = v_dequant;
-                    scalar_body_f32_stride_head_elems = n_per_head;
+                    scalar_body_f32_stride_head_elems = head_stride_elems;
                     scalar_used_f32_body_mirror = true;
                 }
             }
@@ -4905,27 +5055,9 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
 
                         uint32_t dequant_from = 0;
                         if (anchored) {
-                            const uint64_t epoch = kvarn_body_store_epoch((const void *) k_body);
-                            kvarn_dequant_cache_entry & e = g_kvarn_dequant_cache[(const void *) scores];
-                            if (e.k_body == (const void *) k_body && e.epoch == epoch && e.n_records <= n_records) {
-                                dequant_from = e.n_records;
-                            }
-                            if (kvarn_dequant_cache_trace_enabled()) {
-                                const uint64_t trace_i = g_kvarn_dequant_cache_trace_count.fetch_add(1, std::memory_order_relaxed);
-                                if (trace_i < uint64_t(kvarn_dequant_cache_trace_limit())) {
-                                    std::fprintf(stderr,
-                                            "KVarN CUDA dequant-cache trace: %s scratch=%p k_body=%p epoch=%" PRIu64
-                                            " cached_records=%u active_records=%u refill_from=%u anchored=%d\n",
-                                            dequant_from == n_records ? "hit" : (dequant_from == 0 ? "miss" : "partial"),
-                                            (const void *) scores, (const void *) k_body, epoch,
-                                            e.n_records, n_records, dequant_from, anchored ? 1 : 0);
-                                }
-                            }
-                            if (dequant_from < n_records) {
-                                e.k_body = (const void *) k_body;
-                                e.n_records = n_records;
-                                e.epoch = epoch;
-                            }
+                            dequant_from = kvarn_dequant_cache_refill_from(
+                                    (const void *) scores, (const void *) k_body, n_records, n_head_kv,
+                                    head_dim, group_size, 0);
                         }
 
                         if (dequant_from < n_records) {
