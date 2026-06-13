@@ -1691,3 +1691,73 @@ What remains to reach production parity:
   For Gemma, per-record dirty tracking for dequant mirrors must be explicit; for
   Qwen, parallelizing the two KV-head body store remains the highest-value store
   target.
+
+### Round 21 active-body prefill status
+
+Current safe code changes in this round:
+- Added a GQA-tiled exact scalar active-body attention kernel. It keeps the same
+  serial per-row QK accumulation order as the split/generic oracle, but maps a
+  CTA over multiple query heads that share one KV head so loaded/dequantized K/V
+  values are reused across GQA heads.
+- Added CUDA dynamic shared-memory opt-in helpers and uses them for the larger
+  256d GQA tile.
+- Default active-body dispatch now uses a 256d `qt=8, ht=4` GQA tile when the
+  opt-in shared-memory limit allows it. The larger `ht=4` tile is intentionally
+  restricted to `head_dim == 256`; the same tile regressed Gemma 512d.
+- Added an optional f32 body-dequant mirror for 512d scalar-GQA when the
+  attention scratch has enough capacity. It is controlled by
+  `LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR=1`. It is correctness-clean but did
+  not materially close the Gemma short prefill gap in r3 testing.
+
+Rejected or non-production Round 21 findings:
+- 512d `ht=4` GQA tiling regressed Gemma true KVarN `pp512` to
+  `1681.71 / 2264.15 = 74.3%` in
+  `artifacts/kvarn-mainline-parity/round21-gemma-true-gqa-ht4-r3`; keep that
+  tile disabled for 512d.
+- The f32 mirror is exact, but clean Gemma r3 was essentially neutral:
+  `round21-gemma-true-f32mirror-r3` gave `2012.67 / 2473.58 = 81.4%`, while
+  `round21-gemma-true-f32mirror-disabled-r3` gave
+  `1961.67 / 2425.14 = 80.9%`. This is not enough to count as the production
+  prefill fix.
+- Qwen `pp512` measurements remain high-variance. The dedicated `pp512` r3 run
+  `round21-qwen-gqa-ht4-r3` reached `215.27 / 241.50 = 89.1%`, but the later
+  combined short gate `round21-qwen-short-current-r3` measured
+  `217.44 / 295.97 = 73.5%` due a much faster mainline cell. Do not claim Qwen
+  prefill pass without a stable r5/r10 gate.
+
+Latest focused validation:
+- `cmake --build build-kvarn-cuda-static-vs --config Release --target
+  llama-bench llama-results test-kvarn-cuda-scratch-ref test-kvarn-kv -j 8`
+  passed after the Round 21 changes.
+- `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R
+  "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure"
+  --output-on-failure` passed all 6 tests.
+- Gemma 4 12B true KVarN+ISWA strict logits passed exact KVarN layers
+  `5-47:6`, max body records `2`, packed-repeat `NMSE = 0`, and
+  packed-vs-split `NMSE = 0`.
+- Qwen3.6 MTP strict logits passed exact KVarN layers `3-39:4`, max body
+  records `2`, packed-repeat `NMSE = 0`, and packed-vs-split `NMSE = 0`.
+
+Latest short parity measurements:
+- Qwen3.6 MTP, `round21-qwen-short-current-r3`:
+  `pp512 = 217.44 / 295.97 = 73.5%` fail,
+  `tg64 = 41.51 / 40.53 = 102.4%` pass.
+- Gemma 4 12B true KVarN+ISWA, `round21-gemma-true-short-current-r3`:
+  `pp512 = 1969.77 / 2283.42 = 86.3%` fail,
+  `tg64 = 65.61 / 66.28 = 99.0%` pass.
+
+What it will take to reach production:
+- Decode is no longer the blocker for the short gate. Production now requires a
+  real active-body prefill path, not another measurement-only change.
+- For Qwen 256d, keep the exact `qt=8, ht=4` GQA tile but attack remaining
+  `pp512` cost in the store pipeline. The next implementation target should
+  parallelize or batch the two KV-head body stores and reduce per-record
+  Sinkhorn launch count.
+- For Gemma 512d, the remaining gap is store/seal plus exact attention
+  overhead. Larger exact shared-memory tiles reduce CTA count but hurt
+  occupancy. The next viable options are a bit-equivalent warp-level replay
+  kernel, or store scheduling/launch-count reduction that does not change
+  logits.
+- Do not promote 256d or 512d warp-QK until boundary replay proves exact
+  score/prob/output equivalence against the split oracle. Prior warp-QK
+  attempts failed strict packed-vs-split even when body mirrors were disabled.
