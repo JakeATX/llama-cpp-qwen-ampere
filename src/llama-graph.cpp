@@ -100,6 +100,21 @@ static bool kvarn_graph_reuse_trace_enabled() {
     return kvarn_graph_parse_env_flag("LLAMA_KVARN_GRAPH_REUSE_TRACE");
 }
 
+static bool kvarn_graph_prefill_direct_trace_enabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_PREFILL_DIRECT_TRACE");
+}
+
+static bool kvarn_graph_prefill_direct_trace_claim() {
+    static std::atomic<int> n_trace{0};
+
+    const int limit = kvarn_graph_parse_env_int("LLAMA_KVARN_PREFILL_DIRECT_TRACE_LIMIT", 64);
+    if (limit <= 0) {
+        return true;
+    }
+
+    return n_trace.fetch_add(1, std::memory_order_relaxed) < limit;
+}
+
 static void kvarn_graph_reuse_trace_miss(const char * where, const char * check) {
     // llama-bench installs a null log callback; mirror kvarn cache instrumentation.
     std::fprintf(stderr, "%s: KVarN graph reuse miss: %s\n", where, check);
@@ -827,7 +842,7 @@ static bool kvarn_graph_use_attn_f16_body_mirror(int64_t head_dim) {
         return true;
     }
     return head_dim == 256 &&
-        kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR");
+        !kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR");
 }
 
 static bool kvarn_graph_reuse_unsafe_forced_512_fused(
@@ -3070,11 +3085,35 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.layout_k.key_bits == 4);
         GGML_ASSERT(layer.layout_v.value_bits == 2);
         GGML_ASSERT(inp_kvarn->mctx_kvarn->body_store_scratch_floats(il) > 0);
+        bool contiguous_initial_prefill = stores_kv &&
+            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            ubatch.pos != nullptr &&
+            ubatch.n_tokens > cparams.kvarn.sink_tokens + cparams.kvarn.tail_tokens &&
+            q_cur != nullptr && k_cur != nullptr && v_cur != nullptr &&
+            q_cur->ne[2] == int64_t(ubatch.n_tokens) &&
+            k_cur->ne[2] == int64_t(ubatch.n_tokens) &&
+            v_cur->ne[2] == int64_t(ubatch.n_tokens) &&
+            ubatch.pos[0] == 0;
+        if (contiguous_initial_prefill) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.pos[i] != llama_pos(i)) {
+                    contiguous_initial_prefill = false;
+                    break;
+                }
+            }
+        }
+        const uint32_t direct_body_tokens = contiguous_initial_prefill ?
+            (ubatch.n_tokens - cparams.kvarn.sink_tokens - cparams.kvarn.tail_tokens) : 0;
+        const bool direct_prefill_store =
+            contiguous_initial_prefill &&
+            direct_body_tokens > 0 &&
+            direct_body_tokens%cparams.kvarn.group_size == 0 &&
+            direct_body_tokens/cparams.kvarn.group_size <= layer.n_records;
         if (stores_kv) {
             ggml_build_forward_expand(gf, inp_kvarn->get_body_plan());
             ggml_build_forward_expand(gf, inp_kvarn->get_body_offsets());
             ggml_build_forward_expand(gf, inp_kvarn->get_tail_evict_idxs());
-            if (inp_kvarn->get_body_offsets()->ne[0] > 0) {
+            if (!direct_prefill_store && inp_kvarn->get_body_offsets()->ne[0] > 0) {
                 ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_k(
                             ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
                 ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_v(
@@ -3088,11 +3127,26 @@ ggml_tensor * llm_graph_context::build_attn(
             inp_kvarn->baked_seal_records = seal_records;
 
             ggml_tensor * body_store_scratch = nullptr;
-            if (!seal_records.empty()) {
+            if (!seal_records.empty() || direct_prefill_store) {
                 body_store_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
 
-            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
+            if (direct_prefill_store) {
+                const uint32_t n_direct_records = direct_body_tokens/cparams.kvarn.group_size;
+                for (uint32_t record = 0; record < n_direct_records; ++record) {
+                    const uint32_t pos0 = cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size;
+                    ggml_tensor * k_tile = ggml_view_3d(
+                            ctx0, k_cur,
+                            layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size,
+                            k_cur->nb[1], k_cur->nb[2], size_t(pos0)*k_cur->nb[2]);
+                    ggml_tensor * v_tile = ggml_view_3d(
+                            ctx0, v_cur,
+                            layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
+                            v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
+                    ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads(
+                                ctx0, k_tile, v_tile, body_store_scratch, il, record));
+                }
+            } else if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
                 ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_records_from_pending(
                             ctx0, body_store_scratch, il, seal_records));
             } else {
@@ -3112,6 +3166,50 @@ ggml_tensor * llm_graph_context::build_attn(
                     }
                 }
             }
+        }
+
+        const ggml_tensor * kq_mask = inp->get_kq_mask();
+        const bool prefill_direct_attn =
+            stores_kv &&
+            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            q_cur != nullptr && k_cur != nullptr && v_cur != nullptr && kq_mask != nullptr &&
+            q_cur->ne[2] > 1 &&
+            k_cur->ne[2] == q_cur->ne[2] &&
+            v_cur->ne[2] == q_cur->ne[2] &&
+            kq_mask->ne[0] == k_cur->ne[2] &&
+            kq_mask->ne[1] == q_cur->ne[2];
+        if (kvarn_graph_prefill_direct_trace_enabled() && kvarn_graph_prefill_direct_trace_claim()) {
+            std::fprintf(stderr,
+                    "KVarN graph prefill-direct trace: use=%d stores_kv=%d q_tokens=%" PRId64
+                    " k_tokens=%" PRId64 " v_tokens=%" PRId64 " mask=[%" PRId64 ",%" PRId64 "]\n",
+                    prefill_direct_attn ? 1 : 0, stores_kv ? 1 : 0,
+                    q_cur ? q_cur->ne[2] : int64_t(-1),
+                    k_cur ? k_cur->ne[2] : int64_t(-1),
+                    v_cur ? v_cur->ne[2] : int64_t(-1),
+                    kq_mask ? kq_mask->ne[0] : int64_t(-1),
+                    kq_mask ? kq_mask->ne[1] : int64_t(-1));
+        }
+        if (prefill_direct_attn) {
+            ggml_tensor * cur = build_attn_mha(q_cur, k_cur, v_cur, kq_b, inp->get_kq_mask(), sinks, v_mla, kq_scale, il);
+            cb(cur, "kvarn_prefill_direct_kqv_out", il);
+
+            if (wo) {
+                if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+                    cur = build_lora_mm(wo, cur);
+                    ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                    if (wo_s) {
+                        cur = ggml_mul(ctx0, cur, wo_s);
+                    }
+                } else {
+                    cur = build_lora_mm(wo, cur, wo_s);
+                }
+            }
+
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+            }
+
+            return cur;
         }
 
         const llama_pos pos = ubatch.pos ? ubatch.pos[0] : llama_pos(0);
@@ -3551,12 +3649,38 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.scales_v != nullptr);
         GGML_ASSERT(layer.layout_k.key_bits == 4);
         GGML_ASSERT(layer.layout_v.value_bits == 2);
+        GGML_ASSERT(mctx_kvarn->body_store_scratch_floats(il) > 0);
+
+        bool contiguous_initial_prefill = stores_kv &&
+            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            ubatch.pos != nullptr &&
+            ubatch.n_tokens > cparams.kvarn.sink_tokens + cparams.kvarn.tail_tokens &&
+            q_cur != nullptr && k_cur != nullptr && v_cur != nullptr &&
+            q_cur->ne[2] == int64_t(ubatch.n_tokens) &&
+            k_cur->ne[2] == int64_t(ubatch.n_tokens) &&
+            v_cur->ne[2] == int64_t(ubatch.n_tokens) &&
+            ubatch.pos[0] == 0;
+        if (contiguous_initial_prefill) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.pos[i] != llama_pos(i)) {
+                    contiguous_initial_prefill = false;
+                    break;
+                }
+            }
+        }
+        const uint32_t direct_body_tokens = contiguous_initial_prefill ?
+            (ubatch.n_tokens - cparams.kvarn.sink_tokens - cparams.kvarn.tail_tokens) : 0;
+        const bool direct_prefill_store =
+            contiguous_initial_prefill &&
+            direct_body_tokens > 0 &&
+            direct_body_tokens%cparams.kvarn.group_size == 0 &&
+            direct_body_tokens/cparams.kvarn.group_size <= layer.n_records;
 
         if (stores_kv) {
             ggml_build_forward_expand(gf, inp->base_body_plan);
             ggml_build_forward_expand(gf, inp->base_body_offsets);
             ggml_build_forward_expand(gf, inp->base_tail_evict_idxs);
-            if (inp->base_body_offsets->ne[0] > 0) {
+            if (!direct_prefill_store && inp->base_body_offsets->ne[0] > 0) {
                 ggml_build_forward_expand(gf, mctx_kvarn->cpy_tail_evict_pending_k(
                             ctx0, inp->base_tail_evict_idxs, inp->base_body_offsets, il));
                 ggml_build_forward_expand(gf, mctx_kvarn->cpy_tail_evict_pending_v(
@@ -3570,11 +3694,26 @@ ggml_tensor * llm_graph_context::build_attn(
             inp->base_baked_seal_records = seal_records;
 
             ggml_tensor * body_store_scratch = nullptr;
-            if (!seal_records.empty()) {
+            if (!seal_records.empty() || direct_prefill_store) {
                 body_store_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
 
-            if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
+            if (direct_prefill_store) {
+                const uint32_t n_direct_records = direct_body_tokens/cparams.kvarn.group_size;
+                for (uint32_t record = 0; record < n_direct_records; ++record) {
+                    const uint32_t pos0 = cparams.kvarn.sink_tokens + record*cparams.kvarn.group_size;
+                    ggml_tensor * k_tile = ggml_view_3d(
+                            ctx0, k_cur,
+                            layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size,
+                            k_cur->nb[1], k_cur->nb[2], size_t(pos0)*k_cur->nb[2]);
+                    ggml_tensor * v_tile = ggml_view_3d(
+                            ctx0, v_cur,
+                            layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
+                            v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
+                    ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads(
+                                ctx0, k_tile, v_tile, body_store_scratch, il, record));
+                }
+            } else if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
                 ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_records_from_pending(
                             ctx0, body_store_scratch, il, seal_records));
             } else {
@@ -3594,6 +3733,42 @@ ggml_tensor * llm_graph_context::build_attn(
                     }
                 }
             }
+        }
+
+        const ggml_tensor * kq_mask = inp->get_kq_mask();
+        const bool prefill_direct_attn =
+            stores_kv &&
+            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            q_cur != nullptr && k_cur != nullptr && v_cur != nullptr && kq_mask != nullptr &&
+            q_cur->ne[2] > 1 &&
+            k_cur->ne[2] == q_cur->ne[2] &&
+            v_cur->ne[2] == q_cur->ne[2] &&
+            kq_mask->ne[0] == k_cur->ne[2] &&
+            kq_mask->ne[1] == q_cur->ne[2];
+        if (kvarn_graph_prefill_direct_trace_enabled() && kvarn_graph_prefill_direct_trace_claim()) {
+            std::fprintf(stderr,
+                    "KVarN graph iswa prefill-direct trace: use=%d stores_kv=%d q_tokens=%" PRId64
+                    " k_tokens=%" PRId64 " v_tokens=%" PRId64 " mask=[%" PRId64 ",%" PRId64 "]\n",
+                    prefill_direct_attn ? 1 : 0, stores_kv ? 1 : 0,
+                    q_cur ? q_cur->ne[2] : int64_t(-1),
+                    k_cur ? k_cur->ne[2] : int64_t(-1),
+                    v_cur ? v_cur->ne[2] : int64_t(-1),
+                    kq_mask ? kq_mask->ne[0] : int64_t(-1),
+                    kq_mask ? kq_mask->ne[1] : int64_t(-1));
+        }
+        if (prefill_direct_attn) {
+            ggml_tensor * cur = build_attn_mha(q_cur, k_cur, v_cur, kq_b, inp->get_kq_mask(), sinks, v_mla, kq_scale, il);
+            cb(cur, "kvarn_iswa_prefill_direct_kqv_out", il);
+            cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+            }
+
+            return cur;
         }
 
         const llama_pos pos = ubatch.pos ? ubatch.pos[0] : llama_pos(0);

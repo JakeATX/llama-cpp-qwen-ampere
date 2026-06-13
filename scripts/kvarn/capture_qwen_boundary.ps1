@@ -12,6 +12,7 @@ param(
     [int] $DumpLayer = -1,
     [int] $DumpIq = 0,
     [int] $DumpIh = 0,
+    [switch] $DumpFullQO,
     [switch] $FirstBodyActive256D,
     [switch] $Enable256DWarpqk,
     [switch] $Enable256DBodyMirror,
@@ -69,6 +70,9 @@ if ($DumpLayer -ge 0) {
 if ($FirstBodyActive256D.IsPresent) {
     $envSet["LLAMA_KVARN_ATTN_BOUNDARY_DUMP_FIRST_256D"] = "1"
 }
+if ($DumpFullQO.IsPresent) {
+    $envSet["LLAMA_KVARN_ATTN_BOUNDARY_DUMP_FULL_QO"] = "1"
+}
 if ($Enable256DWarpqk.IsPresent) {
     $envSet["LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK"] = "1"
 }
@@ -92,6 +96,7 @@ $manifest = @(
     "dump_layer=$DumpLayer",
     "dump_iq=$DumpIq",
     "dump_ih=$DumpIh",
+    "dump_full_qo=$($DumpFullQO.IsPresent)",
     "first_body_active_256d=$($FirstBodyActive256D.IsPresent)",
     "enable_256d_warpqk=$($Enable256DWarpqk.IsPresent)",
     "enable_256d_body_mirror=$($Enable256DBodyMirror.IsPresent)",

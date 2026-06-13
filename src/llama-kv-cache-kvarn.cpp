@@ -795,6 +795,17 @@ ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_record(
     return kv->store_kv_body_record(ctx, k_tile, v_tile, scratch, il, ih, record);
 }
 
+ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_all_heads(
+        ggml_context * ctx,
+        ggml_tensor * k_tile,
+        ggml_tensor * v_tile,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t record) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->store_kv_body_all_heads(ctx, k_tile, v_tile, scratch, il, record);
+}
+
 ggml_tensor * llama_kv_cache_kvarn_context::store_k_body_record_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
@@ -958,7 +969,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             int64_t scratch_floats = int64_t(n_sink) + int64_t(n_records_w)*params.group_size + n_pending + n_tail;
             const bool mirror_scratch = head_k >= 512 ||
                 kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_REF_SCRATCH") ||
-                (head_k == 256 && kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR"));
+                (head_k == 256 && !kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR"));
             if (n_records_alloc > 0 && mirror_scratch) {
                 scratch_floats += 2*int64_t(n_head_kv)*int64_t(n_records_alloc)*int64_t(head_k)*int64_t(params.group_size);
             }
@@ -1568,6 +1579,35 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record(
     return ggml_kvarn_store_kv_body(
             ctx, k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
             view.head_dim_k, params.group_size, params.key_bits, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+}
+
+ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads(
+        ggml_context * ctx,
+        ggml_tensor * k_tile,
+        ggml_tensor * v_tile,
+        ggml_tensor * scratch,
+        int32_t il,
+        uint32_t record) const {
+    const llama_kvarn_layer_view view = get_layer_view(il);
+    if (record >= view.n_records) {
+        throw std::out_of_range("KVarN body record index is out of range");
+    }
+    if (view.head_dim_k != view.head_dim_v) {
+        throw std::runtime_error("KVarN fused K/V body store requires equal K and V head dimensions");
+    }
+    if (view.n_head_kv <= 1) {
+        return store_kv_body_record(ctx, k_tile, v_tile, scratch, il, 0, record);
+    }
+
+    ggml_tensor * k_body   = view_k_body_record_heads(ctx, il, record);
+    ggml_tensor * v_body   = view_v_body_record_heads(ctx, il, record);
+    ggml_tensor * k_scales = view_k_scales_record_heads(ctx, il, record);
+    ggml_tensor * v_scales = view_v_scales_record_heads(ctx, il, record);
+    return ggml_kvarn_store_kv_body_pending_heads(
+            ctx, k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
+            int32_t(view.n_head_kv), int32_t(view.head_dim_k), int32_t(params.group_size),
+            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(params.sinkhorn_iters), params.rtn_quantile);
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_k_body_record_from_pending(

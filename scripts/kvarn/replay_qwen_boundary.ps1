@@ -1,5 +1,7 @@
 param(
-    [Parameter(Mandatory = $true)] [string] $BoundaryDir
+    [Parameter(Mandatory = $true)] [string] $BoundaryDir,
+    [switch] $WriteReference,
+    [double] $MaxOutNmse = -1
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,4 +114,21 @@ Write-Host ("Boundary metadata validation: PASS path={0} mode={1} q={2} h={3} re
     $BoundaryDir, $meta.cuda_trace_mode, $meta.n_queries, $meta.n_head,
     $meta.n_records, $meta.n_pending, $meta.n_tail, $meta.qt,
     $meta.body_mirror_allowed, $meta.body_mirror_used)
-Write-Host "Note: this validates capture completeness only. CUDA split-vs-warpqk replay requires future split_scores/probs/out capture."
+
+$pythonReplay = Join-Path $PSScriptRoot "replay_qwen_boundary.py"
+if (-not (Test-Path -LiteralPath $pythonReplay)) {
+    throw "Missing Python replay helper at $pythonReplay"
+}
+
+$argv = @($pythonReplay, "--dump", $BoundaryDir)
+if ($WriteReference.IsPresent) {
+    $argv += "--write-reference"
+}
+if ($MaxOutNmse -ge 0) {
+    $argv += @("--max-out-nmse", ([string] $MaxOutNmse))
+}
+
+& python @argv
+if ($LASTEXITCODE -ne 0) {
+    throw "Boundary CPU replay failed with exit code $LASTEXITCODE"
+}

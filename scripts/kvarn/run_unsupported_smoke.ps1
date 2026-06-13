@@ -304,7 +304,10 @@ try {
         Invoke-ExpectFailure `
             $results `
             $iswaArgs `
-            @{ "LLAMA_KVARN_DEBUG_UBATCH" = "bogus" } `
+            @{
+                "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = "1"
+                "LLAMA_KVARN_DEBUG_UBATCH" = "bogus"
+            } `
             "KVarN debug ubatch override must be a positive integer" `
             "KVarN+ISWA invalid debug ubatch rejection"
     }

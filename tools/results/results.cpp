@@ -7,7 +7,9 @@
 #include "log.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <string>
 #include <vector>
@@ -38,6 +40,98 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     }
 
     return mse_a_b / mse_a_0;
+}
+
+static bool results_env_flag(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static void log_nmse_rows(
+        const std::vector<float> & reference,
+        const std::vector<float> & actual,
+        const size_t n_rows,
+        const size_t n_cols,
+        const int limit) {
+    GGML_ASSERT(reference.size() == actual.size());
+    GGML_ASSERT(reference.size() == n_rows*n_cols);
+
+    struct row_error {
+        size_t row = 0;
+        double nmse = 0.0;
+        double max_abs = 0.0;
+        size_t max_col = 0;
+    };
+
+    std::vector<row_error> worst;
+    worst.reserve(size_t(limit));
+
+    for (size_t row = 0; row < n_rows; ++row) {
+        double mse_diff = 0.0;
+        double mse_ref = 0.0;
+        double max_abs = 0.0;
+        size_t max_col = 0;
+        bool finite = true;
+        for (size_t col = 0; col < n_cols; ++col) {
+            const size_t idx = row*n_cols + col;
+            const float ref = reference[idx];
+            const float got = actual[idx];
+            if (!std::isfinite(ref) || !std::isfinite(got)) {
+                if (ref == got) {
+                    continue;
+                }
+                finite = false;
+                max_abs = std::numeric_limits<double>::infinity();
+                max_col = col;
+                break;
+            }
+            const double diff = double(ref) - double(got);
+            const double abs_diff = std::fabs(diff);
+            mse_diff += diff*diff;
+            mse_ref += double(ref)*double(ref);
+            if (abs_diff > max_abs) {
+                max_abs = abs_diff;
+                max_col = col;
+            }
+        }
+
+        const double row_nmse = finite ?
+            (mse_ref == 0.0 ? (mse_diff == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : mse_diff/mse_ref) :
+            std::numeric_limits<double>::infinity();
+        if (row_nmse == 0.0 && max_abs == 0.0) {
+            continue;
+        }
+
+        row_error cur{ row, row_nmse, max_abs, max_col };
+        if (worst.size() < size_t(limit)) {
+            worst.push_back(cur);
+        } else {
+            size_t min_i = 0;
+            for (size_t i = 1; i < worst.size(); ++i) {
+                if (worst[i].nmse < worst[min_i].nmse) {
+                    min_i = i;
+                }
+            }
+            if (cur.nmse > worst[min_i].nmse) {
+                worst[min_i] = cur;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < worst.size(); ++i) {
+        for (size_t j = i + 1; j < worst.size(); ++j) {
+            if (worst[j].nmse > worst[i].nmse) {
+                const row_error tmp = worst[i];
+                worst[i] = worst[j];
+                worst[j] = tmp;
+            }
+        }
+    }
+
+    for (const row_error & row : worst) {
+        LOG_INF("%s: NMSE_ROW row=%zu nmse=%.6e max_abs=%.6e max_col=%zu\n",
+                __func__, row.row, row.nmse, row.max_abs, row.max_col);
+    }
 }
 
 static std::vector<float> get_logits(
@@ -144,6 +238,11 @@ int main(int argc, char ** argv) {
         load_tensor_data("logits", logits_disk.data(), logits_disk.size()*sizeof(float));
         const double nmse_val = nmse(logits_disk, logits_calc);
         LOG_INF("%s: NMSE=%.3e\n", __func__, nmse_val);
+        if (results_env_flag("LLAMA_RESULTS_NMSE_TRACE")) {
+            const char * limit_env = std::getenv("LLAMA_RESULTS_NMSE_TRACE_LIMIT");
+            const int limit = std::max(1, std::atoi(limit_env != nullptr ? limit_env : "8"));
+            log_nmse_rows(logits_disk, logits_calc, tokens_calc.size(), n_vocab, limit);
+        }
 
         if (nmse_val > 1e-6) {
             printf("\033[1;31mFAIL\033[0m\n");

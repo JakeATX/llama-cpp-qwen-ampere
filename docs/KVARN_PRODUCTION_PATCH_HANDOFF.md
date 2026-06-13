@@ -799,3 +799,78 @@ Recommended next step:
   - Qwen3.6 MTP `pp512,tg64`, `-r 3`, `-ncmoe 34`, expected layers `3-39:4`.
   - Gemma 4 12B true KVarN `pp512,tg64`, `-r 3`, expected layers `5-47:6`, force experimental ISWA only when intentionally measuring true KVarN instead of fallback.
 - Use the new boundary capture only to debug correctness-equivalent 256d experiments. Do not enable 256d warpqk or 256d body mirror for production until full Qwen3.6 MTP packed-repeat and packed-vs-split are both NMSE `0`.
+
+---
+
+## Round 24 production parity handoff - 2026-06-13
+
+Current local branch before this commit:
+
+- Branch: `kvarn-atx-integration`
+- Previous remote/head: `d8a9e3d6f kvarn: add exact GQA tiled prefill path`
+- Mainline baseline build SHA: `263cc04a5`
+- KVarN build was dirty during measurement because this Round 24 patchset was still uncommitted.
+
+Production-short status:
+
+- The required short production gate is now passing for both required models.
+- Gemma measurements below are **true KVarN+ISWA**, not fallback. They require `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1` and showed the expected KVarN layers `5,11,17,23,29,35,41,47`.
+- Qwen3.6 MTP measurements showed the expected KVarN layers `3,7,11,15,19,23,27,31,35,39` with `-ncmoe 34`.
+
+Implemented in Round 24:
+
+- Added a direct prefill attention path for KVarN when the current ubatch already contains the complete contiguous prompt window. This lets prefill use the normal current `q_cur/k_cur/v_cur` attention path while still writing KVarN sink/tail/body cache records.
+- Added direct current-ubatch body-store views from `k_cur/v_cur`, including all-head stores for Qwen-style 256d multi-KV-head layers.
+- Extended the same direct prefill path to the Gemma true KVarN+ISWA non-SWA/base branch. This was the missing production path for Gemma; before this change Gemma `pp512` still went through `ggml_kvarn_attn_mixed`.
+- Relaxed the KVarN ubatch splitter only for the direct-prefill-safe initial contiguous prompt case, so short prefill can run as a full `512` token graph instead of the older split topology.
+- Added low-overhead CUDA timing instrumentation controlled by `LLAMA_KVARN_CUDA_TIMING=1`.
+- Added `LLAMA_KVARN_PREFILL_DIRECT_TRACE=1` to prove when the direct prefill path is selected. Gemma trace confirmed `KVarN graph iswa prefill-direct trace: use=1 ... mask=[512,512]`.
+- Kept the unsafe 256d warpqk path disabled by default. The production Qwen path uses the correctness-clean scalar/GQA route with the body mirror support, not the rejected warpqk threshold experiment.
+- Fixed `scripts/kvarn/run_unsupported_smoke.ps1` so its Gemma KVarN+ISWA guard test explicitly sets `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`; otherwise Gemma defaults to normal fallback and the KVarN-specific invalid-env test is not exercised.
+
+Validation completed after Round 24 changes:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-bench llama-results test-kvarn-cuda-scratch-ref test-kvarn-kv -j 8`
+- `llama-cli` and `llama-server` builds passed.
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator self-test passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- Gemma true KVarN+ISWA logits passed packed repeat and packed-vs-split with NMSE `0`, expected layers `5-47:6`, body-record check enabled.
+- Qwen3.6 MTP logits passed packed repeat and packed-vs-split with NMSE `0`, expected layers `3-39:4`, body-record check enabled, `-ncmoe 34 -fit off`.
+- Qwen2.5 FP16 CLI smoke passed for contexts `256 512`; KVarN correctly rejected that 64d-head model with the expected unsupported-dimension guard.
+- Unsupported smoke passed after the Gemma true-KVarN guard fix.
+
+Short production parity results:
+
+- Gemma 4 12B true KVarN+ISWA, artifact `artifacts/kvarn-mainline-parity/round24-gemma-true-iswa-direct-r3`:
+  - `pp512`: mainline `2271.95 t/s`, KVarN `2215.96 t/s`, `97.5%` PASS.
+  - `tg64`: mainline `66.24 t/s`, KVarN `65.68 t/s`, `99.2%` PASS.
+- Qwen3.6 MTP, artifact `artifacts/kvarn-mainline-parity/round24-qwen-full-direct-r3`:
+  - `pp512`: mainline `244.35 t/s`, KVarN `315.93 t/s`, `129.3%` PASS.
+  - `tg64`: mainline `42.76 t/s`, KVarN `42.63 t/s`, `99.7%` PASS.
+
+Long-context diagnostic results:
+
+- Gemma 4 12B true KVarN+ISWA, artifact `artifacts/kvarn-mainline-parity/round24-gemma-true-iswa-direct-long4096-r1`:
+  - `pp4096`: mainline `2272.36 t/s`, KVarN `891.21 t/s`, `39.2%` FAIL.
+  - `tg4096`: mainline `61.46 t/s`, KVarN `31.37 t/s`, `51.0%` FAIL.
+- Qwen3.6 MTP, artifact `artifacts/kvarn-mainline-parity/round24-qwen-full-direct-long4096-r1`:
+  - `pp4096`: mainline `187.97 t/s`, KVarN `106.35 t/s`, `56.6%` FAIL.
+  - `tg4096`: mainline `49.02 t/s`, KVarN `32.13 t/s`, `65.5%` FAIL.
+
+Current diagnosis:
+
+- The short production path is no longer the blocker. Both required models clear `pp512` and `tg64` with true KVarN layer routing.
+- The remaining production-quality gap is the long body-heavy path. At `4096`, both models allocate `30` body records per KVarN layer and fall far below mainline.
+- For long prefill, the direct attention shortcut cannot avoid the cost of sealing many body records. The current direct body-store graph emits one store op per body record per KVarN layer for the current-ubatch path. That is acceptable for two records at `pp512`, but likely too expensive at thirty records.
+- For long decode, the mixed body-attention path and dequant/cache behavior are the likely bottlenecks. Do not re-enable the rejected 256d warpqk experiment as a production fix; isolate body dequant/cache reuse and mixed-attention throughput first.
+- Subagent exploration was attempted for body-store and mixed-attention analysis, but both subagents hit the Codex usage limit before returning results. The next engineer should continue locally from the files and artifacts listed here.
+
+Recommended next implementation targets:
+
+- Add a batched direct-current-ubatch body-store op for contiguous prefill records, analogous to the existing pending-record batch store. The high-value target is replacing one op per record per layer with a small number of batched record-store ops.
+- Profile `GGML_OP_KVARN_STORE_KV_BODY` under `LLAMA_KVARN_CUDA_TIMING=1` on `pp4096` to split long prefill time into store, direct attention, and other graph costs before changing kernels.
+- Add/verify dequant-cache hit/miss summaries for `tg4096`; if hit rates are low, fix cache keying/epoch reuse before kernel work. If hit rates are high, focus on `ggml_kvarn_attn_mixed` body-record attention throughput.
+- Keep the Round 24 short gate as the regression floor: Gemma true KVarN and Qwen MTP must stay `>=90%` on `pp512` and `tg64`, with logits NMSE `0` and expected KVarN layer routing.

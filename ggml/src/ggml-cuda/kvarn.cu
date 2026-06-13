@@ -4481,7 +4481,8 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             size_t scalar_body_f32_stride_head_elems = 0;
             bool scalar_used_f32_body_mirror = false;
             const bool scalar_allow_f32_body_mirror =
-                head_dim >= 512 && scores != nullptr && !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR");
+                (head_dim == 256 || head_dim >= 512) &&
+                scores != nullptr && !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR");
             if (scalar_allow_f32_body_mirror) {
                 const size_t n_per_record = size_t(group_size)*head_dim;
                 const size_t n_per_head = size_t(n_records)*n_per_record;
@@ -4509,6 +4510,77 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 }
             }
             if (n_gqa >= 2 && qt_override != 16 && !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT")) {
+                if (head_dim == 256 && n_gqa >= 8 && !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT_HT8")) {
+                    constexpr int scalar_gqa_ht8 = 8;
+                    const size_t scalar_gqa_ht8_q4_shmem =
+                        (size_t(scalar_gqa_ht8)*4*size_t(head_dim) + size_t(scalar_gqa_ht8)*4*size_t(n_tokens) +
+                         size_t(scalar_qt_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+                    const size_t scalar_gqa_ht8_q8_shmem =
+                        (size_t(scalar_gqa_ht8)*8*size_t(head_dim) + size_t(scalar_gqa_ht8)*8*size_t(n_tokens) +
+                         size_t(scalar_qt_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+                    const bool scalar_gqa_ht8_q8 =
+                        ((qt_override == 8 && n_queries > 4) || (qt_override == 0 && n_queries > 4)) &&
+                        kvarn_cuda_dynamic_shmem_optin_fits(scalar_gqa_ht8_q8_shmem) &&
+                        kvarn_cuda_prepare_dynamic_shmem(kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<8, scalar_gqa_ht8>, scalar_gqa_ht8_q8_shmem);
+                    const bool scalar_gqa_ht8_q4 =
+                        !scalar_gqa_ht8_q8 &&
+                        qt_override == 4 && n_queries > 2 &&
+                        kvarn_cuda_dynamic_shmem_optin_fits(scalar_gqa_ht8_q4_shmem) &&
+                        kvarn_cuda_prepare_dynamic_shmem(kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<4, scalar_gqa_ht8>, scalar_gqa_ht8_q4_shmem);
+                    if (scalar_gqa_ht8_q8 || scalar_gqa_ht8_q4) {
+                        const int selected_qt = scalar_gqa_ht8_q8 ? 8 : 4;
+                        const size_t scalar_gqa_shmem = scalar_gqa_ht8_q8 ? scalar_gqa_ht8_q8_shmem : scalar_gqa_ht8_q4_shmem;
+                        const int scalar_gqa_grid = int(((n_queries + uint32_t(selected_qt - 1))/uint32_t(selected_qt))*
+                                n_head_kv*((n_gqa + uint32_t(scalar_gqa_ht8 - 1))/uint32_t(scalar_gqa_ht8)));
+                        if (kvarn_attn_trace_claim()) {
+                            std::fprintf(stderr,
+                                    "KVarN CUDA mixed-attn inner trace: mode=scalar-qt-gqa head_dim=%u n_queries=%u n_head=%u"
+                                    " n_head_kv=%u n_gqa=%u sink=%u records=%u pending=%u tail=%u tail_start=%u"
+                                    " tokens=%u qt=%d ht=%d block=%d grid=%d shmem=%zu scores_nelems=%" PRId64
+                                    " body_records_cap=%" PRId64 " body_mirror_allowed=%d body_mirror_used=%d"
+                                    " kq_mask_type=%u kq_mask_stride_query_bytes=%zu kq_mask_stride_token_bytes=%zu\n",
+                                    head_dim, n_queries, n_head, n_head_kv, n_gqa,
+                                    n_sink, n_records, n_pending, n_tail, tail_start, n_tokens,
+                                    selected_qt, scalar_gqa_ht8, scalar_qt_block, scalar_gqa_grid, scalar_gqa_shmem, scores_nelems,
+                                    k_body_records_cap, scalar_allow_f32_body_mirror ? 1 : 0, scalar_used_f32_body_mirror ? 1 : 0,
+                                    kq_mask_type, kq_mask_stride_query_bytes, kq_mask_stride_token_bytes);
+                        }
+                        if (scalar_gqa_ht8_q8) {
+                            kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<8, scalar_gqa_ht8><<<scalar_gqa_grid, scalar_qt_block, scalar_gqa_shmem, cuda_stream>>>(
+                                    q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                                    kq_mask, scalar_body_k_f32, scalar_body_v_f32,
+                                    out, scores, n_queries, n_head, n_head_kv,
+                                    n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                                    q_stride_head_floats, q_stride_query_floats,
+                                    out_stride_head_floats, out_stride_query_floats,
+                                    sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                                    pending_stride_head_floats, pending_stride_token_floats,
+                                    k_body_stride_record_bytes, v_body_stride_record_bytes,
+                                    k_body_stride_head_bytes, v_body_stride_head_bytes,
+                                    k_scale_stride_record_floats, v_scale_stride_record_floats,
+                                    k_scale_stride_head_floats, v_scale_stride_head_floats,
+                                    kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
+                                    scalar_body_f32_stride_head_elems);
+                        } else {
+                            kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<4, scalar_gqa_ht8><<<scalar_gqa_grid, scalar_qt_block, scalar_gqa_shmem, cuda_stream>>>(
+                                    q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                                    kq_mask, scalar_body_k_f32, scalar_body_v_f32,
+                                    out, scores, n_queries, n_head, n_head_kv,
+                                    n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                                    q_stride_head_floats, q_stride_query_floats,
+                                    out_stride_head_floats, out_stride_query_floats,
+                                    sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                                    pending_stride_head_floats, pending_stride_token_floats,
+                                    k_body_stride_record_bytes, v_body_stride_record_bytes,
+                                    k_body_stride_head_bytes, v_body_stride_head_bytes,
+                                    k_scale_stride_record_floats, v_scale_stride_record_floats,
+                                    k_scale_stride_head_floats, v_scale_stride_head_floats,
+                                    kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
+                                    scalar_body_f32_stride_head_elems);
+                        }
+                        return;
+                    }
+                }
                 if (head_dim == 256 && n_gqa >= 4 && !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT_HT4")) {
                     constexpr int scalar_gqa_ht4 = 4;
                     const size_t scalar_gqa_ht4_q4_shmem =
@@ -4577,6 +4649,50 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                                     kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
                                     scalar_body_f32_stride_head_elems);
                         }
+                        return;
+                    }
+                }
+                if (head_dim == 512 && n_gqa >= 4 && kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_512D_GQA_SCALAR_QT_HT4")) {
+                    constexpr int scalar_gqa_512_ht4 = 4;
+                    const size_t scalar_gqa_512_ht4_q4_shmem =
+                        (size_t(scalar_gqa_512_ht4)*4*size_t(head_dim) + size_t(scalar_gqa_512_ht4)*4*size_t(n_tokens) +
+                         size_t(scalar_qt_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+                    const bool scalar_gqa_512_ht4_q4 =
+                        ((qt_override == 4 && n_queries > 2) || qt_override == 0) &&
+                        kvarn_cuda_dynamic_shmem_optin_fits(scalar_gqa_512_ht4_q4_shmem) &&
+                        kvarn_cuda_prepare_dynamic_shmem(kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<4, scalar_gqa_512_ht4>, scalar_gqa_512_ht4_q4_shmem);
+                    if (scalar_gqa_512_ht4_q4) {
+                        const int selected_qt = 4;
+                        const int scalar_gqa_grid = int(((n_queries + uint32_t(selected_qt - 1))/uint32_t(selected_qt))*
+                                n_head_kv*((n_gqa + uint32_t(scalar_gqa_512_ht4 - 1))/uint32_t(scalar_gqa_512_ht4)));
+                        if (kvarn_attn_trace_claim()) {
+                            std::fprintf(stderr,
+                                    "KVarN CUDA mixed-attn inner trace: mode=scalar-qt-gqa head_dim=%u n_queries=%u n_head=%u"
+                                    " n_head_kv=%u n_gqa=%u sink=%u records=%u pending=%u tail=%u tail_start=%u"
+                                    " tokens=%u qt=%d ht=%d block=%d grid=%d shmem=%zu scores_nelems=%" PRId64
+                                    " body_records_cap=%" PRId64 " body_mirror_allowed=%d body_mirror_used=%d"
+                                    " kq_mask_type=%u kq_mask_stride_query_bytes=%zu kq_mask_stride_token_bytes=%zu\n",
+                                    head_dim, n_queries, n_head, n_head_kv, n_gqa,
+                                    n_sink, n_records, n_pending, n_tail, tail_start, n_tokens,
+                                    selected_qt, scalar_gqa_512_ht4, scalar_qt_block, scalar_gqa_grid, scalar_gqa_512_ht4_q4_shmem, scores_nelems,
+                                    k_body_records_cap, scalar_allow_f32_body_mirror ? 1 : 0, scalar_used_f32_body_mirror ? 1 : 0,
+                                    kq_mask_type, kq_mask_stride_query_bytes, kq_mask_stride_token_bytes);
+                        }
+                        kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<4, scalar_gqa_512_ht4><<<scalar_gqa_grid, scalar_qt_block, scalar_gqa_512_ht4_q4_shmem, cuda_stream>>>(
+                                q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales, pending_k, pending_v,
+                                kq_mask, scalar_body_k_f32, scalar_body_v_f32,
+                                out, scores, n_queries, n_head, n_head_kv,
+                                n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, key_bits, value_bits,
+                                q_stride_head_floats, q_stride_query_floats,
+                                out_stride_head_floats, out_stride_query_floats,
+                                sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                                pending_stride_head_floats, pending_stride_token_floats,
+                                k_body_stride_record_bytes, v_body_stride_record_bytes,
+                                k_body_stride_head_bytes, v_body_stride_head_bytes,
+                                k_scale_stride_record_floats, v_scale_stride_record_floats,
+                                k_scale_stride_head_floats, v_scale_stride_head_floats,
+                                kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
+                                scalar_body_f32_stride_head_elems);
                         return;
                     }
                 }
@@ -4733,7 +4849,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             !kvarn_disable_warpqk() &&
             ((head_dim >= 512 && kvarn_enable_512d_warpqk()) ||
              (head_dim == 256 && kvarn_enable_256d_warpqk()));
-        if (use_warpqk_body) {
+        if (use_warpqk_body && n_records > 0) {
             const int warpqk_block = head_dim >= 512 ? 512 : 256;
             // Q-tile selection: QT=4 amortizes every K/V load across 4 query
             // rows (4x fewer CTAs, 4x FMA reuse) whenever the tiled shared

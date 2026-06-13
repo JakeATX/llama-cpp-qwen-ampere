@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 
 // Bounds a KVarN ubatch chunk by tail-ring evictions per graph (<= tail_tokens),
@@ -39,6 +40,14 @@ inline static uint32_t kvarn_tail_safe_ubatch_limit(
     const llama_pos first_pos = batch.pos[i0];
     if (first_pos < 0) {
         return 1;
+    }
+
+    // The initial contiguous prompt can be stored directly from the current
+    // K/V tensors by the KVarN graph prefill path, so it is not constrained by
+    // tail-ring eviction staging.
+    const char * disable_direct_prefill = std::getenv("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN");
+    if ((disable_direct_prefill == nullptr || disable_direct_prefill[0] != '1') && i0 == 0 && first_pos == 0) {
+        return std::min<uint32_t>(default_limit, uint32_t(batch.n_tokens));
     }
 
     uint32_t n_safe = 0;
