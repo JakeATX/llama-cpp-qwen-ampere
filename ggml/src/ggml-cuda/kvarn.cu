@@ -190,6 +190,10 @@ static bool kvarn_disable_body_mirror() {
     return kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_BODY_MIRROR");
 }
 
+static bool kvarn_paper_frame_enabled() {
+    return kvarn_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
+}
+
 static bool kvarn_dequant_cache_trace_enabled() {
     return kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
 }
@@ -1473,6 +1477,7 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
         uint32_t value_bits,
         uint32_t sinkhorn_iters,
         float rtn_quantile,
+        bool input_already_rotated,
         void * stream) {
     ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t n = size_t(head_dim)*group_size;
@@ -1503,20 +1508,25 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
     cudaEventRecord(aux.main_ready, cuda_stream);
     cudaStreamWaitEvent(aux_stream, aux.main_ready, 0);
 
-    const int k_hadamard_block = kvarn_pow2_block(head_dim);
-    if (k_hadamard_block <= 1024) {
-        kvarn_hadamard_cols_parallel_kernel<<<int(group_size), k_hadamard_block, size_t(k_hadamard_block)*sizeof(float), cuda_stream>>>(
-                k_tile, k_data, head_dim, group_size);
+    if (input_already_rotated) {
+        cudaMemcpyAsync(k_data, k_tile, n*sizeof(float), cudaMemcpyDeviceToDevice, cuda_stream);
+        cudaMemcpyAsync(v_data, v_tile, n*sizeof(float), cudaMemcpyDeviceToDevice, aux_stream);
     } else {
-        kvarn_hadamard_cols_kernel<<<int(group_size), 1, 0, cuda_stream>>>(k_tile, k_data, head_dim, group_size);
-    }
+        const int k_hadamard_block = kvarn_pow2_block(head_dim);
+        if (k_hadamard_block <= 1024) {
+            kvarn_hadamard_cols_parallel_kernel<<<int(group_size), k_hadamard_block, size_t(k_hadamard_block)*sizeof(float), cuda_stream>>>(
+                    k_tile, k_data, head_dim, group_size);
+        } else {
+            kvarn_hadamard_cols_kernel<<<int(group_size), 1, 0, cuda_stream>>>(k_tile, k_data, head_dim, group_size);
+        }
 
-    const int v_hadamard_block = kvarn_pow2_block(head_dim);
-    if (v_hadamard_block <= 1024) {
-        kvarn_hadamard_rows_parallel_kernel<<<int(group_size), v_hadamard_block, size_t(v_hadamard_block)*sizeof(float), aux_stream>>>(
-                v_tile, v_data, group_size, head_dim);
-    } else {
-        kvarn_hadamard_rows_kernel<<<int(group_size), 1, 0, aux_stream>>>(v_tile, v_data, group_size, head_dim);
+        const int v_hadamard_block = kvarn_pow2_block(head_dim);
+        if (v_hadamard_block <= 1024) {
+            kvarn_hadamard_rows_parallel_kernel<<<int(group_size), v_hadamard_block, size_t(v_hadamard_block)*sizeof(float), aux_stream>>>(
+                    v_tile, v_data, group_size, head_dim);
+        } else {
+            kvarn_hadamard_rows_kernel<<<int(group_size), 1, 0, aux_stream>>>(v_tile, v_data, group_size, head_dim);
+        }
     }
 
     float * k_row_scale = k_scales;
@@ -1651,6 +1661,7 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
     kvarn_gather_pending_v_head_kernel<<<grid, block, 0, cuda_stream>>>(
             v_pending, v_tile, head_dim, group_size, uint32_t(pending_v_head_stride_floats));
 
+    const bool pending_already_rotated = kvarn_paper_frame_enabled();
     for (uint32_t bi = 0; bi < n_record_batch; ++bi) {
         const uint32_t record = uint32_t(records[bi]);
         if (head_dim >= 256) {
@@ -1661,7 +1672,8 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
                     k_scales + size_t(record)*k_scale_record_stride_floats,
                     v_scales + size_t(record)*v_scale_record_stride_floats,
                     pipeline,
-                    head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile, stream);
+                    head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
+                    pending_already_rotated, stream);
         } else {
             ggml_cuda_kvarn_store_k_body_reference_minmax(
                     k_tile,
@@ -1711,6 +1723,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
     const int block = 256;
     const int grid = int((tile_floats + block - 1)/block);
 
+    const bool pending_already_rotated = kvarn_paper_frame_enabled();
     for (uint32_t ih = 0; ih < n_heads; ++ih) {
         const float * k_pending = pending_k + size_t(ih)*pending_k_head_stride_floats;
         const float * v_pending = pending_v + size_t(ih)*pending_v_head_stride_floats;
@@ -1727,7 +1740,8 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
                     k_scales + size_t(ih)*k_scale_stride_floats,
                     v_scales + size_t(ih)*v_scale_stride_floats,
                     pipeline,
-                    head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile, stream);
+                    head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
+                    pending_already_rotated, stream);
         } else {
             ggml_cuda_kvarn_store_k_body_reference_minmax(
                     k_tile,
@@ -1831,7 +1845,8 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
                         k_scales + size_t(ih)*k_scale_head_stride_floats + size_t(record)*k_scale_record_stride_floats,
                         v_scales + size_t(ih)*v_scale_head_stride_floats + size_t(record)*v_scale_record_stride_floats,
                         pipeline,
-                        head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile, stream);
+                        head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
+                        false, stream);
             } else {
                 ggml_cuda_kvarn_store_k_body_reference_minmax(
                         k_tile,
@@ -1869,7 +1884,8 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
     if (head_dim >= 256) {
         ggml_cuda_kvarn_store_kv_body_pipelined(
                 k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
-                head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile, stream);
+                head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
+                false, stream);
         return;
     }
 

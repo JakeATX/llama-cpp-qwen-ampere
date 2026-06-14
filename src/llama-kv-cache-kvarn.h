@@ -49,6 +49,8 @@ void llama_kvarn_hadamard_channels(
         uint32_t cols,
         bool channels_are_rows);
 
+std::vector<float> llama_kvarn_hadamard_matrix(uint32_t d);
+
 void llama_kvarn_pack_bits(const std::vector<uint8_t> & src, uint32_t bits, std::vector<uint8_t> & dst);
 void llama_kvarn_unpack_bits(const std::vector<uint8_t> & src, uint32_t bits, size_t n_values, std::vector<uint8_t> & dst);
 

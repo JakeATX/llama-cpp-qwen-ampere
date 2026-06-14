@@ -286,6 +286,36 @@ void llama_kvarn_hadamard_channels(
     }
 }
 
+std::vector<float> llama_kvarn_hadamard_matrix(uint32_t d) {
+    if (!is_power_of_2(d)) {
+        throw std::invalid_argument("KVarN Hadamard matrix dim must be a power of two");
+    }
+
+    std::vector<float> H(size_t(d)*d, 0.0f);
+    std::vector<float> col(d, 0.0f);
+    const float norm = 1.0f/std::sqrt(float(d));
+    for (uint32_t j = 0; j < d; ++j) {
+        std::fill(col.begin(), col.end(), 0.0f);
+        col[j] = 1.0f;
+        for (uint32_t step = 1; step < d; step <<= 1) {
+            for (uint32_t base = 0; base < d; base += 2*step) {
+                for (uint32_t i = 0; i < step; ++i) {
+                    const uint32_t i0 = base + i;
+                    const uint32_t i1 = i0 + step;
+                    const float a = col[i0];
+                    const float b = col[i1];
+                    col[i0] = a + b;
+                    col[i1] = a - b;
+                }
+            }
+        }
+        for (uint32_t r = 0; r < d; ++r) {
+            H[size_t(r)*d + j] = col[r]*norm;
+        }
+    }
+    return H;
+}
+
 void llama_kvarn_pack_bits(const std::vector<uint8_t> & src, uint32_t bits, std::vector<uint8_t> & dst) {
     if (bits == 0 || bits > 8) {
         throw std::invalid_argument("KVarN pack bit width must be in [1, 8]");

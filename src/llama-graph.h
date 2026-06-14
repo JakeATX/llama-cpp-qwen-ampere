@@ -373,6 +373,10 @@ public:
 
     const llama_kv_cache_kvarn_context * mctx_kvarn;
     ggml_tensor * kvarn_window = nullptr;   // I32 [8]
+    ggml_tensor * kvarn_hadamard = nullptr; // F32 [head_dim, head_dim]
+    std::vector<float> kvarn_hadamard_host;
+    bool kvarn_hadamard_filled = false;
+    uint32_t kvarn_hadamard_dim = 0;
     bool window_indirect = false;
     std::vector<ggml_tensor *> mixed_attn_nodes;
     std::vector<ggml_tensor *> mixed_attn_scores;
@@ -509,6 +513,10 @@ public:
     // n_tail, tail_start] streamed via this input; mixed-attn op_params stay
     // frozen at regime caps so node properties are replay-stable.
     ggml_tensor * base_kvarn_window = nullptr;   // I32 [8]
+    ggml_tensor * base_kvarn_hadamard = nullptr; // F32 [head_dim, head_dim]
+    std::vector<float> base_kvarn_hadamard_host;
+    bool base_kvarn_hadamard_filled = false;
+    uint32_t base_kvarn_hadamard_dim = 0;
     bool base_window_indirect = false;
     std::vector<ggml_tensor *> base_mixed_attn_nodes;
     std::vector<ggml_tensor *> base_mixed_attn_scores;

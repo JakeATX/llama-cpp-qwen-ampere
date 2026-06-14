@@ -199,3 +199,39 @@ Conclusion:
 - The next likely production patch is fused/occupancy-improved body-record
   attention: split active body records across CTAs per head/query, reduce
   score max/sum/value, and keep packed-vs-split/scratch as the oracle.
+
+## Round 28 Codex update
+
+The Opus paper-frame critique was implemented as a default-off scaffold:
+
+- Env gate: `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`.
+- Regular KVarN and true KVarN+ISWA mixed attention now can rotate `q`, store
+  rotated sink/tail, and unrotate the output using an explicit Hadamard matrix.
+- Pending stores are treated as already rotated under the flag, while direct raw
+  prefill body stores are forced through the direct-record path so they still get
+  exactly one body Hadamard.
+
+Results:
+
+- Default-off focused tests still pass.
+- Small Qwen3.5 paper-frame logits pass repeat/split/scratch with NMSE `0`.
+- Qwen3.6 ctx512/chunks2 accuracy passes both default and paper-frame at `0.28%`
+  PPL increase.
+- Qwen3.6 ctx4096/chunks2 improves but still fails:
+  - old failure: `46.71%` PPL increase.
+  - paper-frame after direct/pending corrections: `37.24%` PPL increase.
+- Gemma 4 12B true KVarN+ISWA ctx4096/chunks2 still fails catastrophically.
+- The Round 28 decode-parallel patch from Downloads is not directly applyable
+  (`git apply --check` reports a corrupt patch at line 246) and should remain a
+  speed follow-up, not the next production patch, until the 4096 accuracy gate
+  passes.
+
+Updated priority:
+
+1. Do boundary-level f16-vs-KVarN diagnosis at ctx4096 under
+   `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`.
+2. Identify whether the remaining error is body quantization/scales, mask/window
+   indexing, pending/direct layout, or output-frame handling.
+3. Only after Qwen3.6 and Gemma ctx4096 accuracy pass, implement the
+   decode-parallel body-attention path as an opt-in diagnostic and then benchmark
+   `tg4096`.

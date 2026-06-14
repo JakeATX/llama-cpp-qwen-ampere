@@ -1138,3 +1138,70 @@ Immediate next work:
 2. Use the new paper-frame unit as a hard regression test for any further fused dequant/attention work.
 3. Implement long decode/body-attention parallelism across record partitions per head/query, with reductions for max/sum/value.
 4. Revisit direct-record batched store after attention is no longer dominant; possible refinements are reducing scratch writes, fusing Hadamard+VarN more tightly, and avoiding one CTA per row/column for small tiles.
+
+---
+
+## Round 28 paper-frame scaffold - 2026-06-14
+
+Inputs reviewed:
+
+- `C:\Users\sjake\Downloads\KVARN_PAPER_FRAME_SCAFFOLD.md`
+- `C:\Users\sjake\Downloads\KVARN_ROUND28_DECODE_PARALLEL_BODY_ATTENTION_HANDOFF.md`
+- `C:\Users\sjake\Downloads\KVARN_ROUND28_DECODE_PARALLEL_BODY_ATTENTION.patch`
+
+Implemented from the paper-frame scaffold:
+
+- Added `llama_kvarn_hadamard_matrix(uint32_t d)`, built by the same normalized Sylvester-Hadamard butterfly used by body store.
+- Added default-off graph plumbing under `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`.
+- In regular KVarN and true KVarN+ISWA mixed-attention graph paths:
+  - rotate `q` before `ggml_kvarn_attn_mixed`;
+  - rotate sink/tail `k/v` before cache copy;
+  - unrotate the KVarN attention output before reshape/output projection.
+- Added paper-frame handling for pending body stores:
+  - rotated sink/tail evictions copied into pending are treated as already rotated when later sealed;
+  - direct raw prefill record stores are forced through the direct-record body-store op under paper-frame mode so they still receive exactly one Hadamard rotation.
+
+Important status:
+
+- `LLAMA_KVARN_ENABLE_PAPER_FRAME` remains default off.
+- The scaffold compiles and preserves default behavior, but it does not yet pass the production 4096 accuracy gates.
+- The Round 28 decode-parallel patch file is not directly applyable (`git apply --check` reports a corrupt patch at line 246). More importantly, decode speed work should stay behind accuracy until the 4096 f16-vs-KVarN gate is fixed.
+
+Validation:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-cli llama-bench llama-perplexity test-kvarn-cuda-scratch-ref -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- Small Qwen3.5, `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`, context 512:
+  - packed repeat NMSE `0`
+  - packed-vs-split NMSE `0`
+  - packed-vs-scratch NMSE `0`
+- Qwen3.6 MTP accuracy, context 512, chunks 2:
+  - default: f16 PPL `3.8849`, KVarN PPL `3.8956`, increase `0.28%`, PASS.
+  - paper-frame: f16 PPL `3.8849`, KVarN PPL `3.8956`, increase `0.28%`, PASS.
+- Qwen3.6 MTP accuracy, context 4096, chunks 2:
+  - old Round 26 baseline: increase `46.71%`.
+  - paper-frame q/sink/output only: increase `46.71%`.
+  - paper-frame plus pending-rotated store: increase `39.83%`.
+  - paper-frame plus pending-rotated store plus forced direct-record raw prefill stores: increase `37.24%`.
+  - Result: still FAIL.
+- Gemma 4 12B true KVarN+ISWA accuracy, context 4096, chunks 2, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`:
+  - f16 PPL `418.2027`.
+  - KVarN PPL `149227980.3447`.
+  - Result: still FAIL.
+
+Interpretation:
+
+- Opus's frame critique was partially correct: fixing the frame changed Qwen3.6 long-context PPL in the right direction.
+- The frame scaffold is not sufficient. There is still at least one long-context accuracy bug or a severe KVarN quantization/config mismatch before long-context speed numbers should be treated as production evidence.
+- The next investigation should compare long-context KVarN against f16 at the layer/window boundary, not benchmark another faster kernel first.
+
+Recommended next work:
+
+1. Add a selected-layer boundary dump for f16 K/V, KVarN dequantized body, rotated sink/tail, pending, `q`, scores, and output under `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`.
+2. Run the dump at the first token where Qwen3.6 ctx4096 KVarN diverges materially from f16.
+3. Decide whether the remaining error is body quantization itself, scale application, pending/direct store layout, mask/window indexing, or output-frame handling.
+4. Only after Qwen3.6 and Gemma 4096 accuracy pass, resurrect the decode-parallel body-attention patch as an opt-in diagnostic path.

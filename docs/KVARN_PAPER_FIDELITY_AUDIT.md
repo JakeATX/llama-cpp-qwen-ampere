@@ -227,3 +227,9 @@ The first paper-shaped implementation slice has landed as a diagnostic path, not
 - It does not yet improve production Qwen3.6 pp4096; keep it opt-in and continue with fused/parallel body attention work.
 - Anchored dequant mirrors now have append-aware invalidation for one-epoch append-only body stores, reducing redundant body scratch materialization in layouts that store only newly sealed records without changing the packed format or attention arithmetic.
 - Qwen3.6 pp4096 tracing still shows the current direct-record prefill graph dirtying from record 0, so the append-aware cache is a correctness-safe infrastructure fix, not the long-prefill production fix by itself.
+
+## Round 28 update
+
+`LLAMA_KVARN_ENABLE_PAPER_FRAME=1` adds a default-off graph scaffold that rotates KVarN mixed-attention `q`, stores rotated sink/tail K/V, and unrotates the mixed-attention output with an explicit Hadamard matrix. It also handles the direct-vs-pending body-store distinction so raw direct prefill records are rotated once and already-rotated pending records are not rotated twice.
+
+Validation changed the Qwen3.6 ctx4096 bounded accuracy failure from `46.71%` PPL increase to `37.24%`, but the gate still fails. Gemma 4 12B true KVarN+ISWA ctx4096 also still fails. Therefore the frame critique is partially confirmed, but the remaining long-context accuracy problem is not solved.
