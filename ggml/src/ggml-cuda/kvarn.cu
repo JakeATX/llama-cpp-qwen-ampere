@@ -7,6 +7,17 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <string>
+#include <vector>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 // NVCC can vectorize shared-memory reduction loads at the end of the scratch
 // region. Keep a small pad so sanitizer-visible overreads stay inside the
@@ -22,6 +33,7 @@ static std::atomic<uint64_t> g_kvarn_body_store_epoch_next{1};
 static std::atomic<uint64_t> g_kvarn_dequant_cache_trace_count{0};
 static std::atomic<uint64_t> g_kvarn_attn_trace_count{0};
 static std::atomic<uint64_t> g_kvarn_store_phase_trace_count{0};
+static std::atomic<uint64_t> g_kvarn_body_record_dump_count{0};
 
 struct kvarn_dequant_cache_entry {
     const void * k_body    = nullptr;
@@ -224,6 +236,123 @@ static bool kvarn_store_phase_trace_claim() {
     }
     const int limit = kvarn_env_int("LLAMA_KVARN_STORE_TRACE_LIMIT", 64);
     return g_kvarn_store_phase_trace_count.fetch_add(1, std::memory_order_relaxed) < uint64_t(limit);
+}
+
+struct kvarn_body_record_dump_state {
+    bool active = false;
+    uint64_t call_index = 0;
+    uint32_t record = 0;
+    uint32_t head = 0;
+    std::string dir;
+};
+
+static int kvarn_env_optional_nonneg_int(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return -1;
+    }
+    return kvarn_env_int(name, -1);
+}
+
+static std::string kvarn_join_path(const std::string & dir, const char * leaf) {
+    if (dir.empty()) {
+        return std::string(leaf);
+    }
+    const char last = dir[dir.size() - 1];
+    if (last == '/' || last == '\\') {
+        return dir + leaf;
+    }
+    return dir + "/" + leaf;
+}
+
+static void kvarn_mkdir_one(const std::string & path) {
+    if (path.empty()) {
+        return;
+    }
+#ifdef _WIN32
+    (void) _mkdir(path.c_str());
+#else
+    (void) mkdir(path.c_str(), 0777);
+#endif
+}
+
+static void kvarn_create_directories(const std::string & path) {
+    std::string cur;
+    cur.reserve(path.size());
+    for (size_t i = 0; i < path.size(); ++i) {
+        const char c = path[i];
+        cur.push_back(c);
+        if ((c == '/' || c == '\\') && cur.size() > 1 && cur[cur.size() - 2] != ':') {
+            kvarn_mkdir_one(cur);
+        }
+    }
+    kvarn_mkdir_one(path);
+}
+
+static void kvarn_write_binary_file(const std::string & path, const void * data, size_t nbytes) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        std::fprintf(stderr, "KVarN body-record dump: failed to open %s\n", path.c_str());
+        return;
+    }
+    f.write(reinterpret_cast<const char *>(data), std::streamsize(nbytes));
+    if (!f) {
+        std::fprintf(stderr, "KVarN body-record dump: failed to write %s\n", path.c_str());
+    }
+}
+
+static void kvarn_dump_device_buffer(const std::string & path, const void * dev, size_t nbytes) {
+    std::vector<uint8_t> host(nbytes, uint8_t(0));
+    cudaError_t err = cudaMemcpy(host.data(), dev, nbytes, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "KVarN body-record dump: cudaMemcpy failed for %s: %s\n",
+                path.c_str(), cudaGetErrorString(err));
+        return;
+    }
+    kvarn_write_binary_file(path, host.data(), host.size());
+}
+
+static kvarn_body_record_dump_state kvarn_body_record_dump_claim(uint32_t record, uint32_t head) {
+    kvarn_body_record_dump_state dump;
+    if (record == UINT32_MAX || head == UINT32_MAX) {
+        return dump;
+    }
+    if (!kvarn_env_flag("LLAMA_KVARN_DEBUG_BODY_RECORD_DUMP")) {
+        return dump;
+    }
+
+    const int record_filter = kvarn_env_optional_nonneg_int("LLAMA_KVARN_DEBUG_BODY_RECORD");
+    if (record_filter >= 0 && uint32_t(record_filter) != record) {
+        return dump;
+    }
+    const int head_filter = kvarn_env_optional_nonneg_int("LLAMA_KVARN_DEBUG_BODY_HEAD");
+    if (head_filter >= 0 && uint32_t(head_filter) != head) {
+        return dump;
+    }
+
+    const uint64_t call_index = g_kvarn_body_record_dump_count.fetch_add(1, std::memory_order_relaxed);
+    const int call_filter = kvarn_env_optional_nonneg_int("LLAMA_KVARN_DEBUG_BODY_RECORD_CALL");
+    if (call_filter >= 0 && call_index != uint64_t(call_filter)) {
+        return dump;
+    }
+    const int limit = kvarn_env_int("LLAMA_KVARN_DEBUG_BODY_RECORD_LIMIT", 1);
+    if (call_filter < 0 && limit >= 0 && call_index >= uint64_t(limit)) {
+        return dump;
+    }
+
+    const char * dir_env = std::getenv("LLAMA_KVARN_DEBUG_BODY_RECORD_DIR");
+    const std::string root = dir_env != nullptr && dir_env[0] != '\0' ?
+        std::string(dir_env) : std::string("artifacts/kvarn-body-record/default");
+    std::ostringstream stem;
+    stem << "store_" << std::setw(6) << std::setfill('0') << call_index
+         << "_h" << head << "_r" << record;
+    dump.dir = kvarn_join_path(root, stem.str().c_str());
+    kvarn_create_directories(dump.dir);
+    dump.active = true;
+    dump.call_index = call_index;
+    dump.record = record;
+    dump.head = head;
+    return dump;
 }
 
 struct kvarn_aux_cuda_state {
@@ -1739,6 +1868,8 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         bool input_already_rotated,
+        uint32_t debug_record,
+        uint32_t debug_head,
         void * stream) {
     ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t n = size_t(head_dim)*group_size;
@@ -1790,6 +1921,22 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
         }
     }
 
+    const kvarn_body_record_dump_state dump = kvarn_body_record_dump_claim(debug_record, debug_head);
+    if (dump.active) {
+        cudaError_t err = cudaStreamSynchronize(cuda_stream);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "KVarN body-record dump: cudaStreamSynchronize(main) failed: %s\n", cudaGetErrorString(err));
+        }
+        err = cudaStreamSynchronize(aux_stream);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "KVarN body-record dump: cudaStreamSynchronize(aux) failed: %s\n", cudaGetErrorString(err));
+        }
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "k_tile_input.bin"), k_tile, n*sizeof(float));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "v_tile_input.bin"), v_tile, n*sizeof(float));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "k_rot_or_copy.bin"), k_data, n*sizeof(float));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "v_rot_or_copy.bin"), v_data, n*sizeof(float));
+    }
+
     float * k_row_scale = k_scales;
     float * k_col_scale = k_scales + 2*head_dim;
     float * v_col_scale = v_scales;
@@ -1833,6 +1980,44 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
 
     cudaEventRecord(aux.aux_done, aux_stream);
     cudaStreamWaitEvent(cuda_stream, aux.aux_done, 0);
+
+    if (dump.active) {
+        const cudaError_t err = cudaStreamSynchronize(cuda_stream);
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "KVarN body-record dump: cudaStreamSynchronize(final) failed: %s\n", cudaGetErrorString(err));
+        }
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "k_normalized.bin"), k_data, n*sizeof(float));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "v_normalized.bin"), v_data, n*sizeof(float));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "k_body.bin"), k_body, kvarn_packed_nbytes(n, key_bits));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "v_body.bin"), v_body, kvarn_packed_nbytes(n, value_bits));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "scales_k.bin"), k_scales, size_t(2*head_dim + group_size)*sizeof(float));
+        kvarn_dump_device_buffer(kvarn_join_path(dump.dir, "scales_v.bin"), v_scales, size_t(head_dim + 2*group_size)*sizeof(float));
+
+        std::ofstream json(kvarn_join_path(dump.dir, "body_record.json"));
+        json << "{\n";
+        json << "  \"version\": 1,\n";
+        json << "  \"mode\": \"kvarn-body-record-store\",\n";
+        json << "  \"call_index\": " << dump.call_index << ",\n";
+        json << "  \"record\": " << dump.record << ",\n";
+        json << "  \"head\": " << dump.head << ",\n";
+        json << "  \"head_dim\": " << head_dim << ",\n";
+        json << "  \"group_size\": " << group_size << ",\n";
+        json << "  \"key_bits\": " << key_bits << ",\n";
+        json << "  \"value_bits\": " << value_bits << ",\n";
+        json << "  \"sinkhorn_iters\": " << sinkhorn_iters << ",\n";
+        json << "  \"rtn_quantile\": " << std::setprecision(9) << rtn_quantile << ",\n";
+        json << "  \"input_already_rotated\": " << (input_already_rotated ? "true" : "false") << ",\n";
+        json << "  \"paper_frame\": " << (kvarn_paper_frame_enabled() ? "true" : "false") << ",\n";
+        json << "  \"log_std_sinkhorn\": " << (kvarn_log_std_sinkhorn_enabled() ? "true" : "false") << ",\n";
+        json << "  \"k_layout\": \"channel-major [head_dim, group_size]\",\n";
+        json << "  \"v_layout\": \"token-major [group_size, head_dim]\"\n";
+        json << "}\n";
+        json.close();
+
+        std::fprintf(stderr,
+                "KVarN body-record dump: call=%" PRIu64 " head=%u record=%u path=%s\n",
+                dump.call_index, dump.head, dump.record, dump.dir.c_str());
+    }
 }
 
 static __global__ void kvarn_transpose_pending_k_head_kernel(
@@ -1936,7 +2121,7 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
                     v_scales + size_t(record)*v_scale_record_stride_floats,
                     pipeline,
                     head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
-                    pending_already_rotated, stream);
+                    pending_already_rotated, record, 0, stream);
         } else {
             ggml_cuda_kvarn_store_k_body_reference_minmax(
                     k_tile,
@@ -2004,7 +2189,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
                     v_scales + size_t(ih)*v_scale_stride_floats,
                     pipeline,
                     head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
-                    pending_already_rotated, stream);
+                    pending_already_rotated, 0, ih, stream);
         } else {
             ggml_cuda_kvarn_store_k_body_reference_minmax(
                     k_tile,
@@ -2109,7 +2294,7 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
                         v_scales + size_t(ih)*v_scale_head_stride_floats + size_t(record)*v_scale_record_stride_floats,
                         pipeline,
                         head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
-                        false, stream);
+                        false, record, ih, stream);
             } else {
                 ggml_cuda_kvarn_store_k_body_reference_minmax(
                         k_tile,
@@ -2148,7 +2333,7 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         ggml_cuda_kvarn_store_kv_body_pipelined(
                 k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
                 head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
-                false, stream);
+                false, UINT32_MAX, UINT32_MAX, stream);
         return;
     }
 

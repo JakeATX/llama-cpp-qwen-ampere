@@ -1408,3 +1408,51 @@ Next work:
 2. Compare production CUDA output against the independent Python oracle for one body-active Qwen ctx4096 query/head/record span.
 3. If the dump matches the oracle but PPL still fails, investigate layer-routing/cumulative KVarN layer selection; if it diverges, fix the first mismatched boundary.
 4. Keep long-context speed benchmarking blocked as production evidence until ctx4096 accuracy is below the 5% gate.
+
+---
+
+## Round 31 follow-up body-record store dump - 2026-06-14
+
+Implemented after the Round 31 push:
+
+- Added an explicit, opt-in CUDA body-record store dump behind:
+  - `LLAMA_KVARN_DEBUG_BODY_RECORD_DUMP=1`
+  - `LLAMA_KVARN_DEBUG_BODY_RECORD_DIR=<dir>`
+  - `LLAMA_KVARN_DEBUG_BODY_RECORD_LIMIT=<n>`
+  - optional filters `LLAMA_KVARN_DEBUG_BODY_RECORD=<record>`, `LLAMA_KVARN_DEBUG_BODY_HEAD=<head>`, and `LLAMA_KVARN_DEBUG_BODY_RECORD_CALL=<call>`
+- The dump captures one store tile at the store boundary:
+  - `k_tile_input.bin`
+  - `v_tile_input.bin`
+  - `k_rot_or_copy.bin`
+  - `v_rot_or_copy.bin`
+  - `k_normalized.bin`
+  - `v_normalized.bin`
+  - `k_body.bin`
+  - `v_body.bin`
+  - `scales_k.bin`
+  - `scales_v.bin`
+  - `body_record.json`
+- Added `scripts/kvarn/replay_body_record_dump.py` to independently check:
+  - the frame transform/copy into the store tile;
+  - packed body/scales dequantization back into the rotated frame.
+
+Validation:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-perplexity test-kvarn-cuda-scratch-ref test-kvarn-kv -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure`
+- Enabled-dump CUDA smoke passed:
+  `LLAMA_KVARN_DEBUG_BODY_RECORD_DUMP=1 LLAMA_KVARN_DEBUG_BODY_RECORD_LIMIT=1 ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda" --output-on-failure`
+- Replay on the smoke dump passed the frame contract:
+  `python scripts/kvarn/replay_body_record_dump.py --dump artifacts/kvarn-body-record/round31-smoke --max-frame-nmse 1e-10`
+  - `k_frame_nmse=0`
+  - `v_frame_nmse=0`
+  - `k_dequant_nmse=3.209030e-03`
+  - `v_dequant_nmse=1.162076e-01`
+
+Interpretation:
+
+- The diagnostic path is inert by default and works when enabled.
+- The smoke dump proves the local frame transform/copy boundary can be checked independently.
+- This still does not prove production Qwen ctx4096 correctness. The next run should capture a real Qwen3.6 body-active store record from the failing ctx4096 case, replay it, then compare it with the existing mixed-attention boundary dump for the same head/record span.

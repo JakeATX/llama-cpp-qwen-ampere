@@ -242,7 +242,12 @@ llama_context::llama_context(
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_TRACE");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DEBUG_BODY_RECORD_DUMP");
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_RECORD", 0);
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_HEAD", 0);
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_RECORD_CALL", 0);
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_RECORD_LIMIT", 1);
         }
 
         if (graph_reuse_disable) {
