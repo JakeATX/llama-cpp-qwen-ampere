@@ -4,7 +4,6 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
-#include "layer-profile.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1170,24 +1169,10 @@ struct common_init_result::impl {
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 
-    std::unique_ptr<common_layer_profile_user_data> layer_profile;
 };
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    if (!params.layer_profile_path.empty()) {
-        common_layer_profile_config cfg;
-        cfg.path = params.layer_profile_path;
-        cfg.detail = params.layer_profile_detail;
-        cfg.sync = params.layer_profile_sync;
-        cfg.warmup = params.layer_profile_warmup;
-        cfg.max_tokens = params.layer_profile_max_tokens;
-        pimpl->layer_profile.reset(new common_layer_profile_user_data(params, cfg));
-        if (!pimpl->layer_profile->ok()) {
-            LOG_ERR("%s: layer profiler failed to initialize\n", __func__);
-        }
-    }
-
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

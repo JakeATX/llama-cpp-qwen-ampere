@@ -3545,8 +3545,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const char * __restrict__ atx_hot_x, const int32_t * __restrict__ atx_expert_map,
-        const int atx_hot_stride_channel) {
+        const uint3 ntx) {
 
     // Skip unused template specializations for faster compilation:
     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
@@ -3626,16 +3625,11 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int32_t atx_hot_idx = ids_dst && atx_expert_map ? atx_expert_map[zt] : -1;
-        const bool atx_use_hot = atx_hot_idx >= 0 && atx_hot_x != nullptr;
-        const char * x_active = atx_use_hot ? atx_hot_x : x;
-        const int channel_x = atx_use_hot ? atx_hot_idx : fastdiv(zt, channel_ratio);
-        const int stride_channel_x_active = atx_use_hot ? atx_hot_stride_channel : stride_channel_x;
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_x*stride_channel_x_active + it*mmq_y*stride_row_x;
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x_active, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
     }
@@ -3711,16 +3705,11 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
         const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-        const int32_t atx_hot_idx = ids_dst && atx_expert_map ? atx_expert_map[zt] : -1;
-        const bool atx_use_hot = atx_hot_idx >= 0 && atx_hot_x != nullptr;
-        const char * x_active = atx_use_hot ? atx_hot_x : x;
-        const int channel_x = atx_use_hot ? atx_hot_idx : fastdiv(zt, channel_ratio);
-        const int stride_channel_x_active = atx_use_hot ? atx_hot_stride_channel : stride_channel_x;
-        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_x*stride_channel_x_active + it*mmq_y*stride_row_x;
+        const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-            (x_active, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 
         kbc += blocks_per_ne00.z;
@@ -3785,16 +3774,11 @@ static __global__ void mul_mat_q(
     const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
     const int tile_y_max_j = col_diff - jt*mmq_x - 1;
 
-    const int32_t atx_hot_idx = ids_dst && atx_expert_map ? atx_expert_map[zt] : -1;
-    const bool atx_use_hot = atx_hot_idx >= 0 && atx_hot_x != nullptr;
-    const char * x_active = atx_use_hot ? atx_hot_x : x;
-    const int channel_x = atx_use_hot ? atx_hot_idx : fastdiv(zt, channel_ratio);
-    const int stride_channel_x_active = atx_use_hot ? atx_hot_stride_channel : stride_channel_x;
-    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + channel_x*stride_channel_x_active + it*mmq_y*stride_row_x;
+    const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + fastdiv(zt, channel_ratio)*stride_channel_x + it*mmq_y*stride_row_x;
 
     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
-        (x_active, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
@@ -3943,9 +3927,6 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     bool use_stream_k; int64_t ncols_max;
-    const char * atx_hot_x = nullptr;
-    const int32_t * atx_expert_map = nullptr;
-    int64_t atx_hot_stride_channel = 0;
 };
 
 template<ggml_type type>
@@ -3999,7 +3980,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.atx_hot_x, args.atx_expert_map, (int) args.atx_hot_stride_channel);
+                 ntx_fd);
         } else {
             constexpr bool need_check = true;
             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
@@ -4007,7 +3988,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-                 ntx_fd, args.atx_hot_x, args.atx_expert_map, (int) args.atx_hot_stride_channel);
+                 ntx_fd);
         }
         return;
     }
@@ -4039,7 +4020,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.atx_hot_x, args.atx_expert_map, (int) args.atx_hot_stride_channel);
+             ntx_fd);
 
         if (!fixup_needed) {
             return;
@@ -4057,7 +4038,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.atx_hot_x, args.atx_expert_map, (int) args.atx_hot_stride_channel);
+             ntx_fd);
 
         if (!fixup_needed) {
             return;

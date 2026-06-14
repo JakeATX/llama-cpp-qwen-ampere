@@ -475,12 +475,6 @@ struct common_params {
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
 
-    std::string layer_profile_path   = "";
-    std::string layer_profile_detail = "summary";
-    std::string layer_profile_sync   = "layer";
-    int32_t     layer_profile_warmup = 0;
-    int32_t     layer_profile_max_tokens = -1;
-
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;

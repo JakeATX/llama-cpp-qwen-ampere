@@ -168,22 +168,6 @@ contiguous batches; recurrent slots require `split_equal`. Fixed by gating
 | `run_unsupported_smoke.ps1` | PASS (15/15, pre-fix baseline) |
 | `compare_cuda_logits_ref.ps1` | **UNBLOCKED** — `common_prompt_batch_decode` call-site arity fixed; use static `build-kvarn-cuda-static-vs` if Smart App Control blocks shared DLLs |
 
-### Mac validation handoff
-
-After CUDA P0 stabilizes, rerun on Mac (M4 Max) with true full-Metal reference:
-
-```bash
-git checkout atx-expert-residency   # or kvarn-atx-integration when Metal KVarN lands
-./scripts/atx_moe_session.sh
-# or directly:
-python scripts/atx_moe_metal_server_acceptance.py \
-  --reference-no-ncpu-moe \
-  --layer-scenario best_candidate=0-40
-```
-
-Compare decode/prefill to Mac baseline table above (87.22 / 921.40 tok/s).
-KVarN CUDA-only today; Mac KVarN parity is out of scope until Metal backend exists.
-
 ### Expand coverage (deferred)
 
 - DFlash model row — model not present locally; download + smoke pending.

@@ -83,8 +83,6 @@ add_library(${TARGET}
     json-partial.cpp
     json-partial.h
     json-schema-to-grammar.cpp
-    layer-profile.cpp
-    layer-profile.h
     licenses.cpp
     llguidance.cpp
     log.cpp
