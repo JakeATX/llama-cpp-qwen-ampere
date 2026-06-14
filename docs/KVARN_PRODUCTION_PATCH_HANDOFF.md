@@ -1450,9 +1450,23 @@ Validation:
   - `v_frame_nmse=0`
   - `k_dequant_nmse=3.209030e-03`
   - `v_dequant_nmse=1.162076e-01`
+- Real Qwen3.6 MTP ctx4096/chunks2 dump run reproduced the failing long-context quality level:
+  - command output artifact: `artifacts/kvarn-accuracy/round31-bodydump-qwen36-ctx4096-k4v2`
+  - body-record dump: `artifacts/kvarn-body-record/round31-qwen36-ctx4096-k4v2`
+  - f16 PPL `4.5837`
+  - KVarN PPL `5.1165`
+  - increase `11.62%`
+- Replay on the real Qwen dump passed the frame contract:
+  `python scripts/kvarn/replay_body_record_dump.py --dump artifacts/kvarn-body-record/round31-qwen36-ctx4096-k4v2 --max-frame-nmse 1e-10`
+  - `k_frame_nmse=0`
+  - `v_frame_nmse=0`
+  - `k_dequant_nmse=5.827223e-03`
+  - `v_dequant_nmse=2.754752e-01`
 
 Interpretation:
 
 - The diagnostic path is inert by default and works when enabled.
 - The smoke dump proves the local frame transform/copy boundary can be checked independently.
-- This still does not prove production Qwen ctx4096 correctness. The next run should capture a real Qwen3.6 body-active store record from the failing ctx4096 case, replay it, then compare it with the existing mixed-attention boundary dump for the same head/record span.
+- The real Qwen ctx4096 dump proves the selected store boundary is in the correct frame, so the remaining `11.62%` PPL gap is not explained by another K/V frame mismatch in that record.
+- The dumped first record has high V dequant loss at `k4v2`. However, prior full-model `k8v8` did not recover Qwen ctx4096, so this cannot be treated as a complete explanation until the same query/head is checked at the mixed-attention boundary.
+- Next step: capture the existing mixed-attention boundary dump for the same body-active Qwen run and compare per-token scores/probabilities/output against the independently replayed store/dequant data.
