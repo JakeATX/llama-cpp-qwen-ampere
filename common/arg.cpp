@@ -728,25 +728,52 @@ static llama_kv_cache_quant_type kv_cache_quant_type_from_str(const std::string 
     throw std::runtime_error("Unsupported KV cache quantization mode: " + s);
 }
 
+static bool common_kvarn_parse_preset(const std::string & preset, uint32_t & key_bits, uint32_t & value_bits, uint32_t & group_size) {
+    const std::string prefix = "kvarn_k";
+    const size_t vpos = preset.find('v', prefix.size());
+    const size_t gpos = preset.find("_g");
+    if (preset.rfind(prefix, 0) != 0 || vpos == std::string::npos || gpos == std::string::npos ||
+            vpos <= prefix.size() || gpos <= vpos + 1 || gpos + 2 >= preset.size()) {
+        return false;
+    }
+
+    try {
+        const unsigned long k = std::stoul(preset.substr(prefix.size(), vpos - prefix.size()));
+        const unsigned long v = std::stoul(preset.substr(vpos + 1, gpos - (vpos + 1)));
+        const unsigned long g = std::stoul(preset.substr(gpos + 2));
+        if (k < 2 || k > 8 || v < 2 || v > 8 || g == 0) {
+            return false;
+        }
+        key_bits   = uint32_t(k);
+        value_bits = uint32_t(v);
+        group_size = uint32_t(g);
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 static void common_kvarn_apply_preset(common_params & params, const std::string & preset) {
+    uint32_t key_bits = 0;
+    uint32_t value_bits = 0;
+    uint32_t group_size = 0;
+    if (!common_kvarn_parse_preset(preset, key_bits, value_bits, group_size)) {
+        throw std::runtime_error("Unsupported KVarN preset: " + preset +
+                " (expected kvarn_k<K>v<V>_g<G> with K,V in [2,8], e.g. kvarn_k4v2_g128)");
+    }
+
     params.kvarn = llama_kvarn_default_params();
-    if (preset == "kvarn_k4v2_g128") {
-        return;
-    }
-    if (preset == "kvarn_k8v8_g128") {
-        params.kvarn.key_bits   = 8;
-        params.kvarn.value_bits = 8;
-        return;
-    }
-    throw std::runtime_error("Unsupported KVarN preset: " + preset + " (supported: kvarn_k4v2_g128, kvarn_k8v8_g128)");
+    params.kvarn.key_bits   = key_bits;
+    params.kvarn.value_bits = value_bits;
+    params.kvarn.group_size = group_size;
 }
 
 static void common_kvarn_validate(const llama_kvarn_params & params) {
     if (params.group_size != 128) {
         throw std::runtime_error("KVarN currently requires group size 128");
     }
-    if (params.key_bits == 0 || params.key_bits > 8 || params.value_bits == 0 || params.value_bits > 8) {
-        throw std::runtime_error("KVarN currently supports only 1-8 bit K/V");
+    if (params.key_bits < 2 || params.key_bits > 8 || params.value_bits < 2 || params.value_bits > 8) {
+        throw std::runtime_error("KVarN key/value bits must each be in [2, 8]");
     }
     if (params.sink_tokens == 0 || params.tail_tokens == 0) {
         throw std::runtime_error("KVarN sink and tail token counts must be positive");
@@ -2440,7 +2467,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_CACHE_QUANT"));
     add_opt(common_arg(
         {"--kvarn-preset"}, "PRESET",
-        "KVarN preset to use with --kv-cache-quant kvarn (supported: kvarn_k4v2_g128, kvarn_k8v8_g128 diagnostic)",
+        "KVarN preset to use with --kv-cache-quant kvarn, kvarn_k<K>v<V>_g128 with K,V in [2,8] (e.g. kvarn_k4v2_g128, kvarn_k4v4_g128, kvarn_k8v8_g128)",
         [](common_params & params, const std::string & value) {
             common_kvarn_apply_preset(params, value);
             common_kvarn_validate(params.kvarn);

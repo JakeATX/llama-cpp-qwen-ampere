@@ -1249,3 +1249,84 @@ Interpretation:
 - Disabling the direct prefill record path improved Qwen only slightly, so direct-record batching is not the primary corruption source.
 - The next Qwen target is a boundary-level f16-vs-KVarN body-attention dump: original f16 K/V for the selected active body records, KVarN packed body/scales, dequantized K/V, `q`, mask, scores, probabilities, and output.
 - Gemma true KVarN+ISWA remains a separate blocker. Since 8-bit is still catastrophic, investigate ISWA window/eviction/recycling record indexing and frame state after the shared Qwen body-attention issue is isolated.
+
+---
+
+## Round 30 pending-K layout fix - 2026-06-14
+
+Inputs reviewed:
+
+- `C:\Users\sjake\Downloads\KVARN_BITWIDTH_AND_CTX4096_DIAGNOSIS.md`
+- `C:\Users\sjake\Downloads\0004kvarnvariablebitwidthpresets.patch`
+- `C:\Users\sjake\Downloads\KVARN_ROUND28_PENDING_K_LAYOUT_FIX_HANDOFF.md`
+- `C:\Users\sjake\Downloads\KVARN_ROUND28_PENDING_K_LAYOUT_FIX.patch`
+
+Implemented:
+
+- Fixed `kvarn_transpose_pending_k_head_kernel()` so pending K is gathered into the K body-store layout:
+  - old, wrong: `k_tile[g*head_dim + d]`
+  - new, correct: `k_tile[d*group_size + g]`
+- Added an independent CUDA regression for pending-record stores at 256d and 512d, both with and without `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`.
+- Generalized KVarN preset parsing to `kvarn_k<K>v<V>_g128` with K,V in `[2,8]`, so `k4v4`, `k8v4`, and `k8v8` can be tested without more parser patches.
+
+Validation:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-perplexity llama-bench test-kvarn-cuda-scratch-ref -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- Qwen3.6 MTP ctx512/chunks2 accuracy still passes:
+  - f16 PPL `3.8849`
+  - KVarN PPL `3.8956`
+  - increase `0.28%`
+- Qwen3.6 MTP ctx512 logits with paper-frame passed:
+  - packed repeat NMSE `0`
+  - packed-vs-split NMSE `0`
+  - packed-vs-scratch NMSE `0`
+
+Long-context accuracy results, all ctx4096/chunks2:
+
+- Qwen3.6 MTP, paper-frame, `kvarn_k4v2_g128`, `-ncmoe 34`:
+  - before fix: `37.24%` PPL increase
+  - after fix: f16 PPL `4.5843`, KVarN PPL `5.1155`, increase `11.59%`
+  - artifact: `artifacts/kvarn-accuracy/round30-pending-k-fix-qwen36-ctx4096-k4v2`
+- Qwen3.6 MTP, paper-frame, `kvarn_k8v8_g128`, `-ncmoe 34`:
+  - f16 PPL `4.5843`
+  - KVarN PPL `5.1320`
+  - increase `11.95%`
+  - artifact: `artifacts/kvarn-accuracy/round30-pending-k-fix-qwen36-ctx4096-k8v8`
+- Qwen3.6 MTP, paper-frame, `kvarn_k4v2_g128`, direct prefill disabled:
+  - KVarN PPL `5.2479`
+  - increase `14.48%`
+  - artifact: `artifacts/kvarn-accuracy/round30-pending-k-fix-qwen36-ctx4096-k4v2-pendingonly`
+- Qwen3.6 MTP, default/non-paper frame, `kvarn_k4v2_g128`:
+  - KVarN PPL `6.1751`
+  - increase `34.70%`
+  - artifact: `artifacts/kvarn-accuracy/round30-pending-k-fix-qwen36-ctx4096-k4v2-defaultframe`
+- Gemma 4 12B true KVarN+ISWA, paper-frame, `kvarn_k4v2_g128`, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`:
+  - before fix: KVarN PPL `149227980.3447`
+  - after fix: f16 PPL `418.2027`, KVarN PPL `944.8251`, increase `125.93%`
+  - artifact: `artifacts/kvarn-accuracy/round30-pending-k-fix-gemma-ctx4096-k4v2`
+- Gemma 4 12B true KVarN+ISWA, paper-frame, `kvarn_k8v8_g128`:
+  - f16 PPL `418.2027`
+  - KVarN PPL `520.7935`
+  - increase `24.53%`
+  - artifact: `artifacts/kvarn-accuracy/round30-pending-k-fix-gemma-ctx4096-k8v8`
+
+Interpretation:
+
+- The pending-K layout fix is real and large. It moves Qwen3.6 ctx4096 from `37.24%` to `11.59%` PPL increase and moves Gemma true KVarN+ISWA from catastrophic to bounded-but-still-failing.
+- Qwen does not improve with `k8v8`, so its remaining failure is not primarily bit-width quality.
+- Disabling direct prefill is worse for Qwen, so the remaining Qwen gap is not fixed by routing everything through pending.
+- Paper-frame remains necessary: default/non-paper frame is still much worse on Qwen.
+- Gemma benefits from `k8v8`, but still fails by `24.53%`; true KVarN+ISWA likely has an additional sliding-window/eviction/indexing problem.
+
+Next work:
+
+1. Keep the pending-K fix and its independent regression.
+2. Add an f16-vs-KVarN long-context boundary dump for Qwen at the first body-active divergence after the fixed pending-K store.
+3. Compare f16 K/V, dequantized KVarN body, scores, probabilities, and output for the same query/head/record span.
+4. For Gemma true KVarN+ISWA, inspect ISWA eviction/recycling record mapping after the shared body-store fix.
+5. Do not benchmark or optimize long-context speed as production evidence until ctx4096 accuracy is below the 5% gate.

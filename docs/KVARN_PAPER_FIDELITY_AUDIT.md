@@ -250,3 +250,26 @@ Assessment:
 - The direct-record prefill path is not sufficient to explain the failure either.
 - Continue the audit at the f16-vs-KVarN boundary for long-context body-active attention: record mapping, body offset math, scale application, mask/window indexing, and the exact dequantized K/V consumed by attention.
 - Treat Gemma true KVarN+ISWA as a separate correctness bug after or alongside the shared Qwen body path, with emphasis on ISWA eviction/recycling behavior.
+
+## Round 30 update
+
+The pending-K layout bug identified by 5.5 Pro and confirmed by Opus was real:
+
+- Pending K is stored token-major as `pending[d + g*stride]`.
+- K body-store expects channel-major `k_tile[d*group_size + g]`.
+- The old CUDA gather wrote token-major `k_tile[g*head_dim + d]`.
+- The fixed gather writes channel-major and is now covered by an independent CUDA regression for 256d and 512d, paper-frame off/on.
+
+Impact:
+
+- Qwen3.6 ctx4096 paper-frame `k4v2` improves from `37.24%` to `11.59%` PPL increase.
+- Qwen3.6 ctx4096 paper-frame `k8v8` remains `11.95%`; therefore the remaining Qwen failure is not primarily bit-width.
+- Qwen3.6 default/non-paper frame remains much worse at `34.70%`, so the paper-frame scaffold is still required.
+- Gemma true KVarN+ISWA ctx4096 improves from catastrophic to `125.93%` at `k4v2`, and to `24.53%` at `k8v8`, but still fails.
+
+Revised assessment:
+
+- The store math was correct only assuming correctly laid-out input; the pending-K gather violated that assumption.
+- Packed-vs-split/scratch tests were blind because they consumed the same wrongly stored body.
+- The remaining Qwen error needs f16-vs-KVarN boundary comparison after store/dequant, not more same-backend NMSE tests.
+- The remaining Gemma error likely includes ISWA-specific window/eviction/indexing behavior.

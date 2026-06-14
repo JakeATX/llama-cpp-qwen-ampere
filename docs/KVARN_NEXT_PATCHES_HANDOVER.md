@@ -256,3 +256,29 @@ Conclusion:
 - The direct prefill body-store path is not the main Qwen culprit; pending-only improves slightly but still fails.
 - The next patch should add an f16-vs-KVarN boundary dump at a selected long-context body-active attention call, not another speed kernel.
 - Gemma true KVarN+ISWA likely has an additional ISWA window/eviction/recycling bug on top of the shared long-body issue.
+
+## Round 30 update
+
+Applied the pending-K layout fix from the Round 28 supplemental handoff and added a regression that compares CUDA pending-record body stores against an independent channel-major K reference.
+
+What changed:
+
+- `kvarn_transpose_pending_k_head_kernel()` now writes K as `k_tile[d*group_size + g]`.
+- V gather remains token-major.
+- `test-kvarn-cuda-scratch-ref` now covers pending-record stores at 256d and 512d, with paper-frame off and on.
+- Presets are now parsed as `kvarn_k<K>v<V>_g128`, K,V in `[2,8]`.
+
+Results:
+
+- Focused CTest passed and Qwen3.6 ctx512 still passes f16-vs-KVarN accuracy at `0.28%`.
+- Qwen3.6 ctx512 packed repeat/split/scratch logits remain NMSE `0`.
+- Qwen3.6 ctx4096 paper-frame `k4v2` improved from `37.24%` PPL increase to `11.59%`, but still fails the 5% gate.
+- Qwen3.6 ctx4096 paper-frame `k8v8` is `11.95%`, so remaining Qwen error is not primarily bit-width.
+- Qwen3.6 ctx4096 default/non-paper frame is `34.70%`, so paper-frame remains the right direction.
+- Gemma true KVarN+ISWA ctx4096 `k4v2` improved from catastrophic to `125.93%`; `k8v8` improves further to `24.53%`, still failing.
+
+Next:
+
+- Do not resume long-context speed work yet.
+- Add f16-vs-KVarN boundary dump after the fixed pending-K store to isolate the remaining Qwen `~11.6%`.
+- For Gemma, investigate ISWA sliding-window eviction/recycling record mapping; bit-width helps but does not solve it.

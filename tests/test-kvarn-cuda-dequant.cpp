@@ -316,13 +316,34 @@ static llama_kvarn_body_record llama_kvarn_store_reference(
         const llama_kvarn_params & params,
         uint32_t head_dim,
         const std::vector<float> & k_tile,
+        const std::vector<float> & v_tile,
+        bool input_already_rotated);
+
+static llama_kvarn_body_record llama_kvarn_store_reference(
+        const llama_kvarn_params & params,
+        uint32_t head_dim,
+        const std::vector<float> & k_tile,
         const std::vector<float> & v_tile) {
+    return llama_kvarn_store_reference(params, head_dim, k_tile, v_tile, false);
+}
+
+static llama_kvarn_body_record llama_kvarn_store_reference(
+        const llama_kvarn_params & params,
+        uint32_t head_dim,
+        const std::vector<float> & k_tile,
+        const std::vector<float> & v_tile,
+        bool input_already_rotated) {
     const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
 
     std::vector<float> k_rot;
     std::vector<float> v_rot;
-    llama_kvarn_hadamard_channels(k_tile, k_rot, head_dim, params.group_size, true);
-    llama_kvarn_hadamard_channels(v_tile, v_rot, params.group_size, head_dim, false);
+    if (input_already_rotated) {
+        k_rot = k_tile;
+        v_rot = v_tile;
+    } else {
+        llama_kvarn_hadamard_channels(k_tile, k_rot, head_dim, params.group_size, true);
+        llama_kvarn_hadamard_channels(v_tile, v_rot, params.group_size, head_dim, false);
+    }
 
     std::vector<float> k_row_scale, k_col_scale, v_row_scale, v_col_scale;
     sinkhorn_variance_normalize(k_rot, k_row_scale, k_col_scale, head_dim, params.group_size, params.sinkhorn_iters);
@@ -671,6 +692,113 @@ static void test_direct_record_batched_phases(
 
     cudaFree(k_tiles_d);
     cudaFree(v_tiles_d);
+    cudaFree(k_body_d);
+    cudaFree(v_body_d);
+    cudaFree(k_scales_d);
+    cudaFree(v_scales_d);
+    cudaFree(scratch_d);
+}
+
+static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.sinkhorn_iters = 4;
+    params.rtn_quantile = 1.0f;
+
+    const uint32_t group = params.group_size;
+    const size_t n = size_t(head_dim)*group;
+    const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+
+    std::vector<float> pending_k(n);
+    std::vector<float> pending_v(n);
+    std::vector<float> k_ref_tile(n);
+    std::vector<float> v_ref_tile(n);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const float k = 0.021f*std::sin(float(d*13 + g*7)*0.017f) +
+                0.014f*std::cos(float(d*5 + g*19)*0.011f);
+            const float v = 0.018f*std::cos(float(d*3 + g*23)*0.013f) -
+                0.016f*std::sin(float(d*17 + g*2)*0.019f);
+            pending_k[size_t(g)*head_dim + d] = k;
+            pending_v[size_t(g)*head_dim + d] = v;
+            k_ref_tile[size_t(d)*group + g] = k;
+            v_ref_tile[size_t(g)*head_dim + d] = v;
+        }
+    }
+
+    const llama_kvarn_body_record ref =
+        llama_kvarn_store_reference(params, head_dim, k_ref_tile, v_ref_tile, paper_frame);
+
+    float * pending_k_d = cuda_upload(pending_k);
+    float * pending_v_d = cuda_upload(pending_v);
+    uint8_t * k_body_d = nullptr;
+    uint8_t * v_body_d = nullptr;
+    float * k_scales_d = nullptr;
+    float * v_scales_d = nullptr;
+    float * scratch_d = nullptr;
+    const std::vector<int32_t> records = { 0 };
+    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group);
+    const size_t scratch_floats = 2*n + 2*per_pipeline;
+
+    require_cuda(cudaMalloc(&k_body_d, ref.k_body.size()), "cudaMalloc pending K body");
+    require_cuda(cudaMalloc(&v_body_d, ref.v_body.size()), "cudaMalloc pending V body");
+    require_cuda(cudaMalloc(&k_scales_d, ref.k_scales.size()*sizeof(float)), "cudaMalloc pending K scales");
+    require_cuda(cudaMalloc(&v_scales_d, ref.v_scales.size()*sizeof(float)), "cudaMalloc pending V scales");
+    require_cuda(cudaMalloc(&scratch_d, scratch_floats*sizeof(float)), "cudaMalloc pending store scratch");
+
+    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", paper_frame ? "1" : "");
+    ggml_cuda_kvarn_store_body_pending_records_minmax(
+            pending_k_d, pending_v_d,
+            k_body_d, v_body_d,
+            k_scales_d, v_scales_d,
+            scratch_d,
+            records.data(), 1,
+            head_dim, group, params.key_bits, params.value_bits,
+            params.sinkhorn_iters, params.rtn_quantile,
+            layout.k_body_bytes, layout.v_body_bytes,
+            layout.k_body_bytes, layout.v_body_bytes,
+            layout.k_scale_floats, layout.v_scale_floats,
+            layout.k_scale_floats, layout.v_scale_floats,
+            head_dim, head_dim,
+            nullptr);
+    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+    require_cuda(cudaGetLastError(), "KVarN CUDA pending-record store launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA pending-record store sync");
+
+    std::vector<uint8_t> k_body(ref.k_body.size());
+    std::vector<uint8_t> v_body(ref.v_body.size());
+    std::vector<float> k_scales(ref.k_scales.size());
+    std::vector<float> v_scales(ref.v_scales.size());
+    require_cuda(cudaMemcpy(k_body.data(), k_body_d, k_body.size(), cudaMemcpyDeviceToHost), "copy pending K body");
+    require_cuda(cudaMemcpy(v_body.data(), v_body_d, v_body.size(), cudaMemcpyDeviceToHost), "copy pending V body");
+    require_cuda(cudaMemcpy(k_scales.data(), k_scales_d, k_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy pending K scales");
+    require_cuda(cudaMemcpy(v_scales.data(), v_scales_d, v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy pending V scales");
+
+    size_t packed_diff = 0;
+    for (size_t i = 0; i < ref.k_body.size(); ++i) {
+        packed_diff += k_body[i] != ref.k_body[i] ? 1 : 0;
+    }
+    for (size_t i = 0; i < ref.v_body.size(); ++i) {
+        packed_diff += v_body[i] != ref.v_body[i] ? 1 : 0;
+    }
+
+    float scale_err = 0.0f;
+    for (size_t i = 0; i < ref.k_scales.size(); ++i) {
+        scale_err = std::max(scale_err, std::fabs(k_scales[i] - ref.k_scales[i]));
+    }
+    for (size_t i = 0; i < ref.v_scales.size(); ++i) {
+        scale_err = std::max(scale_err, std::fabs(v_scales[i] - ref.v_scales[i]));
+    }
+
+    if (packed_diff > 4 || scale_err >= 1.0e-5f) {
+        std::fprintf(stderr,
+                "pending K layout store diff: head_dim=%u paper_frame=%d packed_diff=%zu scale_err=%g\n",
+                head_dim, paper_frame ? 1 : 0, packed_diff, double(scale_err));
+    }
+    require(packed_diff <= 4, "CUDA pending-record store packed bytes match independent reference");
+    require(scale_err < 1.0e-5f, "CUDA pending-record store scales match independent reference");
+
+    cudaFree(pending_k_d);
+    cudaFree(pending_v_d);
     cudaFree(k_body_d);
     cudaFree(v_body_d);
     cudaFree(k_scales_d);
@@ -3277,5 +3405,9 @@ int main() {
         run_case(256, rtn_quantile);
         run_case(512, rtn_quantile);
     }
+    test_pending_k_layout_store(256, false);
+    test_pending_k_layout_store(256, true);
+    test_pending_k_layout_store(512, false);
+    test_pending_k_layout_store(512, true);
     return 0;
 }

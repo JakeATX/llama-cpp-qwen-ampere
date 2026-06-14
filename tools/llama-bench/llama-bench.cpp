@@ -450,7 +450,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  --kv-cache-quant <none|kvarn>               (default: %s)\n", join(transform_to_str(cmd_params_defaults.kv_cache_quant_type, llama_kv_cache_quant_type_name), ",").c_str());
-    printf("  --kvarn-preset <preset>                     KVarN preset, kvarn_k4v2_g128 or diagnostic kvarn_k8v8_g128\n");
+    printf("  --kvarn-preset <preset>                     KVarN preset kvarn_k<K>v<V>_g128, K,V in [2,8] (e.g. kvarn_k4v2_g128, kvarn_k4v4_g128, kvarn_k8v8_g128)\n");
     printf("  --kvarn-sink-tokens <n>                     KVarN FP16 sink tokens (default: %u)\n", cmd_params_defaults.kvarn.sink_tokens);
     printf("  --kvarn-tail-tokens <n>                     KVarN FP16 tail tokens (default: %u)\n", cmd_params_defaults.kvarn.tail_tokens);
     printf("  --kvarn-iters <n>                           KVarN Sinkhorn-style variance normalization iterations (default: %u)\n", cmd_params_defaults.kvarn.sinkhorn_iters);
@@ -532,23 +532,40 @@ static bool kv_cache_quant_type_from_name(const std::string & s, llama_kv_cache_
 }
 
 static bool kvarn_apply_preset(llama_kvarn_params & params, const std::string & preset) {
+    const std::string prefix = "kvarn_k";
+    const size_t vpos = preset.find('v', prefix.size());
+    const size_t gpos = preset.find("_g");
+    if (preset.rfind(prefix, 0) != 0 || vpos == std::string::npos || gpos == std::string::npos ||
+            vpos <= prefix.size() || gpos <= vpos + 1 || gpos + 2 >= preset.size()) {
+        return false;
+    }
+
+    unsigned long k = 0;
+    unsigned long v = 0;
+    unsigned long g = 0;
+    try {
+        k = std::stoul(preset.substr(prefix.size(), vpos - prefix.size()));
+        v = std::stoul(preset.substr(vpos + 1, gpos - (vpos + 1)));
+        g = std::stoul(preset.substr(gpos + 2));
+    } catch (const std::exception &) {
+        return false;
+    }
+    if (k < 2 || k > 8 || v < 2 || v > 8 || g == 0) {
+        return false;
+    }
+
     params = llama_kvarn_default_params();
-    if (preset == "kvarn_k4v2_g128") {
-        return true;
-    }
-    if (preset == "kvarn_k8v8_g128") {
-        params.key_bits   = 8;
-        params.value_bits = 8;
-        return true;
-    }
-    return false;
+    params.key_bits   = uint32_t(k);
+    params.value_bits = uint32_t(v);
+    params.group_size = uint32_t(g);
+    return true;
 }
 
 static bool kvarn_validate_params(const llama_kvarn_params & params) {
     if (params.group_size != 128) {
         return false;
     }
-    if (params.key_bits == 0 || params.key_bits > 8 || params.value_bits == 0 || params.value_bits > 8) {
+    if (params.key_bits < 2 || params.key_bits > 8 || params.value_bits < 2 || params.value_bits > 8) {
         return false;
     }
     if (params.sink_tokens == 0 || params.tail_tokens == 0 || params.sinkhorn_iters == 0) {

@@ -1580,14 +1580,16 @@ static __global__ void kvarn_transpose_pending_k_head_kernel(
         uint32_t head_dim,
         uint32_t group_size,
         uint32_t pending_head_stride) {
+    // Pending K is stored token-major per head as pending[d + g*stride].
+    // K body-store consumes channel-major tiles, k_tile[d*group_size + g].
     const size_t i = size_t(blockIdx.x)*blockDim.x + threadIdx.x;
     const size_t n = size_t(head_dim)*group_size;
     if (i >= n) {
         return;
     }
 
-    const uint32_t g = uint32_t(i/head_dim);
-    const uint32_t d = uint32_t(i%head_dim);
+    const uint32_t d = uint32_t(i/group_size);
+    const uint32_t g = uint32_t(i - size_t(d)*group_size);
     k_tile[i] = pending[size_t(d) + size_t(g)*pending_head_stride];
 }
 
