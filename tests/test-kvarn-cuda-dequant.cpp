@@ -206,6 +206,61 @@ static void sinkhorn_variance_normalize(
     col_scale.assign(cols, 1.0f);
 
     constexpr float eps = 1.0e-6f;
+    const char * log_std_env = std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
+    if (log_std_env != nullptr && std::strcmp(log_std_env, "1") == 0) {
+        auto update_scale = [](float prev, float stdv) {
+            stdv = std::min(1.0e3f, std::max(1.0e-3f, stdv));
+            const float log_prev = std::log(std::max(prev, 1.0e-20f));
+            const float log_next = std::min(10.0f, std::max(-0.3f, log_prev + std::log(stdv)));
+            return std::exp(log_next);
+        };
+
+        for (uint32_t iter = 0; iter < iters; ++iter) {
+            for (uint32_t c = 0; c < cols; ++c) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const float v = data[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (rows > 1) {
+                    var = (ss - (sum*sum)/double(rows))/double(rows - 1);
+                }
+                const float prev = col_scale[c];
+                const float next = update_scale(prev, std::sqrt(float(std::max(0.0, var))));
+                col_scale[c] = next;
+                const float factor = prev/next;
+                for (uint32_t r = 0; r < rows; ++r) {
+                    data[r*cols + c] *= factor;
+                }
+            }
+
+            for (uint32_t r = 0; r < rows; ++r) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t c = 0; c < cols; ++c) {
+                    const float v = data[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (cols > 1) {
+                    var = (ss - (sum*sum)/double(cols))/double(cols - 1);
+                }
+                const float prev = row_scale[r];
+                const float next = update_scale(prev, std::sqrt(float(std::max(0.0, var))));
+                row_scale[r] = next;
+                const float factor = prev/next;
+                for (uint32_t c = 0; c < cols; ++c) {
+                    data[r*cols + c] *= factor;
+                }
+            }
+        }
+        return;
+    }
+
     for (uint32_t iter = 0; iter < iters; ++iter) {
         for (uint32_t r = 0; r < rows; ++r) {
             double ss = 0.0;

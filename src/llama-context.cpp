@@ -241,6 +241,7 @@ llama_context::llama_context(
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_TRACE");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
         }
 

@@ -106,6 +106,18 @@ static float clamp_quantile(float q) {
     return std::min(1.0f, std::max(0.000001f, q));
 }
 
+static bool log_std_sinkhorn_enabled() {
+    const char * env = std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
+    return env != nullptr && std::strcmp(env, "1") == 0;
+}
+
+static float log_std_scale_update(float prev, float stdv) {
+    stdv = std::min(1.0e3f, std::max(1.0e-3f, stdv));
+    const float log_prev = std::log(std::max(prev, 1.0e-20f));
+    const float log_next = std::min(10.0f, std::max(-0.3f, log_prev + std::log(stdv)));
+    return std::exp(log_next);
+}
+
 static void sinkhorn_variance_normalize(
         std::vector<float> & data,
         std::vector<float> & row_scale,
@@ -117,6 +129,53 @@ static void sinkhorn_variance_normalize(
     col_scale.assign(cols, 1.0f);
 
     constexpr float eps = 1.0e-6f;
+
+    if (log_std_sinkhorn_enabled()) {
+        for (uint32_t iter = 0; iter < iters; ++iter) {
+            for (uint32_t c = 0; c < cols; ++c) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const float v = data[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (rows > 1) {
+                    var = (ss - (sum*sum)/double(rows))/double(rows - 1);
+                }
+                const float prev = col_scale[c];
+                const float next = log_std_scale_update(prev, std::sqrt(float(std::max(0.0, var))));
+                col_scale[c] = next;
+                const float factor = prev/next;
+                for (uint32_t r = 0; r < rows; ++r) {
+                    data[r*cols + c] *= factor;
+                }
+            }
+
+            for (uint32_t r = 0; r < rows; ++r) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t c = 0; c < cols; ++c) {
+                    const float v = data[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (cols > 1) {
+                    var = (ss - (sum*sum)/double(cols))/double(cols - 1);
+                }
+                const float prev = row_scale[r];
+                const float next = log_std_scale_update(prev, std::sqrt(float(std::max(0.0, var))));
+                row_scale[r] = next;
+                const float factor = prev/next;
+                for (uint32_t c = 0; c < cols; ++c) {
+                    data[r*cols + c] *= factor;
+                }
+            }
+        }
+        return;
+    }
 
     for (uint32_t iter = 0; iter < iters; ++iter) {
         for (uint32_t r = 0; r < rows; ++r) {

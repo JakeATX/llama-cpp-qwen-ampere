@@ -1330,3 +1330,81 @@ Next work:
 3. Compare f16 K/V, dequantized KVarN body, scores, probabilities, and output for the same query/head/record span.
 4. For Gemma true KVarN+ISWA, inspect ISWA eviction/recycling record mapping after the shared body-store fix.
 5. Do not benchmark or optimize long-context speed as production evidence until ctx4096 accuracy is below the 5% gate.
+
+---
+
+## Round 31 vLLM oracle and normalization diagnostics - 2026-06-14
+
+Inputs reviewed:
+
+- `C:\Users\sjake\Downloads\KVARN_VLLM_RECODE_HANDOFF.md`
+- `C:\Users\sjake\Downloads\0001-kvarn-add-vllm-oracle.patch`
+- `C:\Users\sjake\Downloads\0002-kvarn-vllm-recode-patch-plan-doc.patch`
+
+Implemented:
+
+- Added an independent vLLM-style oracle:
+  - `scripts/kvarn/kvarn_vllm_oracle.py`
+  - `scripts/kvarn/run_vllm_oracle_selftest.ps1`
+- Added `docs/KVARN_VLLM_RECODE_PATCH_PLAN.md` to preserve the reference-port patch plan and stop conditions.
+- Added an opt-in log/std Sinkhorn implementation behind `LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN=1`.
+  - CUDA store path uses log-domain std scaling when the env var is enabled.
+  - CPU reference path and CUDA unit-test reference use the same env-gated math, so tests validate the selected normalization.
+  - Default production behavior remains unchanged.
+- Relaxed KVarN group validation from fixed `g128` to positive power-of-two groups for diagnostics such as `kvarn_k4v4_g64`.
+
+Validation:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-perplexity test-kvarn-cuda-scratch-ref test-kvarn-kv test-arg-parser -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure`
+- Memory estimator passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- vLLM oracle self-test passed for head dims 128, 256, 512 and presets `k4v2`, `k4v4`, `k8v8`.
+- Opt-in log/std CUDA reference tests passed:
+  `LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN=1 ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-kvarn-cuda" --output-on-failure`
+
+Qwen3.6 MTP ctx4096/chunks2 accuracy diagnostics, all with `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`, expected layers `3-39:4`, and `-ncmoe 34`:
+
+- Baseline after Round 30 pending-K fix, `kvarn_k4v2_g128`, iters 4:
+  - f16 PPL `4.5843`
+  - KVarN PPL `5.1155`
+  - increase `11.59%`
+  - artifact: `artifacts/kvarn-accuracy/round31-vllm-oracle-qwen36-ctx4096-k4v2`
+- Log/std Sinkhorn, `kvarn_k4v2_g128`, iters 8:
+  - f16 PPL `4.5837`
+  - KVarN PPL `5.1395`
+  - increase `12.13%`
+  - artifact: `artifacts/kvarn-accuracy/round31-logstd-qwen36-ctx4096-k4v2`
+- Higher V bitwidth, `kvarn_k4v4_g128`, iters 4:
+  - f16 PPL `4.5837`
+  - KVarN PPL `5.1196`
+  - increase `11.69%`
+  - artifact: `artifacts/kvarn-accuracy/round31-qwen36-ctx4096-k4v4`
+- Smaller group diagnostic, `kvarn_k4v4_g64`, iters 4:
+  - f16 PPL `4.5837`
+  - KVarN PPL `5.2641`
+  - increase `14.84%`
+  - artifact: `artifacts/kvarn-accuracy/round31-qwen36-ctx4096-k4v4-g64`
+
+Interpretation:
+
+- The vLLM-style oracle is now available and passes synthetic checks, but the production ctx4096 accuracy gate is still failing.
+- Log/std Sinkhorn as currently implemented is not a production fix for Qwen3.6; it slightly worsens the ctx4096 gate and remains opt-in only.
+- `k4v4` and `g64` do not rescue Qwen3.6, so the remaining failure is unlikely to be simple value-bitwidth or tile-size quality.
+- Because `k8v8`, `k4v4`, and log/std do not recover accuracy, the next high-value work is a real f16-vs-KVarN body-record boundary oracle, not another speed patch.
+
+Next work:
+
+1. Wire the independent oracle into real body-record dumps:
+   - raw source K/V tile
+   - rotated source K/V tile
+   - balanced/normalized K/V tile
+   - packed bytes
+   - scales and zero-points
+   - dequantized K/V tile
+   - selected query, mask, scores, softmax probabilities, and output
+2. Compare production CUDA output against the independent Python oracle for one body-active Qwen ctx4096 query/head/record span.
+3. If the dump matches the oracle but PPL still fails, investigate layer-routing/cumulative KVarN layer selection; if it diverges, fix the first mismatched boundary.
+4. Keep long-context speed benchmarking blocked as production evidence until ctx4096 accuracy is below the 5% gate.

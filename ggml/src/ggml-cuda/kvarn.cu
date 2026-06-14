@@ -194,6 +194,10 @@ static bool kvarn_paper_frame_enabled() {
     return kvarn_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
 }
 
+static bool kvarn_log_std_sinkhorn_enabled() {
+    return kvarn_env_flag("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
+}
+
 static bool kvarn_dequant_cache_trace_enabled() {
     return kvarn_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
 }
@@ -874,6 +878,123 @@ static __global__ void kvarn_sinkhorn_cols_parallel_kernel(
     }
 }
 
+static __device__ __forceinline__ float kvarn_clamp_log_std(float stdv) {
+    stdv = fminf(1.0e3f, fmaxf(1.0e-3f, stdv));
+    return fminf(10.0f, fmaxf(-0.3f, logf(stdv)));
+}
+
+static __global__ void kvarn_sinkhorn_rows_logstd_parallel_kernel(
+        float * __restrict__ data,
+        float * __restrict__ row_scale,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t init_scale) {
+    const uint32_t r = blockIdx.x;
+    if (r >= rows) {
+        return;
+    }
+
+    float local_sum = 0.0f;
+    float local_ss  = 0.0f;
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float v = data[size_t(r)*cols + c];
+        local_sum += v;
+        local_ss  += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    float * sum_sh = shmem;
+    float * ss_sh  = shmem + blockDim.x;
+    sum_sh[threadIdx.x] = local_sum;
+    ss_sh[threadIdx.x]  = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_sh[threadIdx.x] += sum_sh[threadIdx.x + stride];
+            ss_sh[threadIdx.x]  += ss_sh[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float n = float(cols);
+        float var = 0.0f;
+        if (cols > 1) {
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(cols - 1);
+        }
+        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const float prev = init_scale != 0 ? 1.0f : row_scale[r];
+        const float log_prev = logf(fmaxf(prev, 1.0e-20f));
+        const float log_next = fminf(10.0f, fmaxf(-0.3f, log_prev + kvarn_clamp_log_std(stdv)));
+        const float next = expf(log_next);
+        row_scale[r] = next;
+        sum_sh[0] = prev/next;
+    }
+    __syncthreads();
+
+    const float factor = sum_sh[0];
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        data[size_t(r)*cols + c] *= factor;
+    }
+}
+
+static __global__ void kvarn_sinkhorn_cols_logstd_parallel_kernel(
+        float * __restrict__ data,
+        float * __restrict__ col_scale,
+        uint32_t rows,
+        uint32_t cols,
+        uint32_t init_scale) {
+    const uint32_t c = blockIdx.x;
+    if (c >= cols) {
+        return;
+    }
+
+    float local_sum = 0.0f;
+    float local_ss  = 0.0f;
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        const float v = data[size_t(r)*cols + c];
+        local_sum += v;
+        local_ss  += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    float * sum_sh = shmem;
+    float * ss_sh  = shmem + blockDim.x;
+    sum_sh[threadIdx.x] = local_sum;
+    ss_sh[threadIdx.x]  = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_sh[threadIdx.x] += sum_sh[threadIdx.x + stride];
+            ss_sh[threadIdx.x]  += ss_sh[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float n = float(rows);
+        float var = 0.0f;
+        if (rows > 1) {
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(rows - 1);
+        }
+        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const float prev = init_scale != 0 ? 1.0f : col_scale[c];
+        const float log_prev = logf(fmaxf(prev, 1.0e-20f));
+        const float log_next = fminf(10.0f, fmaxf(-0.3f, log_prev + kvarn_clamp_log_std(stdv)));
+        const float next = expf(log_next);
+        col_scale[c] = next;
+        sum_sh[0] = prev/next;
+    }
+    __syncthreads();
+
+    const float factor = sum_sh[0];
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        data[size_t(r)*cols + c] *= factor;
+    }
+}
+
 static void kvarn_sinkhorn_variance_normalize_parallel(
         float * data,
         float * row_scale,
@@ -896,8 +1017,14 @@ static void kvarn_sinkhorn_variance_normalize_parallel(
 
     for (uint32_t iter = 0; iter < iters; ++iter) {
         const uint32_t init = iter == 0 ? 1u : 0u;
-        kvarn_sinkhorn_rows_parallel_kernel<<<int(rows), block, shmem, stream>>>(data, row_scale, rows, cols, init);
-        kvarn_sinkhorn_cols_parallel_kernel<<<int(cols), block, shmem, stream>>>(data, col_scale, rows, cols, init);
+        if (kvarn_log_std_sinkhorn_enabled()) {
+            const size_t logstd_shmem = size_t(2*block)*sizeof(float);
+            kvarn_sinkhorn_cols_logstd_parallel_kernel<<<int(cols), block, logstd_shmem, stream>>>(data, col_scale, rows, cols, init);
+            kvarn_sinkhorn_rows_logstd_parallel_kernel<<<int(rows), block, logstd_shmem, stream>>>(data, row_scale, rows, cols, init);
+        } else {
+            kvarn_sinkhorn_rows_parallel_kernel<<<int(rows), block, shmem, stream>>>(data, row_scale, rows, cols, init);
+            kvarn_sinkhorn_cols_parallel_kernel<<<int(cols), block, shmem, stream>>>(data, col_scale, rows, cols, init);
+        }
     }
 }
 
@@ -1089,6 +1216,130 @@ static __global__ void kvarn_sinkhorn_cols_batched_kernel(
     }
 }
 
+static __global__ void kvarn_sinkhorn_rows_logstd_batched_kernel(
+        float * __restrict__ data,
+        float * __restrict__ row_scale_base,
+        uint32_t n_heads,
+        uint32_t rows,
+        uint32_t cols,
+        size_t scale_record_stride_floats,
+        size_t scale_head_stride_floats,
+        uint32_t init_scale) {
+    const uint32_t tile = blockIdx.x / rows;
+    const uint32_t r = blockIdx.x - tile*rows;
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+    float * tile_data = data + size_t(tile)*rows*cols;
+    float * row_scale = row_scale_base + size_t(ih)*scale_head_stride_floats +
+        size_t(record)*scale_record_stride_floats;
+
+    float local_sum = 0.0f;
+    float local_ss  = 0.0f;
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        const float v = tile_data[size_t(r)*cols + c];
+        local_sum += v;
+        local_ss  += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    float * sum_sh = shmem;
+    float * ss_sh  = shmem + blockDim.x;
+    sum_sh[threadIdx.x] = local_sum;
+    ss_sh[threadIdx.x]  = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_sh[threadIdx.x] += sum_sh[threadIdx.x + stride];
+            ss_sh[threadIdx.x]  += ss_sh[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float n = float(cols);
+        float var = 0.0f;
+        if (cols > 1) {
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(cols - 1);
+        }
+        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const float prev = init_scale != 0 ? 1.0f : row_scale[r];
+        const float log_prev = logf(fmaxf(prev, 1.0e-20f));
+        const float log_next = fminf(10.0f, fmaxf(-0.3f, log_prev + kvarn_clamp_log_std(stdv)));
+        const float next = expf(log_next);
+        row_scale[r] = next;
+        sum_sh[0] = prev/next;
+    }
+    __syncthreads();
+
+    const float factor = sum_sh[0];
+    for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
+        tile_data[size_t(r)*cols + c] *= factor;
+    }
+}
+
+static __global__ void kvarn_sinkhorn_cols_logstd_batched_kernel(
+        float * __restrict__ data,
+        float * __restrict__ col_scale_base,
+        uint32_t n_heads,
+        uint32_t rows,
+        uint32_t cols,
+        size_t scale_record_stride_floats,
+        size_t scale_head_stride_floats,
+        uint32_t init_scale) {
+    const uint32_t tile = blockIdx.x / cols;
+    const uint32_t c = blockIdx.x - tile*cols;
+    const uint32_t record = tile / n_heads;
+    const uint32_t ih = tile - record*n_heads;
+    float * tile_data = data + size_t(tile)*rows*cols;
+    float * col_scale = col_scale_base + size_t(ih)*scale_head_stride_floats +
+        size_t(record)*scale_record_stride_floats;
+
+    float local_sum = 0.0f;
+    float local_ss  = 0.0f;
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        const float v = tile_data[size_t(r)*cols + c];
+        local_sum += v;
+        local_ss  += v*v;
+    }
+
+    extern __shared__ float shmem[];
+    float * sum_sh = shmem;
+    float * ss_sh  = shmem + blockDim.x;
+    sum_sh[threadIdx.x] = local_sum;
+    ss_sh[threadIdx.x]  = local_ss;
+    __syncthreads();
+
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sum_sh[threadIdx.x] += sum_sh[threadIdx.x + stride];
+            ss_sh[threadIdx.x]  += ss_sh[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        const float n = float(rows);
+        float var = 0.0f;
+        if (rows > 1) {
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(rows - 1);
+        }
+        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const float prev = init_scale != 0 ? 1.0f : col_scale[c];
+        const float log_prev = logf(fmaxf(prev, 1.0e-20f));
+        const float log_next = fminf(10.0f, fmaxf(-0.3f, log_prev + kvarn_clamp_log_std(stdv)));
+        const float next = expf(log_next);
+        col_scale[c] = next;
+        sum_sh[0] = prev/next;
+    }
+    __syncthreads();
+
+    const float factor = sum_sh[0];
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        tile_data[size_t(r)*cols + c] *= factor;
+    }
+}
+
 static void kvarn_sinkhorn_variance_normalize_batched(
         float * data,
         float * row_scale_base,
@@ -1109,12 +1360,22 @@ static void kvarn_sinkhorn_variance_normalize_batched(
 
     for (uint32_t iter = 0; iter < iters; ++iter) {
         const uint32_t init = iter == 0 ? 1u : 0u;
-        kvarn_sinkhorn_rows_batched_kernel<<<int(n_tiles*rows), block, shmem, stream>>>(
-                data, row_scale_base, n_heads, rows, cols,
-                scale_record_stride_floats, scale_head_stride_floats, init);
-        kvarn_sinkhorn_cols_batched_kernel<<<int(n_tiles*cols), block, shmem, stream>>>(
-                data, col_scale_base, n_heads, rows, cols,
-                scale_record_stride_floats, scale_head_stride_floats, init);
+        if (kvarn_log_std_sinkhorn_enabled()) {
+            const size_t logstd_shmem = size_t(2*block)*sizeof(float);
+            kvarn_sinkhorn_cols_logstd_batched_kernel<<<int(n_tiles*cols), block, logstd_shmem, stream>>>(
+                    data, col_scale_base, n_heads, rows, cols,
+                    scale_record_stride_floats, scale_head_stride_floats, init);
+            kvarn_sinkhorn_rows_logstd_batched_kernel<<<int(n_tiles*rows), block, logstd_shmem, stream>>>(
+                    data, row_scale_base, n_heads, rows, cols,
+                    scale_record_stride_floats, scale_head_stride_floats, init);
+        } else {
+            kvarn_sinkhorn_rows_batched_kernel<<<int(n_tiles*rows), block, shmem, stream>>>(
+                    data, row_scale_base, n_heads, rows, cols,
+                    scale_record_stride_floats, scale_head_stride_floats, init);
+            kvarn_sinkhorn_cols_batched_kernel<<<int(n_tiles*cols), block, shmem, stream>>>(
+                    data, col_scale_base, n_heads, rows, cols,
+                    scale_record_stride_floats, scale_head_stride_floats, init);
+        }
     }
 }
 

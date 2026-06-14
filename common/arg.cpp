@@ -472,8 +472,8 @@ static void common_kvarn_apply_preset(common_params & params, const std::string 
 }
 
 static void common_kvarn_validate(const llama_kvarn_params & params) {
-    if (params.group_size != 128) {
-        throw std::runtime_error("KVarN currently requires group size 128");
+    if (params.group_size == 0 || (params.group_size & (params.group_size - 1)) != 0) {
+        throw std::runtime_error("KVarN group size must be a positive power of two");
     }
     if (params.key_bits < 2 || params.key_bits > 8 || params.value_bits < 2 || params.value_bits > 8) {
         throw std::runtime_error("KVarN key/value bits must each be in [2, 8]");
@@ -2170,7 +2170,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_CACHE_QUANT"));
     add_opt(common_arg(
         {"--kvarn-preset"}, "PRESET",
-        "KVarN preset to use with --kv-cache-quant kvarn, kvarn_k<K>v<V>_g128 with K,V in [2,8] (e.g. kvarn_k4v2_g128, kvarn_k4v4_g128, kvarn_k8v8_g128)",
+        "KVarN preset to use with --kv-cache-quant kvarn, kvarn_k<K>v<V>_g<G> with K,V in [2,8] and power-of-two G (e.g. kvarn_k4v2_g128, kvarn_k4v4_g64)",
         [](common_params & params, const std::string & value) {
             common_kvarn_apply_preset(params, value);
             common_kvarn_validate(params.kvarn);
