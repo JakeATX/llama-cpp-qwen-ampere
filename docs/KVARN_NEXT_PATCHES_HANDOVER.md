@@ -235,3 +235,24 @@ Updated priority:
 3. Only after Qwen3.6 and Gemma ctx4096 accuracy pass, implement the
    decode-parallel body-attention path as an opt-in diagnostic and then benchmark
    `tg4096`.
+
+## Round 29 update
+
+Implemented the high-information 8-bit body ablation requested by Opus:
+
+- New diagnostic preset: `kvarn_k8v8_g128`.
+- Production preset remains `kvarn_k4v2_g128`.
+- Common CLI, `llama-bench`, model validation, and graph validation accept KVarN group size 128 with 1-8 bit K/V.
+
+Results with `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`:
+
+- Qwen3.6 MTP ctx4096/chunks2, `kvarn_k8v8_g128`, `-ncmoe 34`: still FAIL, `35.74%` PPL increase.
+- Qwen3.6 MTP ctx4096/chunks2, `kvarn_k8v8_g128`, `LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN=1`: still FAIL, `32.06%` PPL increase.
+- Gemma 4 12B true KVarN+ISWA ctx4096/chunks2, `kvarn_k8v8_g128`, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`: still catastrophic, `53780619.13%` PPL increase.
+
+Conclusion:
+
+- The Qwen ctx4096 failure is not primarily 2-bit V quality; 8-bit K/V still fails.
+- The direct prefill body-store path is not the main Qwen culprit; pending-only improves slightly but still fails.
+- The next patch should add an f16-vs-KVarN boundary dump at a selected long-context body-active attention call, not another speed kernel.
+- Gemma true KVarN+ISWA likely has an additional ISWA window/eviction/recycling bug on top of the shared long-body issue.

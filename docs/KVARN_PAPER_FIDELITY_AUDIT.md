@@ -233,3 +233,20 @@ The first paper-shaped implementation slice has landed as a diagnostic path, not
 `LLAMA_KVARN_ENABLE_PAPER_FRAME=1` adds a default-off graph scaffold that rotates KVarN mixed-attention `q`, stores rotated sink/tail K/V, and unrotates the mixed-attention output with an explicit Hadamard matrix. It also handles the direct-vs-pending body-store distinction so raw direct prefill records are rotated once and already-rotated pending records are not rotated twice.
 
 Validation changed the Qwen3.6 ctx4096 bounded accuracy failure from `46.71%` PPL increase to `37.24%`, but the gate still fails. Gemma 4 12B true KVarN+ISWA ctx4096 also still fails. Therefore the frame critique is partially confirmed, but the remaining long-context accuracy problem is not solved.
+
+## Round 29 update
+
+Added diagnostic `kvarn_k8v8_g128` and ran the Opus bit-width split under `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`.
+
+Results:
+
+- Qwen3.6 MTP ctx4096/chunks2: `k4v2` paper-frame failure was `37.24%`; `k8v8` still fails at `35.74%`.
+- Qwen3.6 MTP ctx4096/chunks2 with direct prefill disabled: `k8v8` still fails at `32.06%`.
+- Gemma 4 12B true KVarN+ISWA ctx4096/chunks2: `k8v8` remains catastrophic at `53780619.13%`.
+
+Assessment:
+
+- The remaining Qwen failure is not mostly the intended low-bit compression loss. If it were, 8-bit K/V should have recovered close to f16.
+- The direct-record prefill path is not sufficient to explain the failure either.
+- Continue the audit at the f16-vs-KVarN boundary for long-context body-active attention: record mapping, body offset math, scale application, mask/window indexing, and the exact dequantized K/V consumed by attention.
+- Treat Gemma true KVarN+ISWA as a separate correctness bug after or alongside the shared Qwen body path, with emphasis on ISWA eviction/recycling behavior.

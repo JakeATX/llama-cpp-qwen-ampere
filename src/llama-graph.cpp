@@ -3141,8 +3141,8 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.body_v != nullptr);
         GGML_ASSERT(layer.scales_k != nullptr);
         GGML_ASSERT(layer.scales_v != nullptr);
-        GGML_ASSERT(layer.layout_k.key_bits == 4);
-        GGML_ASSERT(layer.layout_v.value_bits == 2);
+        GGML_ASSERT(layer.layout_k.key_bits > 0 && layer.layout_k.key_bits <= 8);
+        GGML_ASSERT(layer.layout_v.value_bits > 0 && layer.layout_v.value_bits <= 8);
         GGML_ASSERT(inp_kvarn->mctx_kvarn->body_store_scratch_floats(il) > 0);
         bool contiguous_prefill_chunk = stores_kv &&
             !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
@@ -3774,8 +3774,8 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.body_v != nullptr);
         GGML_ASSERT(layer.scales_k != nullptr);
         GGML_ASSERT(layer.scales_v != nullptr);
-        GGML_ASSERT(layer.layout_k.key_bits == 4);
-        GGML_ASSERT(layer.layout_v.value_bits == 2);
+        GGML_ASSERT(layer.layout_k.key_bits > 0 && layer.layout_k.key_bits <= 8);
+        GGML_ASSERT(layer.layout_v.value_bits > 0 && layer.layout_v.value_bits <= 8);
         GGML_ASSERT(mctx_kvarn->body_store_scratch_floats(il) > 0);
 
         bool contiguous_prefill_chunk = stores_kv &&

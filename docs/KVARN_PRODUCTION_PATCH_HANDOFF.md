@@ -1205,3 +1205,47 @@ Recommended next work:
 2. Run the dump at the first token where Qwen3.6 ctx4096 KVarN diverges materially from f16.
 3. Decide whether the remaining error is body quantization itself, scale application, pending/direct store layout, mask/window indexing, or output-frame handling.
 4. Only after Qwen3.6 and Gemma 4096 accuracy pass, resurrect the decode-parallel body-attention patch as an opt-in diagnostic path.
+
+---
+
+## Round 29 8-bit body ablation - 2026-06-14
+
+Opus's proposed split was implemented as a diagnostic preset:
+
+- Added `--kvarn-preset kvarn_k8v8_g128` to the common CLI and `llama-bench`.
+- Production default remains `kvarn_k4v2_g128`.
+- Backend/model/graph validation now accepts KVarN group size 128 with 1-8 bit K/V, so the 8-bit preset can exercise the same KVarN body topology.
+
+Validation:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-perplexity llama-bench test-kvarn-cuda-scratch-ref -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure" --output-on-failure`
+- Memory estimator passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+
+Accuracy ablation results, all with `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`:
+
+- Qwen3.6 MTP ctx4096/chunks2, `kvarn_k8v8_g128`, `-ncmoe 34`:
+  - f16 PPL `4.5843`
+  - KVarN PPL `6.2226`
+  - increase `35.74%`
+  - artifact: `artifacts/kvarn-accuracy/round29-paper-frame-qwen36-ctx4096-k8v8`
+- Qwen3.6 MTP ctx4096/chunks2, `kvarn_k8v8_g128`, direct prefill disabled with `LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN=1`:
+  - f16 PPL `4.5843`
+  - KVarN PPL `6.0538`
+  - increase `32.06%`
+  - artifact: `artifacts/kvarn-accuracy/round29-paper-frame-qwen36-ctx4096-k8v8-pendingonly`
+- Gemma 4 12B true KVarN+ISWA ctx4096/chunks2, `kvarn_k8v8_g128`, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`:
+  - f16 PPL `418.2027`
+  - KVarN PPL `224912419.4692`
+  - increase `53780619.13%`
+  - artifact: `artifacts/kvarn-accuracy/round29-paper-frame-gemma-ctx4096-k8v8`
+
+Interpretation:
+
+- 8-bit K/V did not rescue Qwen3.6. The remaining ctx4096 failure is therefore unlikely to be explained primarily by 2-bit V quantization quality.
+- Disabling the direct prefill record path improved Qwen only slightly, so direct-record batching is not the primary corruption source.
+- The next Qwen target is a boundary-level f16-vs-KVarN body-attention dump: original f16 K/V for the selected active body records, KVarN packed body/scales, dequantized K/V, `q`, mask, scores, probabilities, and output.
+- Gemma true KVarN+ISWA remains a separate blocker. Since 8-bit is still catastrophic, investigate ISWA window/eviction/recycling record indexing and frame state after the shared Qwen body-attention issue is isolated.

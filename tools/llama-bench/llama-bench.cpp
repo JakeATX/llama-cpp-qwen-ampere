@@ -450,7 +450,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -ctk, --cache-type-k <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_k, ggml_type_name), ",").c_str());
     printf("  -ctv, --cache-type-v <t>                    (default: %s)\n", join(transform_to_str(cmd_params_defaults.type_v, ggml_type_name), ",").c_str());
     printf("  --kv-cache-quant <none|kvarn>               (default: %s)\n", join(transform_to_str(cmd_params_defaults.kv_cache_quant_type, llama_kv_cache_quant_type_name), ",").c_str());
-    printf("  --kvarn-preset <preset>                     KVarN preset, currently kvarn_k4v2_g128\n");
+    printf("  --kvarn-preset <preset>                     KVarN preset, kvarn_k4v2_g128 or diagnostic kvarn_k8v8_g128\n");
     printf("  --kvarn-sink-tokens <n>                     KVarN FP16 sink tokens (default: %u)\n", cmd_params_defaults.kvarn.sink_tokens);
     printf("  --kvarn-tail-tokens <n>                     KVarN FP16 tail tokens (default: %u)\n", cmd_params_defaults.kvarn.tail_tokens);
     printf("  --kvarn-iters <n>                           KVarN Sinkhorn-style variance normalization iterations (default: %u)\n", cmd_params_defaults.kvarn.sinkhorn_iters);
@@ -532,10 +532,31 @@ static bool kv_cache_quant_type_from_name(const std::string & s, llama_kv_cache_
 }
 
 static bool kvarn_apply_preset(llama_kvarn_params & params, const std::string & preset) {
-    if (preset != "kvarn_k4v2_g128") {
+    params = llama_kvarn_default_params();
+    if (preset == "kvarn_k4v2_g128") {
+        return true;
+    }
+    if (preset == "kvarn_k8v8_g128") {
+        params.key_bits   = 8;
+        params.value_bits = 8;
+        return true;
+    }
+    return false;
+}
+
+static bool kvarn_validate_params(const llama_kvarn_params & params) {
+    if (params.group_size != 128) {
         return false;
     }
-    params = llama_kvarn_default_params();
+    if (params.key_bits == 0 || params.key_bits > 8 || params.value_bits == 0 || params.value_bits > 8) {
+        return false;
+    }
+    if (params.sink_tokens == 0 || params.tail_tokens == 0 || params.sinkhorn_iters == 0) {
+        return false;
+    }
+    if (!(params.rtn_quantile > 0.0f && params.rtn_quantile <= 1.0f)) {
+        return false;
+    }
     return true;
 }
 
@@ -1247,6 +1268,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.fit_params_min_ctx.empty()) {
         params.fit_params_min_ctx = cmd_params_defaults.fit_params_min_ctx;
+    }
+    if (!kvarn_validate_params(params.kvarn)) {
+        fprintf(stderr, "error: invalid KVarN parameters\n");
+        exit(1);
     }
 
     return params;

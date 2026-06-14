@@ -2123,8 +2123,10 @@ static void llama_kvarn_validate_memory_support(
         const llama_hparams & hparams,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
-    if (params.kvarn.group_size != 128 || params.kvarn.key_bits != 4 || params.kvarn.value_bits != 2) {
-        throw std::runtime_error("KVarN backend currently supports only kvarn_k4v2_g128");
+    if (params.kvarn.group_size != 128 ||
+            params.kvarn.key_bits == 0 || params.kvarn.key_bits > 8 ||
+            params.kvarn.value_bits == 0 || params.kvarn.value_bits > 8) {
+        throw std::runtime_error("KVarN backend currently supports only group size 128 and 1-8 bit K/V");
     }
 
     if (hparams.is_mla()) {
