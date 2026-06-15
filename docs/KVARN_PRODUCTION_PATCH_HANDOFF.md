@@ -6,6 +6,34 @@ Repo: `JakeATX/llama.cpp`
 Branch: `kvarn-atx-integration`
 Current branch target: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
 
+## Exhaustive line-by-line audit - 2026-06-15
+
+New audit doc: [`docs/KVARN_LINE_BY_LINE_AUDIT.md`](https://github.com/JakeATX/llama.cpp/blob/kvarn-atx-integration/docs/KVARN_LINE_BY_LINE_AUDIT.md)
+
+Scope: the KVarN branch delta against `upstream-ggml/master` at
+`e36a602ba38a26206c749ba4fb5dcf481bfd92db`, covering 75 KVarN/runtime/test
+files and `30498` inserted lines in the scoped paths.
+
+Most important audit findings:
+
+- Default non-paper-frame KVarN is a mixed-frame path when body records are
+  active. True KVarN quality gates must use `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`
+  or explicitly reject body-record runs without it.
+- `ggml_cuda_kvarn_store_body_pending_records_minmax()` stages one pending tile
+  and can write it into multiple body records when `n_record_batch > 1`.
+- `LLAMA_KVARN_LAYER_FILTER` currently filters allocation but not graph routing,
+  so layer-by-layer PPL bisection is not usable yet.
+- KVarN advertises context shifting even though the shift/update graph is not
+  implemented.
+- Full state save/load is not implemented for true KVarN memory.
+- Production harnesses can pass stale tests, miss active body-record evidence,
+  or check only layer-subset presence instead of exact layer routing.
+
+The audit also rejects one earlier static-review false positive: paper-frame
+direct prefill body-store passing raw `k_cur`/`v_cur` is expected because the
+CUDA direct-store path applies the Hadamard internally with
+`input_already_rotated=false`.
+
 Round 35 implements the first part of the exhaustive graph-oracle plan: full-Q/O
 mixed-attention boundary replay. The new evidence makes the remaining Qwen3.6
 ctx4096 K8V8 failure harder to hide: sampled KVarN mixed-attention outputs now
