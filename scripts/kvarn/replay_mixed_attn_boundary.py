@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -109,6 +110,22 @@ def read_mask(root: Path, meta: dict, n_tokens: int) -> np.ndarray:
     raise ValueError(f"unsupported mask_type={mask_type}")
 
 
+def read_full_mask(root: Path, meta: dict, n_queries: int, n_tokens: int) -> np.ndarray | None:
+    mask_path = root / "full_mask.bin"
+    if not mask_path.exists() or int(meta.get("mask_type", 0)) == 0:
+        return None
+    mask_type = int(meta["mask_type"])
+    if mask_type == 1:
+        data = np.fromfile(mask_path, dtype=np.float32, count=n_queries * n_tokens).astype(np.float32)
+    elif mask_type == 2:
+        data = np.fromfile(mask_path, dtype=np.float16, count=n_queries * n_tokens).astype(np.float32)
+    else:
+        raise ValueError(f"unsupported mask_type={mask_type}")
+    if data.size != n_queries * n_tokens:
+        raise ValueError(f"full_mask.bin contains {data.size} elements, expected {n_queries * n_tokens}")
+    return data.reshape(n_queries, n_tokens)
+
+
 def softmax(scores: np.ndarray) -> np.ndarray:
     x = scores.astype(np.float32)
     x = x - np.max(x)
@@ -162,6 +179,90 @@ def reconstruct_kv(root: Path, meta: dict) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(k_rows, axis=0).astype(np.float32), np.concatenate(v_rows, axis=0).astype(np.float32)
 
 
+def replay_row(q: np.ndarray, mask: np.ndarray, k_all: np.ndarray, v_all: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    scores = (k_all @ q).astype(np.float32) * np.float32(scale) + mask
+    probs = softmax(scores)
+    replay_out = (probs.astype(np.float32) @ v_all.astype(np.float32)).astype(np.float32)
+    return scores, probs, replay_out
+
+
+def replay_full_qo(root: Path, meta: dict, k_all: np.ndarray, v_all: np.ndarray, scale: float) -> None:
+    full_q_path = root / "full_q.bin"
+    full_out_path = root / "full_out.bin"
+    if not full_q_path.exists() or not full_out_path.exists():
+        return
+
+    d = int(meta["head_dim"])
+    n_queries = int(meta["n_queries"])
+    n_head = int(meta["n_head"])
+    n_gqa = int(meta["n_gqa"])
+    selected_ikh = int(meta["selected_ikh"])
+    n_tokens = int(meta["n_tokens"])
+    selected_iq = int(meta["selected_iq"])
+
+    full_q = np.fromfile(full_q_path, dtype=np.float32, count=n_queries * n_head * d).reshape(n_queries, n_head, d)
+    full_out = np.fromfile(full_out_path, dtype=np.float32, count=n_queries * n_head * d).reshape(n_queries, n_head, d)
+    full_mask = read_full_mask(root, meta, n_queries, n_tokens)
+    selected_mask = None if full_mask is not None else read_mask(root, meta, n_tokens)
+
+    covered_heads = [ih for ih in range(n_head) if ih // n_gqa == selected_ikh]
+    covered_queries = range(n_queries) if full_mask is not None else [selected_iq]
+
+    rows: list[dict[str, int | float]] = []
+    worst: dict[str, int | float] | None = None
+    for iq in covered_queries:
+        mask = full_mask[iq] if full_mask is not None else selected_mask
+        for ih in covered_heads:
+            _, _, replay_out = replay_row(full_q[iq, ih], mask, k_all, v_all, scale)
+            actual_out = full_out[iq, ih]
+            row_nmse = nmse(replay_out, actual_out)
+            row_mae, row_idx = max_abs(replay_out, actual_out)
+            row = {
+                "iq": int(iq),
+                "ih": int(ih),
+                "ikh": int(ih // n_gqa),
+                "out_nmse": row_nmse,
+                "out_max_abs": row_mae,
+                "out_worst_d": int(row_idx),
+            }
+            rows.append(row)
+            if worst is None or float(row["out_nmse"]) > float(worst["out_nmse"]):
+                worst = row
+
+    csv_path = root / "full_qo_summary.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["iq", "ih", "ikh", "out_nmse", "out_max_abs", "out_worst_d"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary = {
+        "dump": str(root),
+        "layer": meta.get("inferred_layer", -1),
+        "selected_ikh": selected_ikh,
+        "covered_heads": covered_heads,
+        "covered_queries": list(covered_queries),
+        "has_full_mask": full_mask is not None,
+        "coverage_note": (
+            "all queries for query heads mapped to selected KV head"
+            if full_mask is not None else
+            "selected query only because full_mask.bin is not present"
+        ),
+        "rows": len(rows),
+        "worst": worst,
+    }
+    (root / "full_qo_summary.json").write_text(json.dumps(summary, indent=2))
+
+    if worst is None:
+        print("  full_qo: no replayable rows")
+    else:
+        print(
+            "  full_qo: "
+            f"rows={len(rows)} full_mask={full_mask is not None} selected_ikh={selected_ikh} "
+            f"worst_iq={worst['iq']} worst_ih={worst['ih']} "
+            f"out_nmse={float(worst['out_nmse']):.6e} out_max_abs={float(worst['out_max_abs']):.6e}"
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Replay a KVarN mixed-attention boundary dump.")
     ap.add_argument("--dump", required=True, help="Dump directory or parent containing exactly one boundary dump")
@@ -190,9 +291,7 @@ def main() -> int:
         raise SystemExit(f"reconstructed V shape {v_all.shape} != {(n_tokens, d)}")
 
     mask = read_mask(root, meta, n_tokens)
-    scores = (k_all @ q).astype(np.float32) * np.float32(scale) + mask
-    probs = softmax(scores)
-    replay_out = (probs.astype(np.float32) @ v_all.astype(np.float32)).astype(np.float32)
+    scores, probs, replay_out = replay_row(q, mask, k_all, v_all, scale)
 
     out_nmse = nmse(replay_out, actual_out)
     out_mae, out_idx = max_abs(replay_out, actual_out)
@@ -208,6 +307,8 @@ def main() -> int:
         scores.astype(np.float32).tofile(root / "replay_scores.bin")
         probs.astype(np.float32).tofile(root / "replay_probs.bin")
         replay_out.astype(np.float32).tofile(root / "replay_out.bin")
+
+    replay_full_qo(root, meta, k_all, v_all, scale)
 
     score_path = root / "scores.bin"
     if score_path.exists():

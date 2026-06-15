@@ -421,7 +421,9 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
     ggml_cuda_kvarn_copy_strided_rows(bytes, out_row, size_t(head_dim)*sizeof(float), out->nb[0], 1);
     ggml_cuda_kvarn_write_binary_file(dir / "warpqk_out.bin", bytes.data(), bytes.size());
 
-    if (ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_FULL_QO")) {
+    const bool dump_full_qo = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_FULL_QO");
+    bool dumped_full_mask = false;
+    if (dump_full_qo) {
         const size_t full_qo_bytes = size_t(head_dim)*size_t(n_head)*size_t(n_queries)*sizeof(float);
         if (q->nb[0] != sizeof(float) ||
                 q->nb[1] != size_t(head_dim)*sizeof(float) ||
@@ -436,6 +438,23 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
         ggml_cuda_kvarn_write_binary_file(dir / "full_q.bin", bytes.data(), bytes.size());
         CUDA_CHECK(cudaMemcpy(bytes.data(), out->data, full_qo_bytes, cudaMemcpyDeviceToHost));
         ggml_cuda_kvarn_write_binary_file(dir / "full_out.bin", bytes.data(), bytes.size());
+
+        if (kq_mask != nullptr) {
+            const size_t mask_elem_bytes = kq_mask->type == GGML_TYPE_F32 ? sizeof(float) : sizeof(uint16_t);
+            bytes.assign(size_t(n_queries)*size_t(n_tokens)*mask_elem_bytes, uint8_t(0));
+            for (uint32_t iq = 0; iq < n_queries; ++iq) {
+                const uint8_t * mask_row = reinterpret_cast<const uint8_t *>(kq_mask->data) + size_t(iq)*kq_mask->nb[1];
+                for (uint32_t t = 0; t < n_tokens; ++t) {
+                    CUDA_CHECK(cudaMemcpy(
+                        bytes.data() + (size_t(iq)*size_t(n_tokens) + size_t(t))*mask_elem_bytes,
+                        mask_row + size_t(t)*kq_mask->nb[0],
+                        mask_elem_bytes,
+                        cudaMemcpyDeviceToHost));
+                }
+            }
+            ggml_cuda_kvarn_write_binary_file(dir / "full_mask.bin", bytes.data(), bytes.size());
+            dumped_full_mask = true;
+        }
     }
 
     ggml_cuda_kvarn_copy_strided_rows(bytes, reinterpret_cast<const uint8_t *>(body_k->data) + size_t(selected_ikh)*body_k->nb[2], size_t(body_k->ne[0]), body_k->nb[1], uint32_t(n_records));
@@ -530,6 +549,8 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
     json << "  \"qt\": " << qt_override << ",\n";
     json << "  \"body_mirror_allowed\": " << (body_mirror_allowed ? "true" : "false") << ",\n";
     json << "  \"body_mirror_used\": " << (body_mirror_used ? "true" : "false") << ",\n";
+    json << "  \"full_qo\": " << (dump_full_qo ? "true" : "false") << ",\n";
+    json << "  \"full_mask\": " << (dumped_full_mask ? "true" : "false") << ",\n";
     json << "  \"inferred_layer\": " << inferred_layer << ",\n";
     json << "  \"call_index\": " << call_index << ",\n";
     json << "  \"cuda_trace_mode\": \"" << cuda_trace_mode << "\"\n";

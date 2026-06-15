@@ -14,6 +14,7 @@ param(
     [int] $DumpHead = 0,
     [int] $BodyRecordLimit = 30,
     [int] $BodySrcLayout = -1,
+    [switch] $DumpFullQO,
     [string[]] $ExtraArgs = @("-ncmoe", "34")
 )
 
@@ -50,6 +51,9 @@ $envSet = @{
 
 if ($BodySrcLayout -ge 0) {
     $envSet["LLAMA_KVARN_DEBUG_BODY_SRC_LAYOUT"] = [string] $BodySrcLayout
+}
+if ($DumpFullQO) {
+    $envSet["LLAMA_KVARN_ATTN_BOUNDARY_DUMP_FULL_QO"] = "1"
 }
 
 foreach ($key in $envSet.Keys) {

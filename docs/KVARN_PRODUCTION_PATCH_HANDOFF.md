@@ -1,6 +1,126 @@
 # KVarN production patch handoff for coding agent
 
-## Latest handoff for external review - 2026-06-14 Round 34
+## Latest handoff for external review - 2026-06-15 Round 35
+
+Repo: `JakeATX/llama.cpp`
+Branch: `kvarn-atx-integration`
+Current branch target: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
+
+Round 35 implements the first part of the exhaustive graph-oracle plan: full-Q/O
+mixed-attention boundary replay. The new evidence makes the remaining Qwen3.6
+ctx4096 K8V8 failure harder to hide: sampled KVarN mixed-attention outputs now
+match an independent replay across every query row and every query head that
+maps to the dumped KV head, not only one selected `(iq, ih)` row.
+
+### Round 35 code changes
+
+- `ggml/src/ggml-cuda/ggml-cuda.cu`
+  - `LLAMA_KVARN_ATTN_BOUNDARY_DUMP_FULL_QO=1` now also dumps `full_mask.bin`.
+  - `boundary.json` now records `full_qo` and `full_mask`.
+- `scripts/kvarn/replay_mixed_attn_boundary.py`
+  - Still performs the existing selected-row replay.
+  - If `full_q.bin` / `full_out.bin` are present, it now also writes
+    `full_qo_summary.csv` and `full_qo_summary.json` for all query rows and
+    all query heads backed by the dumped KV head.
+- `scripts/kvarn/replay_full_qo_boundary.py`
+  - New standalone full-Q/O replay tool for one boundary or a parent directory.
+  - Uses `full_mask.bin` when present instead of inferring full masks from one
+    selected row.
+- `scripts/kvarn/replay_f16_truth_boundary.py`
+  - Still performs the existing selected-row f16-truth replay.
+  - If full-Q/O tensors and full masks are present, it also writes
+    `f16_truth_full_qo_summary.csv` and
+    `f16_truth_full_qo_summary.json`.
+- `scripts/kvarn/capture_ctx4096_truth_boundary.ps1`
+  - Added `-DumpFullQO` to enable full-Q/O plus full-mask capture.
+- `scripts/kvarn/README.md`
+  - Added the full-Q/O replay command.
+
+### Round 35 validation
+
+Focused tests:
+
+| Gate | Result | Notes |
+|---|---:|---|
+| `cmake --build build-kvarn-cuda-static-vs --config Release --target ggml-cuda llama-perplexity -- /m:1 /v:minimal /clp:ErrorsOnly` | PASS | CUDA backend and `llama-perplexity` rebuilt |
+| `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda-scratch-ref|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure` | PASS | 6/6 |
+| `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS | |
+| `python scripts/kvarn/kvarn_vllm_oracle.py --self-test --head-dims 128,256,512 --presets k4v2,k4v4,k8v8 --iters 16` | PASS | |
+| `python -m py_compile scripts/kvarn/replay_mixed_attn_boundary.py scripts/kvarn/replay_full_qo_boundary.py scripts/kvarn/replay_f16_truth_boundary.py` | PASS | |
+
+Qwen3.6 ctx4096 K8V8 paper-frame accuracy remains failing:
+
+| Case | f16 PPL | KVarN PPL | Increase | Artifact |
+|---|---:|---:|---:|---|
+| layer 3 / KV head 0 full-Q/O capture | 4.5837 | 5.1210 | 11.72% | `artifacts/kvarn-rootcause/round35-qwen36-k8v8-layer3-head0-fullqo` |
+| layer 3 / KV head 1 full-Q/O capture | 4.5837 | 5.1276 | 11.87% | `artifacts/kvarn-rootcause/round35-qwen36-k8v8-layer3-head1-fullqo` |
+| layer 39 / KV head 1 full-Q/O capture | 4.5837 | 5.1205 | 11.71% | `artifacts/kvarn-rootcause/round35-qwen36-k8v8-layer39-head1-fullqo` |
+
+Full-Q/O KVarN self-replay findings:
+
+| Boundary | Rows replayed | Worst output NMSE | Worst max abs | Notes |
+|---|---:|---:|---:|---|
+| layer 3 / KV head 0 | 1024 | `3.538114e-12` | `4.649162e-06` | standalone full-mask replay |
+| layer 3 / KV head 1 | 1024 | `9.639233e-11` | `2.777576e-05` | standalone full-mask replay |
+| layer 39 / KV head 1 | 1024 | `3.247589e-10` | `1.292229e-04` | capture-script full-mask replay |
+
+Full-Q/O independent f16-truth replay findings:
+
+| Boundary | Rows replayed | Worst output NMSE | Worst max abs | Notes |
+|---|---:|---:|---:|---|
+| layer 3 / KV head 0 | 1024 | `6.644494e-05` | `1.149136e-02` | raw body-record f16/f32 truth |
+| layer 3 / KV head 1 | 1024 | `5.002742e-05` | `7.715881e-03` | raw body-record f16/f32 truth |
+| layer 39 / KV head 1 | 1024 | `2.273129e-05` | `4.491997e-02` | raw body-record f16/f32 truth |
+
+### Round 35 interpretation
+
+- The selected KVarN mixed-attention CUDA path is internally correct across
+  full query blocks for the sampled KV heads.
+- The independent f16-truth mismatch for these sampled K8V8 boundaries is small
+  (`~2e-5` to `~7e-5` worst-row NMSE), while the full-model ctx4096 PPL gap is
+  still about `+11.7%`.
+- This pushes the likely bug surface out of the sampled body-store and
+  mixed-attention CUDA path and toward:
+  - post-mixed-attention graph transforms, especially paper-frame output
+    unrotation and reshape/WO handoff;
+  - accumulated block-output drift across all KVarN layers;
+  - a layer/head/query not yet sampled;
+  - or the still-unimplemented layer-subset attribution path.
+- A read-only audit of `LLAMA_KVARN_LAYER_FILTER` found that allocation filtering
+  exists, but graph routing does not. The correct patch needs optional normal-KV
+  fallback storage for excluded layers and separate KVarN-vs-normal attention
+  input masks. Do not land a partial fallback that only changes allocation.
+- The current Qwen3.6 MTP memory path may bypass `llama_memory_hybrid_kvarn` in
+  this branch, so the fallback rewrite must first confirm which memory backend
+  the production MTP run actually uses before making an invasive hybrid-only
+  change.
+
+### Round 35 next bug-finding loop
+
+1. Add post-unrotation/block-output dumps:
+   - dump mixed-attn output before Hadamard unrotation;
+   - dump the tensor after Hadamard unrotation and before `wo`;
+   - dump the layer attention output after `wo`;
+   - compare all three against an independent f16 attention replay in Python.
+2. Extend full-Q/O capture to both KV heads on early/mid/late layers:
+   - at minimum layers `3`, `19`, `39`;
+   - both KV heads for each layer;
+   - report worst `(iq, ih)` rows from self replay and f16-truth replay.
+3. Make layer-subset isolation executable:
+   - add `has_layer()` to KVarN cache/context;
+   - allocate normal KV fallback only when `LLAMA_KVARN_LAYER_FILTER` is present
+     and excludes a full-attention layer;
+   - route excluded layers through normal KV while included layers use KVarN;
+   - disable graph reuse for mixed fallback graphs until reuse checks cover both
+     normal and KVarN masks.
+4. Run PPL bisection only after the fallback path is real:
+   - single layers: `3`, `7`, `11`, ..., `39`;
+   - halves: `3-19:4`, `23-39:4`;
+   - full set: `3-39:4`.
+5. Keep long-context speed work blocked as production evidence until K8V8
+   ctx4096 is near-lossless (`<=1%` PPL delta or mean KL `<=0.005`).
+
+## Prior handoff - 2026-06-14 Round 34
 
 Repo: `JakeATX/llama.cpp`
 Branch: `kvarn-atx-integration`

@@ -61,6 +61,10 @@ For Qwen3.6 256d diagnostics, `capture_qwen_boundary.ps1` captures a bounded
 full-model attention boundary under explicit env flags, and
 `replay_qwen_boundary.ps1` validates capture completeness. The current capture is
 an input/output diagnostic artifact, not yet a CUDA split-vs-warpqk replay test.
+When the capture is run with `-DumpFullQO`, `replay_full_qo_boundary.py` replays
+the dumped KV head's full query/head group and writes per-`(iq, ih)` output
+NMSE/max-abs rows plus a JSON summary:
+`python scripts/kvarn/replay_full_qo_boundary.py --dump <boundary-or-parent>`.
 
 ### P0 CUDA matrix (2026-06-07)
 

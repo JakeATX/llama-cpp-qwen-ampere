@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
 import numpy as np
+
+from replay_mixed_attn_boundary import read_full_mask
 
 
 def nmse(ref: np.ndarray, got: np.ndarray) -> float:
@@ -28,6 +31,25 @@ def softmax(x: np.ndarray) -> np.ndarray:
     y = x.astype(np.float32) - np.max(x.astype(np.float32))
     p = np.exp(y).astype(np.float32)
     return (p / np.sum(p, dtype=np.float32)).astype(np.float32)
+
+
+def softmax_rows(x: np.ndarray) -> np.ndarray:
+    y = x.astype(np.float32) - np.max(x.astype(np.float32), axis=1, keepdims=True)
+    p = np.exp(y).astype(np.float32)
+    return (p / np.sum(p, axis=1, keepdims=True, dtype=np.float32)).astype(np.float32)
+
+
+def nmse_rows(ref: np.ndarray, got: np.ndarray) -> np.ndarray:
+    r = ref.astype(np.float64)
+    g = got.astype(np.float64)
+    d = r - g
+    denom = np.sum(r * r, axis=1)
+    num = np.sum(d * d, axis=1)
+    out = np.empty(ref.shape[0], dtype=np.float64)
+    zero = denom == 0.0
+    out[~zero] = num[~zero] / denom[~zero]
+    out[zero] = np.where(num[zero] == 0.0, 0.0, np.inf)
+    return out
 
 
 def resolve_boundary(path: Path) -> Path:
@@ -95,6 +117,94 @@ def load_raw_body(records: dict[int, Path], n_records: int, head_dim: int, group
     return np.concatenate(k_chunks, axis=0).astype(np.float32), np.concatenate(v_chunks, axis=0).astype(np.float32)
 
 
+def replay_full_qo_truth(
+        boundary: Path,
+        meta: dict,
+        k_all: np.ndarray,
+        v_all: np.ndarray,
+        scale: np.float32) -> None:
+    full_q_path = boundary / "full_q.bin"
+    full_out_path = boundary / "full_out.bin"
+    if not full_q_path.exists() or not full_out_path.exists():
+        return
+
+    head_dim = int(meta["head_dim"])
+    n_queries = int(meta["n_queries"])
+    n_head = int(meta["n_head"])
+    n_gqa = int(meta["n_gqa"])
+    n_tokens = int(meta["n_tokens"])
+    selected_ikh = int(meta["selected_ikh"])
+
+    full_mask = read_full_mask(boundary, meta, n_queries, n_tokens)
+    if full_mask is None:
+        print("  f16_truth_full_qo: skipped because full_mask.bin is not present")
+        return
+
+    expected = n_queries * n_head * head_dim
+    full_q = np.fromfile(full_q_path, dtype=np.float32, count=expected).reshape(n_queries, n_head, head_dim)
+    full_out = np.fromfile(full_out_path, dtype=np.float32, count=expected).reshape(n_queries, n_head, head_dim)
+
+    heads = list(range(selected_ikh * n_gqa, min(n_head, (selected_ikh + 1) * n_gqa)))
+    k_t = k_all.astype(np.float32).T
+    v = v_all.astype(np.float32)
+
+    rows: list[dict[str, int | float]] = []
+    worst: dict[str, int | float] | None = None
+    for iq in range(n_queries):
+        q = full_q[iq, heads, :].astype(np.float32)
+        scores = (q @ k_t).astype(np.float32) * scale
+        scores = (scores + full_mask[iq].reshape(1, -1)).astype(np.float32)
+        probs = softmax_rows(scores)
+        truth_out = (probs @ v).astype(np.float32)
+        actual_out = full_out[iq, heads, :].astype(np.float32)
+
+        diff = np.abs(truth_out.astype(np.float64) - actual_out.astype(np.float64))
+        worst_d = np.argmax(diff, axis=1).astype(np.int64)
+        max_abs = diff[np.arange(len(heads)), worst_d]
+        out_nmse = nmse_rows(truth_out, actual_out)
+
+        for row_i, ih in enumerate(heads):
+            row = {
+                "iq": int(iq),
+                "ih": int(ih),
+                "ikh": int(ih // n_gqa),
+                "out_nmse": float(out_nmse[row_i]),
+                "out_max_abs": float(max_abs[row_i]),
+                "out_worst_d": int(worst_d[row_i]),
+            }
+            rows.append(row)
+            if worst is None or float(row["out_nmse"]) > float(worst["out_nmse"]):
+                worst = row
+
+    csv_path = boundary / "f16_truth_full_qo_summary.csv"
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["iq", "ih", "ikh", "out_nmse", "out_max_abs", "out_worst_d"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary = {
+        "boundary": str(boundary),
+        "layer": int(meta.get("inferred_layer", -1)),
+        "selected_ikh": selected_ikh,
+        "covered_heads": heads,
+        "rows": len(rows),
+        "worst": worst,
+        "max_out_nmse": max((float(row["out_nmse"]) for row in rows), default=0.0),
+        "max_out_abs": max((float(row["out_max_abs"]) for row in rows), default=0.0),
+    }
+    (boundary / "f16_truth_full_qo_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+    if worst is None:
+        print("  f16_truth_full_qo: no replayable rows")
+    else:
+        print(
+            "  f16_truth_full_qo: "
+            f"rows={len(rows)} selected_ikh={selected_ikh} "
+            f"worst_iq={worst['iq']} worst_ih={worst['ih']} "
+            f"out_nmse={float(worst['out_nmse']):.6e} out_max_abs={float(worst['out_max_abs']):.6e}"
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Compare a KVarN boundary dump against raw f16/f32 body-store truth.")
     ap.add_argument("--boundary", required=True, help="Boundary dump dir or parent containing one boundary.json")
@@ -160,6 +270,8 @@ def main() -> int:
         scores.astype(np.float32).tofile(boundary / "f16_truth_scores.bin")
         probs.astype(np.float32).tofile(boundary / "f16_truth_probs.bin")
         truth_out.astype(np.float32).tofile(boundary / "f16_truth_out.bin")
+
+    replay_full_qo_truth(boundary, meta, k_all, v_all, scale)
 
     if args.max_out_nmse is not None and out_nmse > args.max_out_nmse:
         raise SystemExit(f"truth/KVarN out NMSE {out_nmse:.6e} exceeds {args.max_out_nmse:.6e}")
