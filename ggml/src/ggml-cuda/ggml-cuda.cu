@@ -3397,6 +3397,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     k_body_root = k_body_root->view_src;
                 }
                 const void * k_body_store_key = k_body_root ? k_body_root->data : (k_body ? k_body->data : dst->data);
+                const int32_t debug_store_layer = k_body_root != nullptr ?
+                    ggml_cuda_kvarn_parse_layer_from_tensor_name(k_body_root->name) : -1;
                 const int64_t n_values = int64_t(params.head_dim)*params.group_size;
                 const int64_t k_body_bytes = (n_values*params.key_bits   + 7)/8;
                 const int64_t v_body_bytes = (n_values*params.value_bits + 7)/8;
@@ -3435,6 +3437,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_cuda_kvarn_timing_scope timing(ctx.stream(), timing_label.str());
 
                 if (params.n_record_batch > 0 && params.src_layout == 1) {
+                    ggml_cuda_kvarn_debug_set_store_context(
+                            debug_store_layer, uint32_t(params.record_0), uint32_t(params.n_record_batch),
+                            uint32_t(params.n_heads), uint32_t(params.src_layout));
                     ggml_cuda_kvarn_mark_body_store_records(
                             k_body_store_key, uint32_t(params.record_0), uint32_t(params.n_record_batch));
                     ggml_cuda_kvarn_store_body_direct_records_minmax(
@@ -3476,6 +3481,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             first_record = records[i];
                         }
                     }
+                    ggml_cuda_kvarn_debug_set_store_context(
+                            debug_store_layer, uint32_t(first_record), uint32_t(params.n_record_batch),
+                            uint32_t(params.n_heads), uint32_t(params.src_layout));
                     ggml_cuda_kvarn_mark_body_store_records(
                             k_body_store_key, uint32_t(first_record), uint32_t(params.n_record_batch));
                     const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
@@ -3504,6 +3512,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             size_t(pending_group_stride),
                             ctx.stream());
                 } else if (params.n_heads > 1) {
+                    ggml_cuda_kvarn_debug_set_store_context(
+                            debug_store_layer, uint32_t(params.record_0), 1, uint32_t(params.n_heads), uint32_t(params.src_layout));
                     ggml_cuda_kvarn_mark_body_store(k_body_store_key);
                     const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
                     ggml_cuda_kvarn_store_body_pending_heads_minmax(
@@ -3526,6 +3536,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             size_t(pending_group_stride),
                             ctx.stream());
                 } else {
+                    ggml_cuda_kvarn_debug_set_store_context(
+                            debug_store_layer, UINT32_MAX, 1, 1, uint32_t(params.src_layout));
                     ggml_cuda_kvarn_mark_body_store(k_body_store_key);
                     ggml_cuda_kvarn_store_body_reference_minmax(
                             (const float *) k_tile->data,
@@ -3569,7 +3581,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * kq_mask     = dst->src[10];
 
                 const int64_t n_kv = int64_t(params.n_sink) + int64_t(params.n_records)*params.group_size + params.n_pending + params.n_tail;
-                const uint32_t kq_mask_type = kq_mask == nullptr ? 0u : (kq_mask->type == GGML_TYPE_F32 ? 1u : 2u);
+                const bool disable_kq_mask = ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_MASK");
+                const uint32_t kq_mask_type = disable_kq_mask || kq_mask == nullptr ? 0u : (kq_mask->type == GGML_TYPE_F32 ? 1u : 2u);
                 const int64_t scratch_nelems = [&]() {
                     const ggml_tensor * root = scratch;
                     while (root != nullptr && root->view_src != nullptr) {

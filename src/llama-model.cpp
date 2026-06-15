@@ -34,6 +34,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -2078,6 +2079,63 @@ static bool llama_kvarn_force_experimental_iswa() {
     return llama_kvarn_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA");
 }
 
+static llama_memory_i::layer_filter_cb llama_kvarn_layer_filter_from_env() {
+    const char * env = std::getenv("LLAMA_KVARN_LAYER_FILTER");
+    if (env == nullptr || env[0] == '\0') {
+        return nullptr;
+    }
+
+    auto layers = std::make_shared<std::vector<int32_t>>();
+    std::stringstream ss(env);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        std::stringstream parts(token);
+        std::string part;
+        while (parts >> part) {
+            std::smatch m;
+            if (std::regex_match(part, m, std::regex("^([0-9]+)-([0-9]+)(?::([0-9]+))?$"))) {
+                const int32_t start = std::stoi(m[1].str());
+                const int32_t end   = std::stoi(m[2].str());
+                const int32_t step  = m[3].matched ? std::stoi(m[3].str()) : 1;
+                if (end < start || step <= 0) {
+                    throw std::runtime_error(std::string("invalid LLAMA_KVARN_LAYER_FILTER range: ") + part);
+                }
+                for (int32_t il = start; il <= end; il += step) {
+                    layers->push_back(il);
+                }
+            } else if (std::regex_match(part, m, std::regex("^([0-9]+)$"))) {
+                layers->push_back(std::stoi(m[1].str()));
+            } else {
+                throw std::runtime_error(std::string("invalid LLAMA_KVARN_LAYER_FILTER token: ") + part);
+            }
+        }
+    }
+    if (layers->empty()) {
+        throw std::runtime_error("LLAMA_KVARN_LAYER_FILTER did not contain any layer ids");
+    }
+    std::sort(layers->begin(), layers->end());
+    layers->erase(std::unique(layers->begin(), layers->end()), layers->end());
+
+    LLAMA_LOG_WARN("%s: diagnostic KVarN layer filter enabled: %s\n", __func__, env);
+    return [layers](int32_t il) {
+        return std::binary_search(layers->begin(), layers->end(), il);
+    };
+}
+
+static llama_memory_i::layer_filter_cb llama_kvarn_combine_layer_filters(
+        llama_memory_i::layer_filter_cb base,
+        llama_memory_i::layer_filter_cb diagnostic) {
+    if (!diagnostic) {
+        return base;
+    }
+    if (!base) {
+        return diagnostic;
+    }
+    return [base, diagnostic](int32_t il) {
+        return base(il) && diagnostic(il);
+    };
+}
+
 static llama_memory_i * llama_kvarn_create_normal_iswa_fallback(
         const llama_model & model,
         const llama_memory_params & params,
@@ -2281,6 +2339,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     return (uint32_t)il < n_main && hparams.is_recr(il);
                 };
             }
+            filter_attn = llama_kvarn_combine_layer_filters(
+                    std::move(filter_attn), llama_kvarn_layer_filter_from_env());
 
             return new llama_memory_hybrid_kvarn(
                     /* model             */ *this,
@@ -2305,7 +2365,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 cparams.n_ctx_seq,
                 cparams.n_seq_max,
                 1,
-                nullptr);
+                llama_kvarn_layer_filter_from_env());
     }
 
     switch (arch) {

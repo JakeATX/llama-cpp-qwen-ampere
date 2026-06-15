@@ -1,5 +1,88 @@
 # KVarN production patch handoff for coding agent
 
+## Latest handoff for external review - 2026-06-14 Round 34
+
+Repo: `JakeATX/llama.cpp`
+Branch: `kvarn-atx-integration`
+Current branch target: <https://github.com/JakeATX/llama.cpp/tree/kvarn-atx-integration>
+
+This round redirected the long-context quality investigation away from broad kernel rewrites and into independent f16 boundary replay. The key new evidence is that the KVarN store/dequant path is locally correct for Qwen3.6 K8V8 body records, and the sampled mixed-attention CUDA outputs match an independent f16 reconstruction at ctx4096. The remaining Qwen ctx4096 perplexity gap is therefore not explained by the previously suspected K-transpose/body-layout bug.
+
+### Round 34 code changes
+
+- Added store-context metadata for KVarN body-record dumps:
+  - `ggml/src/ggml-cuda/kvarn.cuh`
+  - `ggml/src/ggml-cuda/kvarn.cu`
+  - `ggml/src/ggml-cuda/ggml-cuda.cu`
+- Body-record dumps now include `layer`, `record0`, `n_records_context`, `n_heads_context`, and `src_layout`.
+- Fixed the optional non-negative env parser so debug filters can accept `0`, e.g. `LLAMA_KVARN_DEBUG_BODY_HEAD=0`.
+- Added dump filters:
+  - `LLAMA_KVARN_DEBUG_BODY_RECORD_LAYER`
+  - `LLAMA_KVARN_DEBUG_BODY_SRC_LAYOUT`
+- Added `LLAMA_KVARN_ATTN_DISABLE_MASK=1` as a diagnostic-only mixed-attention mask bypass.
+- Added `scripts/kvarn/replay_f16_truth_boundary.py`, which reconstructs a mixed-attention boundary from raw `k_rot_or_copy.bin` / `v_rot_or_copy.bin` body-record dumps rather than from KVarN packed body bytes.
+- Added `scripts/kvarn/capture_ctx4096_truth_boundary.ps1`, which runs a bounded ctx4096 accuracy gate, captures one mixed-attention boundary plus body-record dumps, then runs both the existing KVarN self-replay and the new f16-truth replay.
+- Added diagnostic `LLAMA_KVARN_LAYER_FILTER` parsing in `src/llama-model.cpp`. It can allocate a layer subset, but the Qwen hybrid graph currently still assumes every scheduled KVarN layer exists, so subset PPL isolation needs additional graph fallback work before it is usable.
+
+### Round 34 validation
+
+Focused tests:
+
+| Gate | Result | Notes |
+|---|---:|---|
+| `cmake --build ... --target ggml llama llama-perplexity test-arg-parser` | PASS | CUDA backend library had already rebuilt `kvarn.obj` / `ggml-cuda.obj`; full `ggml-cuda` target later stalled in unrelated generated `mmf-instance-ncols_1.cu` nvcc compile |
+| `ctest -R "test-batch-split|test-kvarn-kv|test-kvarn-server-load-failure|test-arg-parser"` | PASS | 5/5 |
+| `ctest -R "test-kvarn-cuda-scratch-ref"` | PASS | 1/1 |
+| `python scripts/kvarn/kv_memory_estimate.py --self-test` | PASS | |
+| `python scripts/kvarn/kvarn_vllm_oracle.py --self-test --head-dims 128,256,512 --presets k4v2,k4v4,k8v8 --iters 16` | PASS | |
+
+Qwen3.6 ctx4096 K8V8 paper-frame accuracy runs:
+
+| Case | f16 PPL | KVarN PPL | Increase | Artifact |
+|---|---:|---:|---:|---|
+| `LLAMA_KVARN_ENABLE_PAPER_FRAME=1`, `kvarn_k8v8_g128`, iters 4 | 4.5837 | 5.1152 | 11.60% | `artifacts/kvarn-rootcause/round34-qwen36-k8v8-layer3-head0-iq2047-r4` |
+| same, layer 39 / KV head 1 capture | 4.5837 | 5.1194 | 11.69% | `artifacts/kvarn-rootcause/round34-qwen36-k8v8-layer39-head1-iq2047-r1` |
+| non-paper-frame A/B, K8V8 iters 4 | 4.5837 | 6.2146 | 35.58% | `artifacts/kvarn-rootcause/round34-qwen36-k8v8-nonpaper-ctx4096` |
+
+Boundary replay findings:
+
+| Boundary | KVarN self-replay NMSE | Independent f16-truth NMSE | Notes |
+|---|---:|---:|---|
+| Qwen layer 3, query head 0 / KV head 0, ctx4096 | `4.153787e-13` | `5.545372e-07` | f16 truth uses earliest complete body-record set, records 0-29 |
+| Qwen layer 39, query head 8 / KV head 1, ctx4096 | `1.460266e-10` | `2.191908e-07` | late-layer/head sample also clean |
+
+Record-local K8V8 reconstruction:
+
+- Individual dumped records reconstruct raw rotated body tiles at approximately `2e-5` K NMSE and `4e-5` V NMSE.
+- This rules out a remaining K-transpose/store/dequant layout bug for the sampled Qwen records.
+- The earlier apparent `>1.0` body NMSE was caused by the f16 replay helper choosing the latest duplicate record dumps after the boundary. It now defaults to the earliest dump set, matching the active boundary.
+
+### Round 34 interpretation
+
+- The K-transpose fix and current store/dequant contract appear correct for sampled Qwen ctx4096 K8V8 boundaries.
+- Paper-frame is materially better than non-paper-frame, but not sufficient: Qwen K8V8 still shows roughly `+11.6%` PPL at ctx4096/chunks2.
+- Since sampled mixed-attention boundaries are clean against independent f16 truth, the remaining quality gap likely sits outside the body-store/dequant kernel itself:
+  - output unrotation or graph-frame integration outside the dumped mixed-attention op,
+  - a layer/head/query path not covered by the two sampled boundaries,
+  - accumulated small errors across all KVarN layers,
+  - or Qwen hybrid graph behavior around layers that were not independently sampled.
+- `LLAMA_KVARN_LAYER_FILTER=3` currently allocates only layer 3, but the graph aborts with `KVarN layer is not present in runtime storage` when other scheduled KVarN layers are absent. Layer-subset PPL bisection therefore requires a real graph fallback rewrite, not only an allocation filter.
+
+### Recommended next rewrite loop
+
+1. Make KVarN layer-subset isolation operational:
+   - When `LLAMA_KVARN_LAYER_FILTER` excludes a layer, the Qwen hybrid graph must route that layer through normal KV instead of assuming KVarN runtime storage exists.
+   - Keep this diagnostic-only until validated; default behavior must remain unchanged.
+2. Run ctx4096 K8V8 paper-frame PPL with layer subsets:
+   - single layers: `3`, `7`, `39`;
+   - halves: `3-19:4`, `23-39:4`;
+   - all layers: `3-39:4`.
+3. Add a post-unrotation boundary oracle:
+   - dump the mixed-attention output before and after Hadamard unrotation for one Qwen layer;
+   - compare against an independent f16 non-rotated attention output, not only the rotated-frame mixed-attention output.
+4. Only after K8V8 is near-lossless at ctx4096 should K4V4/K4V2 quality and speed be interpreted as production candidates.
+5. Re-run Gemma true KVarN+ISWA only after the Qwen post-unrotation/layer-subset loop is green; Gemma still has the extra ISWA eviction/reuse surface.
+
 ## Latest handoff for external review - 2026-06-12 Round 12
 
 Repo: `JakeATX/llama.cpp`

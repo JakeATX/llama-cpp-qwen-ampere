@@ -5,6 +5,7 @@
 
 void ggml_cuda_kvarn_mark_body_store(const void * k_body);
 void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first_record, uint32_t n_records);
+void ggml_cuda_kvarn_debug_set_store_context(int32_t layer, uint32_t record0, uint32_t n_records, uint32_t n_heads, uint32_t src_layout);
 
 void ggml_cuda_kvarn_store_body_reference_minmax(
         const float * k_tile,

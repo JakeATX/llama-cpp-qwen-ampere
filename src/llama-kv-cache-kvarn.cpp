@@ -1714,7 +1714,8 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads(
     ggml_tensor * v_scales = view_v_scales_record_heads(ctx, il, record);
     return ggml_kvarn_store_kv_body_pending_heads(
             ctx, k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
-            int32_t(view.n_head_kv), int32_t(view.head_dim_k), int32_t(params.group_size),
+            int32_t(view.n_head_kv), int32_t(record),
+            int32_t(view.head_dim_k), int32_t(params.group_size),
             int32_t(params.key_bits), int32_t(params.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
 }
@@ -1971,7 +1972,8 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads_from_pending(
     return ggml_kvarn_store_kv_body_pending_heads(
             ctx, layer_tensors[li].pending_k, layer_tensors[li].pending_v,
             k_body, v_body, k_scales, v_scales, scratch,
-            int32_t(view.n_head_kv), int32_t(view.head_dim_k), int32_t(params.group_size),
+            int32_t(view.n_head_kv), int32_t(record),
+            int32_t(view.head_dim_k), int32_t(params.group_size),
             int32_t(params.key_bits), int32_t(params.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
 }

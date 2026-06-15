@@ -35,6 +35,26 @@ static std::atomic<uint64_t> g_kvarn_attn_trace_count{0};
 static std::atomic<uint64_t> g_kvarn_store_phase_trace_count{0};
 static std::atomic<uint64_t> g_kvarn_body_record_dump_count{0};
 
+struct kvarn_debug_store_context {
+    int32_t  layer = -1;
+    uint32_t record0 = 0;
+    uint32_t n_records = 0;
+    uint32_t n_heads = 0;
+    uint32_t src_layout = 0;
+};
+
+static thread_local kvarn_debug_store_context g_kvarn_debug_store_context;
+
+void ggml_cuda_kvarn_debug_set_store_context(int32_t layer, uint32_t record0, uint32_t n_records, uint32_t n_heads, uint32_t src_layout) {
+    g_kvarn_debug_store_context = {
+        layer,
+        record0,
+        n_records,
+        n_heads,
+        src_layout,
+    };
+}
+
 struct kvarn_dequant_cache_entry {
     const void * k_body    = nullptr;
     uint32_t     n_records = 0;
@@ -241,8 +261,13 @@ static bool kvarn_store_phase_trace_claim() {
 struct kvarn_body_record_dump_state {
     bool active = false;
     uint64_t call_index = 0;
+    int32_t layer = -1;
     uint32_t record = 0;
     uint32_t head = 0;
+    uint32_t record0 = 0;
+    uint32_t n_records = 0;
+    uint32_t n_heads = 0;
+    uint32_t src_layout = 0;
     std::string dir;
 };
 
@@ -251,7 +276,14 @@ static int kvarn_env_optional_nonneg_int(const char * name) {
     if (env == nullptr || env[0] == '\0') {
         return -1;
     }
-    return kvarn_env_int(name, -1);
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (end == nullptr || *end != '\0' || errno == ERANGE || value < 0 || value > 1000000) {
+        std::fprintf(stderr, "invalid KVarN CUDA environment integer %s=%s; expected integer in [0,1000000]\n", name, env);
+        std::abort();
+    }
+    return int(value);
 }
 
 static std::string kvarn_join_path(const std::string & dir, const char * leaf) {
@@ -314,6 +346,13 @@ static void kvarn_dump_device_buffer(const std::string & path, const void * dev,
 
 static kvarn_body_record_dump_state kvarn_body_record_dump_claim(uint32_t record, uint32_t head) {
     kvarn_body_record_dump_state dump;
+    dump.layer = g_kvarn_debug_store_context.layer;
+    dump.record = record;
+    dump.head = head;
+    dump.record0 = g_kvarn_debug_store_context.record0;
+    dump.n_records = g_kvarn_debug_store_context.n_records;
+    dump.n_heads = g_kvarn_debug_store_context.n_heads;
+    dump.src_layout = g_kvarn_debug_store_context.src_layout;
     if (record == UINT32_MAX || head == UINT32_MAX) {
         return dump;
     }
@@ -321,6 +360,14 @@ static kvarn_body_record_dump_state kvarn_body_record_dump_claim(uint32_t record
         return dump;
     }
 
+    const int layer_filter = kvarn_env_optional_nonneg_int("LLAMA_KVARN_DEBUG_BODY_RECORD_LAYER");
+    if (layer_filter >= 0 && dump.layer != layer_filter) {
+        return dump;
+    }
+    const int src_layout_filter = kvarn_env_optional_nonneg_int("LLAMA_KVARN_DEBUG_BODY_SRC_LAYOUT");
+    if (src_layout_filter >= 0 && dump.src_layout != uint32_t(src_layout_filter)) {
+        return dump;
+    }
     const int record_filter = kvarn_env_optional_nonneg_int("LLAMA_KVARN_DEBUG_BODY_RECORD");
     if (record_filter >= 0 && uint32_t(record_filter) != record) {
         return dump;
@@ -350,8 +397,6 @@ static kvarn_body_record_dump_state kvarn_body_record_dump_claim(uint32_t record
     kvarn_create_directories(dump.dir);
     dump.active = true;
     dump.call_index = call_index;
-    dump.record = record;
-    dump.head = head;
     return dump;
 }
 
@@ -1998,8 +2043,13 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
         json << "  \"version\": 1,\n";
         json << "  \"mode\": \"kvarn-body-record-store\",\n";
         json << "  \"call_index\": " << dump.call_index << ",\n";
+        json << "  \"layer\": " << dump.layer << ",\n";
         json << "  \"record\": " << dump.record << ",\n";
         json << "  \"head\": " << dump.head << ",\n";
+        json << "  \"record0\": " << dump.record0 << ",\n";
+        json << "  \"n_records_context\": " << dump.n_records << ",\n";
+        json << "  \"n_heads_context\": " << dump.n_heads << ",\n";
+        json << "  \"src_layout\": " << dump.src_layout << ",\n";
         json << "  \"head_dim\": " << head_dim << ",\n";
         json << "  \"group_size\": " << group_size << ",\n";
         json << "  \"key_bits\": " << key_bits << ",\n";
@@ -2015,8 +2065,8 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
         json.close();
 
         std::fprintf(stderr,
-                "KVarN body-record dump: call=%" PRIu64 " head=%u record=%u path=%s\n",
-                dump.call_index, dump.head, dump.record, dump.dir.c_str());
+                "KVarN body-record dump: call=%" PRIu64 " layer=%d head=%u record=%u path=%s\n",
+                dump.call_index, dump.layer, dump.head, dump.record, dump.dir.c_str());
     }
 }
 
@@ -2189,7 +2239,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
                     v_scales + size_t(ih)*v_scale_stride_floats,
                     pipeline,
                     head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
-                    pending_already_rotated, 0, ih, stream);
+                    pending_already_rotated, g_kvarn_debug_store_context.record0, ih, stream);
         } else {
             ggml_cuda_kvarn_store_k_body_reference_minmax(
                     k_tile,

@@ -1741,6 +1741,7 @@ extern "C" {
             struct ggml_tensor  * v_scales,
             struct ggml_tensor  * scratch,
                    int32_t        n_heads,
+                   int32_t        record,
                    int32_t        head_dim,
                    int32_t        group_size,
                    int32_t        key_bits,

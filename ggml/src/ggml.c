@@ -4115,6 +4115,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
         struct ggml_tensor  * v_scales,
         struct ggml_tensor  * scratch,
                int32_t        n_heads,
+               int32_t        record,
                int32_t        head_dim,
                int32_t        group_size,
                int32_t        key_bits,
@@ -4129,6 +4130,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
     GGML_ASSERT(v_scales->type == GGML_TYPE_F32);
     GGML_ASSERT(scratch->type == GGML_TYPE_F32);
     GGML_ASSERT(n_heads > 1);
+    GGML_ASSERT(record >= 0);
     GGML_ASSERT(head_dim > 0);
     GGML_ASSERT(group_size > 0);
     GGML_ASSERT(key_bits > 0 && key_bits <= 8);
@@ -4188,7 +4190,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
         rtn_quantile,
         n_heads,
         0,
-        0, 0, 0, 0,
+        record, 0, 0, 0,
         0,
     };
     ggml_set_op_params(result, &params, sizeof(params));
