@@ -1604,3 +1604,48 @@ Recommended next action:
 2. If reverting wholesale is too broad, split the cleanup into small chunks and require this gate after each chunk:
    - Gemma true KVarN+ISWA ctx4096/chunks2, paper-frame, expected layers `5-47:6`, `kvarn_k4v2_g128`.
 3. Only after Gemma returns to the bounded Round 30 level should the team decide whether to keep the RTN/guard corrective changes.
+
+---
+
+## Rejected patch - lossless quality defaults - 2026-06-15
+
+Claude-provided patch `C:\Users\sjake\Downloads\0001kvarnlosslessqualityfix.patch` was applied locally and tested, then reverted.
+
+What the patch changed:
+
+- Made log/std Sinkhorn normalization default-on for CPU and CUDA unless `LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN=0`.
+- Changed `llama_kvarn_default_params().value_bits` from `2` to `4`.
+- Added `docs/KVARN_LOSSLESS_QUALITY_FIX.md`.
+
+Local integration fixes needed for the patch:
+
+- `tests/test-kvarn-cuda-dequant.cpp` independent CPU reference had to follow the same default-on log/std behavior, otherwise CPU/CUDA packed-byte checks failed.
+- `tests/test-kvarn-kv.cpp` byte-count assertions had to be updated for V4 default.
+
+Focused validation after those local integration fixes:
+
+- `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure`: PASS, 7/7.
+- `python scripts/kvarn/kv_memory_estimate.py --self-test`: PASS.
+- `python scripts/kvarn/kvarn_vllm_oracle.py --self-test --head-dims 128,256,512 --presets k4v2,k4v4,k8v8 --iters 16`: PASS.
+
+Qwen3.6 MTP ctx4096 accuracy results, paper-frame enabled, expected KVarN layers `3-39:4`, `-ncmoe 34`, chunks2:
+
+- `kvarn_k4v4_g128`, log/std default-on, iters 16:
+  - artifact: `artifacts/kvarn-accuracy/round33-lossless-default-qwen36-ctx4096-k4v4-logstd16`
+  - f16 PPL `4.5837`
+  - KVarN PPL `5.1127`
+  - increase `11.54%`
+  - result: FAIL versus 5% quality gate
+- `kvarn_k8v8_g128`, log/std default-on, iters 16:
+  - artifact: `artifacts/kvarn-accuracy/round33-lossless-default-qwen36-ctx4096-k8v8-logstd16`
+  - f16 PPL `4.5837`
+  - KVarN PPL `5.1308`
+  - increase `11.94%`
+  - result: FAIL versus 5% quality gate
+
+Conclusion:
+
+- Do not push this patch as a production default change.
+- V4 default and log/std default-on do not make Qwen3.6 ctx4096 lossless in this branch.
+- The claim that high-bit results were only stale from before the pending-K transpose fix is not supported by this run: K8V8 still fails after the pending-K fix and after log/std default-on.
+- Because even K8V8 is still around `+12%`, the next useful work is not more bit-width tuning. Continue with f16-vs-KVarN activation/logit boundary capture across layers/heads/queries and the Gemma cleanup-regression bisect.
