@@ -1470,3 +1470,83 @@ Interpretation:
 - The real Qwen ctx4096 dump proves the selected store boundary is in the correct frame, so the remaining `11.62%` PPL gap is not explained by another K/V frame mismatch in that record.
 - The dumped first record has high V dequant loss at `k4v2`. However, prior full-model `k8v8` did not recover Qwen ctx4096, so this cannot be treated as a complete explanation until the same query/head is checked at the mixed-attention boundary.
 - Next step: capture the existing mixed-attention boundary dump for the same body-active Qwen run and compare per-token scores/probabilities/output against the independently replayed store/dequant data.
+
+---
+
+## Round 32 mixed-attention boundary replay - 2026-06-15
+
+Inputs reviewed:
+
+- `C:\Users\sjake\Downloads\KVARN_ROUND32_MIXED_ATTN_BOUNDARY_HANDOFF.md`
+- `C:\Users\sjake\Downloads\0001-kvarn-generalize-mixed-attn-boundary-dump.patch`
+- `C:\Users\sjake\Downloads\0002-kvarn-add-mixed-attn-boundary-replay.patch`
+- `C:\Users\sjake\Downloads\0003-docs-round32-mixed-attn-boundary-handoff.patch`
+
+Implemented:
+
+- Generalized `LLAMA_KVARN_ATTN_BOUNDARY_DUMP` so it is no longer hard-coded to `head_dim == 256`.
+- Added `LLAMA_KVARN_ATTN_BOUNDARY_DUMP_HEAD_DIM=<D>` for bounded 512d Gemma captures.
+- Renamed new boundary dump mode to `kvarn-mixed-attn-boundary-input`.
+- Added `scripts/kvarn/replay_mixed_attn_boundary.py`.
+- Added `docs/KVARN_ROUND32_MIXED_ATTN_BOUNDARY_HANDOFF.md`.
+- Added the new dump head-dim env var to KVarN env validation and production-gate cleanup.
+
+Validation:
+
+- Build passed:
+  `cmake --build build-kvarn-cuda-static-vs --config Release --target llama-perplexity test-kvarn-cuda-scratch-ref test-kvarn-kv test-arg-parser -- /m:1 /v:minimal /clp:ErrorsOnly`
+- Focused CTest passed:
+  `ctest --test-dir build-kvarn-cuda-static-vs -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure`
+- Memory estimator passed:
+  `python scripts/kvarn/kv_memory_estimate.py --self-test`
+- vLLM oracle self-test passed:
+  `scripts/kvarn/run_vllm_oracle_selftest.ps1`
+- Replay script py-compile passed:
+  `python -m py_compile scripts/kvarn/replay_mixed_attn_boundary.py`
+- Existing Qwen boundary replay passed:
+  - artifact: `artifacts/kvarn-boundary/round22-qwen-warpqk-qt1-layer3-fullqo/call_000000_2`
+  - `out_nmse=3.287233e-14`
+
+Qwen3.6 MTP ctx4096/chunks2 mixed-attention boundary:
+
+- Run artifact: `artifacts/kvarn-accuracy/round32-qwen36-ctx4096-k4v2-boundary`
+- Boundary artifact: `artifacts/kvarn-boundary/round32-qwen36-ctx4096-k4v2/call_000000`
+- Accuracy result:
+  - f16 PPL `4.5837`
+  - KVarN PPL `5.1249`
+  - increase `11.81%`
+- Replay result:
+  - layer `3`, query `0`, head `0`
+  - tokens `4096`, body records `30`
+  - CUDA mode `fused-batch`
+  - `out_nmse=3.981132e-13`
+  - `out_max_abs=4.470348e-07`
+
+Gemma 4 12B true KVarN+ISWA ctx4096/chunks2 mixed-attention boundary:
+
+- Run artifact: `artifacts/kvarn-accuracy/round32-gemma-ctx4096-k4v2-boundary`
+- Boundary artifact: `artifacts/kvarn-boundary/round32-gemma-ctx4096-k4v2/call_000000`
+- Accuracy result:
+  - f16 PPL `404.2271`
+  - KVarN PPL `9466.9647`
+  - increase `2241.99%`
+- Replay result:
+  - layer `5`, query `0`, head `0`
+  - tokens `4096`, body records `30`
+  - CUDA mode `warpqk-f16-dequant`
+  - `out_nmse=1.050904e-12`
+  - `out_max_abs=3.337860e-06`
+
+Interpretation:
+
+- The selected Qwen and Gemma mixed-attention rows are internally consistent with the packed KVarN body/scales and token order.
+- This rules out a single-row CUDA mixed-attention readout bug for the sampled rows.
+- Qwen still fails ctx4096 by about `11.8%`, so the next diagnostic should compare KVarN layer outputs against the f16 baseline over multiple layers/heads/queries, not just replay KVarN against itself.
+- Gemma true KVarN+ISWA still has a much larger long-context failure. Since the sampled 512d mixed-attention row replays correctly, the next Gemma target is ISWA topology/window/eviction state or cumulative layer effects, not the sampled body-record dequant order.
+
+Next work:
+
+1. Add f16-vs-KVarN activation boundary capture around KVarN-selected layers at ctx4096.
+2. Sample several Qwen layers/heads/queries, not only layer 3/head 0/query 0.
+3. For Gemma, inspect ISWA body-record span mapping, window eviction/recycling, and whether the layer-5 sampled row is representative of later KVarN layers.
+4. Keep long-context speed work blocked until Qwen ctx4096 is under the 5% PPL gate and Gemma true-KVarN+ISWA is either fixed or explicitly kept out of production.

@@ -340,7 +340,11 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
         int64_t scores_nelems,
         int64_t k_body_records_cap,
         cudaStream_t stream) {
-    if (!ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_BOUNDARY_DUMP") || head_dim != 256) {
+    if (!ggml_cuda_kvarn_env_flag("LLAMA_KVARN_ATTN_BOUNDARY_DUMP")) {
+        return;
+    }
+    const int head_dim_filter = ggml_cuda_kvarn_env_optional_nonneg_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_HEAD_DIM");
+    if (head_dim_filter >= 0 && head_dim != head_dim_filter) {
         return;
     }
     const uint32_t n_tokens = uint32_t(n_sink + n_records*group_size + n_pending + n_tail);
@@ -483,7 +487,7 @@ static void ggml_cuda_kvarn_maybe_dump_boundary(
     std::ofstream json(dir / "boundary.json");
     json << "{\n";
     json << "  \"version\": 1,\n";
-    json << "  \"mode\": \"qwen36-256d-boundary-input\",\n";
+    json << "  \"mode\": \"kvarn-mixed-attn-boundary-input\",\n";
     json << "  \"head_dim\": " << head_dim << ",\n";
     json << "  \"group_size\": " << group_size << ",\n";
     json << "  \"key_bits\": " << key_bits << ",\n";
