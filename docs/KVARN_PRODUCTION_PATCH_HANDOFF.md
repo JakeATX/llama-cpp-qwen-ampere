@@ -1550,3 +1550,57 @@ Next work:
 2. Sample several Qwen layers/heads/queries, not only layer 3/head 0/query 0.
 3. For Gemma, inspect ISWA body-record span mapping, window eviction/recycling, and whether the layer-5 sampled row is representative of later KVarN layers.
 4. Keep long-context speed work blocked until Qwen ctx4096 is under the 5% PPL gate and Gemma true-KVarN+ISWA is either fixed or explicitly kept out of production.
+
+---
+
+## Regression note - Gemma true KVarN+ISWA broke after cleanup - 2026-06-15
+
+This is the handoff section to read before more Gemma work.
+
+Finding:
+
+- The severe Gemma true KVarN+ISWA ctx4096 quality regression was introduced by or before commit `94dc11c40 cleanup: remove obsolete TurboQuant experiments`.
+- It was not introduced by the Round 32 mixed-attention boundary replay patch.
+- It was not caused by `LLAMA_KVARN_ATTN_BOUNDARY_DUMP`; the no-dump recheck reproduced the same bad result.
+
+Evidence:
+
+- Round 30 artifact at commit `3af66f419`:
+  - artifact: `artifacts/kvarn-accuracy/round30-pending-k-fix-gemma-ctx4096-k4v2`
+  - f16 PPL `418.2027`
+  - KVarN PPL `944.8251`
+  - increase `125.93%`
+- Recheck at commit `94dc11c40`:
+  - artifact: `artifacts/kvarn-accuracy/bisect-94dc-gemma-ctx4096-k4v2`
+  - f16 PPL `404.2271`
+  - KVarN PPL `9210.3180`
+  - increase `2178.50%`
+- Current branch no-dump recheck:
+  - artifact: `artifacts/kvarn-accuracy/round32-gemma-ctx4096-k4v2-nodump-recheck`
+  - f16 PPL `404.2271`
+  - KVarN PPL `9466.9647`
+  - increase `2241.99%`
+
+Interpretation:
+
+- `94dc11c40` was intended as cleanup, but it touched broad runtime areas, including CUDA/backend/graph-adjacent code. Treat it as suspect for Gemma true KVarN+ISWA until surgically bisected.
+- Round 32 mixed-attention replay still matters diagnostically: sampled Qwen and Gemma rows replay internally against packed KVarN cache with near-zero NMSE. That only proves KVarN is self-consistent for sampled rows; it does not prove KVarN matches f16.
+- The cleanup regression must be resolved before trusting Gemma long-context speed or quality numbers.
+
+Do not push yet:
+
+- Local uncommitted corrective patch attempts from `KVARN_ROUND32_CORRECTIVE_PATCHES_HANDOFF.md`:
+  - RTN nearest-even plus `1e-10` scale clamp.
+  - pending multi-record seal guard.
+- These local changes built and passed focused tests, and Qwen ctx512 logits stayed NMSE 0, but they did not fix Qwen ctx4096 and did not recover Gemma:
+  - Qwen3.6 ctx4096 k4v2: `+11.57%`
+  - Qwen3.6 ctx4096 k8v8: `+11.85%`
+  - Gemma true KVarN+ISWA ctx4096 k4v2: `+2374.62%`
+  - Gemma true KVarN+ISWA ctx4096 k8v8: `+1191.52%`
+
+Recommended next action:
+
+1. Revert or surgically bisect `94dc11c40` before any further Gemma optimization.
+2. If reverting wholesale is too broad, split the cleanup into small chunks and require this gate after each chunk:
+   - Gemma true KVarN+ISWA ctx4096/chunks2, paper-frame, expected layers `5-47:6`, `kvarn_k4v2_g128`.
+3. Only after Gemma returns to the bounded Round 30 level should the team decide whether to keep the RTN/guard corrective changes.
