@@ -30,6 +30,18 @@ static void require(bool cond, const char * msg) {
     }
 }
 
+static void set_env_var(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    if (value[0] == '\0') {
+        unsetenv(name);
+    } else {
+        setenv(name, value, 1);
+    }
+#endif
+}
+
 static llama_batch make_embedding_batch(
         std::vector<float> & embd,
         std::vector<llama_pos> & pos,
@@ -136,17 +148,47 @@ static void test_tail_safe_ubatch_limit_pp512() {
 
     balloc.split_reset();
     const uint32_t chunk0 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
-    require(chunk0 == 384, "pp512 first chunk is 384 tokens");
+    require(chunk0 == 512, "pp512 direct-prefill first chunk is 512 tokens");
 
     auto ubatch0 = balloc.split_simple(chunk0);
-    require(ubatch0.n_tokens == 384, "pp512 first split consumes 384 tokens");
+    require(ubatch0.n_tokens == 512, "pp512 direct-prefill split consumes 512 tokens");
+    require(balloc.get_n_used() == 512, "pp512 direct-prefill batch fully consumed");
+}
+
+static void test_tail_safe_ubatch_limit_pp512_without_direct_prefill() {
+    constexpr uint32_t sink = 128;
+    constexpr uint32_t tail = 128;
+    constexpr uint32_t default_limit = 512;
+
+    std::vector<float> embd;
+    std::vector<llama_pos> pos;
+    std::vector<int32_t> n_seq_id;
+    std::vector<llama_seq_id *> seq_id;
+    std::vector<llama_seq_id> seq_id_data;
+    std::vector<int8_t> logits;
+
+    llama_batch batch = make_contiguous_single_seq_batch(
+            embd, pos, n_seq_id, seq_id, seq_id_data, logits, 512, 0);
+
+    llama_batch_allocr balloc(/*n_pos_per_embd =*/ 1);
+    require(balloc.init(batch, fake_vocab(), nullptr, /*n_embd =*/ 1, /*n_seq_max =*/ 1, /*output_all =*/ false),
+            "tail-safe pp512 no-direct batch init");
+
+    set_env_var("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN", "1");
+    balloc.split_reset();
+    const uint32_t chunk0 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
+    set_env_var("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN", "");
+    require(chunk0 == 384, "pp512 no-direct first chunk is 384 tokens");
+
+    auto ubatch0 = balloc.split_simple(chunk0);
+    require(ubatch0.n_tokens == 384, "pp512 no-direct first split consumes 384 tokens");
 
     const uint32_t chunk1 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
-    require(chunk1 == 128, "pp512 second chunk is 128 tokens");
+    require(chunk1 == 128, "pp512 no-direct second chunk is 128 tokens");
 
     auto ubatch1 = balloc.split_simple(chunk1);
-    require(ubatch1.n_tokens == 128, "pp512 second split consumes 128 tokens");
-    require(balloc.get_n_used() == 512, "pp512 batch fully consumed");
+    require(ubatch1.n_tokens == 128, "pp512 no-direct second split consumes 128 tokens");
+    require(balloc.get_n_used() == 512, "pp512 no-direct batch fully consumed");
 }
 
 static void test_tail_safe_ubatch_limit_fallback() {
@@ -223,6 +265,7 @@ static void test_split_equal_zero_limit() {
 
 int main() {
     test_tail_safe_ubatch_limit_pp512();
+    test_tail_safe_ubatch_limit_pp512_without_direct_prefill();
     test_tail_safe_ubatch_limit_fallback();
     test_tail_safe_ubatch_limit_negative_pos();
     test_split_equal_zero_limit();

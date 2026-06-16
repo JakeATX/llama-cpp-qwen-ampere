@@ -18,6 +18,7 @@ param(
     [string] $Tier2ExpectedKvarnLayers = "",
     [string[]] $QwenExtraArgs = @("-ncmoe", "34"),
     [int] $Tier2MinKvarnBodyRecords = 1,
+    [int] $Tier2MinActiveKvarnBodyRecords = 0,
     [switch] $AllowDiagnosticEnv
 )
 
@@ -49,6 +50,9 @@ if ($RunTier2.IsPresent -and -not (Test-Path -LiteralPath $Tier2Model)) {
 }
 if ($Tier2MinKvarnBodyRecords -lt 0) {
     throw "Tier2MinKvarnBodyRecords must be non-negative"
+}
+if ($Tier2MinActiveKvarnBodyRecords -lt 0) {
+    throw "Tier2MinActiveKvarnBodyRecords must be non-negative"
 }
 if ($Tier2MinKvarnLayerLogs -lt -1) {
     throw "Tier2MinKvarnLayerLogs must be -1 for auto or non-negative"
@@ -198,6 +202,7 @@ $manifest = @(
     "tier2_expected_kvarn_layers=$tier2EffectiveExpectedLayers",
     "tier2_min_kvarn_layer_logs=$tier2EffectiveMinLayerLogs",
     "tier2_min_kvarn_body_records=$Tier2MinKvarnBodyRecords",
+    "tier2_min_active_kvarn_body_records=$Tier2MinActiveKvarnBodyRecords",
     "allow_diagnostic_env=$($AllowDiagnosticEnv.IsPresent)",
     "qwen_extra_args=$($qwenEffectiveExtraArgs -join ' ')",
     "qwen_expected_kvarn_layers=3-39:4",
@@ -207,14 +212,23 @@ $manifest = @(
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
 
 if (-not $SkipBuild.IsPresent) {
-    Invoke-Logged "build llama-bench llama-results" {
-        cmake --build $BuildDir --config Release --target llama-bench llama-results -j 8
+    Invoke-Logged "build production and KVarN test targets" {
+        cmake --build $BuildDir --config Release --target `
+            llama-bench `
+            llama-results `
+            test-batch-split `
+            test-kvarn-kv `
+            test-kvarn-cuda-scratch-ref `
+            test-kvarn-cuda-mixed-tail `
+            test-kvarn-server-load-failure `
+            test-arg-parser `
+            -j 8
     }
 }
 
 if (-not $SkipTests.IsPresent) {
     Invoke-Logged "ctest kvarn" {
-        ctest --test-dir $BuildDir -C Release -R "test-kvarn-kv|test-kvarn-cuda|test-batch-split" --output-on-failure
+        ctest --test-dir $BuildDir -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure
     }
     Invoke-Logged "kv memory estimate self-test" {
         python scripts/kvarn/kv_memory_estimate.py --self-test
@@ -285,23 +299,30 @@ if ($RunGemmaExperimental.IsPresent) {
 
 if ($RunTier2.IsPresent) {
     Invoke-Logged "tier2 logits" {
-        & $logitsScript `
-            -Model $Tier2Model `
-            -BuildDir $BuildDir `
-            -Context 512 `
-            -Batch 512 `
-            -Repeat 16 `
-            -KvarnIters 4 `
-            -CheckPackedRepeat `
-            -CheckPackedSplit `
-            -ScratchMaxNmse 1e-5 `
-            -SplitMaxNmse 1e-5 `
-            -RepeatMaxNmse 1e-12 `
-            -FlashAttn off `
-            -MinKvarnLayerLogs $tier2EffectiveMinLayerLogs `
-            -MinKvarnBodyRecords $Tier2MinKvarnBodyRecords `
-            -ExpectedKvarnLayers $tier2EffectiveExpectedLayers `
-            -ExtraArgs @($tier2EffectiveExtraArgs)
+        $tier2LogitsArgs = @(
+            "-Model", $Tier2Model,
+            "-BuildDir", $BuildDir,
+            "-Context", "512",
+            "-Batch", "512",
+            "-Repeat", "16",
+            "-KvarnIters", "4",
+            "-CheckPackedRepeat",
+            "-CheckPackedSplit",
+            "-ScratchMaxNmse", "1e-5",
+            "-SplitMaxNmse", "1e-5",
+            "-RepeatMaxNmse", "1e-12",
+            "-FlashAttn", "off",
+            "-MinKvarnLayerLogs", [string] $tier2EffectiveMinLayerLogs,
+            "-MinKvarnBodyRecords", [string] $Tier2MinKvarnBodyRecords,
+            "-MinActiveKvarnBodyRecords", [string] $Tier2MinActiveKvarnBodyRecords,
+            "-ExpectedKvarnLayers", $tier2EffectiveExpectedLayers
+        )
+        if ($Tier2MinActiveKvarnBodyRecords -gt 0) {
+            $tier2LogitsArgs += "-TraceAttn"
+        }
+        $tier2LogitsArgs += "-ExtraArgs"
+        $tier2LogitsArgs += @($tier2EffectiveExtraArgs)
+        & $logitsScript @tier2LogitsArgs
     }
 }
 

@@ -321,7 +321,12 @@ static void test_runtime_metadata() {
     require(view.body_v->ne[0] == (int64_t) view.layout_v.v_body_bytes, "KVarN layer view body V shape");
     require(view.scales_k->ne[0] == (int64_t) view.layout_k.k_scale_floats, "KVarN layer view scale K shape");
     require(view.scales_v->ne[0] == (int64_t) view.layout_v.v_scale_floats, "KVarN layer view scale V shape");
-    require(cache.body_store_scratch_floats(0) == 128*128 + 2*128, "KVarN body store scratch floats");
+    {
+        const size_t tile = size_t(128)*128;
+        const size_t per_pipeline = tile + 2*128 + 128 + 128 + 1;
+        const size_t expected = 2*tile + per_pipeline;
+        require(cache.body_store_scratch_floats(0) == expected, "128-dim multi-head KVarN body store scratch floats");
+    }
     size_t breakdown_bytes = 0;
     for (const auto & entry : cache.memory_breakdown()) {
         breakdown_bytes += entry.second;
@@ -367,7 +372,7 @@ static void test_runtime_metadata() {
     require(view256.scales_v->ne[0] == 512, "256-dim KVarN layer view scale V shape");
     {
         const size_t tile = size_t(256)*128;
-        const size_t per_pipeline = tile + 2*256;
+        const size_t per_pipeline = tile + 2*256 + 256 + 128 + 1;
         const size_t expected = 2*tile + 2*per_pipeline;
         require(cache256.body_store_scratch_floats(0) == expected, "256-dim KVarN body store scratch floats");
     }
@@ -383,7 +388,7 @@ static void test_runtime_metadata() {
     require(view512.scales_v->ne[0] == 768, "512-dim KVarN layer view scale V shape");
   {
         const size_t tile = size_t(512)*128;
-        const size_t per_pipeline = tile + 2*512;
+        const size_t per_pipeline = tile + 2*512 + 512 + 128 + 1;
         const size_t expected = 2*tile + 2*per_pipeline;
         require(cache512.body_store_scratch_floats(0) == expected, "512-dim KVarN body store scratch floats");
     }
@@ -401,7 +406,7 @@ static void test_runtime_metadata() {
     require(view_reuse1.body_k == view_reuse0.body_k, "KVarN reuse layer shares body K storage");
   {
         const size_t tile = size_t(512)*128;
-        const size_t per_pipeline = tile + 2*512;
+        const size_t per_pipeline = tile + 2*512 + 512 + 128 + 1;
         const size_t expected = 2*tile + 2*per_pipeline;
         require(cache_reuse.body_store_scratch_floats(1) == expected, "KVarN reuse body scratch uses logical layer head dim");
     }
@@ -748,7 +753,13 @@ static void test_runtime_body_record_graph_api() {
     require(view.layout_v.v_body_bytes == 8, "KVarN V body record bytes");
     require(view.layout_k.k_scale_floats == 20, "KVarN K scale record floats");
     require(view.layout_v.v_scale_floats == 16, "KVarN V scale record floats");
-    require(cache.body_store_scratch_floats(0) == 48, "KVarN small body store scratch floats");
+    {
+        const size_t tile = size_t(view.head_dim_k)*params.group_size;
+        const size_t per_pipeline = tile + 2*std::max<uint32_t>(view.head_dim_k, params.group_size) +
+            view.head_dim_k + params.group_size + 1;
+        const size_t expected = 2*tile + per_pipeline;
+        require(cache.body_store_scratch_floats(0) == expected, "KVarN small multi-head body store scratch floats");
+    }
 
     ggml_init_params init_params = {
         /*.mem_size   =*/ 64*1024,
@@ -793,10 +804,16 @@ static void test_runtime_body_record_graph_api() {
     ggml_tensor * k_store = cache.store_k_body_record(ctx.get(), k_tile, scratch, 0, ih, record);
     ggml_tensor * v_store = cache.store_v_body_record(ctx.get(), v_tile, scratch, 0, ih, record);
     ggml_tensor * kv_store = cache.store_kv_body_record(ctx.get(), k_tile, v_tile, scratch, 0, ih, record);
+    ggml_tensor * k_all_heads = ggml_new_tensor_3d(
+            ctx.get(), GGML_TYPE_F32, view.head_dim_k, view.n_head_kv, params.group_size);
+    ggml_tensor * v_all_heads = ggml_new_tensor_3d(
+            ctx.get(), GGML_TYPE_F32, view.head_dim_v, view.n_head_kv, params.group_size);
+    ggml_tensor * kv_all_heads = cache.store_kv_body_all_heads(ctx.get(), k_all_heads, v_all_heads, scratch, 0, record);
 
     require(k_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN K body record store op");
     require(v_store->op == GGML_OP_KVARN_STORE_BODY, "KVarN V body record store op");
     require(kv_store->op == GGML_OP_KVARN_STORE_KV_BODY, "KVarN fused KV body record store op");
+    require(kv_all_heads->op == GGML_OP_KVARN_STORE_KV_BODY, "KVarN fused KV all-head body record store op");
     require(k_store->src[0] == k_tile && k_store->src[1]->view_src == view.scales_k &&
             k_store->src[2] == scratch && k_store->src[3]->view_src == view.body_k,
             "KVarN K body record store sources");
@@ -842,6 +859,16 @@ static void test_runtime_body_record_graph_api() {
     require(kv_from_pending->src[0]->type == GGML_TYPE_F32 && kv_from_pending->src[0]->ne[0] == (int64_t) params.group_size &&
             kv_from_pending->src[1]->type == GGML_TYPE_F32 && kv_from_pending->src[1]->ne[0] == (int64_t) view.head_dim_v,
             "KVarN pending fused KV body tile shapes");
+
+    bool rejected_multi_record_pending = false;
+    try {
+        std::vector<uint32_t> records = { 0, 1 };
+        (void) cache.store_kv_body_records_from_pending(ctx.get(), scratch, 0, records);
+    } catch (const std::invalid_argument &) {
+        rejected_multi_record_pending = true;
+    }
+    require(rejected_multi_record_pending,
+            "KVarN pending fused KV body store rejects unsafe multi-record batches");
 }
 
 static void test_kvarn_store_body_ggml_ops() {

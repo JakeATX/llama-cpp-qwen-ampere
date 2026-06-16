@@ -993,6 +993,35 @@ bool llm_graph_input_attn_kvarn::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_attn_kvarn_filter::set_input(const llama_ubatch * ubatch) {
+    inp_normal->set_input(ubatch);
+    inp_kvarn->set_input(ubatch);
+}
+
+bool llm_graph_input_attn_kvarn_filter::can_reuse(const llm_graph_params & params) {
+    GGML_UNUSED(params);
+    // Diagnostic layer-filter graphs combine two attention memories. Rebuilding
+    // prevents stale mixed KVarN topology or normal-KV masks from being reused
+    // across layer-bisection cells.
+    return false;
+}
+
+llm_graph_input_attn_kv * llm_graph_input_attn_kvarn_filter::input_for_layer(int32_t il) const {
+    const auto * kvarn = dynamic_cast<const llm_graph_input_attn_kvarn *>(inp_kvarn.get());
+    GGML_ASSERT(kvarn != nullptr);
+
+    if (kvarn->mctx_kvarn->has_layer(il)) {
+        return inp_kvarn.get();
+    }
+
+    GGML_ASSERT(inp_normal->mctx != nullptr);
+    if (!inp_normal->mctx->has_layer(il)) {
+        throw std::runtime_error("KVarN layer-filter graph has neither KVarN nor normal KV storage for layer");
+    }
+
+    return inp_normal.get();
+}
+
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
@@ -1048,7 +1077,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         base_ctx->set_input_body_plan(base_body_plan, ubatch);
         base_ctx->set_input_body_offsets(base_body_offsets, ubatch);
         base_ctx->set_input_tail_evict_idxs(base_tail_evict_idxs, ubatch);
-        base_ctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        base_ctx->set_input_kq_mask(base_kvarn_kq_mask, ubatch, cparams.causal_attn);
         if (base_kvarn_hadamard != nullptr && base_kvarn_hadamard->buffer != nullptr && !base_kvarn_hadamard_filled) {
             ggml_backend_tensor_set(
                     base_kvarn_hadamard,
@@ -1087,6 +1116,21 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
         }
         if (self_v_rot_swa) {
             swa_ctx->set_input_v_rot(self_v_rot_swa);
+        }
+        if (const auto * full_ctx = mctx_kvarn_iswa->get_full_normal()) {
+            if (self_k_idxs && self_k_idxs->buffer) {
+                full_ctx->set_input_k_idxs(self_k_idxs, ubatch);
+                full_ctx->set_input_v_idxs(self_v_idxs, ubatch);
+            }
+            if (self_kq_mask && self_kq_mask->buffer) {
+                full_ctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+            }
+            if (self_k_rot) {
+                full_ctx->set_input_k_rot(self_k_rot);
+            }
+            if (self_v_rot) {
+                full_ctx->set_input_v_rot(self_v_rot);
+            }
         }
         return;
     }
@@ -1155,8 +1199,8 @@ void llm_graph_input_attn_kv_iswa::rewire_kvarn_mixed_attn_inputs() {
         if (i < base_mixed_attn_scores.size() && base_mixed_attn_scores[i] != nullptr) {
             node->src[9] = base_mixed_attn_scores[i];
         }
-        if (self_kq_mask_cnv != nullptr) {
-            node->src[10] = self_kq_mask_cnv;
+        if (base_kvarn_kq_mask_cnv != nullptr) {
+            node->src[10] = base_kvarn_kq_mask_cnv;
         }
     }
 }
@@ -1185,6 +1229,13 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         this->mctx_kvarn_iswa = mctx;
         this->mctx = nullptr;
         const bool reuse_trace = kvarn_graph_reuse_trace_enabled();
+        if (reuse_trace) {
+            const char * reason = mctx->get_full_normal() != nullptr ?
+                "diagnostic KVarN+ISWA normal fallback disables graph reuse" :
+                "KVarN+ISWA graph reuse disabled pending independent correctness proof";
+            kvarn_graph_reuse_trace_miss(__func__, reason);
+        }
+        return false;
 
         const auto * base_ctx = mctx->get_base();
         const kvarn_active_window window = kvarn_graph_active_window(params.cparams.kvarn, params.ubatch, base_ctx->get_size());
@@ -1241,11 +1292,11 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
         check(base_tail_evict_idxs->ne[0] == n_tail_evict,
                 "base_tail_evict_idxs.ne[0] != n_tail_evict");
         check(can_reuse_kq_mask(
-                self_kq_mask,
+                base_kvarn_kq_mask,
                 kvarn_graph_reuse_mask_n_kv(window, base_ctx->get_size(), params.ubatch),
                 params.ubatch,
                 params.cparams),
-                "base self_kq_mask shape mismatch");
+                "base KVarN kq mask shape mismatch");
         check(!base_mixed_attn_nodes.empty(),
                 "base_mixed_attn_nodes empty");
 
@@ -2992,14 +3043,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        //cb(cur, "kqv_wo", il);
+        cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
+        cb(cur, "kqv_wo_b", il);
     }
 
     return cur;
@@ -3048,6 +3097,19 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kvarn_impl(
     return inp;
 }
 
+static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kvarn_filter_impl(
+    ggml_context * ctx0,
+    const llama_ubatch & ubatch,
+    const llama_hparams & hparams,
+    const llama_cparams & cparams,
+    const llama_kv_cache_context * mctx_normal,
+    const llama_kv_cache_kvarn_context * mctx_kvarn) {
+    auto inp_normal = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_normal);
+    auto inp_kvarn  = build_attn_inp_kvarn_impl(ctx0, ubatch, hparams, cparams, mctx_kvarn);
+    return std::make_unique<llm_graph_input_attn_kvarn_filter>(
+            hparams, cparams, std::move(inp_normal), std::move(inp_kvarn));
+}
+
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     if (const auto * mctx_kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx)) {
         auto inp = build_attn_inp_kvarn_impl(ctx0, ubatch, hparams, cparams, mctx_kvarn);
@@ -3075,6 +3137,11 @@ ggml_tensor * llm_graph_context::build_attn(
             float     kq_scale,
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
+
+    if (auto * inp_filter = dynamic_cast<llm_graph_input_attn_kvarn_filter *>(inp)) {
+        return build_attn(inp_filter->input_for_layer(il),
+                wo, wo_b, wo_s, q_cur, k_cur, v_cur, kq_b, sinks, v_mla, kq_scale, il);
+    }
 
     if (auto * inp_kvarn = dynamic_cast<llm_graph_input_attn_kvarn *>(inp)) {
         ggml_build_forward_expand(gf, q_cur);
@@ -3284,10 +3351,12 @@ ggml_tensor * llm_graph_context::build_attn(
                 } else {
                     cur = build_lora_mm(wo, cur, wo_s);
                 }
+                cb(cur, "kvarn_prefill_direct_kqv_wo", il);
             }
 
             if (wo_b) {
                 cur = ggml_add(ctx0, cur, wo_b);
+                cb(cur, "kvarn_prefill_direct_kqv_wo_b", il);
             }
 
             return cur;
@@ -3350,8 +3419,10 @@ ggml_tensor * llm_graph_context::build_attn(
         cb(cur, "kvarn_kqv_out", il);
         if (kvarn_paper_frame) {
             cur = kvarn_graph_apply_hadamard(ctx0, kvarn_H, cur);
+            cb(cur, "kvarn_kqv_out_unrot", il);
         }
         cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+        cb(cur, "kvarn_kqv_out_2d", il);
 
         if (wo) {
             if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
@@ -3363,10 +3434,12 @@ ggml_tensor * llm_graph_context::build_attn(
             } else {
                 cur = build_lora_mm(wo, cur, wo_s);
             }
+            cb(cur, "kvarn_kqv_wo", il);
         }
 
         if (wo_b) {
             cur = ggml_add(ctx0, cur, wo_b);
+            cb(cur, "kvarn_kqv_wo_b", il);
         }
 
         return cur;
@@ -3425,10 +3498,12 @@ ggml_tensor * llm_graph_context::build_attn(
         } else {
             cur = build_lora_mm(wo, cur, wo_s);
         }
+        cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
+        cb(cur, "kqv_wo_b", il);
     }
 
     return cur;
@@ -3647,7 +3722,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, v_cur);
     }
 
-    if (!is_swa && inp->mctx_kvarn_iswa != nullptr) {
+    if (!is_swa && inp->mctx_kvarn_iswa != nullptr && inp->mctx_kvarn_iswa->get_base()->has_layer(il)) {
         const auto * mctx_kvarn = inp->mctx_kvarn_iswa->get_base();
 
         if (inp->self_k_rot || inp->self_v_rot || kq_b || sinks) {
@@ -3814,7 +3889,7 @@ ggml_tensor * llm_graph_context::build_attn(
             }
         }
 
-        const ggml_tensor * kq_mask = inp->get_kq_mask();
+        const ggml_tensor * kq_mask = inp->get_kq_mask_kvarn();
         const bool prefill_direct_attn =
             stores_kv &&
             !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
@@ -3836,15 +3911,17 @@ ggml_tensor * llm_graph_context::build_attn(
                     kq_mask ? kq_mask->ne[1] : int64_t(-1));
         }
         if (prefill_direct_attn) {
-            ggml_tensor * cur = build_attn_mha(q_cur, k_cur, v_cur, kq_b, inp->get_kq_mask(), sinks, v_mla, kq_scale, il);
+            ggml_tensor * cur = build_attn_mha(q_cur, k_cur, v_cur, kq_b, inp->get_kq_mask_kvarn(), sinks, v_mla, kq_scale, il);
             cb(cur, "kvarn_iswa_prefill_direct_kqv_out", il);
             cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
 
             if (wo) {
                 cur = build_lora_mm(wo, cur, wo_s);
+                cb(cur, "kvarn_iswa_prefill_direct_kqv_wo", il);
             }
             if (wo_b) {
                 cur = ggml_add(ctx0, cur, wo_b);
+                cb(cur, "kvarn_iswa_prefill_direct_kqv_wo_b", il);
             }
 
             return cur;
@@ -3902,7 +3979,7 @@ ggml_tensor * llm_graph_context::build_attn(
         }
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
                 ctx0, q_in, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
-                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask(),
+                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask_kvarn(),
                 op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                 int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
                 int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);
@@ -3913,14 +3990,18 @@ ggml_tensor * llm_graph_context::build_attn(
         cb(cur, "kvarn_iswa_kqv_out", il);
         if (kvarn_paper_frame) {
             cur = kvarn_graph_apply_hadamard(ctx0, kvarn_H, cur);
+            cb(cur, "kvarn_iswa_kqv_out_unrot", il);
         }
         cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+        cb(cur, "kvarn_iswa_kqv_out_2d", il);
 
         if (wo) {
             cur = build_lora_mm(wo, cur, wo_s);
+            cb(cur, "kvarn_iswa_kqv_wo", il);
         }
         if (wo_b) {
             cur = ggml_add(ctx0, cur, wo_b);
+            cb(cur, "kvarn_iswa_kqv_wo_b", il);
         }
 
         return cur;
@@ -3929,9 +4010,13 @@ ggml_tensor * llm_graph_context::build_attn(
     const llama_kv_cache_context * mctx_cur = nullptr;
     if (inp->mctx_kvarn_iswa != nullptr) {
         if (!is_swa) {
-            throw std::runtime_error("KVarN+ISWA graph backend reached normal KV path for a non-SWA layer");
+            mctx_cur = inp->mctx_kvarn_iswa->get_full_normal();
+            if (mctx_cur == nullptr || !mctx_cur->has_layer(il)) {
+                throw std::runtime_error("KVarN+ISWA graph backend reached normal KV path for a non-SWA layer without a diagnostic normal fallback");
+            }
+        } else {
+            mctx_cur = inp->mctx_kvarn_iswa->get_swa();
         }
-        mctx_cur = inp->mctx_kvarn_iswa->get_swa();
     } else {
         const auto * mctx_iswa = inp->mctx;
         mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
@@ -3967,14 +4052,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        //cb(cur, "kqv_wo", il);
+        cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
+        cb(cur, "kqv_wo_b", il);
     }
 
     return cur;
@@ -4026,14 +4109,12 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);
-    }
-
-    if (wo_b) {
-        //cb(cur, "kqv_wo", il);
+        cb(cur, "kqv_wo", il);
     }
 
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
+        cb(cur, "kqv_wo_b", il);
     }
 
     return cur;
@@ -4081,8 +4162,20 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
         inp->base_tail_evict_idxs = base_ctx->build_input_tail_evict_idxs(ctx0, ubatch);
         const kvarn_active_window mask_window = kvarn_graph_active_window(cparams.kvarn, ubatch, base_ctx->get_size());
         const uint32_t mask_n_kv = kvarn_graph_mask_n_kv(mask_window, base_ctx->get_size(), ubatch);
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mask_n_kv, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        inp->base_kvarn_kq_mask = build_attn_inp_kq_mask(ctx0, mask_n_kv, ubatch, cparams);
+        inp->base_kvarn_kq_mask_cnv = inp->base_kvarn_kq_mask;
+
+        if (const auto * full_ctx = mctx_kvarn_iswa->get_full_normal()) {
+            inp->self_k_idxs = full_ctx->build_input_k_idxs(ctx0, ubatch);
+            inp->self_v_idxs = full_ctx->build_input_v_idxs(ctx0, ubatch);
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, full_ctx, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+            inp->self_k_rot = full_ctx->build_input_k_rot(ctx0);
+            inp->self_v_rot = full_ctx->build_input_v_rot(ctx0);
+        } else {
+            inp->self_kq_mask = inp->base_kvarn_kq_mask;
+            inp->self_kq_mask_cnv = inp->base_kvarn_kq_mask_cnv;
+        }
 
         const auto * swa_ctx = mctx_kvarn_iswa->get_swa();
         inp->self_k_idxs_swa = swa_ctx->build_input_k_idxs(ctx0, ubatch);
@@ -4252,7 +4345,14 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
 llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     if (const auto * mctx_kvarn = dynamic_cast<const llama_memory_hybrid_kvarn_context *>(mctx)) {
         auto inp_rs   = build_rs_inp_impl(ctx0, ubatch, mctx_kvarn->get_recr());
-        auto inp_attn = build_attn_inp_kvarn_impl(ctx0, ubatch, hparams, cparams, mctx_kvarn->get_attn());
+        std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
+        if (mctx_kvarn->has_attn_normal()) {
+            inp_attn = build_attn_inp_kvarn_filter_impl(
+                    ctx0, ubatch, hparams, cparams,
+                    mctx_kvarn->get_attn_normal(), mctx_kvarn->get_attn());
+        } else {
+            inp_attn = build_attn_inp_kvarn_impl(ctx0, ubatch, hparams, cparams, mctx_kvarn->get_attn());
+        }
 
         auto inp = std::make_unique<llm_graph_input_mem_hybrid_kvarn>(
                 cparams, std::move(inp_attn), std::move(inp_rs), mctx_kvarn);

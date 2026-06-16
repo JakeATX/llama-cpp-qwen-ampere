@@ -11,6 +11,7 @@ param(
     [int] $Repetitions = 1,
     [int] $MinKvarnLayerLogs = 1,
     [int] $MinKvarnBodyRecords = 0,
+    [int] $MinActiveKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
     [ValidateSet("csv", "json", "jsonl", "md", "sql")] [string] $OutputFormat = "md",
     [string] $OutputDir = "",
@@ -44,6 +45,9 @@ if ($MinKvarnLayerLogs -lt 1) {
 }
 if ($MinKvarnBodyRecords -lt 0) {
     throw "MinKvarnBodyRecords must be non-negative"
+}
+if ($MinActiveKvarnBodyRecords -lt 0) {
+    throw "MinActiveKvarnBodyRecords must be non-negative"
 }
 if ($TraceLimit -le 0) {
     throw "TraceLimit must be positive"
@@ -201,7 +205,22 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
     if ($missing.Count -gt 0) {
         throw "$label missing expected KVarN layer ids: $($missing -join ',')"
     }
-    Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
+
+    $expectedSet = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($id in $expected) {
+        [void] $expectedSet.Add($id)
+    }
+    $extra = @()
+    foreach ($id in $actual) {
+        if (-not $expectedSet.Contains($id)) {
+            $extra += $id
+        }
+    }
+    if ($extra.Count -gt 0) {
+        throw "$label emitted unexpected extra KVarN layer ids: $($extra -join ',')"
+    }
+
+    Write-Host ("KVarN exact layer check: PASS, layers = {0}" -f ($expected -join ","))
 }
 
 function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
@@ -221,6 +240,37 @@ function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $la
     }
 
     Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
+}
+
+function Assert-MinActiveKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA mixed-attn trace:.*?\bn_records=([0-9]+)",
+            [System.Text.RegularExpressions.RegexOptions]::Singleline)) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA mixed-attn inner trace:.*?\brecords=([0-9]+)",
+            [System.Text.RegularExpressions.RegexOptions]::Singleline)) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+
+    if ($maxRecords -lt 0) {
+        throw "$label did not emit KVarN mixed-attn trace records evidence; rerun with -TraceAttn when using -MinActiveKvarnBodyRecords"
+    }
+    if ($maxRecords -lt $minimum) {
+        throw "$label observed maximum active KVarN body records $maxRecords, expected at least $minimum"
+    }
+
+    Write-Host ("KVarN active body-record check: PASS, max active body records = {0}" -f $maxRecords)
 }
 
 function Get-BenchThroughputByKvq([string] $text) {
@@ -387,6 +437,7 @@ $manifest = @(
     "repetitions=$Repetitions",
     "min_kvarn_layer_logs=$MinKvarnLayerLogs",
     "min_kvarn_body_records=$MinKvarnBodyRecords",
+    "min_active_kvarn_body_records=$MinActiveKvarnBodyRecords",
     "expected_kvarn_layers=$ExpectedKvarnLayers",
     "output_format=$OutputFormat",
     "warmup=$($Warmup.IsPresent)",
@@ -488,6 +539,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         }
         Assert-ExpectedKvarnLayers $text $expectedKvarnLayerIds "llama-bench case '$($case.Name)'"
         Assert-MinKvarnBodyRecords $text $MinKvarnBodyRecords "llama-bench case '$($case.Name)'"
+        Assert-MinActiveKvarnBodyRecords $text $MinActiveKvarnBodyRecords "llama-bench case '$($case.Name)'"
         Write-Host ("KVarN bench log check: PASS, KVarN layer lines = {0}" -f $kvarnLayerLogs)
     } elseif ($kvqIncludesKvarn -and -not $hasKvarnEvidence) {
         Write-Warning ("llama-bench case '{0}' did not initialize KVarN tensors; treating the KVarN row as production fallback because AllowKvarnFallback was set" -f $case.Name)

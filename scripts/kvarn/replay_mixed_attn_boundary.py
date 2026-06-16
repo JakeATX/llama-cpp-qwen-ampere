@@ -100,9 +100,16 @@ def resolve_dump(path: Path) -> Path:
 
 def read_mask(root: Path, meta: dict, n_tokens: int) -> np.ndarray:
     mask_path = root / "mask.bin"
-    if not mask_path.exists() or int(meta.get("mask_type", 0)) == 0:
+    mask_type = int(meta.get("mask_type", 0))
+    if mask_type == 3:
+        n_queries = int(meta.get("n_queries", 1))
+        selected_iq = int(meta.get("selected_iq", max(0, n_queries - 1)))
+        limit = (n_tokens - n_queries + selected_iq) if n_tokens >= n_queries else selected_iq
+        mask = np.full(n_tokens, -np.inf, dtype=np.float32)
+        mask[:min(n_tokens, limit + 1)] = 0.0
+        return mask
+    if not mask_path.exists() or mask_type == 0:
         return np.zeros(n_tokens, dtype=np.float32)
-    mask_type = int(meta["mask_type"])
     if mask_type == 1:
         return np.fromfile(mask_path, dtype=np.float32, count=n_tokens).astype(np.float32)
     if mask_type == 2:
@@ -112,9 +119,15 @@ def read_mask(root: Path, meta: dict, n_tokens: int) -> np.ndarray:
 
 def read_full_mask(root: Path, meta: dict, n_queries: int, n_tokens: int) -> np.ndarray | None:
     mask_path = root / "full_mask.bin"
-    if not mask_path.exists() or int(meta.get("mask_type", 0)) == 0:
+    mask_type = int(meta.get("mask_type", 0))
+    if mask_type == 3:
+        mask = np.full((n_queries, n_tokens), -np.inf, dtype=np.float32)
+        q_base = n_tokens - n_queries if n_tokens >= n_queries else 0
+        for iq in range(n_queries):
+            mask[iq, :min(n_tokens, q_base + iq + 1)] = 0.0
+        return mask
+    if not mask_path.exists() or mask_type == 0:
         return None
-    mask_type = int(meta["mask_type"])
     if mask_type == 1:
         data = np.fromfile(mask_path, dtype=np.float32, count=n_queries * n_tokens).astype(np.float32)
     elif mask_type == 2:

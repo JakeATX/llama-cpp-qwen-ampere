@@ -1202,6 +1202,10 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+bool llama_kv_cache::has_layer(int32_t il) const {
+    return map_layer_ids.find(il) != map_layer_ids.end();
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -2561,6 +2565,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::has_layer(int32_t il) const {
+    return kv->has_layer(il);
 }
 
 ggml_type llama_kv_cache_context::type_k() const {

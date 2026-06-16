@@ -70,6 +70,8 @@ def body_records(root: Path, layer: int, head: int, record_set: str) -> dict[int
         if int(meta.get("head", -1)) != head:
             continue
         record = int(meta["record"])
+        if int(meta.get("src_layout", -1)) == 1:
+            record += int(meta.get("record0", 0))
         call_index = int(meta.get("call_index", 0))
         grouped.setdefault(record, []).append((call_index, meta_path.parent))
     out: dict[int, Path] = {}
@@ -82,6 +84,13 @@ def body_records(root: Path, layer: int, head: int, record_set: str) -> dict[int
 def read_mask(root: Path, meta: dict, n_tokens: int) -> np.ndarray:
     path = root / "mask.bin"
     mask_type = int(meta.get("mask_type", 0))
+    if mask_type == 3:
+        n_queries = int(meta.get("n_queries", 1))
+        selected_iq = int(meta.get("selected_iq", max(0, n_queries - 1)))
+        limit = (n_tokens - n_queries + selected_iq) if n_tokens >= n_queries else selected_iq
+        mask = np.full(n_tokens, -np.inf, dtype=np.float32)
+        mask[:min(n_tokens, limit + 1)] = 0.0
+        return mask
     if not path.exists() or mask_type == 0:
         return np.zeros(n_tokens, dtype=np.float32)
     if mask_type == 1:
@@ -209,7 +218,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Compare a KVarN boundary dump against raw f16/f32 body-store truth.")
     ap.add_argument("--boundary", required=True, help="Boundary dump dir or parent containing one boundary.json")
     ap.add_argument("--body-records", required=True, help="Body-record dump parent containing body_record.json children")
-    ap.add_argument("--record-set", choices=["earliest", "latest"], default="earliest",
+    ap.add_argument("--record-set", choices=["earliest", "latest"], default="latest",
                     help="Which duplicate body-record dump to use when records were captured more than once")
     ap.add_argument("--max-out-nmse", type=float, default=None)
     ap.add_argument("--write-truth", action="store_true")

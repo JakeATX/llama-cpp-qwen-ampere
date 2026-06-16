@@ -14,7 +14,7 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         uint8_t * v_body,
         float * k_scales,
         float * v_scales,
-        float * scratch, // at least head_dim*group_size + 2*max(head_dim, group_size) floats
+        float * scratch, // at least one store pipeline, or two when head_dim >= 256
         uint32_t head_dim,
         uint32_t group_size,
         uint32_t key_bits,

@@ -1,6 +1,7 @@
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-backend.h"
 #include "log.h"
 #include "llama.h"
 
@@ -13,9 +14,13 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <memory>
 #include <mutex>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -2005,6 +2010,110 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
 }
 
+struct kvarn_tensor_dump_state {
+    std::filesystem::path dir;
+    std::regex           filter;
+    std::vector<uint8_t> data;
+    int                  limit = 16;
+    int                  count = 0;
+};
+
+static std::string kvarn_tensor_dump_sanitize(std::string name) {
+    for (char & c : name) {
+        const bool ok =
+            (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.';
+        if (!ok) {
+            c = '_';
+        }
+    }
+    return name.empty() ? "unnamed" : name;
+}
+
+static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * state = static_cast<kvarn_tensor_dump_state *>(user_data);
+    if (state == nullptr) {
+        return true;
+    }
+    if (state->limit >= 0 && state->count >= state->limit) {
+        return ask ? false : true;
+    }
+
+    const char * name_c = t->name[0] ? t->name : "unnamed";
+    const std::string name(name_c);
+    if (!std::regex_search(name, state->filter)) {
+        return ask ? false : true;
+    }
+    if (ask) {
+        return true;
+    }
+
+    const int index = state->count++;
+    std::ostringstream stem;
+    stem << "tensor_" << std::setw(6) << std::setfill('0') << index
+         << "_" << kvarn_tensor_dump_sanitize(name);
+
+    const auto bin_path  = state->dir / (stem.str() + ".bin");
+    const auto json_path = state->dir / (stem.str() + ".json");
+
+    const size_t n_bytes = ggml_nbytes(t);
+    const bool is_host = t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
+    const void * src = t->data;
+    if (!is_host) {
+        state->data.resize(n_bytes);
+        ggml_backend_tensor_get(t, state->data.data(), 0, n_bytes);
+        src = state->data.data();
+    }
+
+    {
+        std::ofstream out(bin_path, std::ios::binary);
+        out.write(static_cast<const char *>(src), static_cast<std::streamsize>(n_bytes));
+    }
+    {
+        std::ofstream meta(json_path);
+        meta << "{\n";
+        meta << "  \"index\": " << index << ",\n";
+        meta << "  \"name\": \"" << name << "\",\n";
+        meta << "  \"type\": \"" << ggml_type_name(t->type) << "\",\n";
+        meta << "  \"op\": \"" << ggml_op_name(t->op) << "\",\n";
+        meta << "  \"n_bytes\": " << n_bytes << ",\n";
+        meta << "  \"ne\": [" << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "],\n";
+        meta << "  \"nb\": [" << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3] << "],\n";
+        meta << "  \"bin\": \"" << bin_path.filename().string() << "\"\n";
+        meta << "}\n";
+    }
+
+    return true;
+}
+
+static std::unique_ptr<kvarn_tensor_dump_state> kvarn_tensor_dump_try_init(common_params & params) {
+    const char * dir_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_DIR");
+    if (dir_env == nullptr || dir_env[0] == '\0') {
+        return nullptr;
+    }
+
+    auto state = std::make_unique<kvarn_tensor_dump_state>();
+    state->dir = std::filesystem::path(dir_env);
+    std::filesystem::create_directories(state->dir);
+
+    const char * filter_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_FILTER");
+    const std::string filter = (filter_env != nullptr && filter_env[0] != '\0') ? filter_env : "kvarn_.*";
+    state->filter = std::regex(filter, std::regex::optimize);
+
+    const char * limit_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_LIMIT");
+    if (limit_env != nullptr && limit_env[0] != '\0') {
+        state->limit = std::atoi(limit_env);
+    }
+
+    params.cb_eval           = kvarn_tensor_dump_cb_eval;
+    params.cb_eval_user_data = state.get();
+    LOG_INF("KVarN tensor dump enabled: dir=%s filter=%s limit=%d\n",
+            state->dir.string().c_str(), filter.c_str(), state->limit);
+    return state;
+}
+
 // satisfies -Wmissing-declarations
 int llama_perplexity(int argc, char ** argv);
 
@@ -2043,6 +2152,8 @@ int llama_perplexity(int argc, char ** argv) {
                 params.n_ctx, params.n_ctx + params.ppl_stride/2);
         params.n_ctx += params.ppl_stride/2;
     }
+
+    auto kvarn_tensor_dump_state = kvarn_tensor_dump_try_init(params);
 
     llama_backend_init();
     llama_numa_init(params.numa);

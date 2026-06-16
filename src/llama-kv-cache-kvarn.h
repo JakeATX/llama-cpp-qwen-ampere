@@ -189,6 +189,7 @@ public:
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
 
     uint32_t get_size() const;
+    bool has_layer(int32_t il) const;
 
     ggml_tensor * cpy_sink_tail_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_sink_tail_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * idxs, int32_t il) const;
@@ -283,6 +284,7 @@ public:
 
     uint32_t get_size() const;
     uint32_t get_n_layer() const;
+    bool has_layer(int32_t il) const;
     uint32_t get_sink_tokens() const { return params.sink_tokens; }
     uint32_t get_tail_tokens() const { return params.tail_tokens; }
     uint32_t get_group_size() const { return params.group_size; }

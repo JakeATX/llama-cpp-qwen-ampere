@@ -14,6 +14,7 @@ param(
     [switch] $FailBelowMinParityRatio,
     [int] $MinKvarnLayerLogs = 1,
     [int] $MinKvarnBodyRecords = 0,
+    [int] $MinActiveKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
     [string] $OutputDir = "",
     [switch] $TraceAttn,
@@ -41,6 +42,9 @@ if ($MinKvarnLayerLogs -lt 0) {
 }
 if ($MinKvarnBodyRecords -lt 0) {
     throw "MinKvarnBodyRecords must be non-negative"
+}
+if ($MinActiveKvarnBodyRecords -lt 0) {
+    throw "MinActiveKvarnBodyRecords must be non-negative"
 }
 if ($TraceLimit -le 0 -or $TraceStoreLimit -le 0 -or $TraceDequantCacheLimit -le 0) {
     throw "Trace limits must be positive"
@@ -415,7 +419,22 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
     if ($missing.Count -gt 0) {
         throw "$label missing expected KVarN layer ids: $($missing -join ',')"
     }
-    Write-Host ("KVarN expected layer check: PASS, layers = {0}" -f ($expected -join ","))
+
+    $expectedSet = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($id in $expected) {
+        [void] $expectedSet.Add($id)
+    }
+    $extra = @()
+    foreach ($id in $actual) {
+        if (-not $expectedSet.Contains($id)) {
+            $extra += $id
+        }
+    }
+    if ($extra.Count -gt 0) {
+        throw "$label emitted unexpected extra KVarN layer ids: $($extra -join ',')"
+    }
+
+    Write-Host ("KVarN exact layer check: PASS, layers = {0}" -f ($expected -join ","))
 }
 
 function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
@@ -435,6 +454,37 @@ function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $la
     }
 
     Write-Host ("KVarN body-record check: PASS, max body records = {0}" -f $maxRecords)
+}
+
+function Assert-MinActiveKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    $maxRecords = -1
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA mixed-attn trace:.*?\bn_records=([0-9]+)",
+            [System.Text.RegularExpressions.RegexOptions]::Singleline)) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA mixed-attn inner trace:.*?\brecords=([0-9]+)",
+            [System.Text.RegularExpressions.RegexOptions]::Singleline)) {
+        $records = [int] $m.Groups[1].Value
+        if ($records -gt $maxRecords) {
+            $maxRecords = $records
+        }
+    }
+
+    if ($maxRecords -lt 0) {
+        throw "$label did not emit KVarN mixed-attn trace records evidence; rerun with -TraceAttn when using -MinActiveKvarnBodyRecords"
+    }
+    if ($maxRecords -lt $minimum) {
+        throw "$label observed maximum active KVarN body records $maxRecords, expected at least $minimum"
+    }
+
+    Write-Host ("KVarN active body-record check: PASS, max active body records = {0}" -f $maxRecords)
 }
 
 function Invoke-BenchRow {
@@ -540,6 +590,7 @@ $manifest = @(
     "kvarn_rtn_quantile=$rtnQuantileArg",
     "min_kvarn_layer_logs=$MinKvarnLayerLogs",
     "min_kvarn_body_records=$MinKvarnBodyRecords",
+    "min_active_kvarn_body_records=$MinActiveKvarnBodyRecords",
     "expected_kvarn_layers=$ExpectedKvarnLayers",
     "trace_attn=$($TraceAttn.IsPresent)",
     "trace_store=$($TraceStore.IsPresent)",
@@ -607,6 +658,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         }
         Assert-ExpectedKvarnLayers $kvarnRow.Text $expectedKvarnLayerIds "KVarN case '$($case.Name)'"
         Assert-MinKvarnBodyRecords $kvarnRow.Text $MinKvarnBodyRecords "KVarN case '$($case.Name)'"
+        Assert-MinActiveKvarnBodyRecords $kvarnRow.Text $MinActiveKvarnBodyRecords "KVarN case '$($case.Name)'"
     } elseif ($AllowKvarnFallback.IsPresent) {
         Write-Warning ("KVarN case '{0}' emitted no KVarN cache logs; treating as allowed fallback path for parity accounting" -f $case.Name)
     } else {

@@ -240,15 +240,26 @@ llama_context::llama_context(
         if (is_kvarn) {
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_TRACE");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_SERIAL_FUSED");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ATTN_DISABLE_MASK");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DISABLE_INTERNAL_CAUSAL_MASK");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DEBUG_BODY_RECORD_DUMP");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_STORE_TRACE");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DEQUANT_CACHE_TRACE");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_MASK_TRACE");
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_ATTN_TRACE_LIMIT", 64);
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_ATTN_BOUNDARY_DUMP_HEAD_DIM", 0);
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_RECORD", 0);
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_HEAD", 0);
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_RECORD_CALL", 0);
             (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEBUG_BODY_RECORD_LIMIT", 1);
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_STORE_TRACE_LIMIT", 64);
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT", 256);
+            (void) llama_kvarn_parse_env_int("LLAMA_KVARN_MASK_TRACE_LIMIT", 16);
         }
 
         if (graph_reuse_disable) {

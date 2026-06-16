@@ -26,6 +26,7 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
         const layer_filter_cb & filter,
+        const layer_filter_cb & filter_full_normal,
         const  layer_reuse_cb & reuse);
 
     llama_memory_context_ptr init_batch(
@@ -56,6 +57,8 @@ public:
 
     llama_kv_cache_kvarn * get_base() const;
     llama_kv_cache       * get_swa () const;
+    llama_kv_cache       * get_full_normal() const;
+    bool has_full_normal() const;
 
 private:
     const llama_hparams & hparams;
@@ -63,6 +66,7 @@ private:
 
     std::unique_ptr<llama_kv_cache_kvarn> kv_base;
     std::unique_ptr<llama_kv_cache>       kv_swa;
+    std::unique_ptr<llama_kv_cache>       kv_full_normal;
 };
 
 class llama_kv_cache_kvarn_iswa_context : public llama_memory_context_i {
@@ -80,6 +84,7 @@ public:
             llama_kv_cache_kvarn_iswa * kv,
             slot_info_vec_t             sinfos_base,
             slot_info_swa_vec_t         sinfos_swa,
+            slot_info_swa_vec_t         sinfos_full_normal,
             std::vector<llama_ubatch>   ubatches);
 
     bool next() override;
@@ -90,6 +95,7 @@ public:
 
     const llama_kv_cache_kvarn_context * get_base() const;
     const llama_kv_cache_context       * get_swa () const;
+    const llama_kv_cache_context       * get_full_normal() const;
 
 private:
     size_t i_next = 0;
@@ -98,6 +104,7 @@ private:
 
     const llama_memory_context_ptr ctx_base;
     const llama_memory_context_ptr ctx_swa;
+    const llama_memory_context_ptr ctx_full_normal;
 
     const llama_memory_status status;
 };

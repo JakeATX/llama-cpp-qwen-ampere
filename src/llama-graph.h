@@ -385,6 +385,28 @@ public:
     std::vector<uint32_t> baked_seal_records;
 };
 
+class llm_graph_input_attn_kvarn_filter : public llm_graph_input_attn_kv {
+public:
+    llm_graph_input_attn_kvarn_filter(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv> inp_normal,
+            std::unique_ptr<llm_graph_input_attn_kv> inp_kvarn) :
+        llm_graph_input_attn_kv(hparams, cparams, nullptr),
+        inp_normal(std::move(inp_normal)),
+        inp_kvarn(std::move(inp_kvarn)) {
+    }
+    ~llm_graph_input_attn_kvarn_filter() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_attn_kv * input_for_layer(int32_t il) const;
+
+    std::unique_ptr<llm_graph_input_attn_kv> inp_normal;
+    std::unique_ptr<llm_graph_input_attn_kv> inp_kvarn;
+};
+
 // V-less input for the KV cache
 // ref: https://github.com/ggml-org/llama.cpp/pull/19067
 class llm_graph_input_attn_k : public llm_graph_input_i {
@@ -488,6 +510,7 @@ public:
 
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
+    ggml_tensor * get_kq_mask_kvarn() const { return base_kvarn_kq_mask_cnv; }
 
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
@@ -498,6 +521,8 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * base_kvarn_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * base_kvarn_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;

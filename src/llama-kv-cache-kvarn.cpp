@@ -20,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <utility>
 
 static bool is_power_of_2(uint32_t n) {
     return n != 0 && (n & (n - 1)) == 0;
@@ -107,8 +108,14 @@ static float clamp_quantile(float q) {
 }
 
 static bool log_std_sinkhorn_enabled() {
+    if (kvarn_env_flag_enabled("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN")) {
+        return false;
+    }
     const char * env = std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
-    return env != nullptr && std::strcmp(env, "1") == 0;
+    if (env != nullptr) {
+        return env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }
+    return true;
 }
 
 static float log_std_scale_update(float prev, float stdv) {
@@ -131,6 +138,53 @@ static void sinkhorn_variance_normalize(
     constexpr float eps = 1.0e-6f;
 
     if (log_std_sinkhorn_enabled()) {
+        auto imbalance = [&](const std::vector<float> & tile) {
+            float col_min = std::numeric_limits<float>::max();
+            float col_max = 0.0f;
+            for (uint32_t c = 0; c < cols; ++c) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const float v = tile[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (rows > 1) {
+                    var = (ss - (sum*sum)/double(rows))/double(rows - 1);
+                }
+                const float stdv = std::sqrt(float(std::max(0.0, var)));
+                col_min = std::min(col_min, stdv);
+                col_max = std::max(col_max, stdv);
+            }
+
+            float row_min = std::numeric_limits<float>::max();
+            float row_max = 0.0f;
+            for (uint32_t r = 0; r < rows; ++r) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t c = 0; c < cols; ++c) {
+                    const float v = tile[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (cols > 1) {
+                    var = (ss - (sum*sum)/double(cols))/double(cols - 1);
+                }
+                const float stdv = std::sqrt(float(std::max(0.0, var)));
+                row_min = std::min(row_min, stdv);
+                row_max = std::max(row_max, stdv);
+            }
+
+            return col_max/std::max(col_min, 1.0e-8f) + row_max/std::max(row_min, 1.0e-8f);
+        };
+
+        float best_imb = imbalance(data);
+        std::vector<float> best_data = data;
+        std::vector<float> best_row_scale = row_scale;
+        std::vector<float> best_col_scale = col_scale;
+
         for (uint32_t iter = 0; iter < iters; ++iter) {
             for (uint32_t c = 0; c < cols; ++c) {
                 double sum = 0.0;
@@ -173,7 +227,18 @@ static void sinkhorn_variance_normalize(
                     data[r*cols + c] *= factor;
                 }
             }
+
+            const float imb = imbalance(data);
+            if (imb <= best_imb) {
+                best_imb = imb;
+                best_data = data;
+                best_row_scale = row_scale;
+                best_col_scale = col_scale;
+            }
         }
+        data = std::move(best_data);
+        row_scale = std::move(best_row_scale);
+        col_scale = std::move(best_col_scale);
         return;
     }
 
@@ -762,6 +827,11 @@ void llama_kv_cache_kvarn_context::set_input_kq_mask(ggml_tensor * dst, const ll
 uint32_t llama_kv_cache_kvarn_context::get_size() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return kv->get_size();
+}
+
+bool llama_kv_cache_kvarn_context::has_layer(int32_t il) const {
+    assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+    return kv->has_layer(il);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_sink_tail_k(
@@ -1456,6 +1526,10 @@ uint32_t llama_kv_cache_kvarn::get_n_layer() const {
     return layer_ids.size();
 }
 
+bool llama_kv_cache_kvarn::has_layer(int32_t il) const {
+    return map_layer_ids.find(il) != map_layer_ids.end();
+}
+
 llama_kvarn_memory_estimate llama_kv_cache_kvarn::estimate() const {
     return mem_estimate;
 }
@@ -1569,10 +1643,12 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
 
     const size_t tile_floats = size_t(view.head_dim_k)*params.group_size;
     const size_t per_pipeline =
-        tile_floats + 2*std::max<uint32_t>(view.head_dim_k, params.group_size);
+        tile_floats + 2*std::max<uint32_t>(view.head_dim_k, params.group_size) +
+        view.head_dim_k + params.group_size + 1;
     const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
-    // Batched pending-head seals keep transpose tiles plus K/V scratch in one buffer.
-    const bool needs_pending_head_tiles = view.head_dim_k >= 512 || (view.head_dim_k >= 256 && view.n_head_kv > 1);
+    // Multi-head stores gather one K and one V tile per head before the fused store kernel.
+    // Reserve those transpose tiles for every multi-head layer, including 128-dim Qwen paths.
+    const bool needs_pending_head_tiles = view.n_head_kv > 1 || view.head_dim_k >= 512;
     size_t result = needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
 
     if (kvarn_env_flag_enabled("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES")) {
@@ -1924,8 +2000,10 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_from_pending(
     if (records.empty()) {
         throw std::invalid_argument("KVarN record batch seal requires at least one record");
     }
-    if (records.size() > 4) {
-        throw std::invalid_argument("KVarN record batch seal supports at most four records per op");
+    if (records.size() > 1) {
+        throw std::invalid_argument(
+                "KVarN pending record batch seal is disabled: pending storage holds only one body record; "
+                "use direct record store or seal records one at a time");
     }
     for (const uint32_t record : records) {
         if (record >= view.n_records) {
@@ -2212,6 +2290,24 @@ void llama_kv_cache_kvarn::set_input_kq_mask(ggml_tensor * dst, const llama_ubat
     GGML_ASSERT(dst->ne[1] == ubatch->n_tokens);
 
     const int64_t n_kv = dst->ne[0];
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    llama_pos last_pos = llama_pos(n_tokens > 0 ? n_tokens - 1 : 0);
+    if (ubatch->pos != nullptr && n_tokens > 0) {
+        last_pos = ubatch->pos[n_tokens - 1];
+    }
+
+    // KVarN mixed attention expands the active cache in logical token order:
+    // sink | sealed body | pending | tail. For single-sequence prefill this is
+    // still positions [0, n_seen), even though body storage is compressed.
+    //
+    // Some graph paths reuse a mask tensor whose ubatch positions describe the
+    // batch end more reliably than every individual row. Deriving the query row
+    // positions from the final position keeps multi-token KVarN prefill causal
+    // and avoids admitting future tail/body tokens.
+    const llama_pos q_base = causal_attn && n_tokens > 0 && last_pos >= llama_pos(n_tokens - 1) ?
+        last_pos - llama_pos(n_tokens - 1) :
+        llama_pos(0);
 
     const auto write = [&](int64_t t, int64_t q, float v) {
         char * p = (char *) dst->data + size_t(q)*dst->nb[1] + size_t(t)*dst->nb[0];
@@ -2223,10 +2319,54 @@ void llama_kv_cache_kvarn::set_input_kq_mask(ggml_tensor * dst, const llama_ubat
     };
 
     for (int64_t q = 0; q < dst->ne[1]; ++q) {
-        const llama_pos pos = ubatch->pos ? ubatch->pos[q] : llama_pos(q);
+        const llama_pos pos = causal_attn ? q_base + llama_pos(q) :
+            (ubatch->pos ? ubatch->pos[q] : llama_pos(q));
         const int64_t visible = causal_attn && pos >= 0 ? std::min<int64_t>(n_kv, int64_t(pos) + 1) : n_kv;
         for (int64_t t = 0; t < n_kv; ++t) {
             write(t, q, t < visible ? 0.0f : -INFINITY);
+        }
+    }
+
+    if (kvarn_env_flag_enabled("LLAMA_KVARN_MASK_TRACE")) {
+        static uint64_t trace_count = 0;
+        const char * limit_env = std::getenv("LLAMA_KVARN_MASK_TRACE_LIMIT");
+        uint64_t limit = 64;
+        if (limit_env != nullptr && limit_env[0] != '\0') {
+            char * end = nullptr;
+            errno = 0;
+            const unsigned long long parsed = std::strtoull(limit_env, &end, 10);
+            if (end != limit_env && end != nullptr && *end == '\0' && errno != ERANGE) {
+                limit = uint64_t(parsed);
+            }
+        }
+
+        const uint64_t trace_index = trace_count++;
+        if (trace_index < limit) {
+            const auto read = [&](int64_t t, int64_t q) -> float {
+                const char * p = (const char *) dst->data + size_t(q)*dst->nb[1] + size_t(t)*dst->nb[0];
+                return dst->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(*(const ggml_fp16_t *) p) : *(const float *) p;
+            };
+            const auto count_visible = [&](int64_t q) -> int64_t {
+                int64_t n = 0;
+                for (int64_t t = 0; t < n_kv; ++t) {
+                    if (read(t, q) > -1.0e20f) {
+                        ++n;
+                    }
+                }
+                return n;
+            };
+            const int64_t q0 = 0;
+            const int64_t qm = dst->ne[1] > 0 ? dst->ne[1]/2 : 0;
+            const int64_t ql = dst->ne[1] > 0 ? dst->ne[1] - 1 : 0;
+            std::fprintf(stderr,
+                    "KVarN mask trace: call=%llu n_kv=%lld n_q=%lld causal=%d last_pos=%d q_base=%d"
+                    " visible[q0=%lld]=%lld visible[qm=%lld]=%lld visible[ql=%lld]=%lld\n",
+                    (unsigned long long) trace_index,
+                    (long long) n_kv, (long long) dst->ne[1], causal_attn ? 1 : 0,
+                    int(last_pos), int(q_base),
+                    (long long) q0, (long long) count_visible(q0),
+                    (long long) qm, (long long) count_visible(qm),
+                    (long long) ql, (long long) count_visible(ql));
         }
     }
 }

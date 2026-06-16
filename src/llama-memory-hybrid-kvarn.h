@@ -2,6 +2,7 @@
 
 #include "llama-batch.h"
 #include "llama-graph.h"
+#include "llama-kv-cache.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
@@ -17,6 +18,9 @@ public:
     llama_memory_hybrid_kvarn(
         const llama_model & model,
         llama_kvarn_params params,
+                ggml_type   type_k,
+                ggml_type   type_v,
+                     bool   v_trans,
                  uint32_t   kv_size,
                  uint32_t   n_pad,
                 ggml_type   type_r,
@@ -25,8 +29,10 @@ public:
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   offload,
+                     bool   unified,
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    const layer_filter_cb & filter_attn_normal = nullptr);
 
     ~llama_memory_hybrid_kvarn() = default;
 
@@ -57,12 +63,15 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
     llama_kv_cache_kvarn * get_mem_attn() const;
+    llama_kv_cache * get_mem_attn_normal() const;
+    bool has_mem_attn_normal() const;
     llama_memory_recurrent * get_mem_recr() const;
 
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache_kvarn> mem_attn;
+    const std::unique_ptr<llama_kv_cache> mem_attn_normal;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 };
 
@@ -79,6 +88,7 @@ public:
     llama_memory_hybrid_kvarn_context(
               llama_memory_hybrid_kvarn * mem,
                   slot_info_vec_t         sinfos_attn,
+       llama_kv_cache::slot_info_vec_t     sinfos_attn_normal,
         std::vector<llama_ubatch>         ubatches);
 
     ~llama_memory_hybrid_kvarn_context() = default;
@@ -90,6 +100,8 @@ public:
     const llama_ubatch & get_ubatch() const override;
 
     const llama_kv_cache_kvarn_context * get_attn() const;
+    const llama_kv_cache_context * get_attn_normal() const;
+    bool has_attn_normal() const;
     const llama_memory_recurrent_context * get_recr() const;
 
 private:
@@ -98,6 +110,7 @@ private:
     std::vector<llama_ubatch> ubatches;
 
     const llama_memory_context_ptr ctx_attn;
+    const llama_memory_context_ptr ctx_attn_normal;
     const llama_memory_context_ptr ctx_recr;
 
     const llama_memory_status status;

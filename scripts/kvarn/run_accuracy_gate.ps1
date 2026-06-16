@@ -164,7 +164,7 @@ function Get-ExpectedKvarnLayerIds([string] $layers) {
             $ids += $id
         }
     }
-    return $ids
+    return @($ids | Sort-Object -Unique)
 }
 
 function Get-ObservedKvarnLayerIds([string] $text) {
@@ -172,7 +172,7 @@ function Get-ObservedKvarnLayerIds([string] $text) {
     foreach ($m in [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer\s+([0-9]+)")) {
         [void] $actual.Add([int] $m.Groups[1].Value)
     }
-    return $actual
+    return ,$actual
 }
 
 function Invoke-PplRun {
@@ -216,7 +216,11 @@ function Invoke-PplRun {
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..")).Path
 $pplExe   = Resolve-BuildExe $BuildDir "llama-perplexity.exe"
 $gitHead  = Get-GitHead $repoRoot
-$expectedLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
+$expectedLayerIds = @(Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers)
+$expectedLayerSet = New-Object 'System.Collections.Generic.HashSet[int]'
+foreach ($id in $expectedLayerIds) {
+    [void] $expectedLayerSet.Add([int] $id)
+}
 
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
@@ -322,8 +326,17 @@ if ($hasKvarnCache -and $expectedLayerIds.Count -gt 0) {
             $missing += $id
         }
     }
+    $extra = @()
+    foreach ($id in $observedLayerIds) {
+        if (-not $expectedLayerSet.Contains($id)) {
+            $extra += $id
+        }
+    }
     if ($missing.Count -gt 0) {
         $gateFailures += "KVarN layer log missed expected layer ids: $($missing -join ',')"
+    }
+    if ($extra.Count -gt 0) {
+        $gateFailures += "KVarN layer log included unexpected layer ids: $($extra -join ',')"
     }
 }
 
@@ -362,6 +375,6 @@ Write-Host "artifacts: $OutputDir"
 
 if ($gateFailures.Count -gt 0) {
     foreach ($f in $gateFailures) { Write-Host "FAIL: $f" }
-    exit 1
+    throw "KVarN accuracy gate failed; see $OutputDir"
 }
 exit 0

@@ -32,6 +32,9 @@ static uint32_t kvarn_ubatch_limit(uint32_t default_limit, bool & invalid_debug_
 llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
         const llama_model & model,
         llama_kvarn_params params,
+                ggml_type   type_k,
+                ggml_type   type_v,
+                     bool   v_trans,
                  uint32_t   kv_size,
                  uint32_t   n_pad,
                 ggml_type   type_r,
@@ -40,8 +43,10 @@ llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                      bool   offload,
+                     bool   unified,
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+    const layer_filter_cb & filter_attn_normal) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_kvarn(
         &model,
@@ -55,6 +60,26 @@ llama_memory_hybrid_kvarn::llama_memory_hybrid_kvarn(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn
     )),
+    mem_attn_normal(filter_attn_normal ?
+        new llama_kv_cache(
+            model,
+            model.hparams,
+            type_k,
+            type_v,
+            v_trans,
+            offload,
+            unified,
+            kv_size,
+            n_seq_max,
+            n_pad,
+            0,
+            LLAMA_SWA_TYPE_NONE,
+            nullptr,
+            filter_attn_normal,
+            nullptr,
+            nullptr)
+        : nullptr
+    ),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
@@ -123,8 +148,17 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_batch(
         return std::make_unique<llama_memory_hybrid_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
     }
 
+    llama_kv_cache::slot_info_vec_t sinfos_attn_normal;
+    if (mem_attn_normal) {
+        sinfos_attn_normal = mem_attn_normal->prepare(ubatches);
+        if (sinfos_attn_normal.empty()) {
+            LLAMA_LOG_ERROR("%s: failed to prepare normal attention ubatches for KVarN layer-filter fallback\n", __func__);
+            return std::make_unique<llama_memory_hybrid_kvarn_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+        }
+    }
+
     return std::make_unique<llama_memory_hybrid_kvarn_context>(
-            this, std::move(sinfos_attn), std::move(ubatches));
+            this, std::move(sinfos_attn), std::move(sinfos_attn_normal), std::move(ubatches));
 }
 
 llama_memory_context_ptr llama_memory_hybrid_kvarn::init_full() {
@@ -136,11 +170,14 @@ llama_memory_context_ptr llama_memory_hybrid_kvarn::init_update(llama_context * 
 }
 
 bool llama_memory_hybrid_kvarn::get_can_shift() const {
-    return mem_attn->get_can_shift();
+    return mem_attn->get_can_shift() && (!mem_attn_normal || mem_attn_normal->get_can_shift());
 }
 
 void llama_memory_hybrid_kvarn::clear(bool data) {
     mem_attn->clear(data);
+    if (mem_attn_normal) {
+        mem_attn_normal->clear(data);
+    }
     mem_recr->clear(data);
 }
 
@@ -148,39 +185,67 @@ bool llama_memory_hybrid_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+    if (mem_attn_normal && !mem_attn_normal->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    if (mem_attn_normal) {
+        mem_attn_normal->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid_kvarn::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
+    if (mem_attn_normal) {
+        mem_attn_normal->seq_keep(seq_id);
+    }
     mem_recr->seq_keep(seq_id);
 }
 
 void llama_memory_hybrid_kvarn::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
+    if (mem_attn_normal) {
+        mem_attn_normal->seq_add(seq_id, p0, p1, shift);
+    }
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 
 void llama_memory_hybrid_kvarn::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     mem_attn->seq_div(seq_id, p0, p1, d);
+    if (mem_attn_normal) {
+        mem_attn_normal->seq_div(seq_id, p0, p1, d);
+    }
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
 
 llama_pos llama_memory_hybrid_kvarn::seq_pos_min(llama_seq_id seq_id) const {
-    return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
+    llama_pos res = std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
+    if (mem_attn_normal) {
+        res = std::max(res, mem_attn_normal->seq_pos_min(seq_id));
+    }
+    return res;
 }
 
 llama_pos llama_memory_hybrid_kvarn::seq_pos_max(llama_seq_id seq_id) const {
-    return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
+    llama_pos res = std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
+    if (mem_attn_normal) {
+        res = std::min(res, mem_attn_normal->seq_pos_max(seq_id));
+    }
+    return res;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_kvarn::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
+    if (mem_attn_normal) {
+        for (const auto & buft_size : mem_attn_normal->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
     for (const auto & buft_size : mem_recr->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
@@ -190,6 +255,9 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_kvarn::memory_b
 void llama_memory_hybrid_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);
+        if (mem_attn_normal) {
+            mem_attn_normal->state_write(io, seq_id, flags);
+        }
     }
     mem_recr->state_write(io, seq_id, flags);
 }
@@ -197,12 +265,23 @@ void llama_memory_hybrid_kvarn::state_write(llama_io_write_i & io, llama_seq_id 
 void llama_memory_hybrid_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_read(io, seq_id, flags);
+        if (mem_attn_normal) {
+            mem_attn_normal->state_read(io, seq_id, flags);
+        }
     }
     mem_recr->state_read(io, seq_id, flags);
 }
 
 llama_kv_cache_kvarn * llama_memory_hybrid_kvarn::get_mem_attn() const {
     return mem_attn.get();
+}
+
+llama_kv_cache * llama_memory_hybrid_kvarn::get_mem_attn_normal() const {
+    return mem_attn_normal.get();
+}
+
+bool llama_memory_hybrid_kvarn::has_mem_attn_normal() const {
+    return mem_attn_normal != nullptr;
 }
 
 llama_memory_recurrent * llama_memory_hybrid_kvarn::get_mem_recr() const {
@@ -215,8 +294,12 @@ llama_memory_hybrid_kvarn_context::llama_memory_hybrid_kvarn_context(llama_memor
 
 llama_memory_hybrid_kvarn_context::llama_memory_hybrid_kvarn_context(llama_memory_hybrid_kvarn * mem) :
     ctx_attn(mem->get_mem_attn()->init_full()),
+    ctx_attn_normal(mem->has_mem_attn_normal() ? mem->get_mem_attn_normal()->init_full() : nullptr),
     ctx_recr(mem->get_mem_recr()->init_full()),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    status(llama_memory_status_combine(
+            llama_memory_status_combine(ctx_attn->get_status(),
+                    ctx_attn_normal ? ctx_attn_normal->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE),
+            ctx_recr->get_status())) {
 }
 
 llama_memory_hybrid_kvarn_context::llama_memory_hybrid_kvarn_context(
@@ -224,24 +307,39 @@ llama_memory_hybrid_kvarn_context::llama_memory_hybrid_kvarn_context(
               llama_context       * lctx,
                        bool         optimize) :
     ctx_attn(mem->get_mem_attn()->init_update(lctx, optimize)),
+    ctx_attn_normal(mem->has_mem_attn_normal() ? mem->get_mem_attn_normal()->init_update(lctx, optimize) : nullptr),
     ctx_recr(mem->get_mem_recr()->init_update(lctx, optimize)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    status(llama_memory_status_combine(
+            llama_memory_status_combine(ctx_attn->get_status(),
+                    ctx_attn_normal ? ctx_attn_normal->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE),
+            ctx_recr->get_status())) {
 }
 
 llama_memory_hybrid_kvarn_context::llama_memory_hybrid_kvarn_context(
               llama_memory_hybrid_kvarn * mem,
                   slot_info_vec_t         sinfos_attn,
+       llama_kv_cache::slot_info_vec_t     sinfos_attn_normal,
         std::vector<llama_ubatch>         ubatches) :
     ubatches(std::move(ubatches)),
     ctx_attn(new llama_kv_cache_kvarn_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
+    ctx_attn_normal(mem->has_mem_attn_normal()
+            ? llama_memory_context_ptr(new llama_kv_cache_context(
+                    mem->get_mem_attn_normal(), std::move(sinfos_attn_normal), this->ubatches))
+            : nullptr),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
-    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+    status(llama_memory_status_combine(
+            llama_memory_status_combine(ctx_attn->get_status(),
+                    ctx_attn_normal ? ctx_attn_normal->get_status() : LLAMA_MEMORY_STATUS_NO_UPDATE),
+            ctx_recr->get_status())) {
 }
 
 bool llama_memory_hybrid_kvarn_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     ctx_attn->next();
+    if (ctx_attn_normal) {
+        ctx_attn_normal->next();
+    }
     ctx_recr->next();
 
     if (++i_next >= ubatches.size()) {
@@ -257,6 +355,9 @@ bool llama_memory_hybrid_kvarn_context::apply() {
     bool res = true;
 
     res = res & ctx_attn->apply();
+    if (ctx_attn_normal) {
+        res = res & ctx_attn_normal->apply();
+    }
     res = res & ctx_recr->apply();
 
     return res;
@@ -273,6 +374,14 @@ const llama_ubatch & llama_memory_hybrid_kvarn_context::get_ubatch() const {
 
 const llama_kv_cache_kvarn_context * llama_memory_hybrid_kvarn_context::get_attn() const {
     return static_cast<const llama_kv_cache_kvarn_context *>(ctx_attn.get());
+}
+
+const llama_kv_cache_context * llama_memory_hybrid_kvarn_context::get_attn_normal() const {
+    return static_cast<const llama_kv_cache_context *>(ctx_attn_normal.get());
+}
+
+bool llama_memory_hybrid_kvarn_context::has_attn_normal() const {
+    return ctx_attn_normal != nullptr;
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_kvarn_context::get_recr() const {

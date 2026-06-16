@@ -171,7 +171,7 @@ try {
         $results `
         $commonKvarn `
         @{ "LLAMA_KVARN_STORE_TRACE" = "bogus" } `
-        "invalid KVarN CUDA environment flag LLAMA_KVARN_STORE_TRACE=bogus" `
+        "invalid KVarN( CUDA)? environment flag LLAMA_KVARN_STORE_TRACE=bogus" `
         "KVarN invalid store-trace env rejection"
 
     Invoke-ExpectFailure `
@@ -181,28 +181,28 @@ try {
             "LLAMA_KVARN_STORE_TRACE" = "1"
             "LLAMA_KVARN_STORE_TRACE_LIMIT" = "bogus"
         } `
-        "invalid KVarN CUDA environment integer LLAMA_KVARN_STORE_TRACE_LIMIT=bogus" `
+        "invalid KVarN( CUDA)? environment integer LLAMA_KVARN_STORE_TRACE_LIMIT=bogus" `
         "KVarN invalid store-trace-limit env rejection"
 
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_SERIAL_FUSED" = "2" } `
-        "invalid KVarN CUDA environment flag LLAMA_KVARN_ATTN_SERIAL_FUSED=2" `
+        "invalid KVarN( CUDA)? environment flag LLAMA_KVARN_ATTN_SERIAL_FUSED=2" `
         "KVarN out-of-range CUDA serial-fused env rejection"
 
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_SPLIT_KERNELS" = "2" } `
-        "invalid KVarN CUDA environment flag LLAMA_KVARN_ATTN_SPLIT_KERNELS=2" `
+        "invalid KVarN( CUDA)? environment flag LLAMA_KVARN_ATTN_SPLIT_KERNELS=2" `
         "KVarN out-of-range CUDA split-kernel env rejection"
 
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
         @{ "LLAMA_KVARN_DEQUANT_CACHE_TRACE" = "bogus" } `
-        "invalid KVarN CUDA environment flag LLAMA_KVARN_DEQUANT_CACHE_TRACE=bogus" `
+        "invalid KVarN( CUDA)? environment flag LLAMA_KVARN_DEQUANT_CACHE_TRACE=bogus" `
         "KVarN invalid dequant-cache trace env rejection"
 
     Invoke-ExpectFailure `
@@ -212,7 +212,7 @@ try {
             "LLAMA_KVARN_DEQUANT_CACHE_TRACE" = "1"
             "LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT" = "bogus"
         } `
-        "invalid KVarN CUDA environment integer LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT=bogus" `
+        "invalid KVarN( CUDA)? environment integer LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT=bogus" `
         "KVarN invalid dequant-cache trace-limit env rejection"
 
     Invoke-ExpectFailure `

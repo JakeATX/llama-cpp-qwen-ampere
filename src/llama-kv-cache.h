@@ -155,6 +155,7 @@ public:
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
+    bool     has_layer(int32_t il) const;
 
     bool get_has_shift() const;
 
@@ -360,6 +361,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    bool     has_layer(int32_t il) const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;

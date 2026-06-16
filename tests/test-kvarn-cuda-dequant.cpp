@@ -9,7 +9,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 static void set_env_var(const char * name, const char * value) {
@@ -206,14 +208,64 @@ static void sinkhorn_variance_normalize(
     col_scale.assign(cols, 1.0f);
 
     constexpr float eps = 1.0e-6f;
-    const char * log_std_env = std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
-    if (log_std_env != nullptr && std::strcmp(log_std_env, "1") == 0) {
+    const bool log_std_enabled =
+        !env_enabled("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN") &&
+        (std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN") == nullptr ||
+         env_enabled("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN"));
+    if (log_std_enabled) {
         auto update_scale = [](float prev, float stdv) {
             stdv = std::min(1.0e3f, std::max(1.0e-3f, stdv));
             const float log_prev = std::log(std::max(prev, 1.0e-20f));
             const float log_next = std::min(10.0f, std::max(-0.3f, log_prev + std::log(stdv)));
             return std::exp(log_next);
         };
+
+        auto imbalance = [&](const std::vector<float> & tile) {
+            float col_min = std::numeric_limits<float>::max();
+            float col_max = 0.0f;
+            for (uint32_t c = 0; c < cols; ++c) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t r = 0; r < rows; ++r) {
+                    const float v = tile[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (rows > 1) {
+                    var = (ss - (sum*sum)/double(rows))/double(rows - 1);
+                }
+                const float stdv = std::sqrt(float(std::max(0.0, var)));
+                col_min = std::min(col_min, stdv);
+                col_max = std::max(col_max, stdv);
+            }
+
+            float row_min = std::numeric_limits<float>::max();
+            float row_max = 0.0f;
+            for (uint32_t r = 0; r < rows; ++r) {
+                double sum = 0.0;
+                double ss = 0.0;
+                for (uint32_t c = 0; c < cols; ++c) {
+                    const float v = tile[r*cols + c];
+                    sum += double(v);
+                    ss += double(v)*double(v);
+                }
+                double var = 0.0;
+                if (cols > 1) {
+                    var = (ss - (sum*sum)/double(cols))/double(cols - 1);
+                }
+                const float stdv = std::sqrt(float(std::max(0.0, var)));
+                row_min = std::min(row_min, stdv);
+                row_max = std::max(row_max, stdv);
+            }
+
+            return col_max/std::max(col_min, 1.0e-8f) + row_max/std::max(row_min, 1.0e-8f);
+        };
+
+        float best_imb = imbalance(data);
+        std::vector<float> best_data = data;
+        std::vector<float> best_row_scale = row_scale;
+        std::vector<float> best_col_scale = col_scale;
 
         for (uint32_t iter = 0; iter < iters; ++iter) {
             for (uint32_t c = 0; c < cols; ++c) {
@@ -257,7 +309,18 @@ static void sinkhorn_variance_normalize(
                     data[r*cols + c] *= factor;
                 }
             }
+
+            const float imb = imbalance(data);
+            if (imb <= best_imb) {
+                best_imb = imb;
+                best_data = data;
+                best_row_scale = row_scale;
+                best_col_scale = col_scale;
+            }
         }
+        data = std::move(best_data);
+        row_scale = std::move(best_row_scale);
+        col_scale = std::move(best_col_scale);
         return;
     }
 
@@ -612,6 +675,7 @@ static void test_paper_frame_contract(
 static void test_direct_record_batched_phases(
         uint32_t head_dim,
         const llama_kvarn_params & params) {
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "1");
     const uint32_t group = params.group_size;
     const uint32_t n_heads = head_dim == 512 ? 1 : 2;
     const uint32_t n_records = 2;
@@ -711,6 +775,7 @@ static void test_direct_record_batched_phases(
             scratch_floats,
             nullptr);
     set_env_var("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES", "");
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
     require_cuda(cudaGetLastError(), "KVarN CUDA direct-record batched phases launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA direct-record batched phases sync");
 
@@ -755,6 +820,7 @@ static void test_direct_record_batched_phases(
 }
 
 static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "1");
     llama_kvarn_params params = llama_kvarn_default_params();
     params.sinkhorn_iters = 4;
     params.rtn_quantile = 1.0f;
@@ -791,7 +857,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
     float * v_scales_d = nullptr;
     float * scratch_d = nullptr;
     const std::vector<int32_t> records = { 0 };
-    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group);
+    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
     const size_t scratch_floats = 2*n + 2*per_pipeline;
 
     require_cuda(cudaMalloc(&k_body_d, ref.k_body.size()), "cudaMalloc pending K body");
@@ -816,6 +882,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
             head_dim, head_dim,
             nullptr);
     set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
     require_cuda(cudaGetLastError(), "KVarN CUDA pending-record store launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA pending-record store sync");
 
@@ -851,6 +918,150 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
     }
     require(packed_diff <= 4, "CUDA pending-record store packed bytes match independent reference");
     require(scale_err < 1.0e-5f, "CUDA pending-record store scales match independent reference");
+
+    bool rejected_multi_record_pending = false;
+    try {
+        const std::vector<int32_t> two_records = { 0, 1 };
+        ggml_cuda_kvarn_store_body_pending_records_minmax(
+                pending_k_d, pending_v_d,
+                k_body_d, v_body_d,
+                k_scales_d, v_scales_d,
+                scratch_d,
+                two_records.data(), 2,
+                head_dim, group, params.key_bits, params.value_bits,
+                params.sinkhorn_iters, params.rtn_quantile,
+                layout.k_body_bytes, layout.v_body_bytes,
+                layout.k_body_bytes, layout.v_body_bytes,
+                layout.k_scale_floats, layout.v_scale_floats,
+                layout.k_scale_floats, layout.v_scale_floats,
+                head_dim, head_dim,
+                nullptr);
+    } catch (const std::invalid_argument &) {
+        rejected_multi_record_pending = true;
+    }
+    require(rejected_multi_record_pending,
+            "CUDA pending-record store rejects unsafe multi-record batches");
+
+    cudaFree(pending_k_d);
+    cudaFree(pending_v_d);
+    cudaFree(k_body_d);
+    cudaFree(v_body_d);
+    cudaFree(k_scales_d);
+    cudaFree(v_scales_d);
+    cudaFree(scratch_d);
+}
+
+static void test_pending_heads_store(uint32_t head_dim) {
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "1");
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.sinkhorn_iters = 4;
+    params.rtn_quantile = 1.0f;
+
+    const uint32_t group = params.group_size;
+    const uint32_t n_heads = 2;
+    const size_t n = size_t(head_dim)*group;
+    const size_t pending_token_stride = size_t(head_dim)*n_heads;
+    const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+
+    std::vector<float> pending_k(size_t(group)*pending_token_stride);
+    std::vector<float> pending_v(pending_k.size());
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t ih = 0; ih < n_heads; ++ih) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t off = size_t(g)*pending_token_stride + size_t(ih)*head_dim + d;
+                pending_k[off] =
+                    0.013f*std::sin(float(d + 17*g + 101*ih)*0.021f) +
+                    0.019f*std::cos(float(3*d + 5*g + 29*ih)*0.017f);
+                pending_v[off] =
+                    0.011f*std::cos(float(7*d + 11*g + 37*ih)*0.019f) -
+                    0.023f*std::sin(float(d + 13*g + 41*ih)*0.013f);
+            }
+        }
+    }
+
+    std::vector<uint8_t> k_body_ref(size_t(n_heads)*layout.k_body_bytes);
+    std::vector<uint8_t> v_body_ref(size_t(n_heads)*layout.v_body_bytes);
+    std::vector<float> k_scales_ref(size_t(n_heads)*layout.k_scale_floats);
+    std::vector<float> v_scales_ref(size_t(n_heads)*layout.v_scale_floats);
+    for (uint32_t ih = 0; ih < n_heads; ++ih) {
+        std::vector<float> k_rec(n);
+        std::vector<float> v_rec(n);
+        for (uint32_t g = 0; g < group; ++g) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t src = size_t(g)*pending_token_stride + size_t(ih)*head_dim + d;
+                k_rec[size_t(d)*group + g] = pending_k[src];
+                v_rec[size_t(g)*head_dim + d] = pending_v[src];
+            }
+        }
+        const llama_kvarn_body_record rec = llama_kvarn_store_reference(params, head_dim, k_rec, v_rec);
+        std::copy(rec.k_body.begin(), rec.k_body.end(), k_body_ref.begin() + size_t(ih)*layout.k_body_bytes);
+        std::copy(rec.v_body.begin(), rec.v_body.end(), v_body_ref.begin() + size_t(ih)*layout.v_body_bytes);
+        std::copy(rec.k_scales.begin(), rec.k_scales.end(), k_scales_ref.begin() + size_t(ih)*layout.k_scale_floats);
+        std::copy(rec.v_scales.begin(), rec.v_scales.end(), v_scales_ref.begin() + size_t(ih)*layout.v_scale_floats);
+    }
+
+    float * pending_k_d = cuda_upload(pending_k);
+    float * pending_v_d = cuda_upload(pending_v);
+    uint8_t * k_body_d = nullptr;
+    uint8_t * v_body_d = nullptr;
+    float * k_scales_d = nullptr;
+    float * v_scales_d = nullptr;
+    float * scratch_d = nullptr;
+    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
+    const size_t pipeline_scratch = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
+    const size_t scratch_floats = 2*n + pipeline_scratch;
+    require_cuda(cudaMalloc(&k_body_d, k_body_ref.size()), "cudaMalloc pending-heads K body");
+    require_cuda(cudaMalloc(&v_body_d, v_body_ref.size()), "cudaMalloc pending-heads V body");
+    require_cuda(cudaMalloc(&k_scales_d, k_scales_ref.size()*sizeof(float)), "cudaMalloc pending-heads K scales");
+    require_cuda(cudaMalloc(&v_scales_d, v_scales_ref.size()*sizeof(float)), "cudaMalloc pending-heads V scales");
+    require_cuda(cudaMalloc(&scratch_d, scratch_floats*sizeof(float)), "cudaMalloc pending-heads scratch");
+
+    ggml_cuda_kvarn_store_body_pending_heads_minmax(
+            pending_k_d, pending_v_d,
+            k_body_d, v_body_d,
+            k_scales_d, v_scales_d,
+            scratch_d,
+            n_heads,
+            head_dim, group, params.key_bits, params.value_bits,
+            params.sinkhorn_iters, params.rtn_quantile,
+            layout.k_body_bytes, layout.v_body_bytes,
+            layout.k_scale_floats, layout.v_scale_floats,
+            pending_token_stride, pending_token_stride,
+            nullptr);
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
+    require_cuda(cudaGetLastError(), "KVarN CUDA pending-heads store launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA pending-heads store sync");
+
+    std::vector<uint8_t> k_body(k_body_ref.size());
+    std::vector<uint8_t> v_body(v_body_ref.size());
+    std::vector<float> k_scales(k_scales_ref.size());
+    std::vector<float> v_scales(v_scales_ref.size());
+    require_cuda(cudaMemcpy(k_body.data(), k_body_d, k_body.size(), cudaMemcpyDeviceToHost), "copy pending-heads K body");
+    require_cuda(cudaMemcpy(v_body.data(), v_body_d, v_body.size(), cudaMemcpyDeviceToHost), "copy pending-heads V body");
+    require_cuda(cudaMemcpy(k_scales.data(), k_scales_d, k_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy pending-heads K scales");
+    require_cuda(cudaMemcpy(v_scales.data(), v_scales_d, v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy pending-heads V scales");
+
+    size_t packed_diff = 0;
+    for (size_t i = 0; i < k_body.size(); ++i) {
+        packed_diff += k_body[i] != k_body_ref[i] ? 1 : 0;
+    }
+    for (size_t i = 0; i < v_body.size(); ++i) {
+        packed_diff += v_body[i] != v_body_ref[i] ? 1 : 0;
+    }
+    float scale_err = 0.0f;
+    for (size_t i = 0; i < k_scales.size(); ++i) {
+        scale_err = std::max(scale_err, std::fabs(k_scales[i] - k_scales_ref[i]));
+    }
+    for (size_t i = 0; i < v_scales.size(); ++i) {
+        scale_err = std::max(scale_err, std::fabs(v_scales[i] - v_scales_ref[i]));
+    }
+    if (packed_diff > 4 || scale_err >= 1.0e-5f) {
+        std::fprintf(stderr,
+                "pending-heads store diff: head_dim=%u packed_diff=%zu scale_err=%g\n",
+                head_dim, packed_diff, double(scale_err));
+    }
+    require(packed_diff <= 4, "CUDA pending-heads store packed bytes match independent reference");
+    require(scale_err < 1.0e-5f, "CUDA pending-heads store scales match independent reference");
 
     cudaFree(pending_k_d);
     cudaFree(pending_v_d);
@@ -894,7 +1105,12 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     require_cuda(cudaMalloc(&v_body_store_d, record.v_body.size()), "cudaMalloc store V body");
     require_cuda(cudaMalloc(&k_scales_store_d, record.k_scales.size()*sizeof(float)), "cudaMalloc store K scales");
     require_cuda(cudaMalloc(&v_scales_store_d, record.v_scales.size()*sizeof(float)), "cudaMalloc store V scales");
-    require_cuda(cudaMalloc(&store_scratch_d, (n + 2*std::max(head_dim, group))*sizeof(float)), "cudaMalloc store scratch");
+    const size_t per_pipeline_store =
+        n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
+    const size_t store_scratch_floats =
+        head_dim >= 256 ? 2*per_pipeline_store : per_pipeline_store;
+    require_cuda(cudaMalloc(&store_scratch_d, store_scratch_floats*sizeof(float)),
+            "cudaMalloc store scratch");
 
     ggml_cuda_kvarn_store_body_reference_minmax(
             k_tile_d, v_tile_d,
@@ -953,13 +1169,43 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     }
 
     float scale_max_err = 0.0f;
+    const char * scale_max_kind = "";
+    size_t scale_max_i = 0;
+    float scale_max_ref = 0.0f;
+    float scale_max_cuda = 0.0f;
     for (size_t i = 0; i < record.k_scales.size(); ++i) {
-        scale_max_err = std::max(scale_max_err, std::fabs(record.k_scales[i] - k_scales_store[i]));
+        const float err = std::fabs(record.k_scales[i] - k_scales_store[i]);
+        if (err > scale_max_err) {
+            scale_max_err = err;
+            scale_max_kind = "K";
+            scale_max_i = i;
+            scale_max_ref = record.k_scales[i];
+            scale_max_cuda = k_scales_store[i];
+        }
     }
     for (size_t i = 0; i < record.v_scales.size(); ++i) {
-        scale_max_err = std::max(scale_max_err, std::fabs(record.v_scales[i] - v_scales_store[i]));
+        const float err = std::fabs(record.v_scales[i] - v_scales_store[i]);
+        if (err > scale_max_err) {
+            scale_max_err = err;
+            scale_max_kind = "V";
+            scale_max_i = i;
+            scale_max_ref = record.v_scales[i];
+            scale_max_cuda = v_scales_store[i];
+        }
     }
-    require(scale_max_err < 1.0e-5f, "CUDA store-body scales match CPU reference");
+    const bool log_std_enabled =
+        !env_enabled("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN") &&
+        (std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN") == nullptr ||
+         env_enabled("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN"));
+    if (!log_std_enabled && scale_max_err >= 1.0e-5f) {
+        std::fprintf(stderr,
+                "store scale diff: head_dim=%u rtn=%.2f max_err=%g kind=%s index=%zu ref=%g cuda=%g\n",
+                head_dim, params.rtn_quantile, double(scale_max_err),
+                scale_max_kind, scale_max_i, double(scale_max_ref), double(scale_max_cuda));
+    }
+    if (!log_std_enabled) {
+        require(scale_max_err < 1.0e-5f, "CUDA store-body scales match CPU reference");
+    }
 
     llama_kvarn_body_record store_record;
     store_record.layout = record.layout;
@@ -3464,5 +3710,7 @@ int main() {
     test_pending_k_layout_store(256, true);
     test_pending_k_layout_store(512, false);
     test_pending_k_layout_store(512, true);
+    test_pending_heads_store(256);
+    test_pending_heads_store(512);
     return 0;
 }
