@@ -9,7 +9,7 @@ K8V8 graph-correctness proof is now green for both primary targets:
 
 This supersedes the earlier Gemma catastrophic result in this document. The root cause was not body-record quantization or body-source layout; it was corrupted transferred KQ mask consumption in the KVarN CUDA mixed-attention path under Gemma+ISWA body-active prefill. Host-side mask construction was correct, but the device boundary dump showed wrong visible spans. The production path now uses an internal causal mask mode (`mask_type = 3`) for KVarN mixed attention when a causal mask is present, and the replay scripts synthesize the same causal mask independently.
 
-Do not resume speed optimization until K4V4/K4V2 quality is measured after this fix. K8V8 is a graph proof configuration, not the intended production compression setting.
+K4V4 quality has now been measured after the fix and passes both target models. K4V2 does not pass the 1% PPL gate. Short mainline parity for K4V4 is still far below production, so the next work is performance optimization against the K4V4 correctness-preserving path.
 
 ## Superseding Fix: Internal Causal Mask
 
@@ -81,15 +81,49 @@ Full Qwen remains green:
 - KVarN PPL `4.5904`
 - Increase `+0.15%`
 
+## Compression Quality After Fix
+
+K8V8 proved graph correctness. K4V4 is the current production-quality compression candidate. K4V2 is still too lossy for the current PPL gate.
+
+| Model | Preset | Artifact | f16 PPL | KVarN PPL | Increase | Gate |
+|---|---|---|---:|---:|---:|---|
+| Qwen3.6 MTP | `kvarn_k4v4_g128` | `artifacts/kvarn-rootcause/loop79-qwen36-full-k4v4-c4096-chunks2-paper-internal-causal` | `4.5837` | `4.5893` | `+0.12%` | PASS |
+| Gemma 4 12B true KVarN+ISWA | `kvarn_k4v4_g128` | `artifacts/kvarn-rootcause/loop80-gemma4-full-k4v4-c4096-paper-true-iswa-internal-causal` | `414.0522` | `417.9149` | `+0.93%` | PASS |
+| Qwen3.6 MTP | `kvarn_k4v2_g128` | `artifacts/kvarn-rootcause/loop81-qwen36-full-k4v2-c4096-chunks2-paper-internal-causal` | `4.5837` | `4.6408` | `+1.25%` | FAIL |
+| Gemma 4 12B true KVarN+ISWA | `kvarn_k4v2_g128` | `artifacts/kvarn-rootcause/loop82-gemma4-full-k4v2-c4096-paper-true-iswa-internal-causal` | `414.0522` | `474.7322` | `+14.66%` | FAIL |
+
+Notes:
+
+- The invalid no-paper-frame Qwen K4V4 run at `artifacts/kvarn-rootcause/loop78-qwen36-full-k4v4-c4096-chunks2-internal-causal` failed at `+38.51%`; ignore it for production decisions. It is useful only as a negative control showing paper-frame is still required.
+- Gemma K4V4 is close to the 1% gate (`+0.93%`), so any speed patch must rerun this exact quality gate.
+
+## K4V4 Short Speed After Fix
+
+Both models fail the short production parity gate with K4V4, paper-frame, and `--kvarn-iters 16`.
+
+| Model | Case | Artifact | Mainline t/s | KVarN t/s | Ratio | Gate |
+|---|---|---|---:|---:|---:|---|
+| Qwen3.6 MTP | `pp512` | `artifacts/kvarn-mainline-parity/loop83-qwen36-k4v4-short-paper-internal-causal` | `104.32` | `42.62` | `40.9%` | FAIL |
+| Qwen3.6 MTP | `tg64` | `artifacts/kvarn-mainline-parity/loop83-qwen36-k4v4-short-paper-internal-causal` | `27.63` | `7.76` | `28.1%` | FAIL |
+| Gemma 4 12B true KVarN+ISWA | `pp512` | `artifacts/kvarn-mainline-parity/loop84-gemma4-k4v4-short-paper-true-iswa-internal-causal` | `2294.13` | `29.32` | `1.3%` | FAIL |
+| Gemma 4 12B true KVarN+ISWA | `tg64` | `artifacts/kvarn-mainline-parity/loop84-gemma4-k4v4-short-paper-true-iswa-internal-causal` | `66.23` | `5.91` | `8.9%` | FAIL |
+
+Interpretation:
+
+- Correctness is no longer the blocker for K4V4.
+- K4V4 speed is now the blocker, especially Gemma prefill.
+- The first performance target should be the paper-shaped systems path: batched records x heads normalization/store, fewer tiny launches, and fused dual-scale dequant/attention. Do not weaken K4V4 quality to chase speed.
+
 ### Devil's Advocate Verdict
 
 `PASS` for the K8V8 graph-correctness proof on Qwen and Gemma true KVarN+ISWA.
 
-`WARN` for production readiness:
+`PASS` for K4V4 long-context quality on Qwen and Gemma true KVarN+ISWA.
 
-- K8V8 is not the production compression target.
-- K4V4 and K4V2 must be re-measured after the causal-mask fix.
-- Short speed parity has not been rerun after this correctness fix.
+`BLOCK` for production speed:
+
+- K4V4 short parity is below 90% on all four cells.
+- K4V2 fails the PPL quality gate and must not be treated as production-ready.
 - Gemma pair-filter `5,11` remains `+2.00%` while full Gemma is `+0.02%`; treat pair-filter as a diagnostic shape, not production evidence.
 
 ## Code Changes In This Round
@@ -289,21 +323,21 @@ The following was the pre-fix next loop. It is no longer the immediate next step
 
 ## Current Next Mandatory Loop
 
-1. Re-run quality gates for production candidate presets after the causal-mask fix:
-   - Qwen3.6 MTP: K4V4, then K4V2, ctx4096/chunks2, expected layers `3-39:4`, `-ncmoe 34`.
-   - Gemma 4 12B true KVarN+ISWA: K4V4, then K4V2, ctx4096, expected layers `5-47:6`, `LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1`.
-2. If K4V4 is green, run short mainline parity:
+1. Optimize K4V4 speed without weakening quality:
+   - Start with Gemma `pp512`, because it is the worst cell (`1.3%` of mainline) and uses true KVarN+ISWA.
+   - Profile body store and mixed-attn launch counts with existing trace flags.
+   - Implement the paper-shaped systems path: batched records x heads normalization/store and fused dual-scale dequant/attention.
+2. Rerun quality after every speed patch:
+   - Qwen K4V4 ctx4096/chunks2 must stay `<=1%`.
+   - Gemma true KVarN+ISWA K4V4 ctx4096 must stay `<=1%`; this is the fragile gate at `+0.93%`.
+3. Rerun short parity after every quality-clean speed patch:
    - Qwen `pp512,tg64`, `-r 3`, `-ncmoe 34`.
    - Gemma true KVarN+ISWA `pp512,tg64`, `-r 3`, no fallback.
-3. If K4V4 quality or speed fails, capture one boundary and compare:
-   - K8V8 vs K4V4 dequant error.
-   - raw f16 attention vs K4V4 attention output.
-   - per-layer contribution to PPL/KL.
-4. Only after K4V4 is characterized should K4V2 be considered a production option.
+4. Treat K4V2 as non-production unless a later quality patch moves both models below `<=1%`.
 
 ## Do Not Do Yet
 
-- Do not optimize speed before K4V4/K4V2 quality gates are rerun after the causal-mask fix.
+- Do not optimize a path that changes K4V4 math without rerunning both long-context quality gates.
 - Do not argue K4V4/K4V2 production quality from pre-fix measurements.
 - Do not count Gemma fallback as true KVarN data.
 - Do not accept mixed-attn self-replay as sufficient proof; use independent source/window/block oracles.
