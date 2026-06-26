@@ -19,11 +19,17 @@ class llama_batch_allocr;
 class llama_io_read_i;
 class llama_io_write_i;
 
+enum llama_kvarn_v_layout : uint32_t {
+    LLAMA_KVARN_V_LAYOUT_LEGACY          = 0,
+    LLAMA_KVARN_V_LAYOUT_TURBO_CANONICAL = 1,
+};
+
 struct llama_kvarn_layout {
     uint32_t head_dim;
     uint32_t group_size;
     uint32_t key_bits;
     uint32_t value_bits;
+    uint32_t v_layout;
 
     size_t k_body_bytes;
     size_t v_body_bytes;
@@ -225,11 +231,14 @@ public:
     ggml_tensor * store_v_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_kv_body_record_from_pending(
-            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record,
+            ggml_tensor * pending_k = nullptr, ggml_tensor * pending_v = nullptr) const;
     ggml_tensor * store_kv_body_all_heads_from_pending(
-            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t record) const;
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t record,
+            ggml_tensor * pending_k = nullptr, ggml_tensor * pending_v = nullptr) const;
     ggml_tensor * store_kv_body_records_from_pending(
-            ggml_context * ctx, ggml_tensor * scratch, int32_t il, const std::vector<uint32_t> & records) const;
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, const std::vector<uint32_t> & records,
+            ggml_tensor * pending_k = nullptr, ggml_tensor * pending_v = nullptr) const;
 
 private:
     llama_memory_status status;
@@ -347,11 +356,14 @@ public:
     ggml_tensor * store_v_body_record_from_pending(
             ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
     ggml_tensor * store_kv_body_record_from_pending(
-            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record) const;
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t ih, uint32_t record,
+            ggml_tensor * pending_k = nullptr, ggml_tensor * pending_v = nullptr) const;
     ggml_tensor * store_kv_body_all_heads_from_pending(
-            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t record) const;
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, uint32_t record,
+            ggml_tensor * pending_k = nullptr, ggml_tensor * pending_v = nullptr) const;
     ggml_tensor * store_kv_body_records_from_pending(
-            ggml_context * ctx, ggml_tensor * scratch, int32_t il, const std::vector<uint32_t> & records) const;
+            ggml_context * ctx, ggml_tensor * scratch, int32_t il, const std::vector<uint32_t> & records,
+            ggml_tensor * pending_k = nullptr, ggml_tensor * pending_v = nullptr) const;
     ggml_tensor * view_k_body_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
     ggml_tensor * view_v_body_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
     ggml_tensor * view_k_scales_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
@@ -367,6 +379,8 @@ private:
         uint32_t n_head_kv = 0;
         uint32_t n_sink_tail = 0;
         uint32_t n_records = 0;
+        llama_kvarn_layout layout_k = {};
+        llama_kvarn_layout layout_v = {};
 
         ggml_tensor * sink_tail_k = nullptr; // F16 [head_dim, n_head_kv, n_sink_tail]
         ggml_tensor * sink_tail_v = nullptr; // F16 [head_dim, n_head_kv, n_sink_tail]

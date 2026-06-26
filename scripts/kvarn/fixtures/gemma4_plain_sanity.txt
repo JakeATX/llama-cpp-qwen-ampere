@@ -1,0 +1,90 @@
+The benchmark team reviewed a long engineering report about numerical kernels,
+model loading, and cache management. The report described a sequence of tests
+that separated data quality problems from implementation problems. A reliable
+test corpus should use ordinary UTF-8 prose, avoid placeholder tokens, and avoid
+chat markers that belong to a different model family.
+
+The first section described how an attention cache stores keys and values for a
+single sequence. The implementation tracks context positions, builds a causal
+mask, and compares the optimized cache path against the normal cache path. When
+the reference run has a reasonable loss, the optimized run can be judged by its
+change in perplexity or by the divergence between logit distributions.
+
+The second section described a debugging session. The engineers found that a
+bad corpus can make a healthy model look broken. The corpus used tokenization
+artifacts from an older dataset and role labels from another chat format. Those
+strings were not meaningful control tokens for the target model, so the
+reference perplexity was not a trustworthy baseline.
+
+The third section listed the rules for future measurements. First, run a short
+baseline sanity check with no optimized cache. Second, reject the fixture if it
+contains unknown-token placeholders or incompatible chat delimiters. Third, only
+compare cache implementations after the baseline model has shown that it can
+predict the corpus with ordinary loss. Fourth, keep GPU tests sequential so that
+memory pressure does not change the result.
+
+The fourth section covered long-context behavior. A long context can expose
+masking bugs, sliding-window mistakes, and cache eviction errors, but it should
+not be used to hide a bad input file. A short clean test is the fastest way to
+prove that the model graph and tokenizer are basically sane. A longer clean
+test can then exercise the full attention path and the sliding-window path.
+
+The final section summarized the decision. The team would preserve the fast
+kernel work, but every production benchmark would begin with a reference-quality
+check. If the baseline perplexity is already excessive, the test fails before
+running the optimized cache path. That rule saves time and prevents misleading
+speed or correctness claims.
+
+The appendix described the expected artifact layout. Each run records the exact
+command line, the model path, the dataset path, the context length, and the cache
+configuration. The summary file reports whether the optimized cache was actually
+engaged. If the cache silently falls back to the normal implementation, the run
+is marked as a failure unless the caller explicitly allows that fallback for a
+diagnostic experiment.
+
+Another appendix described common failure patterns. A tokenizer mismatch often
+appears as very high reference perplexity, especially when a corpus contains
+literal unknown-token strings from another tokenizer. A graph implementation bug
+usually appears on clean text as well, because normal prose exercises the same
+attention layers, normalization layers, and output projection. A cache-specific
+bug should not affect the unoptimized reference path.
+
+The review also covered sliding-window attention. Sliding-window layers only
+attend to a local span of recent tokens, while full-attention layers can attend
+to the entire retained context. A mixed architecture needs separate masks and
+separate cache views for those two layer classes. The test plan therefore checks
+short contexts first and then longer contexts, so mask errors can be isolated
+from ordinary fixture problems.
+
+The engineers agreed that speed measurements come last. A fast implementation
+that changes the model distribution is not useful. A slow but correct diagnostic
+path can still be valuable because it provides a reference for optimization.
+Once correctness is stable, the profiling work can focus on memory bandwidth,
+kernel launch overhead, graph reuse, and cache-update costs.
+
+The document ended with a practical checklist. Use a clean corpus. Verify the
+baseline. Run optimized and reference paths one at a time. Compare the same
+model, the same binary, and the same input. Save the logs. Reject surprising
+results until a causal explanation is supported by both code inspection and
+measurements.
+
+The release checklist added several operational details. A benchmark owner
+should record the GPU model, driver stack, build flags, and exact git revision.
+The owner should also note whether graph capture, flash attention, and memory
+fitting were enabled. These details matter because an automatic retry can change
+batch shape, context length, or backend placement without changing the visible
+test name.
+
+The team also defined a rule for interpreting negative deltas. If the optimized
+path reports slightly better perplexity than the reference, the result should be
+treated as measurement noise unless a separate logit comparison proves a real
+distributional improvement. Cache compression is expected to preserve behavior,
+not improve the language model. Small improvements and small regressions both
+belong inside the noise band.
+
+A final note described how to handle model-specific formats. Some models use
+ordinary plain text well, while instruction-tuned models may require a template
+for chat transcripts. A plain-text sanity corpus is still useful because it
+avoids role markers entirely. A chat-shaped corpus must be rendered with the
+target model template, not copied from a different family. The fixture should be
+audited before any long benchmark starts.

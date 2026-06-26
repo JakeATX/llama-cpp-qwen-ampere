@@ -5,7 +5,14 @@
 
 void ggml_cuda_kvarn_mark_body_store(const void * k_body);
 void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first_record, uint32_t n_records);
-void ggml_cuda_kvarn_debug_set_store_context(int32_t layer, uint32_t record0, uint32_t n_records, uint32_t n_heads, uint32_t src_layout);
+void ggml_cuda_kvarn_debug_set_store_context(
+        int32_t layer,
+        uint32_t record0,
+        uint32_t n_records,
+        uint32_t n_heads,
+        uint32_t src_layout,
+        uint32_t records_cap,
+        const void * raw_mirror_key);
 
 void ggml_cuda_kvarn_store_body_reference_minmax(
         const float * k_tile,
@@ -21,7 +28,10 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         uint32_t value_bits,
         uint32_t sinkhorn_iters,
         float rtn_quantile,
-        void * stream);
+        uint32_t turbo_v_mode,
+        void * stream,
+        uint32_t debug_record = UINT32_MAX,
+        uint32_t debug_head = UINT32_MAX);
 
 void ggml_cuda_kvarn_store_body_pending_records_minmax(
         const float * pending_k,
@@ -49,6 +59,7 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
         size_t v_scale_head_stride_floats,
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
+        uint32_t turbo_v_mode,
         void * stream);
 
 void ggml_cuda_kvarn_store_body_pending_heads_minmax(
@@ -72,6 +83,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         size_t v_scale_stride_floats,
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
+        uint32_t turbo_v_mode,
         void * stream);
 
 void ggml_cuda_kvarn_store_body_direct_records_minmax(
@@ -105,6 +117,7 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
         size_t k_tile_record_stride_floats,
         size_t v_tile_record_stride_floats,
         size_t scratch_floats,
+        uint32_t turbo_v_mode,
         void * stream);
 
 void ggml_cuda_kvarn_store_k_body_reference_minmax(
@@ -129,6 +142,7 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
         uint32_t value_bits,
         uint32_t sinkhorn_iters,
         float rtn_quantile,
+        uint32_t turbo_v_mode,
         void * stream);
 
 void ggml_cuda_kvarn_dequant_body(
@@ -142,6 +156,7 @@ void ggml_cuda_kvarn_dequant_body(
         uint32_t group_size,
         uint32_t key_bits,
         uint32_t value_bits,
+        uint32_t turbo_v_mode,
         void * stream);
 
 void ggml_cuda_kvarn_dequant_body_n(
@@ -162,6 +177,7 @@ void ggml_cuda_kvarn_dequant_body_n(
         size_t v_scale_stride_floats,
         size_t k_out_stride_floats,
         size_t v_out_stride_floats,
+        uint32_t turbo_v_mode,
         void * stream);
 
 // K f32 output in token-major layout (g*head_dim + d); V identical to
@@ -185,6 +201,7 @@ void ggml_cuda_kvarn_dequant_body_n_k_token_major(
         size_t v_scale_stride_floats,
         size_t k_out_stride_floats,
         size_t v_out_stride_floats,
+        uint32_t turbo_v_mode,
         void * stream);
 
 // f16 outputs, token-major K (g*head_dim + d); used by the 512d warpqk
@@ -208,6 +225,37 @@ void ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
         size_t v_scale_stride_floats,
         size_t k_out_stride_elems,
         size_t v_out_stride_elems,
+        uint32_t turbo_v_mode,
+        void * stream);
+
+void ggml_cuda_kvarn_materialize_kv_f16(
+        const uint16_t * sink_tail,
+        const uint8_t * body,
+        const float * scales,
+        const float * pending,
+        uint16_t * out,
+        uint32_t is_v,
+        uint32_t n_sink,
+        uint32_t n_records,
+        uint32_t n_pending,
+        uint32_t n_tail,
+        uint32_t tail_start,
+        uint32_t n_head_kv,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t bits,
+        uint32_t turbo_v_mode,
+        uint32_t debug_raw_body,
+        size_t sink_tail_stride_head_f16,
+        size_t sink_tail_stride_token_f16,
+        size_t body_stride_record_bytes,
+        size_t body_stride_head_bytes,
+        size_t scale_stride_record_floats,
+        size_t scale_stride_head_floats,
+        size_t pending_stride_head_floats,
+        size_t pending_stride_token_floats,
+        size_t out_stride_head_f16,
+        size_t out_stride_token_f16,
         void * stream);
 
 void ggml_cuda_kvarn_qk_body(
@@ -338,6 +386,7 @@ void ggml_cuda_kvarn_attn_mixed_f32_scratch(
 
 void ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
         const float * q,
+        const float * q_body,
         const uint16_t * sink_tail_k,
         const uint16_t * sink_tail_v,
         const float * body_k,
@@ -359,6 +408,8 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
         uint32_t group_size,
         size_t q_stride_head_floats,
         size_t q_stride_query_floats,
+        size_t q_body_stride_head_floats,
+        size_t q_body_stride_query_floats,
         size_t out_stride_head_floats,
         size_t out_stride_query_floats,
         size_t sink_tail_stride_head_f16,
@@ -373,9 +424,75 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
         size_t kq_mask_stride_token_bytes,
         uint32_t kq_mask_type,
         float scale,
-        void * stream);
+        void * stream,
+        float logit_softcap = 0.0f);
 
 void ggml_cuda_kvarn_attn_mixed_f16_batch(
+        const float * q,
+        const float * q_body,
+        const uint16_t * sink_tail_k,
+        const uint16_t * sink_tail_v,
+        const uint8_t * k_body,
+        const uint8_t * v_body,
+        const float * k_scales,
+        const float * v_scales,
+        const float * pending_k,
+        const float * pending_v,
+        const void * kq_mask,
+        float * out,
+        float * scores,
+        uint32_t n_queries,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        uint32_t n_sink,
+        uint32_t n_records,
+        uint32_t n_pending,
+        uint32_t n_tail,
+        uint32_t tail_start,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t key_bits,
+        uint32_t value_bits,
+        size_t q_stride_head_floats,
+        size_t q_stride_query_floats,
+        size_t q_body_stride_head_floats,
+        size_t q_body_stride_query_floats,
+        size_t out_stride_head_floats,
+        size_t out_stride_query_floats,
+        size_t sink_tail_stride_head_f16,
+        size_t sink_tail_stride_token_f16,
+        size_t pending_stride_head_floats,
+        size_t pending_stride_token_floats,
+        size_t k_body_stride_record_bytes,
+        size_t v_body_stride_record_bytes,
+        size_t k_body_stride_head_bytes,
+        size_t v_body_stride_head_bytes,
+        size_t k_scale_stride_record_floats,
+        size_t v_scale_stride_record_floats,
+        size_t k_scale_stride_head_floats,
+        size_t v_scale_stride_head_floats,
+        size_t kq_mask_stride_query_bytes,
+        size_t kq_mask_stride_token_bytes,
+        uint32_t kq_mask_type,
+        float scale,
+        // optional device-side live window [n_sink, n_records, n_pending,
+        // n_tail, tail_start]; when non-null and the op is in the pure
+        // sink/tail decode regime, kernels read the window from device memory
+        // (CUDA-graph-replay-safe; host args carry frozen caps for sizing)
+        void * stream,
+        const int32_t * window_dev = nullptr,
+        // worst-case persistent scratch capacity (parent tensor floats, not
+        // the active view size) and packed body record capacity; when
+        // provided, the K dequant region is end-anchored in the scratch and
+        // cached across calls (re-filled incrementally on seal-epoch change only)
+        int64_t scores_nelems = 0,
+        int64_t k_body_records_cap = 0,
+        const void * raw_body_store_key = nullptr,
+        uint32_t frame_flags = 0,
+        float logit_softcap = 0.0f,
+        uint32_t turbo_v_mode = 0);
+
+inline void ggml_cuda_kvarn_attn_mixed_f16_batch(
         const float * q,
         const uint16_t * sink_tail_k,
         const uint16_t * sink_tail_v,
@@ -420,15 +537,34 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         size_t kq_mask_stride_token_bytes,
         uint32_t kq_mask_type,
         float scale,
-        // optional device-side live window [n_sink, n_records, n_pending,
-        // n_tail, tail_start]; when non-null and the op is in the pure
-        // sink/tail decode regime, kernels read the window from device memory
-        // (CUDA-graph-replay-safe; host args carry frozen caps for sizing)
         void * stream,
         const int32_t * window_dev = nullptr,
-        // worst-case persistent scratch capacity (parent tensor floats, not
-        // the active view size) and packed body record capacity; when
-        // provided, the K dequant region is end-anchored in the scratch and
-        // cached across calls (re-filled incrementally on seal-epoch change only)
         int64_t scores_nelems = 0,
-        int64_t k_body_records_cap = 0);
+        int64_t k_body_records_cap = 0,
+        const void * raw_body_store_key = nullptr,
+        uint32_t frame_flags = 0,
+        float logit_softcap = 0.0f,
+        uint32_t turbo_v_mode = 0) {
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            q, nullptr,
+            sink_tail_k, sink_tail_v,
+            k_body, v_body,
+            k_scales, v_scales,
+            pending_k, pending_v, kq_mask,
+            out, scores,
+            n_queries, n_head, n_head_kv,
+            n_sink, n_records, n_pending, n_tail, tail_start,
+            head_dim, group_size, key_bits, value_bits,
+            q_stride_head_floats, q_stride_query_floats,
+            0, 0,
+            out_stride_head_floats, out_stride_query_floats,
+            sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+            pending_stride_head_floats, pending_stride_token_floats,
+            k_body_stride_record_bytes, v_body_stride_record_bytes,
+            k_body_stride_head_bytes, v_body_stride_head_bytes,
+            k_scale_stride_record_floats, v_scale_stride_record_floats,
+            k_scale_stride_head_floats, v_scale_stride_head_floats,
+            kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
+            kq_mask_type, scale,
+            stream, window_dev, scores_nelems, k_body_records_cap, raw_body_store_key, frame_flags, logit_softcap, turbo_v_mode);
+}

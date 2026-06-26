@@ -126,6 +126,33 @@ def load_raw_body(records: dict[int, Path], n_records: int, head_dim: int, group
     return np.concatenate(k_chunks, axis=0).astype(np.float32), np.concatenate(v_chunks, axis=0).astype(np.float32)
 
 
+def mixed_frame_scores(
+        q: np.ndarray,
+        q_body: np.ndarray | None,
+        k_all: np.ndarray,
+        meta: dict,
+        scale: np.float32,
+        mask: np.ndarray) -> np.ndarray:
+    n_sink = int(meta["n_sink"])
+    n_records = int(meta["n_records"])
+    group_size = int(meta["group_size"])
+    n_pending = int(meta["n_pending"])
+    n_body = n_records * group_size
+    scores = np.zeros(k_all.shape[0], dtype=np.float32)
+    if n_sink:
+        scores[:n_sink] = (k_all[:n_sink] @ q).astype(np.float32)
+    if n_body:
+        body_q = q if q_body is None else q_body
+        scores[n_sink:n_sink + n_body] = (k_all[n_sink:n_sink + n_body] @ body_q).astype(np.float32)
+    pending0 = n_sink + n_body
+    pending1 = pending0 + n_pending
+    if n_pending:
+        scores[pending0:pending1] = (k_all[pending0:pending1] @ q).astype(np.float32)
+    if pending1 < k_all.shape[0]:
+        scores[pending1:] = (k_all[pending1:] @ q).astype(np.float32)
+    return (scores * scale + mask).astype(np.float32)
+
+
 def replay_full_qo_truth(
         boundary: Path,
         meta: dict,
@@ -151,6 +178,11 @@ def replay_full_qo_truth(
 
     expected = n_queries * n_head * head_dim
     full_q = np.fromfile(full_q_path, dtype=np.float32, count=expected).reshape(n_queries, n_head, head_dim)
+    full_q_body_path = boundary / "full_q_body.bin"
+    full_q_body = (
+        np.fromfile(full_q_body_path, dtype=np.float32, count=expected).reshape(n_queries, n_head, head_dim)
+        if full_q_body_path.exists() else None
+    )
     full_out = np.fromfile(full_out_path, dtype=np.float32, count=expected).reshape(n_queries, n_head, head_dim)
 
     heads = list(range(selected_ikh * n_gqa, min(n_head, (selected_ikh + 1) * n_gqa)))
@@ -161,7 +193,20 @@ def replay_full_qo_truth(
     worst: dict[str, int | float] | None = None
     for iq in range(n_queries):
         q = full_q[iq, heads, :].astype(np.float32)
-        scores = (q @ k_t).astype(np.float32) * scale
+        q_body = q if full_q_body is None else full_q_body[iq, heads, :].astype(np.float32)
+        n_sink = int(meta["n_sink"])
+        n_records = int(meta["n_records"])
+        group_size = int(meta["group_size"])
+        n_body = n_records * group_size
+        scores = np.zeros((len(heads), k_all.shape[0]), dtype=np.float32)
+        if n_sink:
+            scores[:, :n_sink] = (q @ k_t[:, :n_sink]).astype(np.float32)
+        if n_body:
+            scores[:, n_sink:n_sink + n_body] = (q_body @ k_t[:, n_sink:n_sink + n_body]).astype(np.float32)
+        tail0 = n_sink + n_body
+        if tail0 < k_all.shape[0]:
+            scores[:, tail0:] = (q @ k_t[:, tail0:]).astype(np.float32)
+        scores = scores * scale
         scores = (scores + full_mask[iq].reshape(1, -1)).astype(np.float32)
         probs = softmax_rows(scores)
         truth_out = (probs @ v).astype(np.float32)
@@ -243,6 +288,8 @@ def main() -> int:
         raise SystemExit("boundary n_tokens does not match sink/body/tail layout")
 
     q = np.fromfile(boundary / "q.bin", dtype=np.float32, count=head_dim).astype(np.float32)
+    q_body_path = boundary / "q_body.bin"
+    q_body = np.fromfile(q_body_path, dtype=np.float32, count=head_dim).astype(np.float32) if q_body_path.exists() else None
     actual_out_path = boundary / "mixed_out.bin"
     if not actual_out_path.exists():
         actual_out_path = boundary / "warpqk_out.bin"
@@ -259,7 +306,7 @@ def main() -> int:
     if k_all.shape != (n_tokens, head_dim) or v_all.shape != (n_tokens, head_dim):
         raise SystemExit(f"truth K/V shape mismatch: K={k_all.shape} V={v_all.shape} expected={(n_tokens, head_dim)}")
 
-    scores = (k_all @ q).astype(np.float32) * scale + mask
+    scores = mixed_frame_scores(q, q_body, k_all, meta, scale, mask)
     probs = softmax(scores)
     truth_out = (probs.astype(np.float32) @ v_all.astype(np.float32)).astype(np.float32)
 

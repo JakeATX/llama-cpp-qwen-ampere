@@ -201,7 +201,10 @@ static inline void apir_encode_ggml_tensor_inline(apir_encoder * enc, const ggml
         apir_encoder_write(enc, tensor_size, tensor->view_src, tensor_size);
     }
 
-    for (int i = 0; tensor->src[i]; i++) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (tensor->src[i] == nullptr) {
+            continue;
+        }
         const ggml_tensor * tensor_src = tensor->src[i];
         apir_encoder_write(enc, tensor_size, tensor_src, tensor_size);
     }
@@ -223,7 +226,10 @@ static inline const ggml_tensor * apir_decode_ggml_tensor_inplace(apir_decoder *
         tensor->view_src              = tensor_view_src;
     }
 
-    for (int i = 0; tensor->src[i]; i++) {
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (tensor->src[i] == nullptr) {
+            continue;
+        }
         ggml_tensor * tensor_src = (ggml_tensor *) (uintptr_t) apir_decoder_use_inplace(dec, sizeof(ggml_tensor));
         tensor->src[i] = tensor_src;  // overwrite op->src[i] pointer with the actual location of the src tensor
     }

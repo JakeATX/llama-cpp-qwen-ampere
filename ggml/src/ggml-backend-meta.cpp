@@ -933,7 +933,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ASSERT(split_states_equal(src_ss[1], src_ss[8]));
                 GGML_ASSERT(src_ss[9].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 GGML_ASSERT(tensor->src[10] == nullptr || src_ss[10].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(tensor->src[11] == nullptr || src_ss[11].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                GGML_ASSERT(tensor->src[12] == nullptr || src_ss[12].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
                 split_state = src_ss[1];
+            } break;
+            case GGML_OP_KVARN_MATERIALIZE_KV: {
+                GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
+                GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
+                GGML_ASSERT(split_states_equal(src_ss[0], src_ss[3]));
+                split_state = src_ss[0];
             } break;
             case GGML_OP_DIAG:
             case GGML_OP_DIAG_MASK_INF:

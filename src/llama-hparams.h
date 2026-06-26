@@ -343,6 +343,8 @@ struct llama_hparams {
 
     bool has_kv(uint32_t il) const;
 
+    int32_t kv_reuse_layer_matching_attention_type(int32_t il) const;
+
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
 

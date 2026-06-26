@@ -437,6 +437,15 @@ static llama_kvarn_body_record llama_kvarn_store_reference(
         const std::vector<float> & v_tile,
         bool input_already_rotated);
 
+static llama_kvarn_body_record llama_kvarn_store_reference_frame(
+        const llama_kvarn_params & params,
+        uint32_t head_dim,
+        const std::vector<float> & k_tile,
+        const std::vector<float> & v_tile,
+        bool paper_frame,
+        bool paper_mixed_frame,
+        bool input_already_rotated);
+
 static llama_kvarn_body_record llama_kvarn_store_reference(
         const llama_kvarn_params & params,
         uint32_t head_dim,
@@ -451,16 +460,32 @@ static llama_kvarn_body_record llama_kvarn_store_reference(
         const std::vector<float> & k_tile,
         const std::vector<float> & v_tile,
         bool input_already_rotated) {
+    return llama_kvarn_store_reference_frame(
+            params, head_dim, k_tile, v_tile, true, false, input_already_rotated);
+}
+
+static llama_kvarn_body_record llama_kvarn_store_reference_frame(
+        const llama_kvarn_params & params,
+        uint32_t head_dim,
+        const std::vector<float> & k_tile,
+        const std::vector<float> & v_tile,
+        bool paper_frame,
+        bool paper_mixed_frame,
+        bool input_already_rotated) {
     const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
 
     std::vector<float> k_rot;
     std::vector<float> v_rot;
-    if (input_already_rotated) {
+    if (input_already_rotated || !paper_frame) {
         k_rot = k_tile;
         v_rot = v_tile;
     } else {
         llama_kvarn_hadamard_channels(k_tile, k_rot, head_dim, params.group_size, true);
-        llama_kvarn_hadamard_channels(v_tile, v_rot, params.group_size, head_dim, false);
+        if (paper_mixed_frame) {
+            v_rot = v_tile;
+        } else {
+            llama_kvarn_hadamard_channels(v_tile, v_rot, params.group_size, head_dim, false);
+        }
     }
 
     std::vector<float> k_row_scale, k_col_scale, v_row_scale, v_col_scale;
@@ -539,6 +564,350 @@ static void llama_kvarn_dequant_reference(
     }
 }
 
+static const float TURBO_TEST_S1[128] = {
+    -1, 1, 1, -1, -1, 1, -1, 1, -1, -1, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, -1, 1, 1, 1, -1, 1, 1, -1, -1, -1,
+    -1, 1, 1, -1, 1, 1, -1, 1, -1, 1, 1, -1, -1, 1, -1, 1, 1, 1, 1, -1, -1, -1, -1, -1, 1, -1, 1, 1, 1, 1, -1, 1,
+    -1, -1, 1, -1, -1, -1, 1, -1, -1, -1, 1, -1, -1, -1, 1, 1, 1, -1, -1, 1, 1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1, -1,
+    -1, 1, 1, -1, 1, -1, 1, -1, 1, 1, 1, 1, -1, 1, -1, 1, 1, -1, 1, 1, -1, -1, -1, -1, -1, 1, 1, -1, 1, 1, -1, 1,
+};
+
+static const float TURBO_TEST_S2[128] = {
+     1, 1, 1, 1, -1, 1, 1, -1, 1, -1, -1, -1, 1, -1, -1, -1, 1, 1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1, -1, 1, 1, 1,
+     1, 1, -1, -1, -1, 1, -1, -1, -1, -1, -1, -1, 1, 1, 1, -1, 1, -1, 1, 1, 1, -1, -1, 1, -1, -1, -1, -1, -1, -1, 1, 1,
+     1, -1, 1, -1, -1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, 1, 1, -1, 1, -1, -1, -1, -1, 1, -1, -1, 1, -1,
+     1, -1, 1, 1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1, 1, -1, 1, -1, -1, -1, -1, -1, 1, -1,
+};
+
+static const float TURBO_TEST_C2[4] = {
+    -0.133462f, -0.039994f, 0.039994f, 0.133462f,
+};
+
+static const float TURBO_TEST_C4[16] = {
+    -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+    -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+     0.006938f,  0.020989f,  0.035597f,  0.051262f,
+     0.068756f,  0.089527f,  0.117195f,  0.173926f,
+};
+
+static float turbo_test_centroid(uint32_t bits, uint32_t idx) {
+    return bits == 2 ? TURBO_TEST_C2[idx & 3u] : TURBO_TEST_C4[idx & 15u];
+}
+
+static size_t turbo_test_block_bytes(uint32_t bits) {
+    return bits == 2 ? 34 : 68;
+}
+
+static uint32_t turbo_test_nearest(float v, uint32_t bits) {
+    if (bits == 2) {
+        if (v < -0.086728f) {
+            return 0;
+        }
+        if (v < 0.0f) {
+            return 1;
+        }
+        if (v < 0.086728f) {
+            return 2;
+        }
+        return 3;
+    }
+
+    uint32_t best = 0;
+    float best_dist = std::fabs(v - TURBO_TEST_C4[0]);
+    for (uint32_t i = 1; i < 16; ++i) {
+        const float dist = std::fabs(v - TURBO_TEST_C4[i]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static void turbo_test_fwht128(std::vector<float> & x) {
+    for (uint32_t step = 1; step < 128; step <<= 1) {
+        for (uint32_t base = 0; base < 128; base += 2*step) {
+            for (uint32_t i = 0; i < step; ++i) {
+                const uint32_t i0 = base + i;
+                const uint32_t i1 = i0 + step;
+                const float a = x[i0];
+                const float b = x[i1];
+                x[i0] = a + b;
+                x[i1] = a - b;
+            }
+        }
+    }
+    const float scale = 1.0f/std::sqrt(128.0f);
+    for (float & v : x) {
+        v *= scale;
+    }
+}
+
+static void turbo_test_pack_ref(
+        const std::vector<float> & v_tile,
+        uint32_t head_dim,
+        uint32_t group,
+        uint32_t bits,
+        bool canonical_layout,
+        std::vector<uint8_t> & body,
+        std::vector<float> & scales,
+        std::vector<float> & deq_rot) {
+    const uint32_t blocks_per_row = head_dim/128u;
+    body.assign(canonical_layout ?
+            size_t(group)*blocks_per_row*turbo_test_block_bytes(bits) :
+            packed_nbytes(size_t(head_dim)*group, bits), 0);
+    scales.assign(size_t(head_dim) + 2u*group, 0.0f);
+    deq_rot.assign(size_t(head_dim)*group, 0.0f);
+
+    std::vector<float> x(128);
+    std::vector<uint8_t> q(128);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t b = 0; b < blocks_per_row; ++b) {
+            double ss = 0.0;
+            for (uint32_t j = 0; j < 128; ++j) {
+                const float v = v_tile[size_t(g)*head_dim + b*128u + j];
+                x[j] = v;
+                ss += double(v)*double(v);
+            }
+            const float norm = std::sqrt(float(ss));
+            for (uint32_t j = 0; j < 128; ++j) {
+                x[j] = norm > 1.0e-10f ? x[j]/norm : 0.0f;
+                x[j] *= TURBO_TEST_S1[j];
+            }
+            turbo_test_fwht128(x);
+            for (uint32_t j = 0; j < 128; ++j) {
+                x[j] *= TURBO_TEST_S2[j];
+                q[j] = uint8_t(turbo_test_nearest(x[j], bits));
+            }
+
+            double rss = 0.0;
+            for (uint32_t j = 0; j < 128; ++j) {
+                const float c = turbo_test_centroid(bits, q[j]);
+                rss += double(c)*double(c);
+            }
+            const float recon_norm = std::sqrt(float(rss));
+            const float corrected_norm = recon_norm > 1.0e-10f ? norm/recon_norm : norm;
+            if (canonical_layout) {
+                const size_t block_off = (size_t(g)*blocks_per_row + b)*turbo_test_block_bytes(bits);
+                const uint16_t norm_bits = f32_to_f16_bits(corrected_norm);
+                body[block_off + 0] = uint8_t(norm_bits & 0xffu);
+                body[block_off + 1] = uint8_t(norm_bits >> 8);
+                if (bits == 4) {
+                    body[block_off + 2] = 0;
+                    body[block_off + 3] = 0;
+                }
+            } else {
+                scales[size_t(g)*blocks_per_row + b] = corrected_norm;
+            }
+
+            for (uint32_t j = 0; j < 128; ++j) {
+                const uint32_t d = b*128u + j;
+                const size_t qi = size_t(g)*head_dim + d;
+                if (bits == 2) {
+                    const size_t byte_pos = canonical_layout ?
+                        (size_t(g)*blocks_per_row + b)*turbo_test_block_bytes(bits) + 2u + (j >> 2) :
+                        ((qi*2u) >> 3);
+                    body[byte_pos] |= uint8_t((q[j] & 0x3u) << ((j & 3u)*2u));
+                } else {
+                    const size_t byte_pos = canonical_layout ?
+                        (size_t(g)*blocks_per_row + b)*turbo_test_block_bytes(bits) + 4u + (j >> 1) :
+                        ((qi*4u) >> 3);
+                    body[byte_pos] |= uint8_t((q[j] & 0x0fu) << ((j & 1u)*4u));
+                }
+                deq_rot[qi] = turbo_test_centroid(bits, q[j])*corrected_norm;
+            }
+        }
+    }
+}
+
+static void test_materialize_kv_window(uint32_t key_bits, uint32_t value_bits) {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.key_bits = key_bits;
+    params.value_bits = value_bits;
+
+    const uint32_t head_dim = 512;
+    const uint32_t group = params.group_size;
+    const uint32_t n_head_kv = 2;
+    const uint32_t n_sink = 3;
+    const uint32_t n_records = 2;
+    const uint32_t n_pending = 2;
+    const uint32_t n_tail = 4;
+    const uint32_t tail_start = 2;
+    const uint32_t n_body = n_records*group;
+    const uint32_t n_kv = n_sink + n_body + n_pending + n_tail;
+
+    std::vector<uint16_t> sink_tail_k(size_t(n_head_kv)*(n_sink + n_tail)*head_dim);
+    std::vector<uint16_t> sink_tail_v(sink_tail_k.size());
+    std::vector<float> pending_k(size_t(n_head_kv)*n_pending*head_dim);
+    std::vector<float> pending_v(pending_k.size());
+    std::vector<uint8_t> k_body;
+    std::vector<uint8_t> v_body;
+    std::vector<float> k_scales;
+    std::vector<float> v_scales;
+    std::vector<float> k_ref(size_t(n_head_kv)*n_kv*head_dim);
+    std::vector<float> v_ref(k_ref.size());
+
+    const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+    const size_t k_body_bytes = layout.k_body_bytes;
+    const size_t v_body_bytes = layout.v_body_bytes;
+    const size_t k_scale_floats = layout.k_scale_floats;
+    const size_t v_scale_floats = layout.v_scale_floats;
+    k_body.resize(size_t(n_head_kv)*n_records*k_body_bytes);
+    v_body.resize(size_t(n_head_kv)*n_records*v_body_bytes);
+    k_scales.resize(size_t(n_head_kv)*n_records*k_scale_floats);
+    v_scales.resize(size_t(n_head_kv)*n_records*v_scale_floats);
+
+    auto ref_at = [head_dim, n_head_kv](std::vector<float> & ref, uint32_t t, uint32_t ih, uint32_t d) -> float & {
+        return ref[(size_t(t)*n_head_kv + ih)*head_dim + d];
+    };
+    auto cache_at = [head_dim, n_head_kv](std::vector<uint16_t> & cache, uint32_t slot, uint32_t ih, uint32_t d) -> uint16_t & {
+        return cache[(size_t(slot)*n_head_kv + ih)*head_dim + d];
+    };
+    auto pending_at = [head_dim, n_head_kv](std::vector<float> & pending, uint32_t t, uint32_t ih, uint32_t d) -> float & {
+        return pending[(size_t(t)*n_head_kv + ih)*head_dim + d];
+    };
+
+    for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+        for (uint32_t slot = 0; slot < n_sink + n_tail; ++slot) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const float k = 0.001f*float(d % 97) + 0.01f*float(ih) + 0.1f*float(slot);
+                const float v = -0.002f*float(d % 83) + 0.015f*float(ih) - 0.05f*float(slot);
+                cache_at(sink_tail_k, slot, ih, d) = f32_to_f16_bits(k);
+                cache_at(sink_tail_v, slot, ih, d) = f32_to_f16_bits(v);
+            }
+        }
+        for (uint32_t t = 0; t < n_pending; ++t) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                pending_at(pending_k, t, ih, d) = 0.003f*float(d % 71) + 0.02f*float(ih) + 0.2f*float(t);
+                pending_at(pending_v, t, ih, d) = -0.004f*float(d % 67) + 0.025f*float(ih) - 0.15f*float(t);
+            }
+        }
+
+        for (uint32_t r = 0; r < n_records; ++r) {
+            std::vector<float> k_tile(size_t(head_dim)*group);
+            std::vector<float> v_tile(k_tile.size());
+            for (uint32_t g = 0; g < group; ++g) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    k_tile[size_t(d)*group + g] = 0.0007f*float((d + 3*g + 11*r + 17*ih) % 251) - 0.09f;
+                    v_tile[size_t(g)*head_dim + d] = 0.0009f*float((5*d + g + 13*r + 19*ih) % 257) - 0.11f;
+                }
+            }
+            const llama_kvarn_body_record rec =
+                llama_kvarn_store_reference_frame(params, head_dim, k_tile, v_tile, false, false, false);
+            std::memcpy(k_body.data() + (size_t(ih)*n_records + r)*k_body_bytes, rec.k_body.data(), k_body_bytes);
+            std::memcpy(v_body.data() + (size_t(ih)*n_records + r)*v_body_bytes, rec.v_body.data(), v_body_bytes);
+            std::memcpy(k_scales.data() + (size_t(ih)*n_records + r)*k_scale_floats, rec.k_scales.data(), k_scale_floats*sizeof(float));
+            std::memcpy(v_scales.data() + (size_t(ih)*n_records + r)*v_scale_floats, rec.v_scales.data(), v_scale_floats*sizeof(float));
+
+            std::vector<float> k_deq, v_deq;
+            llama_kvarn_dequant_reference(rec, k_deq, v_deq);
+            for (uint32_t g = 0; g < group; ++g) {
+                const uint32_t t = n_sink + r*group + g;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    ref_at(k_ref, t, ih, d) = f16_bits_to_f32(f32_to_f16_bits(k_deq[size_t(d)*group + g]));
+                    ref_at(v_ref, t, ih, d) = f16_bits_to_f32(f32_to_f16_bits(v_deq[size_t(g)*head_dim + d]));
+                }
+            }
+        }
+    }
+
+    for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+        for (uint32_t t = 0; t < n_sink; ++t) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                ref_at(k_ref, t, ih, d) = f16_bits_to_f32(cache_at(sink_tail_k, t, ih, d));
+                ref_at(v_ref, t, ih, d) = f16_bits_to_f32(cache_at(sink_tail_v, t, ih, d));
+            }
+        }
+        for (uint32_t t = 0; t < n_pending; ++t) {
+            const uint32_t out_t = n_sink + n_body + t;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                ref_at(k_ref, out_t, ih, d) = f16_bits_to_f32(f32_to_f16_bits(pending_at(pending_k, t, ih, d)));
+                ref_at(v_ref, out_t, ih, d) = f16_bits_to_f32(f32_to_f16_bits(pending_at(pending_v, t, ih, d)));
+            }
+        }
+        for (uint32_t t = 0; t < n_tail; ++t) {
+            const uint32_t out_t = n_sink + n_body + n_pending + t;
+            const uint32_t slot = n_sink + ((tail_start + t) % n_tail);
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                ref_at(k_ref, out_t, ih, d) = f16_bits_to_f32(cache_at(sink_tail_k, slot, ih, d));
+                ref_at(v_ref, out_t, ih, d) = f16_bits_to_f32(cache_at(sink_tail_v, slot, ih, d));
+            }
+        }
+    }
+
+    uint16_t * sink_tail_k_d = cuda_upload(sink_tail_k);
+    uint16_t * sink_tail_v_d = cuda_upload(sink_tail_v);
+    uint8_t * k_body_d = cuda_upload(k_body);
+    uint8_t * v_body_d = cuda_upload(v_body);
+    float * k_scales_d = cuda_upload(k_scales);
+    float * v_scales_d = cuda_upload(v_scales);
+    float * pending_k_d = cuda_upload(pending_k);
+    float * pending_v_d = cuda_upload(pending_v);
+    uint16_t * k_out_d = nullptr;
+    uint16_t * v_out_d = nullptr;
+    require_cuda(cudaMalloc(&k_out_d, size_t(n_head_kv)*n_kv*head_dim*sizeof(uint16_t)), "cudaMalloc materialized K");
+    require_cuda(cudaMalloc(&v_out_d, size_t(n_head_kv)*n_kv*head_dim*sizeof(uint16_t)), "cudaMalloc materialized V");
+
+    ggml_cuda_kvarn_materialize_kv_f16(
+            sink_tail_k_d, k_body_d, k_scales_d, pending_k_d, k_out_d,
+            0, n_sink, n_records, n_pending, n_tail, tail_start,
+            n_head_kv, head_dim, group, key_bits,
+            0,
+            head_dim, size_t(head_dim)*n_head_kv,
+            k_body_bytes, size_t(k_body_bytes)*n_records,
+            k_scale_floats, size_t(k_scale_floats)*n_records,
+            head_dim, size_t(head_dim)*n_head_kv,
+            head_dim, size_t(head_dim)*n_head_kv,
+            nullptr);
+    require_cuda(cudaGetLastError(), "KVarN materialize K launch");
+
+    ggml_cuda_kvarn_materialize_kv_f16(
+            sink_tail_v_d, v_body_d, v_scales_d, pending_v_d, v_out_d,
+            1, n_sink, n_records, n_pending, n_tail, tail_start,
+            n_head_kv, head_dim, group, value_bits,
+            0,
+            head_dim, size_t(head_dim)*n_head_kv,
+            v_body_bytes, size_t(v_body_bytes)*n_records,
+            v_scale_floats, size_t(v_scale_floats)*n_records,
+            head_dim, size_t(head_dim)*n_head_kv,
+            head_dim, size_t(head_dim)*n_head_kv,
+            nullptr);
+    require_cuda(cudaGetLastError(), "KVarN materialize V launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN materialize sync");
+
+    std::vector<uint16_t> k_out(size_t(n_head_kv)*n_kv*head_dim);
+    std::vector<uint16_t> v_out(k_out.size());
+    require_cuda(cudaMemcpy(k_out.data(), k_out_d, k_out.size()*sizeof(uint16_t), cudaMemcpyDeviceToHost), "copy materialized K");
+    require_cuda(cudaMemcpy(v_out.data(), v_out_d, v_out.size()*sizeof(uint16_t), cudaMemcpyDeviceToHost), "copy materialized V");
+
+    float max_err = 0.0f;
+    for (uint32_t t = 0; t < n_kv; ++t) {
+        for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t packed_i = (size_t(t)*n_head_kv + ih)*head_dim + d;
+                const float k = f16_bits_to_f32(k_out[packed_i]);
+                const float v = f16_bits_to_f32(v_out[packed_i]);
+                max_err = std::max(max_err, std::fabs(k - ref_at(k_ref, t, ih, d)));
+                max_err = std::max(max_err, std::fabs(v - ref_at(v_ref, t, ih, d)));
+            }
+        }
+    }
+    if (max_err > 0.0f) {
+        std::fprintf(stderr, "materialize K%uV%u max_err=%g\n", key_bits, value_bits, double(max_err));
+    }
+    require(max_err <= 5.0e-4f, "CUDA KVarN materialize K/V compact window matches CPU oracle");
+
+    cudaFree(sink_tail_k_d);
+    cudaFree(sink_tail_v_d);
+    cudaFree(k_body_d);
+    cudaFree(v_body_d);
+    cudaFree(k_scales_d);
+    cudaFree(v_scales_d);
+    cudaFree(pending_k_d);
+    cudaFree(pending_v_d);
+    cudaFree(k_out_d);
+    cudaFree(v_out_d);
+}
+
 static float nmse(
         const std::vector<float> & ref,
         const std::vector<float> & test) {
@@ -574,6 +943,437 @@ static std::vector<float> hadamard_vector(const std::vector<float> & src) {
         v *= norm;
     }
     return dst;
+}
+
+static void test_fused_paper_frame_sinktail_decode() {
+    for (uint32_t head_dim : { 128u, 256u, 512u }) {
+        const uint32_t n_head = 4;
+        const uint32_t n_head_kv = 1;
+        const uint32_t n_sink = 2;
+        const uint32_t n_tail = 4;
+        const uint32_t tail_start = 1;
+        const uint32_t n_slots = n_sink + n_tail;
+        const float scale = 1.0f/std::sqrt(float(head_dim));
+
+        std::vector<float> q(size_t(n_head)*head_dim);
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                q[size_t(ih)*head_dim + d] =
+                    0.19f*std::sin(float(d + 7*ih)*0.031f) -
+                    0.13f*std::cos(float(3*d + 5*ih)*0.017f);
+            }
+        }
+
+        std::vector<float> k_rot(size_t(n_slots)*n_head_kv*head_dim);
+        std::vector<float> v_rot(k_rot.size());
+        std::vector<uint16_t> k_rot_f16(k_rot.size());
+        std::vector<uint16_t> v_rot_f16(v_rot.size());
+        for (uint32_t t = 0; t < n_slots; ++t) {
+            std::vector<float> k_raw(head_dim);
+            std::vector<float> v_raw(head_dim);
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                k_raw[d] =
+                    0.17f*std::sin(float(d + 11*t)*0.023f) +
+                    0.07f*std::cos(float(5*d + t)*0.019f);
+                v_raw[d] =
+                    0.21f*std::cos(float(2*d + 13*t)*0.015f) -
+                    0.05f*std::sin(float(7*d + t)*0.011f);
+            }
+            const std::vector<float> k_h = hadamard_vector(k_raw);
+            const std::vector<float> v_h = hadamard_vector(v_raw);
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t off = size_t(t)*head_dim + d;
+                k_rot_f16[off] = f32_to_f16_bits(k_h[d]);
+                v_rot_f16[off] = f32_to_f16_bits(v_h[d]);
+                k_rot[off] = f16_bits_to_f32(k_rot_f16[off]);
+                v_rot[off] = f16_bits_to_f32(v_rot_f16[off]);
+            }
+        }
+
+        std::vector<float> ref(size_t(n_head)*head_dim, 0.0f);
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            std::vector<float> q_row(head_dim);
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                q_row[d] = q[size_t(ih)*head_dim + d];
+            }
+            const std::vector<float> q_rot = hadamard_vector(q_row);
+
+            std::vector<float> scores(n_slots, 0.0f);
+            for (uint32_t t = 0; t < n_slots; ++t) {
+                const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    scores[t] += q_rot[d]*k_rot[size_t(slot)*head_dim + d];
+                }
+                scores[t] *= scale;
+            }
+            float row_max = scores[0];
+            for (float s : scores) {
+                row_max = std::max(row_max, s);
+            }
+            std::vector<float> probs(n_slots);
+            float denom = 0.0f;
+            for (uint32_t t = 0; t < n_slots; ++t) {
+                probs[t] = std::exp(scores[t] - row_max);
+                denom += probs[t];
+            }
+            std::vector<float> out_rot(head_dim, 0.0f);
+            for (uint32_t t = 0; t < n_slots; ++t) {
+                const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+                const float p = probs[t]/denom;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    out_rot[d] += p*v_rot[size_t(slot)*head_dim + d];
+                }
+            }
+            const std::vector<float> out = hadamard_vector(out_rot);
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                ref[size_t(ih)*head_dim + d] = out[d];
+            }
+        }
+
+        float * q_d = cuda_upload(q);
+        uint16_t * k_d = cuda_upload(k_rot_f16);
+        uint16_t * v_d = cuda_upload(v_rot_f16);
+        std::vector<uint8_t> dummy_body(1, 0);
+        std::vector<float> dummy_f32(size_t(head_dim), 0.0f);
+        uint8_t * body_d = cuda_upload(dummy_body);
+        float * f32_d = cuda_upload(dummy_f32);
+        float * out_d = nullptr;
+        float * scores_d = nullptr;
+        require_cuda(cudaMalloc(&out_d, ref.size()*sizeof(float)), "cudaMalloc fused paper-frame output");
+        require_cuda(cudaMalloc(&scores_d, sizeof(float)), "cudaMalloc fused paper-frame scores");
+
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_d, k_d, v_d,
+                body_d, body_d, f32_d, f32_d, f32_d, f32_d,
+                nullptr,
+                out_d, scores_d,
+                1, n_head, n_head_kv,
+                n_sink, 0, 0, n_tail, tail_start, head_dim, 4,
+                4, 4,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                1, 1, 1, 1,
+                1, 1, 1, 1,
+                0, 0, 0,
+                scale,
+                nullptr, nullptr, 0, 0, nullptr, 1u);
+        require_cuda(cudaGetLastError(), "KVarN CUDA fused paper-frame decode launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA fused paper-frame decode sync");
+
+        std::vector<float> got(ref.size());
+        require_cuda(cudaMemcpy(got.data(), out_d, got.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy fused paper-frame output");
+        float max_err = 0.0f;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            max_err = std::max(max_err, std::fabs(ref[i] - got[i]));
+        }
+        if (max_err >= 5.0e-4f) {
+            std::fprintf(stderr,
+                    "fused paper-frame sink/tail decode mismatch: head_dim=%u max_err=%g\n",
+                    head_dim, double(max_err));
+        }
+        require(max_err < 5.0e-4f, "fused paper-frame sink/tail decode matches dense-frame oracle");
+
+        cudaFree(q_d);
+        cudaFree(k_d);
+        cudaFree(v_d);
+        cudaFree(body_d);
+        cudaFree(f32_d);
+        cudaFree(out_d);
+        cudaFree(scores_d);
+    }
+}
+
+static void test_fused_paper_frame_sinktail_batch() {
+    const uint32_t head_dim = 512;
+    const uint32_t n_queries = 3;
+    const uint32_t n_head = 4;
+    const uint32_t n_head_kv = 1;
+    const uint32_t n_sink = 2;
+    const uint32_t n_tail = 5;
+    const uint32_t tail_start = 2;
+    const uint32_t n_slots = n_sink + n_tail;
+    const float scale = 1.0f/std::sqrt(float(head_dim));
+
+    std::vector<float> q(size_t(n_queries)*n_head*head_dim);
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                q[(size_t(iq)*n_head + ih)*head_dim + d] =
+                    0.16f*std::sin(float(d + 9*ih + 3*iq)*0.027f) -
+                    0.12f*std::cos(float(2*d + 7*ih + 5*iq)*0.021f);
+            }
+        }
+    }
+
+    std::vector<float> k_rot(size_t(n_slots)*head_dim);
+    std::vector<float> v_rot(k_rot.size());
+    std::vector<uint16_t> k_rot_f16(k_rot.size());
+    std::vector<uint16_t> v_rot_f16(v_rot.size());
+    for (uint32_t t = 0; t < n_slots; ++t) {
+        std::vector<float> k_raw(head_dim);
+        std::vector<float> v_raw(head_dim);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            k_raw[d] =
+                0.15f*std::sin(float(d + 13*t)*0.019f) +
+                0.06f*std::cos(float(3*d + t)*0.013f);
+            v_raw[d] =
+                0.18f*std::cos(float(2*d + 17*t)*0.017f) -
+                0.04f*std::sin(float(5*d + t)*0.009f);
+        }
+        const std::vector<float> k_h = hadamard_vector(k_raw);
+        const std::vector<float> v_h = hadamard_vector(v_raw);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t off = size_t(t)*head_dim + d;
+            k_rot_f16[off] = f32_to_f16_bits(k_h[d]);
+            v_rot_f16[off] = f32_to_f16_bits(v_h[d]);
+            k_rot[off] = f16_bits_to_f32(k_rot_f16[off]);
+            v_rot[off] = f16_bits_to_f32(v_rot_f16[off]);
+        }
+    }
+
+    std::vector<float> ref(q.size(), 0.0f);
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            std::vector<float> q_row(head_dim);
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                q_row[d] = q[(size_t(iq)*n_head + ih)*head_dim + d];
+            }
+            const std::vector<float> q_rot = hadamard_vector(q_row);
+            std::vector<float> scores(n_slots, 0.0f);
+            for (uint32_t t = 0; t < n_slots; ++t) {
+                const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    scores[t] += q_rot[d]*k_rot[size_t(slot)*head_dim + d];
+                }
+                scores[t] *= scale;
+            }
+            float row_max = scores[0];
+            for (float s : scores) {
+                row_max = std::max(row_max, s);
+            }
+            std::vector<float> probs(n_slots);
+            float denom = 0.0f;
+            for (uint32_t t = 0; t < n_slots; ++t) {
+                probs[t] = std::exp(scores[t] - row_max);
+                denom += probs[t];
+            }
+            std::vector<float> out_rot(head_dim, 0.0f);
+            for (uint32_t t = 0; t < n_slots; ++t) {
+                const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+                const float p = probs[t]/denom;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    out_rot[d] += p*v_rot[size_t(slot)*head_dim + d];
+                }
+            }
+            const std::vector<float> out = hadamard_vector(out_rot);
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                ref[(size_t(iq)*n_head + ih)*head_dim + d] = out[d];
+            }
+        }
+    }
+
+    float * q_d = cuda_upload(q);
+    uint16_t * k_d = cuda_upload(k_rot_f16);
+    uint16_t * v_d = cuda_upload(v_rot_f16);
+    std::vector<uint8_t> dummy_body(1, 0);
+    std::vector<float> dummy_f32(size_t(head_dim), 0.0f);
+    uint8_t * body_d = cuda_upload(dummy_body);
+    float * f32_d = cuda_upload(dummy_f32);
+    float * out_d = nullptr;
+    float * scores_d = nullptr;
+    require_cuda(cudaMalloc(&out_d, ref.size()*sizeof(float)), "cudaMalloc fused paper-frame batch output");
+    require_cuda(cudaMalloc(&scores_d, sizeof(float)), "cudaMalloc fused paper-frame batch scores");
+
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            q_d, k_d, v_d,
+            body_d, body_d, f32_d, f32_d, f32_d, f32_d,
+            nullptr,
+            out_d, scores_d,
+            n_queries, n_head, n_head_kv,
+            n_sink, 0, 0, n_tail, tail_start, head_dim, 4,
+            4, 4,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            1, 1, 1, 1,
+            1, 1, 1, 1,
+            0, 0, 0,
+            scale,
+            nullptr, nullptr, 0, 0, nullptr, 1u);
+    require_cuda(cudaGetLastError(), "KVarN CUDA fused paper-frame batch launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA fused paper-frame batch sync");
+
+    std::vector<float> got(ref.size());
+    require_cuda(cudaMemcpy(got.data(), out_d, got.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy fused paper-frame batch output");
+    float max_err = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        max_err = std::max(max_err, std::fabs(ref[i] - got[i]));
+    }
+    if (max_err >= 5.0e-4f) {
+        std::fprintf(stderr,
+                "fused paper-frame sink/tail batch mismatch: max_err=%g\n",
+                double(max_err));
+    }
+    require(max_err < 5.0e-4f, "fused paper-frame sink/tail batch matches dense-frame oracle");
+
+    cudaFree(q_d);
+    cudaFree(k_d);
+    cudaFree(v_d);
+    cudaFree(body_d);
+    cudaFree(f32_d);
+    cudaFree(out_d);
+    cudaFree(scores_d);
+}
+
+static void test_gemma512_sinktail_production_shape_sampled() {
+    const uint32_t head_dim = 512;
+    const uint32_t n_queries = 512;
+    const uint32_t n_head = 16;
+    const uint32_t n_head_kv = 1;
+    const uint32_t n_sink = 128;
+    const uint32_t n_tail = 896;
+    const uint32_t tail_start = 0;
+    const uint32_t n_tokens = n_sink + n_tail;
+    const uint32_t group = 128;
+    const float scale = 1.0f;
+
+    std::vector<float> q(size_t(n_queries)*n_head*head_dim);
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                q[(size_t(iq)*n_head + ih)*head_dim + d] =
+                    0.92f*std::sin(float(d + 3*ih + 17*iq)*0.031f) -
+                    0.77f*std::cos(float(5*d + 11*ih + 7*iq)*0.013f);
+            }
+        }
+    }
+
+    std::vector<uint16_t> k_f16(size_t(n_tokens)*n_head_kv*head_dim);
+    std::vector<uint16_t> v_f16(k_f16.size());
+    std::vector<float> k_ref(k_f16.size());
+    std::vector<float> v_ref(v_f16.size());
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t off = size_t(t)*head_dim + d;
+            const float k = 0.88f*std::sin(float(d + 19*t)*0.017f) -
+                            0.71f*std::cos(float(3*d + 23*t)*0.011f);
+            const float v = 0.83f*std::cos(float(5*d + 29*t)*0.019f) +
+                            0.69f*std::sin(float(d + 31*t)*0.023f);
+            k_f16[off] = f32_to_f16_bits(k);
+            v_f16[off] = f32_to_f16_bits(v);
+            k_ref[off] = f16_bits_to_f32(k_f16[off]);
+            v_ref[off] = f16_bits_to_f32(v_f16[off]);
+        }
+    }
+
+    std::vector<float> pending(size_t(n_head_kv)*head_dim, 0.0f);
+    std::vector<uint8_t> dummy_body(1, 0);
+    std::vector<float> dummy_scales(size_t(head_dim), 0.0f);
+
+    float * q_d = cuda_upload(q);
+    uint16_t * k_d = cuda_upload(k_f16);
+    uint16_t * v_d = cuda_upload(v_f16);
+    float * pending_d = cuda_upload(pending);
+    uint8_t * body_d = cuda_upload(dummy_body);
+    float * scales_d = cuda_upload(dummy_scales);
+
+    float * out_d = nullptr;
+    float * scores_d = nullptr;
+    require_cuda(cudaMalloc(&out_d, q.size()*sizeof(float)), "cudaMalloc Gemma production-shape output");
+    require_cuda(cudaMalloc(&scores_d, n_tokens*sizeof(float)), "cudaMalloc Gemma production-shape scores");
+
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            q_d, k_d, v_d,
+            body_d, body_d, scales_d, scales_d, pending_d, pending_d,
+            nullptr,
+            out_d, scores_d,
+            n_queries, n_head, n_head_kv,
+            n_sink, 0, 0, n_tail, tail_start, head_dim, group,
+            8, 8,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            1, 1, 1, 1,
+            1, 1, 1, 1,
+            0, 0, 3,
+            scale,
+            nullptr);
+    require_cuda(cudaGetLastError(), "KVarN CUDA Gemma production-shape sink/tail launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA Gemma production-shape sink/tail sync");
+
+    std::vector<float> got(q.size());
+    require_cuda(cudaMemcpy(got.data(), out_d, got.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy Gemma production-shape output");
+
+    const uint32_t sample_queries[] = { 0, 1, 127, 255, 511 };
+    float max_err = 0.0f;
+    uint32_t worst_iq = 0;
+    uint32_t worst_ih = 0;
+    uint32_t worst_d = 0;
+    for (const uint32_t iq : sample_queries) {
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            const uint32_t ikh = ih/(n_head/n_head_kv);
+            const float * q_row = q.data() + (size_t(iq)*n_head + ih)*head_dim;
+            std::vector<float> row_scores(n_tokens, 0.0f);
+            const int32_t causal_limit = int32_t(n_tokens - n_queries + iq);
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+                float s = 0.0f;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    s += q_row[d]*k_ref[(size_t(slot)*n_head_kv + ikh)*head_dim + d];
+                }
+                row_scores[t] = int32_t(t) <= causal_limit ? s*scale : -INFINITY;
+            }
+
+            float row_max = row_scores[0];
+            for (float s : row_scores) {
+                row_max = std::max(row_max, s);
+            }
+            std::vector<float> row_probs(n_tokens);
+            float denom = 0.0f;
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                row_probs[t] = std::exp(row_scores[t] - row_max);
+                denom += row_probs[t];
+            }
+
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float ref = 0.0f;
+                for (uint32_t t = 0; t < n_tokens; ++t) {
+                    const uint32_t slot = t < n_sink ? t : n_sink + ((tail_start + (t - n_sink))%n_tail);
+                    ref += (row_probs[t]/denom)*v_ref[(size_t(slot)*n_head_kv + ikh)*head_dim + d];
+                }
+                const size_t off = (size_t(iq)*n_head + ih)*head_dim + d;
+                const float err = std::fabs(ref - got[off]);
+                if (err > max_err) {
+                    max_err = err;
+                    worst_iq = iq;
+                    worst_ih = ih;
+                    worst_d = d;
+                }
+            }
+        }
+    }
+    if (max_err >= 2.0e-4f) {
+        std::fprintf(stderr,
+                "Gemma production-shape sink/tail sampled mismatch: max_err=%g iq=%u ih=%u d=%u\n",
+                double(max_err), worst_iq, worst_ih, worst_d);
+    }
+    require(max_err < 2.0e-4f, "CUDA Gemma production-shape sink/tail attention matches sampled CPU reference");
+
+    cudaFree(q_d);
+    cudaFree(k_d);
+    cudaFree(v_d);
+    cudaFree(pending_d);
+    cudaFree(body_d);
+    cudaFree(scales_d);
+    cudaFree(out_d);
+    cudaFree(scores_d);
 }
 
 static void test_paper_frame_contract(
@@ -674,11 +1474,12 @@ static void test_paper_frame_contract(
 
 static void test_direct_record_batched_phases(
         uint32_t head_dim,
-        const llama_kvarn_params & params) {
-    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "1");
+        const llama_kvarn_params & params,
+        uint32_t n_heads,
+        uint32_t n_records) {
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
+    set_env_var("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", "1");
     const uint32_t group = params.group_size;
-    const uint32_t n_heads = head_dim == 512 ? 1 : 2;
-    const uint32_t n_records = 2;
     const size_t n = size_t(head_dim)*group;
     const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
 
@@ -730,7 +1531,8 @@ static void test_direct_record_batched_phases(
                     v_rec[size_t(g)*head_dim + d] = v_tiles[src];
                 }
             }
-            const llama_kvarn_body_record rec = llama_kvarn_store_reference(params, head_dim, k_rec, v_rec);
+            const llama_kvarn_body_record rec =
+                llama_kvarn_store_reference_frame(params, head_dim, k_rec, v_rec, true, false, false);
             const size_t body_k_off = size_t(ih)*k_body_head_stride + size_t(r)*k_body_record_stride;
             const size_t body_v_off = size_t(ih)*v_body_head_stride + size_t(r)*v_body_record_stride;
             const size_t scale_k_off = size_t(ih)*k_scale_head_stride + size_t(r)*k_scale_record_stride;
@@ -744,49 +1546,132 @@ static void test_direct_record_batched_phases(
 
     float * k_tiles_d = cuda_upload(k_tiles);
     float * v_tiles_d = cuda_upload(v_tiles);
-    uint8_t * k_body_d = nullptr;
-    uint8_t * v_body_d = nullptr;
-    float * k_scales_d = nullptr;
-    float * v_scales_d = nullptr;
-    float * scratch_d = nullptr;
-    const size_t scratch_floats = 2*size_t(n_heads)*n_records*n;
-    require_cuda(cudaMalloc(&k_body_d, k_body_ref.size()), "cudaMalloc direct batched K body");
-    require_cuda(cudaMalloc(&v_body_d, v_body_ref.size()), "cudaMalloc direct batched V body");
-    require_cuda(cudaMalloc(&k_scales_d, k_scales_ref.size()*sizeof(float)), "cudaMalloc direct batched K scales");
-    require_cuda(cudaMalloc(&v_scales_d, v_scales_ref.size()*sizeof(float)), "cudaMalloc direct batched V scales");
-    require_cuda(cudaMalloc(&scratch_d, scratch_floats*sizeof(float)), "cudaMalloc direct batched scratch");
+    const size_t n_tiles = size_t(n_heads)*n_records;
+    const size_t data_floats = n_tiles*n;
+    const size_t best_floats = n_tiles*(size_t(head_dim) + group + 1);
+    const size_t batched_scratch_floats = 2*data_floats + 2*best_floats;
+    const size_t tmp_rows = std::max<uint32_t>(head_dim, group);
+    const size_t per_pipeline_floats = n + 2*tmp_rows + head_dim + group + 1;
+    const size_t fallback_scratch_floats = 2*n + per_pipeline_floats;
+    const size_t scratch_floats = std::max(batched_scratch_floats, fallback_scratch_floats);
 
-    set_env_var("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES", "1");
+    auto run_store = [&](const char * label, bool rollback,
+            std::vector<uint8_t> & k_body,
+            std::vector<uint8_t> & v_body,
+            std::vector<float> & k_scales,
+            std::vector<float> & v_scales) {
+        uint8_t * k_body_d = nullptr;
+        uint8_t * v_body_d = nullptr;
+        float * k_scales_d = nullptr;
+        float * v_scales_d = nullptr;
+        float * scratch_d = nullptr;
+
+        require_cuda(cudaMalloc(&k_body_d, k_body_ref.size()), "cudaMalloc direct batched K body");
+        require_cuda(cudaMalloc(&v_body_d, v_body_ref.size()), "cudaMalloc direct batched V body");
+        require_cuda(cudaMalloc(&k_scales_d, k_scales_ref.size()*sizeof(float)), "cudaMalloc direct batched K scales");
+        require_cuda(cudaMalloc(&v_scales_d, v_scales_ref.size()*sizeof(float)), "cudaMalloc direct batched V scales");
+        require_cuda(cudaMalloc(&scratch_d, scratch_floats*sizeof(float)), "cudaMalloc direct batched scratch");
+        require_cuda(cudaMemset(k_body_d, 0xa5, k_body_ref.size()), "poison direct batched K body");
+        require_cuda(cudaMemset(v_body_d, 0xa5, v_body_ref.size()), "poison direct batched V body");
+
+        set_env_var("LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES", rollback ? "1" : "");
+        set_env_var("LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES", rollback ? "" : "1");
+    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "1");
     ggml_cuda_kvarn_store_body_direct_records_minmax(
             k_tiles_d, v_tiles_d,
             k_body_d, v_body_d,
             k_scales_d, v_scales_d,
-            scratch_d,
-            n_heads, n_records,
-            head_dim, group, params.key_bits, params.value_bits,
-            params.sinkhorn_iters, params.rtn_quantile,
-            k_body_record_stride, v_body_record_stride,
-            k_body_head_stride, v_body_head_stride,
-            k_scale_record_stride, v_scale_record_stride,
-            k_scale_head_stride, v_scale_head_stride,
+                scratch_d,
+                n_heads, n_records,
+                head_dim, group, params.key_bits, params.value_bits,
+                params.sinkhorn_iters, params.rtn_quantile,
+                k_body_record_stride, v_body_record_stride,
+                k_body_head_stride, v_body_head_stride,
+                k_scale_record_stride, v_scale_record_stride,
+                k_scale_head_stride, v_scale_head_stride,
             tile_head_stride, tile_head_stride,
             tile_group_stride, tile_group_stride,
             tile_record_stride, tile_record_stride,
             scratch_floats,
+            0u,
             nullptr);
-    set_env_var("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES", "");
-    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
-    require_cuda(cudaGetLastError(), "KVarN CUDA direct-record batched phases launch");
-    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA direct-record batched phases sync");
+    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+        set_env_var("LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES", "");
+        set_env_var("LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES", "");
+        require_cuda(cudaGetLastError(), label);
+        require_cuda(cudaDeviceSynchronize(), label);
 
-    std::vector<uint8_t> k_body(k_body_ref.size());
-    std::vector<uint8_t> v_body(v_body_ref.size());
-    std::vector<float> k_scales(k_scales_ref.size());
-    std::vector<float> v_scales(v_scales_ref.size());
-    require_cuda(cudaMemcpy(k_body.data(), k_body_d, k_body.size(), cudaMemcpyDeviceToHost), "copy direct batched K body");
-    require_cuda(cudaMemcpy(v_body.data(), v_body_d, v_body.size(), cudaMemcpyDeviceToHost), "copy direct batched V body");
-    require_cuda(cudaMemcpy(k_scales.data(), k_scales_d, k_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct batched K scales");
-    require_cuda(cudaMemcpy(v_scales.data(), v_scales_d, v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct batched V scales");
+        k_body.resize(k_body_ref.size());
+        v_body.resize(v_body_ref.size());
+        k_scales.resize(k_scales_ref.size());
+        v_scales.resize(v_scales_ref.size());
+        require_cuda(cudaMemcpy(k_body.data(), k_body_d, k_body.size(), cudaMemcpyDeviceToHost), "copy direct batched K body");
+        require_cuda(cudaMemcpy(v_body.data(), v_body_d, v_body.size(), cudaMemcpyDeviceToHost), "copy direct batched V body");
+        require_cuda(cudaMemcpy(k_scales.data(), k_scales_d, k_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct batched K scales");
+        require_cuda(cudaMemcpy(v_scales.data(), v_scales_d, v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct batched V scales");
+
+        cudaFree(k_body_d);
+        cudaFree(v_body_d);
+        cudaFree(k_scales_d);
+        cudaFree(v_scales_d);
+        cudaFree(scratch_d);
+    };
+
+    std::vector<uint8_t> k_body;
+    std::vector<uint8_t> v_body;
+    std::vector<float> k_scales;
+    std::vector<float> v_scales;
+    std::vector<uint8_t> k_body_rollback;
+    std::vector<uint8_t> v_body_rollback;
+    std::vector<float> k_scales_rollback;
+    std::vector<float> v_scales_rollback;
+
+    run_store("KVarN CUDA direct-record batched phases launch/sync", false, k_body, v_body, k_scales, v_scales);
+    run_store("KVarN CUDA direct-record rollback phases launch/sync", true,
+            k_body_rollback, v_body_rollback, k_scales_rollback, v_scales_rollback);
+
+    size_t rollback_packed_diff = 0;
+    for (size_t i = 0; i < k_body.size(); ++i) {
+        rollback_packed_diff += k_body[i] != k_body_rollback[i] ? 1 : 0;
+    }
+    for (size_t i = 0; i < v_body.size(); ++i) {
+        rollback_packed_diff += v_body[i] != v_body_rollback[i] ? 1 : 0;
+    }
+    float rollback_scale_err = 0.0f;
+    const char * rollback_scale_kind = "";
+    size_t rollback_scale_i = 0;
+    float rollback_scale_new = 0.0f;
+    float rollback_scale_old = 0.0f;
+    for (size_t i = 0; i < k_scales.size(); ++i) {
+        const float err = std::fabs(k_scales[i] - k_scales_rollback[i]);
+        if (err > rollback_scale_err) {
+            rollback_scale_err = err;
+            rollback_scale_kind = "K";
+            rollback_scale_i = i;
+            rollback_scale_new = k_scales[i];
+            rollback_scale_old = k_scales_rollback[i];
+        }
+    }
+    for (size_t i = 0; i < v_scales.size(); ++i) {
+        const float err = std::fabs(v_scales[i] - v_scales_rollback[i]);
+        if (err > rollback_scale_err) {
+            rollback_scale_err = err;
+            rollback_scale_kind = "V";
+            rollback_scale_i = i;
+            rollback_scale_new = v_scales[i];
+            rollback_scale_old = v_scales_rollback[i];
+        }
+    }
+    if (rollback_packed_diff != 0 || rollback_scale_err != 0.0f) {
+        std::fprintf(stderr,
+                "direct-record batched-vs-rollback diff: head_dim=%u heads=%u records=%u "
+                "kbits=%u vbits=%u packed_diff=%zu scale_err=%g kind=%s index=%zu batched=%g rollback=%g\n",
+                head_dim, n_heads, n_records, params.key_bits, params.value_bits,
+                rollback_packed_diff, double(rollback_scale_err),
+                rollback_scale_kind, rollback_scale_i, double(rollback_scale_new), double(rollback_scale_old));
+    }
+    require(rollback_packed_diff == 0, "CUDA direct-record batched phases packed bytes match rollback path");
+    require(rollback_scale_err == 0.0f, "CUDA direct-record batched phases scales match rollback path");
 
     size_t packed_diff = 0;
     for (size_t i = 0; i < k_body.size(); ++i) {
@@ -802,21 +1687,127 @@ static void test_direct_record_batched_phases(
     for (size_t i = 0; i < v_scales.size(); ++i) {
         scale_err = std::max(scale_err, std::fabs(v_scales[i] - v_scales_ref[i]));
     }
-    if (packed_diff > 4 || scale_err >= 1.0e-5f) {
+    const size_t allowed_cpu_ref_packed_diff = 4*size_t(n_heads)*n_records;
+    if (packed_diff > allowed_cpu_ref_packed_diff || scale_err >= 1.0e-5f) {
         std::fprintf(stderr,
-                "direct-record batched phases diff: head_dim=%u heads=%u records=%u packed_diff=%zu scale_err=%g\n",
-                head_dim, n_heads, n_records, packed_diff, double(scale_err));
+                "direct-record batched phases CPU-reference diff: head_dim=%u heads=%u records=%u "
+                "kbits=%u vbits=%u packed_diff=%zu allowed=%zu scale_err=%g\n",
+                head_dim, n_heads, n_records, params.key_bits, params.value_bits,
+                packed_diff, allowed_cpu_ref_packed_diff, double(scale_err));
     }
-    require(packed_diff <= 4, "CUDA direct-record batched phases packed bytes match CPU reference");
-    require(scale_err < 1.0e-5f, "CUDA direct-record batched phases scales match CPU reference");
+    require(packed_diff <= allowed_cpu_ref_packed_diff,
+            "CUDA direct-record batched phases packed bytes have bounded CPU/GPU rounding drift");
 
     cudaFree(k_tiles_d);
     cudaFree(v_tiles_d);
+    set_env_var("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", "");
+}
+
+static void test_fullrange_store_overwrites_prefilled_body(
+        uint32_t head_dim,
+        const llama_kvarn_params & params) {
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "1");
+    set_env_var("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", "");
+    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+
+    const uint32_t group = params.group_size;
+    const size_t n = size_t(head_dim)*group;
+    std::vector<float> k_tile(n);
+    std::vector<float> v_tile(n);
+    for (size_t i = 0; i < n; ++i) {
+        k_tile[i] = 0.027f*std::sin(float(i)*0.021f) + 0.018f*std::cos(float(i)*0.007f);
+        v_tile[i] = 0.031f*std::cos(float(i)*0.015f) - 0.022f*std::sin(float(i)*0.011f);
+    }
+
+    const llama_kvarn_body_record record =
+        llama_kvarn_store_reference_frame(params, head_dim, k_tile, v_tile, false, false, false);
+
+    float * k_tile_d = cuda_upload(k_tile);
+    float * v_tile_d = cuda_upload(v_tile);
+    uint8_t * k_body_d = nullptr;
+    uint8_t * v_body_d = nullptr;
+    float * k_scales_d = nullptr;
+    float * v_scales_d = nullptr;
+    float * scratch_d = nullptr;
+    require_cuda(cudaMalloc(&k_body_d, record.k_body.size()), "cudaMalloc overwrite K body");
+    require_cuda(cudaMalloc(&v_body_d, record.v_body.size()), "cudaMalloc overwrite V body");
+    require_cuda(cudaMalloc(&k_scales_d, record.k_scales.size()*sizeof(float)), "cudaMalloc overwrite K scales");
+    require_cuda(cudaMalloc(&v_scales_d, record.v_scales.size()*sizeof(float)), "cudaMalloc overwrite V scales");
+
+    const size_t per_pipeline_store =
+        n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
+    const size_t store_scratch_floats =
+        head_dim >= 256 ? 2*per_pipeline_store : per_pipeline_store;
+    require_cuda(cudaMalloc(&scratch_d, store_scratch_floats*sizeof(float)), "cudaMalloc overwrite scratch");
+
+    auto run_prefilled_store = [&](uint8_t poison, std::vector<uint8_t> & k_body, std::vector<uint8_t> & v_body) {
+        require_cuda(cudaMemset(k_body_d, poison, record.k_body.size()), "poison overwrite K body");
+        require_cuda(cudaMemset(v_body_d, poison, record.v_body.size()), "poison overwrite V body");
+
+        ggml_cuda_kvarn_store_body_reference_minmax(
+                k_tile_d, v_tile_d,
+                k_body_d, v_body_d,
+                k_scales_d, v_scales_d,
+                scratch_d,
+                head_dim, group,
+                params.key_bits, params.value_bits,
+                params.sinkhorn_iters, params.rtn_quantile,
+                0u,
+                nullptr);
+        require_cuda(cudaGetLastError(), "KVarN CUDA poisoned fullrange store launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA poisoned fullrange store sync");
+
+        k_body.resize(record.k_body.size());
+        v_body.resize(record.v_body.size());
+        require_cuda(cudaMemcpy(k_body.data(), k_body_d, k_body.size(), cudaMemcpyDeviceToHost), "copy overwrite K body");
+        require_cuda(cudaMemcpy(v_body.data(), v_body_d, v_body.size(), cudaMemcpyDeviceToHost), "copy overwrite V body");
+    };
+
+    std::vector<uint8_t> k_body_zero;
+    std::vector<uint8_t> v_body_zero;
+    std::vector<uint8_t> k_body_ff;
+    std::vector<uint8_t> v_body_ff;
+    run_prefilled_store(0x00, k_body_zero, v_body_zero);
+    run_prefilled_store(0xff, k_body_ff, v_body_ff);
+
+    size_t prefill_diff = 0;
+    for (size_t i = 0; i < k_body_zero.size(); ++i) {
+        prefill_diff += k_body_zero[i] != k_body_ff[i] ? 1 : 0;
+    }
+    for (size_t i = 0; i < v_body_zero.size(); ++i) {
+        prefill_diff += v_body_zero[i] != v_body_ff[i] ? 1 : 0;
+    }
+    if (prefill_diff != 0) {
+        std::fprintf(stderr,
+                "fullrange prefill-invariance diff: head_dim=%u kbits=%u vbits=%u diff=%zu\n",
+                head_dim, params.key_bits, params.value_bits, prefill_diff);
+    }
+    require(prefill_diff == 0, "CUDA fullrange store output is independent of prefilled body bytes");
+
+    size_t packed_diff = 0;
+    for (size_t i = 0; i < k_body_ff.size(); ++i) {
+        packed_diff += k_body_ff[i] != record.k_body[i] ? 1 : 0;
+    }
+    for (size_t i = 0; i < v_body_ff.size(); ++i) {
+        packed_diff += v_body_ff[i] != record.v_body[i] ? 1 : 0;
+    }
+    const size_t allowed_cpu_ref_packed_diff = 4;
+    if (packed_diff > allowed_cpu_ref_packed_diff) {
+        std::fprintf(stderr,
+                "fullrange poisoned overwrite diff: head_dim=%u kbits=%u vbits=%u diff=%zu allowed=%zu\n",
+                head_dim, params.key_bits, params.value_bits, packed_diff, allowed_cpu_ref_packed_diff);
+    }
+    require(packed_diff <= allowed_cpu_ref_packed_diff,
+            "CUDA fullrange store overwrites poisoned body bytes");
+
+    cudaFree(k_tile_d);
+    cudaFree(v_tile_d);
     cudaFree(k_body_d);
     cudaFree(v_body_d);
     cudaFree(k_scales_d);
     cudaFree(v_scales_d);
     cudaFree(scratch_d);
+    set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
 }
 
 static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
@@ -847,7 +1838,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
     }
 
     const llama_kvarn_body_record ref =
-        llama_kvarn_store_reference(params, head_dim, k_ref_tile, v_ref_tile, paper_frame);
+        llama_kvarn_store_reference_frame(params, head_dim, k_ref_tile, v_ref_tile, paper_frame, false, paper_frame);
 
     float * pending_k_d = cuda_upload(pending_k);
     float * pending_v_d = cuda_upload(pending_v);
@@ -880,6 +1871,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
             layout.k_scale_floats, layout.v_scale_floats,
             layout.k_scale_floats, layout.v_scale_floats,
             head_dim, head_dim,
+            0u,
             nullptr);
     set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
@@ -935,6 +1927,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
                 layout.k_scale_floats, layout.v_scale_floats,
                 layout.k_scale_floats, layout.v_scale_floats,
                 head_dim, head_dim,
+                0u,
                 nullptr);
     } catch (const std::invalid_argument &) {
         rejected_multi_record_pending = true;
@@ -993,7 +1986,8 @@ static void test_pending_heads_store(uint32_t head_dim) {
                 v_rec[size_t(g)*head_dim + d] = pending_v[src];
             }
         }
-        const llama_kvarn_body_record rec = llama_kvarn_store_reference(params, head_dim, k_rec, v_rec);
+        const llama_kvarn_body_record rec =
+            llama_kvarn_store_reference_frame(params, head_dim, k_rec, v_rec, false, false, false);
         std::copy(rec.k_body.begin(), rec.k_body.end(), k_body_ref.begin() + size_t(ih)*layout.k_body_bytes);
         std::copy(rec.v_body.begin(), rec.v_body.end(), v_body_ref.begin() + size_t(ih)*layout.v_body_bytes);
         std::copy(rec.k_scales.begin(), rec.k_scales.end(), k_scales_ref.begin() + size_t(ih)*layout.k_scale_floats);
@@ -1027,6 +2021,7 @@ static void test_pending_heads_store(uint32_t head_dim) {
             layout.k_body_bytes, layout.v_body_bytes,
             layout.k_scale_floats, layout.v_scale_floats,
             pending_token_stride, pending_token_stride,
+            0u,
             nullptr);
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
     require_cuda(cudaGetLastError(), "KVarN CUDA pending-heads store launch");
@@ -1087,7 +2082,8 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
         v_tile[i] = 0.04f*std::cos(float(i)*0.011f) - 0.01f*std::sin(float(i)*0.019f);
     }
 
-    llama_kvarn_body_record record = llama_kvarn_store_reference(params, head_dim, k_tile, v_tile);
+    llama_kvarn_body_record record =
+        llama_kvarn_store_reference_frame(params, head_dim, k_tile, v_tile, false, false, false);
 
     std::vector<float> k_ref;
     std::vector<float> v_ref;
@@ -1105,6 +2101,8 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     require_cuda(cudaMalloc(&v_body_store_d, record.v_body.size()), "cudaMalloc store V body");
     require_cuda(cudaMalloc(&k_scales_store_d, record.k_scales.size()*sizeof(float)), "cudaMalloc store K scales");
     require_cuda(cudaMalloc(&v_scales_store_d, record.v_scales.size()*sizeof(float)), "cudaMalloc store V scales");
+    require_cuda(cudaMemset(k_body_store_d, 0xa5, record.k_body.size()), "poison store K body");
+    require_cuda(cudaMemset(v_body_store_d, 0xa5, record.v_body.size()), "poison store V body");
     const size_t per_pipeline_store =
         n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
     const size_t store_scratch_floats =
@@ -1119,6 +2117,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             store_scratch_d,
             head_dim, group, params.key_bits, params.value_bits,
             params.sinkhorn_iters, params.rtn_quantile,
+            0u,
             nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA store-body launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA store-body sync");
@@ -1238,7 +2237,25 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             params.rtn_quantile < 1.0f ? "quantile-store" : "fullrange-store");
 
     if (params.rtn_quantile >= 1.0f) {
-        test_direct_record_batched_phases(head_dim, params);
+        llama_kvarn_params params_v4 = params;
+        params_v4.value_bits = 4;
+        llama_kvarn_params params_k8v2 = params;
+        params_k8v2.key_bits = 8;
+        llama_kvarn_params params_k8v4 = params_v4;
+        params_k8v4.key_bits = 8;
+        llama_kvarn_params params_k8v8 = params_k8v4;
+        params_k8v8.value_bits = 8;
+
+        test_fullrange_store_overwrites_prefilled_body(head_dim, params_k8v8);
+
+        for (uint32_t n_heads_test : { 1u, 2u, 4u, 8u }) {
+            for (uint32_t n_records_test : { 1u, 2u, 4u, 8u }) {
+                test_direct_record_batched_phases(head_dim, params, n_heads_test, n_records_test);
+                test_direct_record_batched_phases(head_dim, params_v4, n_heads_test, n_records_test);
+                test_direct_record_batched_phases(head_dim, params_k8v2, n_heads_test, n_records_test);
+                test_direct_record_batched_phases(head_dim, params_k8v4, n_heads_test, n_records_test);
+            }
+        }
 
         cudaFree(k_tile_d);
         cudaFree(v_tile_d);
@@ -1273,6 +2290,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             k_scales_d, v_scales_d,
             k_out_d, v_out_d,
             head_dim, group, params.key_bits, params.value_bits,
+            0u,
             nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA dequant launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA dequant sync");
@@ -1402,7 +2420,8 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             v_rec[i] = 0.01f*std::cos(float(i + r*11)*0.019f) - 0.04f*std::sin(float(i + r*3)*0.009f);
         }
 
-        llama_kvarn_body_record rec = llama_kvarn_store_reference(params, head_dim, k_rec, v_rec);
+        llama_kvarn_body_record rec =
+            llama_kvarn_store_reference_frame(params, head_dim, k_rec, v_rec, false, false, false);
         std::vector<float> k_deq;
         std::vector<float> v_deq;
         llama_kvarn_dequant_reference(rec, k_deq, v_deq);
@@ -1640,6 +2659,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             records[0].k_body.size(), records[0].v_body.size(),
             records[0].k_scales.size(), records[0].v_scales.size(),
             n, n,
+            0u,
             nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA multi-record scratch dequant launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA multi-record scratch dequant sync");
@@ -1675,6 +2695,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
                 records[0].k_body.size(), records[0].v_body.size(),
                 records[0].k_scales.size(), records[0].v_scales.size(),
                 n, n,
+                0u,
                 nullptr);
         require_cuda(cudaGetLastError(), "KVarN CUDA token-major scratch dequant launch");
         require_cuda(cudaDeviceSynchronize(), "KVarN CUDA token-major scratch dequant sync");
@@ -1723,6 +2744,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
                 records[0].k_body.size(), records[0].v_body.size(),
                 records[0].k_scales.size(), records[0].v_scales.size(),
                 n, n,
+                0u,
                 nullptr);
         require_cuda(cudaGetLastError(), "KVarN CUDA f16 token-major dequant launch");
         require_cuda(cudaDeviceSynchronize(), "KVarN CUDA f16 token-major dequant sync");
@@ -2118,6 +3140,92 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     }
     require(mha_mixed_fused_max_err < 1.0e-5f, "CUDA forced fused batched F16 sink/body/tail mixed attention matches CPU reference");
 
+    if (head_dim == 256 || head_dim == 512) {
+        float * q1_disabled_out_d = nullptr;
+        float * q1_required_out_d = nullptr;
+        float * q1_disabled_scores_d = nullptr;
+        float * q1_required_scores_d = nullptr;
+        require_cuda(cudaMalloc(&q1_disabled_out_d, size_t(n_head)*head_dim*sizeof(float)), "cudaMalloc q1 disabled output");
+        require_cuda(cudaMalloc(&q1_required_out_d, size_t(n_head)*head_dim*sizeof(float)), "cudaMalloc q1 required output");
+        require_cuda(cudaMalloc(&q1_disabled_scores_d, mha_fused_scores_floats*sizeof(float)), "cudaMalloc q1 disabled scores");
+        require_cuda(cudaMalloc(&q1_required_scores_d, mha_fused_scores_floats*sizeof(float)), "cudaMalloc q1 required scores");
+
+        set_env_var("LLAMA_KVARN_ATTN_DISABLE_Q1_GQA_SCALAR", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_mha_d,
+                sink_tail_k_f16_d, sink_tail_v_f16_d,
+                mha_k_body_d, mha_v_body_d,
+                mha_k_scales_d, mha_v_scales_d,
+                pending_k_mha_d, pending_v_mha_d,
+                mha_mask_f16_d,
+                q1_disabled_out_d, q1_disabled_scores_d,
+                1, n_head, n_head_kv,
+                n_sink, n_records, n_pending_mha, n_tail, tail_start, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(mha_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_DISABLE_Q1_GQA_SCALAR", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA q1-GQA disabled baseline launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA q1-GQA disabled baseline sync");
+
+        set_env_var("LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_mha_d,
+                sink_tail_k_f16_d, sink_tail_v_f16_d,
+                mha_k_body_d, mha_v_body_d,
+                mha_k_scales_d, mha_v_scales_d,
+                pending_k_mha_d, pending_v_mha_d,
+                mha_mask_f16_d,
+                q1_required_out_d, q1_required_scores_d,
+                1, n_head, n_head_kv,
+                n_sink, n_records, n_pending_mha, n_tail, tail_start, head_dim, group,
+                params.key_bits, params.value_bits,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                head_dim, size_t(n_head_kv)*head_dim,
+                records[0].k_body.size(), records[0].v_body.size(),
+                size_t(n_records)*records[0].k_body.size(), size_t(n_records)*records[0].v_body.size(),
+                records[0].k_scales.size(), records[0].v_scales.size(),
+                size_t(n_records)*records[0].k_scales.size(), size_t(n_records)*records[0].v_scales.size(),
+                size_t(mha_mask_stride_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                scale,
+                nullptr);
+        set_env_var("LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR", "");
+        require_cuda(cudaGetLastError(), "KVarN CUDA q1-GQA required launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN CUDA q1-GQA required sync");
+
+        std::vector<float> q1_disabled_out(size_t(n_head)*head_dim);
+        std::vector<float> q1_required_out(size_t(n_head)*head_dim);
+        require_cuda(cudaMemcpy(q1_disabled_out.data(), q1_disabled_out_d, q1_disabled_out.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy q1-GQA disabled output");
+        require_cuda(cudaMemcpy(q1_required_out.data(), q1_required_out_d, q1_required_out.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy q1-GQA required output");
+        float q1_gqa_max_err = 0.0f;
+        for (size_t i = 0; i < q1_disabled_out.size(); ++i) {
+            q1_gqa_max_err = std::max(q1_gqa_max_err, std::fabs(q1_disabled_out[i] - q1_required_out[i]));
+        }
+        if (q1_gqa_max_err >= 1.0e-5f) {
+            std::fprintf(stderr, "q1-GQA required-vs-disabled max_err=%g head_dim=%u n_head=%u n_head_kv=%u records=%u\n",
+                    double(q1_gqa_max_err), head_dim, n_head, n_head_kv, n_records);
+        }
+        require(q1_gqa_max_err < 1.0e-5f, "CUDA q1-GQA scalar path matches disabled fallback");
+
+        cudaFree(q1_disabled_out_d);
+        cudaFree(q1_required_out_d);
+        cudaFree(q1_disabled_scores_d);
+        cudaFree(q1_required_scores_d);
+    }
+
     if (head_dim == 256) {
         const uint32_t n_q36_sink = 128;
         const uint32_t n_q36_records = 2;
@@ -2380,8 +3488,11 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
 
             std::vector<float> rt_mask(size_t(n_rt_queries)*rt_mask_stride_tokens, -1.0e30f);
             for (uint32_t iq = 0; iq < n_rt_queries; ++iq) {
+                const uint32_t allowed = std::min<uint32_t>(
+                        n_rt_tokens - 1,
+                        n_q36_sink + n_rt_records*group + n_rt_pending + iq);
                 for (uint32_t t = 0; t < n_rt_tokens; ++t) {
-                    rt_mask[size_t(iq)*rt_mask_stride_tokens + t] = t <= iq ? 0.0f : -1.0e30f;
+                    rt_mask[size_t(iq)*rt_mask_stride_tokens + t] = t <= allowed ? 0.0f : -1.0e30f;
                 }
             }
 
@@ -2463,27 +3574,138 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             require_cuda(cudaMemcpy(rt_fused.data(), rt_fused_d, rt_fused.size()*sizeof(float), cudaMemcpyDeviceToHost),
                     "copy runtime-shape fused output");
 
+            std::vector<float> rt_ref(rt_queries.size(), 0.0f);
+            for (uint32_t iq = 0; iq < n_rt_queries; ++iq) {
+                for (uint32_t ih = 0; ih < n_head; ++ih) {
+                    const uint32_t ikh = ih/(n_head/n_head_kv);
+                    const float * q_row = rt_queries.data() + (size_t(iq)*n_head + ih)*head_dim;
+                    std::vector<float> row_scores(n_rt_tokens, 0.0f);
+
+                    for (uint32_t t = 0; t < n_q36_sink; ++t) {
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            row_scores[t] += q_row[d]*q36_sink_tail_k_ref[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                        }
+                        row_scores[t] *= scale;
+                    }
+                    for (uint32_t r = 0; r < n_rt_records; ++r) {
+                        const size_t rec_off = size_t(r)*n;
+                        for (uint32_t g = 0; g < group; ++g) {
+                            float s = 0.0f;
+                            for (uint32_t d = 0; d < head_dim; ++d) {
+                                s += q_row[d]*multi_k_ref[rec_off + size_t(d)*group + g];
+                            }
+                            row_scores[size_t(n_q36_sink) + size_t(r)*group + g] = s*scale;
+                        }
+                    }
+                    for (uint32_t t = 0; t < n_rt_pending; ++t) {
+                        const size_t score_i = size_t(n_q36_sink) + size_t(n_rt_records)*group + t;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            row_scores[score_i] += q_row[d]*rt_pending[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                        }
+                        row_scores[score_i] *= scale;
+                    }
+                    for (uint32_t t = 0; t < n_rt_tail; ++t) {
+                        const size_t score_i = size_t(n_q36_sink) + size_t(n_rt_records)*group + n_rt_pending + t;
+                        const uint32_t slot = n_q36_sink + (rt_tail_start + t)%n_rt_tail;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            row_scores[score_i] += q_row[d]*q36_sink_tail_k_ref[(size_t(slot)*n_head_kv + ikh)*head_dim + d];
+                        }
+                        row_scores[score_i] *= scale;
+                    }
+                    for (uint32_t t = 0; t < n_rt_tokens; ++t) {
+                        row_scores[t] += rt_mask[size_t(iq)*rt_mask_stride_tokens + t];
+                    }
+
+                    float row_max = row_scores[0];
+                    for (float s : row_scores) {
+                        row_max = std::max(row_max, s);
+                    }
+                    std::vector<float> row_probs(n_rt_tokens);
+                    float row_denom = 0.0f;
+                    for (uint32_t t = 0; t < n_rt_tokens; ++t) {
+                        row_probs[t] = std::exp(row_scores[t] - row_max);
+                        row_denom += row_probs[t];
+                    }
+
+                    float * out_row = rt_ref.data() + (size_t(iq)*n_head + ih)*head_dim;
+                    for (uint32_t t = 0; t < n_q36_sink; ++t) {
+                        const float p = row_probs[t]/row_denom;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            out_row[d] += p*q36_sink_tail_v_ref[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                        }
+                    }
+                    for (uint32_t r = 0; r < n_rt_records; ++r) {
+                        const size_t rec_off = size_t(r)*n;
+                        for (uint32_t g = 0; g < group; ++g) {
+                            const float p = row_probs[size_t(n_q36_sink) + size_t(r)*group + g]/row_denom;
+                            for (uint32_t d = 0; d < head_dim; ++d) {
+                                out_row[d] += p*multi_v_ref[rec_off + size_t(g)*head_dim + d];
+                            }
+                        }
+                    }
+                    for (uint32_t t = 0; t < n_rt_pending; ++t) {
+                        const float p = row_probs[size_t(n_q36_sink) + size_t(n_rt_records)*group + t]/row_denom;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            out_row[d] += p*rt_pending[(size_t(t)*n_head_kv + ikh)*head_dim + d];
+                        }
+                    }
+                    for (uint32_t t = 0; t < n_rt_tail; ++t) {
+                        const size_t prob_i = size_t(n_q36_sink) + size_t(n_rt_records)*group + n_rt_pending + t;
+                        const float p = row_probs[prob_i]/row_denom;
+                        const uint32_t slot = n_q36_sink + (rt_tail_start + t)%n_rt_tail;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            out_row[d] += p*q36_sink_tail_v_ref[(size_t(slot)*n_head_kv + ikh)*head_dim + d];
+                        }
+                    }
+                }
+            }
+
+            float split_ref_err = 0.0f;
+            float fused_ref_err = 0.0f;
+            size_t split_ref_worst = 0;
+            size_t fused_ref_worst = 0;
             float max_err = 0.0f;
             size_t worst = 0;
             for (size_t i = 0; i < rt_split.size(); ++i) {
                 const float err = std::fabs(rt_split[i] - rt_fused[i]);
+                const float split_err = std::fabs(rt_split[i] - rt_ref[i]);
+                const float fused_err = std::fabs(rt_fused[i] - rt_ref[i]);
+                if (split_err > split_ref_err) {
+                    split_ref_err = split_err;
+                    split_ref_worst = i;
+                }
+                if (fused_err > fused_ref_err) {
+                    fused_ref_err = fused_err;
+                    fused_ref_worst = i;
+                }
                 if (err > max_err) {
                     max_err = err;
                     worst = i;
                 }
             }
-            if (max_err >= 1.0e-6f) {
-                const uint32_t d = uint32_t(worst%head_dim);
-                const uint32_t ih = uint32_t((worst/head_dim)%n_head);
-                const uint32_t iq = uint32_t(worst/(size_t(head_dim)*n_head));
+            auto print_rt_worst = [&](const char * kind, size_t idx, float err) {
+                const uint32_t d = uint32_t(idx%head_dim);
+                const uint32_t ih = uint32_t((idx/head_dim)%n_head);
+                const uint32_t iq = uint32_t(idx/(size_t(head_dim)*n_head));
                 std::fprintf(stderr,
-                        "Qwen3.6 runtime-shape 256d %s forced-fused-vs-split=%g"
-                        " iq=%u ih=%u ikh=%u d=%u split=%g fused=%g"
+                        "Qwen3.6 runtime-shape 256d %s %s=%g"
+                        " iq=%u ih=%u ikh=%u d=%u ref=%g split=%g fused=%g"
                         " q=%u records=%u pending=%u tail=%u tail_start=%u tokens=%u\n",
-                        label, double(max_err), iq, ih, ih/(n_head/n_head_kv), d,
-                        double(rt_split[worst]), double(rt_fused[worst]),
+                        label, kind, double(err), iq, ih, ih/(n_head/n_head_kv), d,
+                        double(rt_ref[idx]), double(rt_split[idx]), double(rt_fused[idx]),
                         n_rt_queries, n_rt_records, n_rt_pending, n_rt_tail, rt_tail_start, n_rt_tokens);
+            };
+            if (split_ref_err >= 1.0e-5f) {
+                print_rt_worst("split-vs-ref", split_ref_worst, split_ref_err);
             }
+            if (fused_ref_err >= 1.0e-5f) {
+                print_rt_worst("fused-vs-ref", fused_ref_worst, fused_ref_err);
+            }
+            if (max_err >= 1.0e-6f) {
+                print_rt_worst("forced-fused-vs-split", worst, max_err);
+            }
+            require(split_ref_err < 1.0e-5f, "CUDA Qwen3.6 runtime-shape split attention matches CPU reference");
+            require(fused_ref_err < 1.0e-5f, "CUDA Qwen3.6 runtime-shape forced fused attention matches CPU reference");
             require(max_err < 1.0e-6f, "CUDA Qwen3.6 runtime-shape forced fused attention matches split output");
 
             cudaFree(rt_queries_d);
@@ -3690,7 +4912,131 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     cudaFree(store_scratch_d);
 }
 
+static void test_experimental_turbo_v_codec(uint32_t head_dim, uint32_t bits, bool canonical_layout) {
+    const uint32_t group = 128;
+    const size_t n = size_t(head_dim)*group;
+    std::vector<float> v_tile(n);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const float a = 0.037f*std::sin(float(7*g + 3*d)*0.017f);
+            const float b = 0.021f*std::cos(float(5*g + 11*d)*0.013f);
+            const float c = (d % 41 == 0 ? 0.025f : 0.0f) - (g % 17 == 0 ? 0.014f : 0.0f);
+            v_tile[size_t(g)*head_dim + d] = a + b + c;
+        }
+    }
+
+    std::vector<uint8_t> v_body_ref;
+    std::vector<float> v_scales_ref;
+    std::vector<float> v_deq_ref;
+    turbo_test_pack_ref(v_tile, head_dim, group, bits, canonical_layout, v_body_ref, v_scales_ref, v_deq_ref);
+
+    float * v_tile_d = cuda_upload(v_tile);
+    uint8_t * v_body_d = nullptr;
+    float * v_scales_d = nullptr;
+    float * scratch_d = nullptr;
+    require_cuda(cudaMalloc(&v_body_d, v_body_ref.size()), "cudaMalloc turbo V body");
+    require_cuda(cudaMalloc(&v_scales_d, v_scales_ref.size()*sizeof(float)), "cudaMalloc turbo V scales");
+    require_cuda(cudaMalloc(&scratch_d, (n + 2*std::max<size_t>(head_dim, group))*sizeof(float)), "cudaMalloc turbo V scratch");
+    require_cuda(cudaMemset(v_body_d, 0, v_body_ref.size()), "clear turbo V body");
+
+    set_env_var("LLAMA_KVARN_EXPERIMENTAL_TURBO_V", canonical_layout ? "0" : "1");
+    set_env_var("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", canonical_layout ? "1" : "0");
+    ggml_cuda_kvarn_store_v_body_reference_minmax(
+            v_tile_d, v_body_d, v_scales_d, scratch_d,
+            head_dim, group, bits, 0, 1.0f, canonical_layout ? 2u : 1u, nullptr);
+    require_cuda(cudaGetLastError(), "KVarN CUDA experimental Turbo V store launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA experimental Turbo V store sync");
+
+    std::vector<uint8_t> v_body(v_body_ref.size());
+    std::vector<float> v_scales(v_scales_ref.size());
+    require_cuda(cudaMemcpy(v_body.data(), v_body_d, v_body.size(), cudaMemcpyDeviceToHost), "copy turbo V body");
+    require_cuda(cudaMemcpy(v_scales.data(), v_scales_d, v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy turbo V scales");
+
+    size_t byte_diff = 0;
+    size_t first_diff = v_body.size();
+    for (size_t i = 0; i < v_body.size(); ++i) {
+        if (v_body[i] != v_body_ref[i]) {
+            if (first_diff == v_body.size()) {
+                first_diff = i;
+            }
+            ++byte_diff;
+        }
+    }
+
+    float scale_err = 0.0f;
+    size_t scale_worst = 0;
+    for (size_t i = 0; i < v_scales.size(); ++i) {
+        const float err = std::fabs(v_scales[i] - v_scales_ref[i]);
+        if (err > scale_err) {
+            scale_err = err;
+            scale_worst = i;
+        }
+    }
+    if (byte_diff != 0 || scale_err >= 1.0e-6f) {
+        std::fprintf(stderr,
+                "experimental Turbo V store diff: head_dim=%u bits=%u canonical=%d byte_diff=%zu first=%zu ref/cuda=%d/%d scale_err=%g scale_i=%zu ref=%g cuda=%g\n",
+                head_dim, bits, canonical_layout ? 1 : 0, byte_diff, first_diff,
+                first_diff < v_body_ref.size() ? int(v_body_ref[first_diff]) : -1,
+                first_diff < v_body.size() ? int(v_body[first_diff]) : -1,
+                double(scale_err), scale_worst,
+                double(v_scales_ref[scale_worst]), double(v_scales[scale_worst]));
+    }
+    require(byte_diff == 0, "experimental Turbo V CUDA store bytes match host oracle");
+    require(scale_err < (canonical_layout ? 1.0e-20f : 1.0e-6f), "experimental Turbo V CUDA scales match host oracle");
+
+    std::vector<uint8_t> k_body(packed_nbytes(n, 4), 0);
+    std::vector<float> k_scales(size_t(2)*head_dim + group, 0.0f);
+    uint8_t * k_body_d = cuda_upload(k_body);
+    float * k_scales_d = cuda_upload(k_scales);
+    float * k_out_d = nullptr;
+    float * v_out_d = nullptr;
+    require_cuda(cudaMalloc(&k_out_d, n*sizeof(float)), "cudaMalloc turbo K out");
+    require_cuda(cudaMalloc(&v_out_d, n*sizeof(float)), "cudaMalloc turbo V out");
+    ggml_cuda_kvarn_dequant_body(
+            k_body_d, v_body_d, k_scales_d, v_scales_d,
+            k_out_d, v_out_d, head_dim, group, 4, bits, canonical_layout ? 2u : 1u, nullptr);
+    require_cuda(cudaGetLastError(), "KVarN CUDA experimental Turbo V dequant launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA experimental Turbo V dequant sync");
+    set_env_var("LLAMA_KVARN_EXPERIMENTAL_TURBO_V", "0");
+    set_env_var("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", "0");
+
+    std::vector<float> v_deq(n);
+    require_cuda(cudaMemcpy(v_deq.data(), v_out_d, n*sizeof(float), cudaMemcpyDeviceToHost), "copy turbo V dequant");
+    float deq_err = 0.0f;
+    size_t deq_worst = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const float err = std::fabs(v_deq[i] - v_deq_ref[i]);
+        if (err > deq_err) {
+            deq_err = err;
+            deq_worst = i;
+        }
+    }
+    if (deq_err >= 1.0e-6f) {
+        std::fprintf(stderr,
+                "experimental Turbo V dequant diff: head_dim=%u bits=%u canonical=%d err=%g i=%zu ref=%g cuda=%g\n",
+                head_dim, bits, canonical_layout ? 1 : 0, double(deq_err), deq_worst,
+                double(v_deq_ref[deq_worst]), double(v_deq[deq_worst]));
+    }
+    require(deq_err < 1.0e-6f, "experimental Turbo V CUDA dequant matches host oracle");
+
+    cudaFree(v_tile_d);
+    cudaFree(v_body_d);
+    cudaFree(v_scales_d);
+    cudaFree(scratch_d);
+    cudaFree(k_body_d);
+    cudaFree(k_scales_d);
+    cudaFree(k_out_d);
+    cudaFree(v_out_d);
+}
+
 int main() {
+    const char * materialize_only = std::getenv("LLAMA_KVARN_TEST_MATERIALIZE_ONLY");
+    if (materialize_only != nullptr && std::strcmp(materialize_only, "0") != 0) {
+        test_materialize_kv_window(8, 8);
+        test_materialize_kv_window(8, 2);
+        return 0;
+    }
+
     const char * repro = std::getenv("LLAMA_KVARN_TEST_256D_WARPQK_REPRO");
     if (repro != nullptr && std::strcmp(repro, "0") != 0) {
         set_env_var("LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK", "1");
@@ -3699,6 +5045,23 @@ int main() {
         }
         run_case(256, 0.95f);
         return 0;
+    }
+
+    test_fused_paper_frame_sinktail_decode();
+    test_fused_paper_frame_sinktail_batch();
+    test_gemma512_sinktail_production_shape_sampled();
+    test_materialize_kv_window(8, 8);
+    test_materialize_kv_window(8, 2);
+    const char * run_turbo_v_tests = std::getenv("LLAMA_KVARN_RUN_TURBO_V_TESTS");
+    if (run_turbo_v_tests != nullptr && std::strcmp(run_turbo_v_tests, "0") != 0) {
+        test_experimental_turbo_v_codec(128, 4, false);
+        test_experimental_turbo_v_codec(512, 4, false);
+        test_experimental_turbo_v_codec(128, 2, false);
+        test_experimental_turbo_v_codec(512, 2, false);
+        test_experimental_turbo_v_codec(128, 4, true);
+        test_experimental_turbo_v_codec(512, 4, true);
+        test_experimental_turbo_v_codec(128, 2, true);
+        test_experimental_turbo_v_codec(512, 2, true);
     }
 
     for (float rtn_quantile : { 0.95f, 1.0f }) {

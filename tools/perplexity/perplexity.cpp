@@ -11,6 +11,7 @@
 #include <chrono>
 #include <clocale>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -22,7 +23,9 @@
 #include <random>
 #include <regex>
 #include <sstream>
+#include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -111,6 +114,25 @@ static double log_softmax(int n_vocab, const float * logits, uint16_t * log_prob
     return max_logit + log_sum_exp - logits[tok];
 }
 
+static double log_softmax_f16n(int n_vocab, const float * logits, uint16_t * row, int tok) {
+    float max_logit = logits[0];
+    for (int i = 1; i < n_vocab; ++i) {
+        max_logit = std::max(max_logit, logits[i]);
+    }
+    double sum_exp = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    const float log_sum_exp = log(sum_exp);
+    uint16_t * log_prob = row + 2;
+    for (int i = 0; i < n_vocab; ++i) {
+        log_prob[i] = ggml_fp32_to_fp16(logits[i] - max_logit - log_sum_exp);
+    }
+    const float nll = max_logit + log_sum_exp - logits[tok];
+    std::memcpy(row, &nll, sizeof(nll));
+    return nll;
+}
+
 static void process_logits(
     int n_vocab, const float * logits, const int * tokens, int n_token, std::vector<std::thread> & workers,
     double & nll, double & nll2, float * logit_history, float * prob_history
@@ -146,10 +168,24 @@ static void process_logits(
     }
 }
 
-static void process_logits(std::ostream& out, int n_vocab, const float * logits, const int * tokens, int n_token,
+static bool write_all_chunked(std::ostream & out, const char * data, size_t size) {
+    constexpr size_t chunk_size = size_t(64)*1024*1024;
+    while (size > 0) {
+        const size_t n = std::min(size, chunk_size);
+        out.write(data, static_cast<std::streamsize>(n));
+        if (!out) {
+            return false;
+        }
+        data += n;
+        size -= n;
+    }
+    return true;
+}
+
+static bool process_logits(std::ostream& out, int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, std::vector<uint16_t> & log_probs, double & nll, double & nll2) {
     std::mutex mutex;
-    const int nv = 2*((n_vocab + 1)/2) + 4;
+    const int nv = n_vocab + 2;
     int counter = 0;
     auto compute = [&mutex, &counter, &log_probs, &nll, &nll2, n_vocab, logits, tokens, n_token, nv] () {
         double local_nll  = 0;
@@ -162,7 +198,7 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
                 break;
             }
             lock.unlock();
-            const double v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + size_t(i)*nv, tokens[i+1]);
+            const double v = log_softmax_f16n(n_vocab, logits + size_t(i)*n_vocab, log_probs.data() + size_t(i)*nv, tokens[i+1]);
             local_nll += v;
             local_nll2 += v*v;
         }
@@ -174,7 +210,7 @@ static void process_logits(std::ostream& out, int n_vocab, const float * logits,
     for (auto & w : workers) {
         w.join();
     }
-    out.write((const char *)log_probs.data(), size_t(n_token)*nv*sizeof(uint16_t));
+    return write_all_chunked(out, (const char *)log_probs.data(), size_t(n_token)*nv*sizeof(uint16_t));
 }
 
 struct kl_divergence_result {
@@ -256,13 +292,79 @@ static std::pair<double, float> log_softmax(int n_vocab, const float * logits, c
     return std::make_pair(sum, p_diff);
 }
 
+static std::pair<double, float> log_softmax_f16(
+        int n_vocab,
+        const float * logits,
+        const uint16_t * base_log_prob,
+        int tok,
+        kl_divergence_result & kld,
+        const float * exact_nll_base) {
+    float max_logit = logits[0];
+    int imax = 0;
+    for (int i = 1; i < n_vocab; ++i) {
+        if (logits[i] > max_logit) {
+            max_logit = logits[i];
+            imax = i;
+        }
+    }
+    double sum_exp = 0.0;
+    for (int i = 0; i < n_vocab; ++i) {
+        sum_exp += expf(logits[i] - max_logit);
+    }
+    const float log_sum_exp = log(sum_exp);
+
+    const float nll = max_logit + log_sum_exp - logits[tok];
+    kld.sum_nll  += nll;
+    kld.sum_nll2 += nll*nll;
+
+    const float nll_base = exact_nll_base ? *exact_nll_base : -ggml_fp16_to_fp32(base_log_prob[tok]);
+    kld.sum_nll_base  += nll_base;
+    kld.sum_nll_base2 += nll_base*nll_base;
+
+    kld.sum_nll_nll_base += nll*nll_base;
+
+    max_logit += log_sum_exp;
+    double sum = 0;
+    int imax_base = -1;
+    float p_log_base_max = 0;
+    for (int i = 0; i < n_vocab; ++i) {
+        const float p_log_base = ggml_fp16_to_fp32(base_log_prob[i]);
+        if (i == 0 || p_log_base > p_log_base_max) {
+            p_log_base_max = p_log_base;
+            imax_base = i;
+        }
+        if (p_log_base > -16.f) {
+            const float p_base = expf(p_log_base);
+            sum += p_base * (p_log_base - logits[i] + max_logit);
+        }
+    }
+    kld.sum_kld  += sum;
+    kld.sum_kld2 += sum*sum;
+    ++kld.count;
+    if (imax == imax_base) {
+        ++kld.n_same_top;
+    }
+
+    const float p_base = expf(-nll_base);
+    const float p = expf(-nll);
+    const float p_diff = p - p_base;
+    kld.sum_p_diff  += p_diff;
+    const double p_diff2 = p_diff*p_diff;
+    kld.sum_p_diff2 += p_diff2;
+    kld.sum_p_diff4 += p_diff2*p_diff2;
+    kld.max_p_diff = std::max(kld.max_p_diff, std::fabs(p_diff));
+
+    return std::make_pair(sum, p_diff);
+}
+
 static void process_logits(int n_vocab, const float * logits, const int * tokens, int n_token,
         std::vector<std::thread> & workers, const std::vector<uint16_t> & base_log_probs, kl_divergence_result & kld,
-        float * kld_values, float * p_diff_values) {
+        float * kld_values, float * p_diff_values, int base_log_prob_format) {
     std::mutex mutex;
-    const int nv = 2*((n_vocab + 1)/2) + 4;
+    const bool base_log_probs_f16 = base_log_prob_format == 1 || base_log_prob_format == 2;
+    const int nv = base_log_prob_format == 0 ? 2*((n_vocab + 1)/2) + 4 : n_vocab + (base_log_prob_format == 2 ? 2 : 0);
     int counter = 0;
-    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values] () {
+    auto compute = [&mutex, &counter, &base_log_probs, &kld, n_vocab, logits, tokens, n_token, nv, kld_values, p_diff_values, base_log_probs_f16, base_log_prob_format] () {
         kl_divergence_result local_kld;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex);
@@ -284,7 +386,17 @@ static void process_logits(int n_vocab, const float * logits, const int * tokens
                 break;
             }
             lock.unlock();
-            std::pair<double, float> v = log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_log_probs.data() + size_t(i)*nv, tokens[i+1], local_kld);
+            const uint16_t * base_row = base_log_probs.data() + size_t(i)*nv;
+            float exact_nll_base = 0.0f;
+            const float * exact_nll_base_ptr = nullptr;
+            if (base_log_prob_format == 2) {
+                std::memcpy(&exact_nll_base, base_row, sizeof(exact_nll_base));
+                exact_nll_base_ptr = &exact_nll_base;
+                base_row += 2;
+            }
+            std::pair<double, float> v = base_log_probs_f16 ?
+                log_softmax_f16(n_vocab, logits + size_t(i)*n_vocab, base_row, tokens[i+1], local_kld, exact_nll_base_ptr) :
+                log_softmax(n_vocab, logits + size_t(i)*n_vocab, base_row, tokens[i+1], local_kld);
             kld_values[i]    = (float)v.first;
             p_diff_values[i] = v.second;
         }
@@ -312,7 +424,7 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
 
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
 
     const int n_ctx = llama_n_ctx(ctx);
 
@@ -377,10 +489,17 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
             const int batch_start = start + j * n_batch;
             const int batch_size  = std::min(end - batch_start, n_batch);
 
+            const auto token_org = tokens[batch_start];
+            if (add_bos && j == 0) {
+                tokens[batch_start] = llama_vocab_bos(vocab);
+            }
+
             common_batch_clear(batch);
             for (int i = 0; i < batch_size; i++) {
                 common_batch_add(batch, tokens[batch_start + i], j*n_batch + i, {0}, true);
             }
+
+            tokens[batch_start] = token_org;
 
             //LOG_DBG("    Batch %d: starts at %d, size is %d, n_past is %d\n",j,batch_start,batch_size,j * n_batch);
             if (llama_decode(ctx, batch)) {
@@ -389,20 +508,8 @@ static results_perplexity perplexity_v2(llama_context * ctx, const common_params
                 return {tokens, -1, logit_history, prob_history};
             }
 
-            // save original token and restore it after eval
-            const auto token_org = tokens[batch_start];
-
-            // add BOS token for the first batch of each chunk
-            if (add_bos && j == 0) {
-                tokens[batch_start] = llama_vocab_bos(vocab);
-            }
-
             const auto * batch_logits = llama_get_logits(ctx);
             logits.insert(logits.end(), batch_logits, batch_logits + size_t(batch_size) * n_vocab);
-
-            if (j == 0) {
-                tokens[batch_start] = token_org;
-            }
         }
 
         llama_batch_free(batch);
@@ -470,14 +577,14 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
             return {};
         }
         LOG_INF("%s: saving all logits to %s\n", __func__, params.logits_file.c_str());
-        logits_stream.write("_logits_", 8);
+        logits_stream.write("_logp16n", 8);
         logits_stream.write(reinterpret_cast<const char *>(&n_ctx), sizeof(n_ctx));
     }
 
     auto tim1 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenizing the input ..\n", __func__);
 
-    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true);
+    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
 
     auto tim2 = std::chrono::high_resolution_clock::now();
     LOG_INF("%s: tokenization took %g ms\n",__func__,1e-3*std::chrono::duration_cast<std::chrono::microseconds>(tim2-tim1).count());
@@ -521,15 +628,18 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
     LOG_INF("%s: calculating perplexity over %d chunks, n_ctx=%d, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+    const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> workers(hw_threads - 1);
+
+    const int first = n_ctx/2;
 
     std::vector<uint16_t> log_probs;
     if (!params.logits_file.empty()) {
         logits_stream.write((const char *)&n_vocab, sizeof(n_vocab));
         logits_stream.write((const char *)&n_chunk, sizeof(n_chunk));
         logits_stream.write((const char *)tokens.data(), n_chunk*n_ctx*sizeof(tokens[0]));
-        const int nv = 2*((n_vocab + 1)/2) + 4;
-        log_probs.resize(size_t(n_ctx) * nv);
+        const int nv = n_vocab + 2;
+        log_probs.resize(size_t(n_ctx - 1 - first) * nv);
     }
 
     // We get the logits for all the tokens in the context window (params.n_ctx)
@@ -544,8 +654,6 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
     // process the entire prompt.
-    const int first = n_ctx/2;
-
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
         const int end   = start + n_ctx;
@@ -621,9 +729,13 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
 
             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
             if (!params.logits_file.empty()) {
-                process_logits(logits_stream, n_vocab, all_logits,
+                if (!process_logits(logits_stream, n_vocab, all_logits,
                         tokens_data, n_ctx - 1 - first,
-                        workers, log_probs, nll, nll2);
+                        workers, log_probs, nll, nll2)) {
+                    LOG_ERR("%s: failed writing KL base log-probabilities to %s\n", __func__, params.logits_file.c_str());
+                    llama_batch_free(batch);
+                    return {tokens, -1, logit_history, prob_history};
+                }
             } else {
                 process_logits(n_vocab, all_logits,
                         tokens_data, n_ctx - 1 - first,
@@ -1697,26 +1809,28 @@ static void multiple_choice_score(llama_context * ctx, const common_params & par
     LOG_INF("\n");
 }
 
-static void kl_divergence(llama_context * ctx, const common_params & params) {
+static bool kl_divergence(llama_context * ctx, const common_params & params) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.logits_file.empty()) {
         LOG_ERR("%s: you must provide a name of a file containing the log probabilities of the base model\n", __func__);
-        return;
+        return false;
     }
     std::ifstream in(params.logits_file.c_str(), std::ios::binary);
     if (!in) {
         LOG_ERR("%s: failed to open %s\n", __func__, params.logits_file.c_str());
-        return;
+        return false;
     }
-    {
-        char check[9]; check[8] = 0;
-        in.read(check, 8);
-        if (in.fail() || strncmp("_logits_", check, 8) != 0) {
-            LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
-            return;
-        }
+    char check[9]; check[8] = 0;
+    in.read(check, 8);
+    const int base_log_prob_format =
+        strncmp("_logits_", check, 8) == 0 ? 0 :
+        strncmp("_logp16_", check, 8) == 0 ? 1 :
+        strncmp("_logp16n", check, 8) == 0 ? 2 : -1;
+    if (in.fail() || base_log_prob_format < 0) {
+        LOG_ERR("%s: %s does not look like a file containing log-probabilities\n", __func__, params.logits_file.c_str());
+        return false;
     }
 
     uint32_t n_ctx;
@@ -1724,6 +1838,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     if (n_ctx > llama_n_ctx(ctx)) {
         LOG_ERR("%s: %s has been computed with %u, while the current context is %d. Increase it with -c and retry\n",
                 __func__, params.logits_file.c_str(), n_ctx, params.n_ctx);
+        return false;
+    }
+    if (n_ctx <= 1) {
+        LOG_ERR("%s: invalid KL base context length %u in %s\n", __func__, n_ctx, params.logits_file.c_str());
+        return false;
     }
 
     int n_vocab;
@@ -1732,16 +1851,21 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     in.read((char *)&n_chunk, sizeof(n_chunk));
     if (in.fail()) {
         LOG_ERR("%s: failed reading n_vocab, n_chunk from %s\n", __func__, params.logits_file.c_str());
-        return;
+        return false;
     }
     if (n_vocab != llama_vocab_n_tokens(vocab)) {
         LOG_ERR("%s: inconsistent vocabulary (%d vs %d)\n", __func__, n_vocab, llama_vocab_n_tokens(vocab));
+        return false;
+    }
+    if (n_chunk <= 0) {
+        LOG_ERR("%s: invalid KL base chunk count %d in %s\n", __func__, n_chunk, params.logits_file.c_str());
+        return false;
     }
 
     std::vector<llama_token> tokens(size_t(n_ctx) * n_chunk);
     if (in.read((char *)tokens.data(), tokens.size()*sizeof(tokens[0])).fail()) {
         LOG_ERR("%s: failed reading evaluation tokens from %s\n", __func__, params.logits_file.c_str());
-        return;
+        return false;
     }
 
     const int n_batch = params.n_batch;
@@ -1754,7 +1878,12 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
                 __func__, n_seq, n_seq_max, n_seq_max);
         n_seq = n_seq_max;
     }
-    const int nv = 2*((n_vocab + 1)/2) + 4;
+    if (n_seq != 1) {
+        LOG_ERR("%s: KL divergence currently requires n_seq == 1; got n_seq=%d. Use --parallel 1 and n_batch <= n_ctx.\n",
+                __func__, n_seq);
+        return false;
+    }
+    const int nv = base_log_prob_format == 0 ? 2*((n_vocab + 1)/2) + 4 : n_vocab + (base_log_prob_format == 2 ? 2 : 0);
     const bool add_bos = llama_vocab_get_add_bos(vocab);
     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
 
@@ -1770,7 +1899,27 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     LOG_INF("%s: computing over %d chunks, n_ctx=%u, batch_size=%d, n_seq=%d\n", __func__, n_chunk, n_ctx, n_batch, n_seq);
 
-    std::vector<std::thread> workers(std::thread::hardware_concurrency() - 1);
+    const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> workers(hw_threads - 1);
+    const char * kl_dump_path_env = std::getenv("LLAMA_KVARN_KL_DUMP_CSV");
+    std::ofstream kl_dump_stream;
+    if (kl_dump_path_env && kl_dump_path_env[0] != '\0') {
+        const std::filesystem::path kl_dump_path(kl_dump_path_env);
+        if (!kl_dump_path.parent_path().empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(kl_dump_path.parent_path(), ec);
+            if (ec) {
+                LOG_WRN("%s: failed to create KL dump directory %s: %s\n",
+                        __func__, kl_dump_path.parent_path().string().c_str(), ec.message().c_str());
+            }
+        }
+        kl_dump_stream.open(kl_dump_path, std::ios::out | std::ios::trunc);
+        if (kl_dump_stream) {
+            kl_dump_stream << "chunk,local_index,logit_pos,target_pos,global_logit_index,global_target_index,target_token,kld,p_diff\n";
+        } else {
+            LOG_WRN("%s: failed to open LLAMA_KVARN_KL_DUMP_CSV=%s\n", __func__, kl_dump_path_env);
+        }
+    }
 
     auto mean_and_uncertainty = [] (double sum, double sum2, size_t count) {
         if (count < 1) {
@@ -1839,7 +1988,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             if (llama_decode(ctx, batch)) {
                 LOG_ERR("%s : failed to decode\n", __func__);
                 llama_batch_free(batch);
-                return;
+                return false;
             }
 
             if (num_batches > 1 && n_outputs > 0) {
@@ -1868,13 +2017,33 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
             if (in.read((char *)log_probs_uint16.data(), log_probs_uint16.size()*sizeof(uint16_t)).fail()) {
                 LOG_ERR("%s: failed reading log-probs for chunk %d\n", __func__, i + seq);
                 llama_batch_free(batch);
-                return;
+                return false;
             }
 
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
-                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
+                    workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr, base_log_prob_format);
+            if (kl_dump_stream) {
+                const int chunk = i + seq;
+                const int n_eval = n_ctx - 1 - first;
+                for (int local = 0; local < n_eval; ++local) {
+                    const int logit_pos = first + local;
+                    const int target_pos = logit_pos + 1;
+                    const size_t global_logit_index = size_t(chunk)*n_ctx + logit_pos;
+                    const size_t global_target_index = size_t(chunk)*n_ctx + target_pos;
+                    kl_dump_stream
+                        << chunk << ','
+                        << local << ','
+                        << logit_pos << ','
+                        << target_pos << ','
+                        << global_logit_index << ','
+                        << global_target_index << ','
+                        << tokens[global_target_index] << ','
+                        << std::setprecision(9) << kld_ptr[local] << ','
+                        << std::setprecision(9) << p_diff_ptr[local] << '\n';
+                }
+            }
             p_diff_ptr += n_ctx - 1 - first;
             kld_ptr    += n_ctx - 1 - first;
 
@@ -1912,7 +2081,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     llama_batch_free(batch);
     LOG("\n");
 
-    if (kld.count < 100) return; // we do not wish to do statistics on so few values
+    if (kld.count < 100) {
+        return true; // we do not wish to do statistics on so few values
+    }
 
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
@@ -2008,14 +2179,19 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     const double same_top_p = 1.0*kld.n_same_top/kld.count;
     LOG("Same top p: %6.3lf ± %5.3lf %%\n", 100.0*same_top_p, 100.0*sqrt(same_top_p*(1.0 - same_top_p)/(kld.count - 1)));
+    return true;
 }
 
 struct kvarn_tensor_dump_state {
     std::filesystem::path dir;
     std::regex           filter;
     std::vector<uint8_t> data;
+    std::unordered_map<std::string, int> name_counts;
+    std::unordered_map<std::string, int64_t> name_row_bases;
     int                  limit = 16;
     int                  count = 0;
+    int                  row = -1;
+    int                  scored_row_offset = -1;
 };
 
 static std::string kvarn_tensor_dump_sanitize(std::string name) {
@@ -2051,6 +2227,9 @@ static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * u
     }
 
     const int index = state->count++;
+    const int name_occurrence = state->name_counts[name]++;
+    const int64_t name_row_base = state->name_row_bases[name];
+    state->name_row_bases[name] = name_row_base + t->ne[1];
     std::ostringstream stem;
     stem << "tensor_" << std::setw(6) << std::setfill('0') << index
          << "_" << kvarn_tensor_dump_sanitize(name);
@@ -2058,12 +2237,21 @@ static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * u
     const auto bin_path  = state->dir / (stem.str() + ".bin");
     const auto json_path = state->dir / (stem.str() + ".json");
 
-    const size_t n_bytes = ggml_nbytes(t);
+    const bool row_only = state->row >= 0;
+    if (row_only && (state->row >= t->ne[1] || t->nb[0] != ggml_type_size(t->type))) {
+        return true;
+    }
+    const int64_t inferred_full_row = row_only ? name_row_base + state->row : -1;
+    const int64_t inferred_scored_row =
+        row_only && state->scored_row_offset >= 0 ? int64_t(state->scored_row_offset) + inferred_full_row : -1;
+
+    const size_t n_bytes = row_only ? ggml_row_size(t->type, t->ne[0]) : ggml_nbytes(t);
     const bool is_host = t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
-    const void * src = t->data;
+    const size_t offset = row_only ? size_t(state->row)*t->nb[1] : 0;
+    const void * src = static_cast<const uint8_t *>(t->data) + offset;
     if (!is_host) {
         state->data.resize(n_bytes);
-        ggml_backend_tensor_get(t, state->data.data(), 0, n_bytes);
+        ggml_backend_tensor_get(t, state->data.data(), offset, n_bytes);
         src = state->data.data();
     }
 
@@ -2075,12 +2263,20 @@ static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * u
         std::ofstream meta(json_path);
         meta << "{\n";
         meta << "  \"index\": " << index << ",\n";
+        meta << "  \"name_occurrence\": " << name_occurrence << ",\n";
         meta << "  \"name\": \"" << name << "\",\n";
         meta << "  \"type\": \"" << ggml_type_name(t->type) << "\",\n";
         meta << "  \"op\": \"" << ggml_op_name(t->op) << "\",\n";
         meta << "  \"n_bytes\": " << n_bytes << ",\n";
-        meta << "  \"ne\": [" << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "],\n";
-        meta << "  \"nb\": [" << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3] << "],\n";
+        meta << "  \"ne\": [" << t->ne[0] << ", " << (row_only ? 1 : t->ne[1]) << ", " << (row_only ? 1 : t->ne[2]) << ", " << (row_only ? 1 : t->ne[3]) << "],\n";
+        meta << "  \"nb\": [" << t->nb[0] << ", " << (row_only ? int64_t(n_bytes) : t->nb[1]) << ", " << (row_only ? int64_t(n_bytes) : t->nb[2]) << ", " << (row_only ? int64_t(n_bytes) : t->nb[3]) << "],\n";
+        meta << "  \"source_ne\": [" << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "],\n";
+        meta << "  \"source_nb\": [" << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3] << "],\n";
+        meta << "  \"source_row\": " << (row_only ? state->row : -1) << ",\n";
+        meta << "  \"name_row_base\": " << name_row_base << ",\n";
+        meta << "  \"inferred_full_row\": " << inferred_full_row << ",\n";
+        meta << "  \"inferred_scored_row\": " << inferred_scored_row << ",\n";
+        meta << "  \"scored_row_offset\": " << state->scored_row_offset << ",\n";
         meta << "  \"bin\": \"" << bin_path.filename().string() << "\"\n";
         meta << "}\n";
     }
@@ -2095,22 +2291,41 @@ static std::unique_ptr<kvarn_tensor_dump_state> kvarn_tensor_dump_try_init(commo
     }
 
     auto state = std::make_unique<kvarn_tensor_dump_state>();
-    state->dir = std::filesystem::path(dir_env);
-    std::filesystem::create_directories(state->dir);
-
     const char * filter_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_FILTER");
     const std::string filter = (filter_env != nullptr && filter_env[0] != '\0') ? filter_env : "kvarn_.*";
-    state->filter = std::regex(filter, std::regex::optimize);
+    try {
+        state->dir = std::filesystem::path(dir_env);
+        std::filesystem::create_directories(state->dir);
 
-    const char * limit_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_LIMIT");
-    if (limit_env != nullptr && limit_env[0] != '\0') {
-        state->limit = std::atoi(limit_env);
+        state->filter = std::regex(filter, std::regex::optimize);
+
+        const char * limit_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_LIMIT");
+        if (limit_env != nullptr && limit_env[0] != '\0') {
+            state->limit = std::max(0, std::atoi(limit_env));
+        }
+        const char * row_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_ROW");
+        if (row_env != nullptr && row_env[0] != '\0') {
+            state->row = std::atoi(row_env);
+            if (state->row < 0) {
+                throw std::runtime_error("LLAMA_KVARN_TENSOR_DUMP_ROW must be non-negative");
+            }
+        }
+        const char * scored_offset_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW_OFFSET");
+        if (scored_offset_env != nullptr && scored_offset_env[0] != '\0') {
+            state->scored_row_offset = std::atoi(scored_offset_env);
+            if (state->scored_row_offset < 0) {
+                throw std::runtime_error("LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW_OFFSET must be non-negative");
+            }
+        }
+    } catch (const std::exception & ex) {
+        LOG_ERR("KVarN tensor dump disabled: invalid dump configuration: %s\n", ex.what());
+        return nullptr;
     }
 
     params.cb_eval           = kvarn_tensor_dump_cb_eval;
     params.cb_eval_user_data = state.get();
-    LOG_INF("KVarN tensor dump enabled: dir=%s filter=%s limit=%d\n",
-            state->dir.string().c_str(), filter.c_str(), state->limit);
+    LOG_INF("KVarN tensor dump enabled: dir=%s filter=%s limit=%d row=%d scored_row_offset=%d\n",
+            state->dir.string().c_str(), filter.c_str(), state->limit, state->row, state->scored_row_offset);
     return state;
 }
 
@@ -2195,7 +2410,10 @@ int llama_perplexity(int argc, char ** argv) {
     } else if (params.multiple_choice) {
         multiple_choice_score(ctx, params);
     } else if (params.kl_divergence) {
-        kl_divergence(ctx, params);
+        if (!kl_divergence(ctx, params)) {
+            llama_backend_free();
+            return 1;
+        }
     } else {
         results = perplexity(ctx, params, n_ctx);
     }

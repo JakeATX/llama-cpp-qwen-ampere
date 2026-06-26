@@ -57,7 +57,7 @@ test parameters:
   -ctk, --cache-type-k <t>                  (default: f16)
   -ctv, --cache-type-v <t>                  (default: f16)
   --kv-cache-quant <none|kvarn>             (default: none)
-  --kvarn-preset <preset>                   KVarN preset, currently kvarn_k4v2_g128
+  --kvarn-preset <preset>                   KVarN preset kvarn_k<K>v<V>_g128, K,V in [2,8]
   --kvarn-sink-tokens <n>                   KVarN FP16 sink tokens (default: 128)
   --kvarn-tail-tokens <n>                   KVarN FP16 tail tokens (default: 128)
   --kvarn-iters <n>                         KVarN Sinkhorn-style variance normalization iterations (default: 16)

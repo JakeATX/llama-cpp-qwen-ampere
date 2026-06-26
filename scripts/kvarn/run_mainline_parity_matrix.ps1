@@ -5,6 +5,10 @@ param(
     [string] $CaseList = "tg64:0:64,pp512:512:0,pp4096:4096:0,tg4096:0:4096",
     [int] $GpuLayers = 99,
     [ValidateSet("on", "off", "auto")] [string] $FlashAttn = "off",
+    [ValidateSet("", "on", "off", "auto")] [string] $MainlineFlashAttn = "",
+    [ValidateSet("", "on", "off", "auto")] [string] $KvarnFlashAttn = "",
+    [string] $CacheTypeK = "q8_0",
+    [string] $CacheTypeV = "q8_0",
     [string] $KvarnPreset = "kvarn_k4v2_g128",
     [int] $KvarnIters = 4,
     [double] $RtnQuantile = 1.0,
@@ -16,20 +20,33 @@ param(
     [int] $MinKvarnBodyRecords = 0,
     [int] $MinActiveKvarnBodyRecords = 0,
     [string] $ExpectedKvarnLayers = "",
+    [string] $ExpectedEffectiveKvarnBits = "",
     [string] $OutputDir = "",
     [switch] $TraceAttn,
     [switch] $TraceStore,
+    [switch] $TraceFwht,
     [switch] $TraceDequantCache,
     [int] $TraceLimit = 64,
     [int] $TraceStoreLimit = 64,
+    [int] $MinFwhtTaken = 0,
     [int] $TraceDequantCacheLimit = 256,
+    [switch] $KvarnPaperFrame,
+    [switch] $KvarnDirectRecordBatch,
+    [switch] $RequireDirectRecordBatchPhases,
+    [int] $MinBatchedStorePhaseUses = 0,
     [string[]] $ExtraArgs = @(),
     [string[]] $KvarnExtraArgs = @(),
     [switch] $AllowKvarnFallback,
+    [switch] $AllowSameBinaryBaseline,
+    [switch] $AllowUnsafeLlamaBench,
     [ValidateSet("mainline-first", "kvarn-first")] [string] $RunOrder = "mainline-first"
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $AllowUnsafeLlamaBench.IsPresent) {
+    throw "run_mainline_parity_matrix.ps1 uses llama-bench.exe, which is disabled for this workspace because it has crashed the Codex session. Use scripts/kvarn/run_safe_cli_parity_matrix.ps1 for serial speed evidence, or pass -AllowUnsafeLlamaBench only for an explicit diagnostic run."
+}
 
 if ($Repetitions -le 0) {
     throw "Repetitions must be positive"
@@ -49,6 +66,26 @@ if ($MinActiveKvarnBodyRecords -lt 0) {
 if ($TraceLimit -le 0 -or $TraceStoreLimit -le 0 -or $TraceDequantCacheLimit -le 0) {
     throw "Trace limits must be positive"
 }
+if ($MinFwhtTaken -lt 0) {
+    throw "MinFwhtTaken must be non-negative"
+}
+if ($MinFwhtTaken -gt 0 -and -not $TraceFwht.IsPresent) {
+    throw "MinFwhtTaken requires -TraceFwht so the script can prove CUDA FWHT use"
+}
+if ($MinBatchedStorePhaseUses -lt 0) {
+    throw "MinBatchedStorePhaseUses must be non-negative"
+}
+if ($MinBatchedStorePhaseUses -gt 0 -and -not $TraceStore.IsPresent) {
+    throw "MinBatchedStorePhaseUses requires -TraceStore so the script can prove batched store use"
+}
+if ($RequireDirectRecordBatchPhases.IsPresent -and -not $KvarnPaperFrame.IsPresent) {
+    throw "RequireDirectRecordBatchPhases requires -KvarnPaperFrame because the CUDA batched phase implementation is paper-frame only"
+}
+if ([string]::IsNullOrWhiteSpace($CacheTypeK) -or [string]::IsNullOrWhiteSpace($CacheTypeV)) {
+    throw "CacheTypeK and CacheTypeV must be non-empty"
+}
+$effectiveMainlineFlashAttn = if ([string]::IsNullOrWhiteSpace($MainlineFlashAttn)) { $FlashAttn } else { $MainlineFlashAttn }
+$effectiveKvarnFlashAttn = if ([string]::IsNullOrWhiteSpace($KvarnFlashAttn)) { $FlashAttn } else { $KvarnFlashAttn }
 if (-not (Test-Path -LiteralPath $Model)) {
     throw "Model not found at $Model"
 }
@@ -84,13 +121,14 @@ function Get-BenchCases([string] $rawList) {
     $cases = @()
     foreach ($raw in ($rawList -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
         $parts = $raw -split ":"
-        if ($parts.Count -ne 3) {
-            throw "Invalid case '$raw'; expected name:prompt:gen"
+        if ($parts.Count -ne 3 -and $parts.Count -ne 4) {
+            throw "Invalid case '$raw'; expected name:prompt:gen or name:prompt:gen:depth"
         }
         $cases += [pscustomobject]@{
             Name = $parts[0]
             PromptTokens = [int] $parts[1]
             GenTokens = [int] $parts[2]
+            DepthTokens = $(if ($parts.Count -eq 4) { [int] $parts[3] } else { 0 })
         }
     }
     return $cases
@@ -153,6 +191,68 @@ function Get-GpuRuntimeSummary() {
     }
 }
 
+function Get-GpuMemorySnapshot() {
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($null -eq $nvidiaSmi) {
+        return "nvidia-smi unavailable"
+    }
+
+    try {
+        $rows = & $nvidiaSmi.Path --query-gpu=memory.used,memory.total,memory.free,utilization.gpu --format=csv,noheader,nounits 2>$null
+        if ($LASTEXITCODE -ne 0 -or $null -eq $rows) {
+            return "nvidia-smi query failed"
+        }
+        return (($rows | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ }) -join "; ")
+    } catch {
+        return "nvidia-smi query failed: $($_.Exception.Message)"
+    }
+}
+
+function Get-FileSha256([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return "missing"
+    }
+    try {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    } catch {
+        return "hash failed: $($_.Exception.Message)"
+    }
+}
+
+function Get-KvarnEnvSnapshot() {
+    $names = @(
+        "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA",
+        "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK",
+        "LLAMA_KVARN_LAYER_FILTER",
+        "LLAMA_KVARN_LAYER_KEY_BITS",
+        "LLAMA_KVARN_LAYER_VALUE_BITS",
+        "LLAMA_KVARN_ATTN_TRACE",
+        "LLAMA_KVARN_ATTN_TRACE_LIMIT",
+        "LLAMA_KVARN_ATTN_REF_SCRATCH",
+        "LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE",
+        "LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR",
+        "LLAMA_KVARN_DISABLE_PREFILL_DIRECT_STORE",
+        "LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN",
+        "LLAMA_KVARN_DISABLE_INTERNAL_CAUSAL_MASK",
+        "LLAMA_KVARN_ENABLE_PAPER_FRAME",
+        "LLAMA_KVARN_PAPER_MIXED_FRAME",
+        "LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH",
+        "LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES",
+        "LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES"
+    )
+    $rows = @()
+    foreach ($name in $names) {
+        $value = [Environment]::GetEnvironmentVariable($name, "Process")
+        if (-not [string]::IsNullOrEmpty($value)) {
+            $rows += ("{0}={1}" -f $name, $value)
+        }
+    }
+    if ($rows.Count -eq 0) {
+        return "(none)"
+    }
+    return ($rows -join "; ")
+}
+
 function Get-MaxKvarnBodyRecords([string] $text) {
     $maxRecords = -1
     foreach ($m in [regex]::Matches($text, "body records =\s+([0-9]+)")) {
@@ -168,6 +268,18 @@ function Get-KvarnLayerSet([string] $text) {
     $actual = New-Object 'System.Collections.Generic.SortedSet[int]'
     foreach ($m in [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer\s+([0-9]+)")) {
         [void] $actual.Add([int] $m.Groups[1].Value)
+    }
+    return (($actual | ForEach-Object { [string] $_ }) -join ",")
+}
+
+function Normalize-KvarnBits([string] $bits) {
+    return (($bits.Trim().ToLowerInvariant()) -replace "[^0-9kv]", "")
+}
+
+function Get-KvarnEffectiveBitSet([string] $text) {
+    $actual = New-Object 'System.Collections.Generic.SortedSet[string]'
+    foreach ($m in [regex]::Matches($text, "llama_kv_cache_kvarn: KVarN layer\s+[0-9]+.*?effective k(?<k>[0-9]+)/v(?<v>[0-9]+)")) {
+        [void] $actual.Add(("k{0}/v{1}" -f $m.Groups["k"].Value, $m.Groups["v"].Value))
     }
     return (($actual | ForEach-Object { [string] $_ }) -join ",")
 }
@@ -322,6 +434,9 @@ function Get-GitDirty([string] $RepoRoot) {
 function Get-KvarnStoreTraceSummary([string] $text) {
     $kindCounts = @{}
     $shapeCounts = @{}
+    $batchedUsed = 0
+    $batchedUnavailable = 0
+    $batchedShapeCounts = @{}
 
     foreach ($m in [regex]::Matches($text, "KVarN CUDA store-body trace: kind=([^\s]+)\s+head_dim=([0-9]+)\s+group_size=([0-9]+).*?scratch_floats=([0-9]+)")) {
         $kind = $m.Groups[1].Value
@@ -337,6 +452,21 @@ function Get-KvarnStoreTraceSummary([string] $text) {
         $shapeCounts[$shape]++
     }
 
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA store-body batched-phases trace:\s+used=([01])\s+head_dim=([0-9]+)\s+group_size=([0-9]+)\s+n_records=([0-9]+)\s+n_heads=([0-9]+)\s+scratch_floats=([0-9]+)")) {
+        if ($m.Groups[1].Value -eq "1") {
+            ++$batchedUsed
+        } else {
+            ++$batchedUnavailable
+        }
+
+        $shape = "used{0}:dim{1}/g{2}/rec{3}/heads{4}" -f `
+            $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value, $m.Groups[4].Value, $m.Groups[5].Value
+        if (-not $batchedShapeCounts.ContainsKey($shape)) {
+            $batchedShapeCounts[$shape] = 0
+        }
+        $batchedShapeCounts[$shape]++
+    }
+
     $kinds = $kindCounts.GetEnumerator() |
         Sort-Object Name |
         ForEach-Object { "{0}={1}" -f $_.Key, $_.Value }
@@ -344,10 +474,17 @@ function Get-KvarnStoreTraceSummary([string] $text) {
         Sort-Object @{ Expression = { -$_.Value } }, Name |
         Select-Object -First 8 |
         ForEach-Object { "{0}x {1}" -f $_.Value, $_.Key }
+    $batchedShapes = $batchedShapeCounts.GetEnumerator() |
+        Sort-Object @{ Expression = { -$_.Value } }, Name |
+        Select-Object -First 8 |
+        ForEach-Object { "{0}x {1}" -f $_.Value, $_.Key }
 
     return [pscustomobject]@{
         Kinds = ($kinds -join "; ")
         Shapes = ($shapes -join "; ")
+        BatchedPhaseUsed = $batchedUsed
+        BatchedPhaseUnavailable = $batchedUnavailable
+        BatchedPhaseShapes = ($batchedShapes -join "; ")
     }
 }
 
@@ -437,6 +574,30 @@ function Assert-ExpectedKvarnLayers([string] $text, [int[]] $expected, [string] 
     Write-Host ("KVarN exact layer check: PASS, layers = {0}" -f ($expected -join ","))
 }
 
+function Assert-ExpectedEffectiveKvarnBits([string] $text, [string] $expected, [string] $label) {
+    if ([string]::IsNullOrWhiteSpace($expected)) {
+        return
+    }
+
+    $observed = Get-KvarnEffectiveBitSet $text
+    if ([string]::IsNullOrWhiteSpace($observed)) {
+        throw "$label did not emit effective KVarN bit logs; rebuild with effective k/v allocation logging before using -ExpectedEffectiveKvarnBits"
+    }
+
+    $want = Normalize-KvarnBits $expected
+    $bad = @()
+    foreach ($pair in ($observed -split "," | Where-Object { $_ })) {
+        if ((Normalize-KvarnBits $pair) -ne $want) {
+            $bad += $pair
+        }
+    }
+    if ($bad.Count -gt 0) {
+        throw "$label observed effective KVarN bits '$observed', expected every routed layer to be '$expected'"
+    }
+
+    Write-Host ("KVarN effective-bit check: PASS, bits = {0}" -f $observed)
+}
+
 function Assert-MinKvarnBodyRecords([string] $text, [int] $minimum, [string] $label) {
     if ($minimum -le 0) {
         return
@@ -487,6 +648,47 @@ function Assert-MinActiveKvarnBodyRecords([string] $text, [int] $minimum, [strin
     Write-Host ("KVarN active body-record check: PASS, max active body records = {0}" -f $maxRecords)
 }
 
+function Assert-MinBatchedStorePhaseUses([object] $storeTrace, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+
+    if ($storeTrace.BatchedPhaseUsed -lt $minimum) {
+        throw "$label used direct-record batched store phases $($storeTrace.BatchedPhaseUsed) times, expected at least $minimum. Rerun with -KvarnPaperFrame -KvarnDirectRecordBatch -TraceStore and inspect KVarN CUDA store-body batched-phases trace."
+    }
+
+    Write-Host ("KVarN batched store phase check: PASS, used = {0}" -f $storeTrace.BatchedPhaseUsed)
+}
+
+function Get-KvarnFwhtTraceSummary([string] $text) {
+    $taken = 0
+    $fallback = 0
+    $total = 0
+    foreach ($m in [regex]::Matches($text, "KVarN CUDA FWHT trace:\s+taken=([01])")) {
+        $total++
+        if ($m.Groups[1].Value -eq "1") {
+            $taken++
+        } else {
+            $fallback++
+        }
+    }
+    return [pscustomobject]@{
+        Total = $total
+        Taken = $taken
+        Fallback = $fallback
+    }
+}
+
+function Assert-MinFwhtTaken([object] $fwhtTrace, [int] $minimum, [string] $label) {
+    if ($minimum -le 0) {
+        return
+    }
+    if ($fwhtTrace.Taken -lt $minimum) {
+        throw "$label used CUDA FWHT $($fwhtTrace.Taken) times, expected at least $minimum. Rerun with -TraceFwht and inspect KVarN CUDA FWHT trace lines."
+    }
+    Write-Host ("KVarN CUDA FWHT check: PASS, taken = {0}, fallback = {1}" -f $fwhtTrace.Taken, $fwhtTrace.Fallback)
+}
+
 function Invoke-BenchRow {
     param(
         [string] $Label,
@@ -505,7 +707,7 @@ function Invoke-BenchRow {
     }) -join " ")
     [System.IO.File]::WriteAllText($cmdPath, $commandLine + "`n")
 
-    Write-Host "== $Label case $($Case.Name) p=$($Case.PromptTokens) n=$($Case.GenTokens)"
+    Write-Host "== $Label case $($Case.Name) p=$($Case.PromptTokens) n=$($Case.GenTokens) d=$($Case.DepthTokens)"
     Write-Host $commandLine
 
     $oldEnv = @{}
@@ -528,7 +730,12 @@ function Invoke-BenchRow {
 
     $text = ($output | ForEach-Object { $_.ToString() }) -join "`n"
     [System.IO.File]::WriteAllText($logPath, $text + "`n")
-    $text | Write-Host
+    $tail = @($text -split "`r?`n" | Select-Object -Last 40)
+    if ($tail.Count -gt 0) {
+        Write-Host "---- $Label case $($Case.Name) log tail ----"
+        $tail | Write-Host
+        Write-Host "---------------------------------------------"
+    }
     if ($exit -ne 0) {
         throw "$Label llama-bench failed for case '$($Case.Name)' with exit code $exit; see $logPath"
     }
@@ -546,6 +753,7 @@ function Invoke-BenchRow {
         MaxBodyRecords = Get-MaxKvarnBodyRecords $text
         AttnTrace = Get-KvarnTraceSummary $text
         StoreTrace = Get-KvarnStoreTraceSummary $text
+        FwhtTrace = Get-KvarnFwhtTraceSummary $text
         DequantCacheTrace = Get-KvarnDequantCacheTraceSummary $text
     }
 }
@@ -555,6 +763,10 @@ $mainlineRoot = (Resolve-Path -LiteralPath (Join-Path $repoRoot "..\llama.cpp-ma
 $mainlineBench = Resolve-BuildExe $MainlineBuildDir "llama-bench.exe"
 $kvarnBench = Resolve-BuildExe $KvarnBuildDir "llama-bench.exe"
 $modelPath = (Resolve-Path -LiteralPath $Model).Path
+$mainlineBenchSha256 = Get-FileSha256 $mainlineBench
+$kvarnBenchSha256 = Get-FileSha256 $kvarnBench
+$sameBinaryBaseline = ([System.StringComparer]::OrdinalIgnoreCase.Equals($mainlineBench, $kvarnBench) -or
+    ([string] $mainlineBenchSha256) -eq ([string] $kvarnBenchSha256))
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -566,6 +778,7 @@ $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 $rtnQuantileArg = $RtnQuantile.ToString([System.Globalization.CultureInfo]::InvariantCulture)
 $warmupArgv = if ($Warmup.IsPresent) { @() } else { @("--no-warmup") }
 $expectedKvarnLayerIds = Get-ExpectedKvarnLayerIds $ExpectedKvarnLayers
+$evidenceMode = if ($sameBinaryBaseline) { "same-binary diagnostic" } else { "mainline-vs-kvarn production candidate" }
 
 $manifest = @(
     "model=$modelPath",
@@ -578,22 +791,43 @@ $manifest = @(
     "mainline_build=$MainlineBuildDir",
     "kvarn_build=$KvarnBuildDir",
     "mainline_bench=$mainlineBench",
+    "mainline_bench_sha256=$mainlineBenchSha256",
     "kvarn_bench=$kvarnBench",
+    "kvarn_bench_sha256=$kvarnBenchSha256",
+    "same_binary_baseline=$sameBinaryBaseline",
+    "allow_same_binary_baseline=$($AllowSameBinaryBaseline.IsPresent)",
+    "evidence_mode=$evidenceMode",
     "gpu_runtime=$(Get-GpuRuntimeSummary)",
+    "gpu_memory_snapshot=used,total,free,utilization.gpu -> $(Get-GpuMemorySnapshot)",
     "case_list=$CaseList",
     "min_parity_ratio=$MinParityRatio",
     "repetitions=$Repetitions",
     "warmup=$($Warmup.IsPresent)",
     "flash_attn=$FlashAttn",
+    "mainline_flash_attn=$effectiveMainlineFlashAttn",
+    "kvarn_flash_attn=$effectiveKvarnFlashAttn",
+    "mainline_cache_type_k=$CacheTypeK",
+    "mainline_cache_type_v=$CacheTypeV",
     "kvarn_preset=$KvarnPreset",
     "kvarn_iters=$KvarnIters",
     "kvarn_rtn_quantile=$rtnQuantileArg",
+    "kvarn_env_snapshot=$(Get-KvarnEnvSnapshot)",
+    "env_LLAMA_KVARN_ENABLE_PAPER_FRAME=$([Environment]::GetEnvironmentVariable('LLAMA_KVARN_ENABLE_PAPER_FRAME', 'Process'))",
+    "env_LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=$([Environment]::GetEnvironmentVariable('LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA', 'Process'))",
+    "env_LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK=$([Environment]::GetEnvironmentVariable('LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK', 'Process'))",
     "min_kvarn_layer_logs=$MinKvarnLayerLogs",
     "min_kvarn_body_records=$MinKvarnBodyRecords",
     "min_active_kvarn_body_records=$MinActiveKvarnBodyRecords",
+    "min_batched_store_phase_uses=$MinBatchedStorePhaseUses",
+    "expected_effective_kvarn_bits=$ExpectedEffectiveKvarnBits",
+    "kvarn_paper_frame=$($KvarnPaperFrame.IsPresent)",
+    "kvarn_direct_record_batch=$($KvarnDirectRecordBatch.IsPresent)",
+    "require_direct_record_batch_phases=$($RequireDirectRecordBatchPhases.IsPresent)",
     "expected_kvarn_layers=$ExpectedKvarnLayers",
     "trace_attn=$($TraceAttn.IsPresent)",
     "trace_store=$($TraceStore.IsPresent)",
+    "trace_fwht=$($TraceFwht.IsPresent)",
+    "min_fwht_taken=$MinFwhtTaken",
     "trace_dequant_cache=$($TraceDequantCache.IsPresent)",
     "trace_limit=$TraceLimit",
     "trace_store_limit=$TraceStoreLimit",
@@ -605,6 +839,23 @@ $manifest = @(
 )
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
 
+if ($sameBinaryBaseline -and -not $AllowSameBinaryBaseline.IsPresent) {
+    $blockedSummary = Join-Path $OutputDir "summary.md"
+    $blockedLines = @(
+        "# KVarN mainline parity - BLOCKED",
+        "",
+        "The requested run would compare KVarN against the same binary used for the baseline.",
+        "",
+        "- mainline bench: ``$mainlineBench``",
+        "- KVarN bench: ``$kvarnBench``",
+        "- sha256: ``$mainlineBenchSha256``",
+        "",
+        "Use a real non-KVarN mainline build for production evidence. Pass ``-AllowSameBinaryBaseline`` only for diagnostic same-binary runs."
+    )
+    [System.IO.File]::WriteAllText($blockedSummary, ($blockedLines -join "`n") + "`n")
+    throw "Refusing same-binary baseline; see $blockedSummary. Pass -AllowSameBinaryBaseline only for diagnostic runs."
+}
+
 $summaries = @()
 $gateFailures = @()
 
@@ -613,19 +864,37 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         "-m", $modelPath,
         "-p", [string] $case.PromptTokens,
         "-n", [string] $case.GenTokens,
+        "-d", [string] $case.DepthTokens,
         "-r", [string] $Repetitions,
         "-ngl", [string] $GpuLayers,
-        "-fa", $FlashAttn,
         "-o", "md"
     ) + $warmupArgv + $ExtraArgs
 
+    $mainlineArgv = $commonArgv + @(
+        "-fa", $effectiveMainlineFlashAttn,
+        "-ctk", $CacheTypeK,
+        "-ctv", $CacheTypeV
+    )
+
     $kvarnArgv = $commonArgv + @(
+        "-fa", $effectiveKvarnFlashAttn,
         "--kv-cache-quant", "kvarn",
         "--kvarn-preset", $KvarnPreset,
         "--kvarn-iters", [string] $KvarnIters,
         "--kvarn-rtn-quantile", $rtnQuantileArg
     ) + $KvarnExtraArgs
     $kvarnEnv = @{}
+    if ($KvarnPaperFrame.IsPresent) {
+        $kvarnEnv["LLAMA_KVARN_ENABLE_PAPER_FRAME"] = "1"
+    }
+    if ($KvarnDirectRecordBatch.IsPresent) {
+        $kvarnEnv["LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH"] = "1"
+    }
+    if ($RequireDirectRecordBatchPhases.IsPresent) {
+        $kvarnEnv["LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES"] = "1"
+        $kvarnEnv["LLAMA_KVARN_ENABLE_PAPER_FRAME"] = "1"
+        $kvarnEnv["LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH"] = "1"
+    }
     if ($TraceAttn.IsPresent) {
         $kvarnEnv["LLAMA_KVARN_ATTN_TRACE"] = "1"
         $kvarnEnv["LLAMA_KVARN_ATTN_TRACE_LIMIT"] = [string] $TraceLimit
@@ -634,6 +903,9 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         $kvarnEnv["LLAMA_KVARN_STORE_TRACE"] = "1"
         $kvarnEnv["LLAMA_KVARN_STORE_TRACE_LIMIT"] = [string] $TraceStoreLimit
     }
+    if ($TraceFwht.IsPresent) {
+        $kvarnEnv["LLAMA_KVARN_FWHT_TRACE"] = "1"
+    }
     if ($TraceDequantCache.IsPresent) {
         $kvarnEnv["LLAMA_KVARN_DEQUANT_CACHE_TRACE"] = "1"
         $kvarnEnv["LLAMA_KVARN_DEQUANT_CACHE_TRACE_LIMIT"] = [string] $TraceDequantCacheLimit
@@ -641,9 +913,9 @@ foreach ($case in (Get-BenchCases $CaseList)) {
 
     if ($RunOrder -eq "kvarn-first") {
         $kvarnRow = Invoke-BenchRow -Label "kvarn" -BenchExe $kvarnBench -ModelPath $modelPath -Case $case -Argv $kvarnArgv -EnvSet $kvarnEnv
-        $mainlineRow = Invoke-BenchRow -Label "mainline" -BenchExe $mainlineBench -ModelPath $modelPath -Case $case -Argv $commonArgv
+        $mainlineRow = Invoke-BenchRow -Label "mainline" -BenchExe $mainlineBench -ModelPath $modelPath -Case $case -Argv $mainlineArgv
     } else {
-        $mainlineRow = Invoke-BenchRow -Label "mainline" -BenchExe $mainlineBench -ModelPath $modelPath -Case $case -Argv $commonArgv
+        $mainlineRow = Invoke-BenchRow -Label "mainline" -BenchExe $mainlineBench -ModelPath $modelPath -Case $case -Argv $mainlineArgv
         $kvarnRow = Invoke-BenchRow -Label "kvarn" -BenchExe $kvarnBench -ModelPath $modelPath -Case $case -Argv $kvarnArgv -EnvSet $kvarnEnv
     }
 
@@ -657,8 +929,11 @@ foreach ($case in (Get-BenchCases $CaseList)) {
             Write-Host ("KVarN layer-log check: PASS, layer lines = {0}" -f $kvarnLayerLogs)
         }
         Assert-ExpectedKvarnLayers $kvarnRow.Text $expectedKvarnLayerIds "KVarN case '$($case.Name)'"
+        Assert-ExpectedEffectiveKvarnBits $kvarnRow.Text $ExpectedEffectiveKvarnBits "KVarN case '$($case.Name)'"
         Assert-MinKvarnBodyRecords $kvarnRow.Text $MinKvarnBodyRecords "KVarN case '$($case.Name)'"
         Assert-MinActiveKvarnBodyRecords $kvarnRow.Text $MinActiveKvarnBodyRecords "KVarN case '$($case.Name)'"
+        Assert-MinBatchedStorePhaseUses $kvarnRow.StoreTrace $MinBatchedStorePhaseUses "KVarN case '$($case.Name)'"
+        Assert-MinFwhtTaken $kvarnRow.FwhtTrace $MinFwhtTaken "KVarN case '$($case.Name)'"
     } elseif ($AllowKvarnFallback.IsPresent) {
         Write-Warning ("KVarN case '{0}' emitted no KVarN cache logs; treating as allowed fallback path for parity accounting" -f $case.Name)
     } else {
@@ -680,6 +955,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         Case = $case.Name
         PromptTokens = $case.PromptTokens
         GenTokens = $case.GenTokens
+        DepthTokens = $case.DepthTokens
         MainlineTps = $mainlineRow.Throughput
         KvarnTps = $kvarnRow.Throughput
         KvarnVsMainline = $ratio
@@ -691,6 +967,7 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         MaxKvarnBodyRecords = $kvarnRow.MaxBodyRecords
         ExpectedKvarnLayers = $ExpectedKvarnLayers
         ActualKvarnLayers = Get-KvarnLayerSet $kvarnRow.Text
+        ActualEffectiveKvarnBits = Get-KvarnEffectiveBitSet $kvarnRow.Text
         TraceModes = $kvarnRow.AttnTrace.Modes
         TraceShapes = $kvarnRow.AttnTrace.Shapes
         InnerTraceModes = $kvarnRow.AttnTrace.InnerModes
@@ -718,6 +995,12 @@ foreach ($case in (Get-BenchCases $CaseList)) {
         InnerTraceScoresElems = $kvarnRow.AttnTrace.InnerScoresElems
         StoreTraceKinds = $kvarnRow.StoreTrace.Kinds
         StoreTraceShapes = $kvarnRow.StoreTrace.Shapes
+        StoreTraceBatchedPhaseUsed = $kvarnRow.StoreTrace.BatchedPhaseUsed
+        StoreTraceBatchedPhaseUnavailable = $kvarnRow.StoreTrace.BatchedPhaseUnavailable
+        StoreTraceBatchedPhaseShapes = $kvarnRow.StoreTrace.BatchedPhaseShapes
+        FwhtTraceTotal = $kvarnRow.FwhtTrace.Total
+        FwhtTraceTaken = $kvarnRow.FwhtTrace.Taken
+        FwhtTraceFallback = $kvarnRow.FwhtTrace.Fallback
         DequantCacheTrace = $kvarnRow.DequantCacheTrace
         MainlineLog = $mainlineRow.Log
         KvarnLog = $kvarnRow.Log
@@ -731,27 +1014,32 @@ $summaryMd = Join-Path $OutputDir "summary.md"
 $summaries | Export-Csv -NoTypeInformation -LiteralPath $summaryCsv
 
 $summaryLines = @(
-    "# KVarN vs mainline llama.cpp parity",
+    "# KVarN parity",
     "",
+    ("- Evidence mode: ``{0}``" -f $evidenceMode),
+    ("- Same binary baseline: ``{0}``" -f $sameBinaryBaseline),
     ("- Model: ``{0}``" -f $modelPath),
     ("- Mainline SHA: ``{0}`` dirty=``{1}``" -f (Get-GitHead $mainlineRoot), (Get-GitDirty $mainlineRoot)),
     ("- KVarN SHA: ``{0}`` dirty=``{1}``" -f (Get-GitHead $repoRoot), (Get-GitDirty $repoRoot)),
     ("- Run order: ``{0}``; warmup: ``{1}``; flash-attn: ``{2}``" -f $RunOrder, $Warmup.IsPresent, $FlashAttn),
     ("- KVarN preset: ``{0}``; iters: ``{1}``; RTN quantile: ``{2}``" -f $KvarnPreset, $KvarnIters, $rtnQuantileArg),
+    ("- KVarN paper frame: ``{0}``; direct record batch: ``{1}``; require batched phases: ``{2}``; min batched phase uses: ``{3}``" -f `
+        $KvarnPaperFrame.IsPresent, $KvarnDirectRecordBatch.IsPresent, $RequireDirectRecordBatchPhases.IsPresent, $MinBatchedStorePhaseUses),
     ("- Expected KVarN layers: ``{0}``; fallback allowed: ``{1}``" -f $ExpectedKvarnLayers, $AllowKvarnFallback.IsPresent),
     ("- GPU/runtime: ``{0}``" -f (Get-GpuRuntimeSummary)),
     ("- Extra args: ``{0}``; KVarN extra args: ``{1}``" -f ($ExtraArgs -join ' '), ($KvarnExtraArgs -join ' ')),
     "",
-    "| case | prompt | gen | mainline t/s | KVarN t/s | KVarN/mainline | gate (>=$([int]($MinParityRatio*100))%) | fallback observed | actual layers | max body records | commands |",
-    "| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | --- |"
+    "| case | prompt | gen | depth | mainline t/s | KVarN t/s | KVarN/mainline | gate (>=$([int]($MinParityRatio*100))%) | fallback observed | actual layers | effective bits | max body records | batched store used | FWHT taken | commands |",
+    "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- | ---: | ---: | ---: | --- |"
 )
 foreach ($s in $summaries) {
     $gateText = if ($s.GatePass) { "PASS" } else { "**FAIL**" }
     $commands = "{0}; {1}" -f $s.MainlineCommand, $s.KvarnCommand
     $actualLayers = if ([string]::IsNullOrWhiteSpace($s.ActualKvarnLayers)) { "(none)" } else { $s.ActualKvarnLayers }
-    $summaryLines += "| {0} | {1} | {2} | {3:F2} | {4:F2} | {5:P1} | {6} | {7} | {8} | {9} | {10} |" -f `
-        $s.Case, $s.PromptTokens, $s.GenTokens, $s.MainlineTps, $s.KvarnTps, $s.KvarnVsMainline, $gateText,
-        $s.KvarnFallbackObserved, $actualLayers, $s.MaxKvarnBodyRecords, $commands
+    $actualBits = if ([string]::IsNullOrWhiteSpace($s.ActualEffectiveKvarnBits)) { "(unknown)" } else { $s.ActualEffectiveKvarnBits }
+    $summaryLines += "| {0} | {1} | {2} | {3} | {4:F2} | {5:F2} | {6:P1} | {7} | {8} | {9} | {10} | {11} | {12} | {13} | {14} |" -f `
+        $s.Case, $s.PromptTokens, $s.GenTokens, $s.DepthTokens, $s.MainlineTps, $s.KvarnTps, $s.KvarnVsMainline, $gateText,
+        $s.KvarnFallbackObserved, $actualLayers, $actualBits, $s.MaxKvarnBodyRecords, $s.StoreTraceBatchedPhaseUsed, $s.FwhtTraceTaken, $commands
 }
 [System.IO.File]::WriteAllText($summaryMd, ($summaryLines -join "`n") + "`n")
 

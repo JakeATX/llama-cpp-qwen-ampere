@@ -221,7 +221,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            12
+#define GGML_MAX_SRC            13
 #define GGML_MAX_N_THREADS      512
 #define GGML_MAX_OP_PARAMS      64
 
@@ -526,6 +526,7 @@ extern "C" {
         GGML_OP_KVARN_STORE_BODY,
         GGML_OP_KVARN_STORE_KV_BODY,
         GGML_OP_KVARN_ATTN_MIXED,
+        GGML_OP_KVARN_MATERIALIZE_KV,
         GGML_OP_DIAG,
         GGML_OP_DIAG_MASK_INF,
         GGML_OP_DIAG_MASK_ZERO,
@@ -698,7 +699,7 @@ extern "C" {
         void * extra; // extra things e.g. for ggml-cuda.cu
 
         // Keep sizeof(ggml_tensor) 16-byte aligned when GGML_MAX_SRC grows.
-        char padding[GGML_MAX_SRC > 11 ? 8 : 16];
+        char padding[(GGML_MAX_SRC % 2 == 0) ? 8 : 16];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -1689,6 +1690,13 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // Attach an execution dependency to a SET_ROWS cache-write op. The op
+    // ignores these optional sources at execution time; graph construction uses
+    // them to preserve ordering between stateful cache side effects.
+    GGML_API void ggml_set_rows_add_dep(
+            struct ggml_tensor * set_rows,
+            struct ggml_tensor * dep);
+
     // KVarN body-store cache write ops. These return view(body) and write the
     // matching packed body tensor plus FP32 scale tensor.
     GGML_API struct ggml_tensor * ggml_kvarn_store_k_body(
@@ -1786,6 +1794,22 @@ extern "C" {
                    int32_t        sinkhorn_iters,
                    float          rtn_quantile);
 
+    GGML_API void ggml_kvarn_store_body_set_v_layout(
+            struct ggml_tensor * store,
+                   int32_t       v_layout);
+
+    GGML_API void ggml_kvarn_store_kv_body_set_v_layout(
+            struct ggml_tensor * store,
+                   int32_t       v_layout);
+
+    // Attach an execution dependency to a fused K/V body-store op. The CUDA
+    // kernel ignores these optional sources; they exist to keep graph side
+    // effects ordered when the store reads from a persistent cache tensor that
+    // was written by an earlier op in the same graph.
+    GGML_API void ggml_kvarn_store_kv_body_add_dep(
+            struct ggml_tensor * store,
+            struct ggml_tensor * dep);
+
     // Attach an optional I32 window tensor (>= 5 elems: n_sink, n_records,
     // n_pending, n_tail, tail_start) as src[11]. When present, CUDA kernels
     // read the live attention window from device memory so the op is safe to
@@ -1793,6 +1817,27 @@ extern "C" {
     GGML_API void ggml_kvarn_attn_mixed_set_window(
             struct ggml_tensor * attn,
             struct ggml_tensor * window);
+
+    // Attach an optional F32 body-query tensor as src[12]. This can be used
+    // together with the I32 decode window and is used by mixed-frame KVarN
+    // attention where sink/tail tokens stay in the normal frame while body K
+    // records are stored in the paper/Hadamard frame.
+    GGML_API void ggml_kvarn_attn_mixed_set_q_body(
+            struct ggml_tensor * attn,
+            struct ggml_tensor * q_body);
+
+    enum ggml_kvarn_attn_frame_flags {
+        GGML_KVARN_ATTN_FRAME_NONE              = 0,
+        GGML_KVARN_ATTN_FRAME_FUSED_PAPER_FULL  = 1,
+    };
+
+    GGML_API void ggml_kvarn_attn_mixed_set_frame_flags(
+            struct ggml_tensor * attn,
+                   int32_t       frame_flags);
+
+    GGML_API void ggml_kvarn_attn_mixed_set_v_layout(
+            struct ggml_tensor * attn,
+                   int32_t       v_layout);
 
     GGML_API struct ggml_tensor * ggml_kvarn_attn_mixed(
             struct ggml_context * ctx,
@@ -1816,7 +1861,32 @@ extern "C" {
                    int32_t        group_size,
                    int32_t        key_bits,
                    int32_t        value_bits,
-                   float          scale);
+                   float          scale,
+                   float          logit_softcap);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize_kv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sink_tail,
+            struct ggml_tensor  * body,
+            struct ggml_tensor  * scales,
+            struct ggml_tensor  * pending,
+                   int32_t        is_v,
+                   int32_t        n_sink,
+                   int32_t        n_records,
+                   int32_t        n_pending,
+                   int32_t        n_tail,
+                   int32_t        tail_start,
+                   int32_t        head_dim,
+                   int32_t        group_size,
+                   int32_t        bits);
+
+    GGML_API void ggml_kvarn_materialize_kv_set_v_layout(
+            struct ggml_tensor * materialize,
+                   int32_t       v_layout);
+
+    GGML_API void ggml_kvarn_materialize_kv_set_debug_raw_body(
+            struct ggml_tensor * materialize,
+                   int32_t       use_raw_body);
 
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,

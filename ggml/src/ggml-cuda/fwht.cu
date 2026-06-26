@@ -60,6 +60,9 @@ __global__ void fwht_cuda(const float * src, float * dst, const int64_t n_rows, 
 
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_shape(src, dst));
+    if (src->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
     if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
         return false;
     }

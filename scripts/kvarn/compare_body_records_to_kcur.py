@@ -173,6 +173,10 @@ def main() -> int:
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--context-size", type=int, default=4096)
     ap.add_argument("--record-set", choices=["earliest", "latest"], default="latest")
+    ap.add_argument("--min-record", type=int, default=None,
+                    help="Only compare canonical records >= this value.")
+    ap.add_argument("--max-record-exclusive", type=int, default=None,
+                    help="Only compare canonical records < this value.")
     ap.add_argument("--k-tensor-name", default=None,
                     help="Exact dumped K source tensor name. Defaults to Kcur-<layer>.")
     ap.add_argument("--v-tensor-name", default=None,
@@ -237,6 +241,10 @@ def main() -> int:
     for _, rec_dir in sorted(records.items()):
         meta = json.loads((rec_dir / "body_record.json").read_text())
         record = canonical_record(meta)
+        if args.min_record is not None and record < args.min_record:
+            continue
+        if args.max_record_exclusive is not None and record >= args.max_record_exclusive:
+            continue
         group = int(meta["group_size"])
         if group != args.group_size:
             raise SystemExit(f"{rec_dir} group_size {group} != expected {args.group_size}")
@@ -256,9 +264,11 @@ def main() -> int:
         v_input = np.fromfile(rec_dir / "v_tile_input.bin", dtype=np.float32).reshape(group, head_dim)
         input_already_rotated = bool(meta.get("input_already_rotated", False))
 
-        if bool(meta.get("paper_frame", False)) and args.negative_control != "no-paper-frame":
+        paper_frame = bool(meta.get("paper_frame", False)) and args.negative_control != "no-paper-frame"
+        paper_mixed_frame = bool(meta.get("paper_mixed_frame", False))
+        if paper_frame:
             k_rot_expected = hadamard_rows(k_expected.T).T
-            v_rot_expected = hadamard_rows(v_expected)
+            v_rot_expected = v_expected if paper_mixed_frame else hadamard_rows(v_expected)
         else:
             k_rot_expected = k_expected
             v_rot_expected = v_expected

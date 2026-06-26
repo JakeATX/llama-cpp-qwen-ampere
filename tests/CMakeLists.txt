@@ -216,7 +216,7 @@ llama_build_and_test(test-regex-partial.cpp)
 llama_build_and_test(test-batch-split.cpp ../src/llama-batch.cpp)
 target_include_directories(test-batch-split PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-llama_build_and_test(test-kvarn-kv.cpp ../src/llama-kv-cache-kvarn.cpp)
+llama_build_and_test(test-kvarn-kv.cpp ../src/llama-kv-cache-kvarn.cpp ../src/llama-hparams.cpp)
 target_include_directories(test-kvarn-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 if (TARGET ggml-cuda)
@@ -236,6 +236,10 @@ if (TARGET ggml-cuda)
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     target_link_libraries(test-kvarn-cuda-scratch-ref PRIVATE test-kvarn-cuda-kernels CUDA::cudart)
     llama_test(test-kvarn-cuda-scratch-ref)
+    set_tests_properties(test-kvarn-cuda-scratch-ref PROPERTIES
+        RESOURCE_LOCK kvarn_cuda
+        RUN_SERIAL TRUE
+        TIMEOUT 300)
 
     add_executable(test-kvarn-cuda-mixed-tail
         test-kvarn-cuda-mixed-tail.cpp)
@@ -244,6 +248,10 @@ if (TARGET ggml-cuda)
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
     target_link_libraries(test-kvarn-cuda-mixed-tail PRIVATE test-kvarn-cuda-kernels CUDA::cudart)
     llama_test(test-kvarn-cuda-mixed-tail)
+    set_tests_properties(test-kvarn-cuda-mixed-tail PROPERTIES
+        RESOURCE_LOCK kvarn_cuda
+        RUN_SERIAL TRUE
+        TIMEOUT 300)
 
 endif()
 

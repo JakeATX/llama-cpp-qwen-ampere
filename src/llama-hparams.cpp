@@ -265,6 +265,21 @@ bool llama_hparams::has_kv(uint32_t il) const {
     return true;
 }
 
+int32_t llama_hparams::kv_reuse_layer_matching_attention_type(int32_t il) const {
+    if (n_layer_kv_from_start < 0 || il < n_layer_kv_from_start) {
+        return -1;
+    }
+
+    const bool want_swa = is_swa((uint32_t) il);
+    for (int32_t donor = n_layer_kv_from_start - 1; donor >= 0; --donor) {
+        if (is_swa((uint32_t) donor) == want_swa) {
+            return donor;
+        }
+    }
+
+    GGML_ABORT("%s: no matching KV donor layer found for layer %d", __func__, il);
+}
+
 uint32_t llama_hparams::n_layer() const {
     return n_layer_all - n_layer_nextn;
 }

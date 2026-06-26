@@ -36,6 +36,22 @@ static void trace_phase(const char * name, const char * state) {
     std::fflush(stderr);
 }
 
+static void set_test_env(const char * name, const char * value) {
+#if defined(_WIN32)
+    if (value != nullptr) {
+        _putenv_s(name, value);
+    } else {
+        _putenv_s(name, "");
+    }
+#else
+    if (value != nullptr) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
+}
+
 static void run_phase(const char * name, void (*fn)()) {
     trace_phase(name, "start");
     try {
@@ -232,6 +248,89 @@ static llama_hparams make_small_storage_hparams() {
     return hparams;
 }
 
+static llama_hparams make_shared_kv_hparams(uint32_t n_layer, int32_t n_layer_kv_from_start) {
+    llama_hparams hparams = {};
+    hparams.n_layer_all = n_layer;
+    hparams.n_layer_kv_from_start = n_layer_kv_from_start;
+    return hparams;
+}
+
+static size_t expected_body_store_scratch_floats(
+        const llama_kvarn_layer_view & view,
+        const llama_kvarn_params & params) {
+    const size_t tile = size_t(view.head_dim_k)*params.group_size;
+    const size_t per_pipeline = tile + 2*std::max<uint32_t>(view.head_dim_k, params.group_size) +
+        view.head_dim_k + params.group_size + 1;
+    const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
+    const bool needs_pending_head_tiles = view.n_head_kv > 1 || view.head_dim_k >= 512;
+    size_t expected = needs_pending_head_tiles ? 2*tile + pipeline_scratch : pipeline_scratch;
+
+    if ((view.layout_k.key_bits == 4 || view.layout_k.key_bits == 8) &&
+            (view.layout_v.value_bits == 2 || view.layout_v.value_bits == 4)) {
+        constexpr uint32_t direct_record_batch_max = 8;
+        const size_t n_tiles = size_t(view.n_head_kv)*direct_record_batch_max;
+        const size_t data_floats = n_tiles*tile;
+        const size_t best_floats = n_tiles*(size_t(view.head_dim_k) + params.group_size + 1);
+        expected = std::max(expected, 2*data_floats + 2*best_floats);
+    }
+    return expected;
+}
+
+static void test_shared_kv_reuse_layer_matching_attention_type() {
+    {
+        llama_hparams hparams = make_shared_kv_hparams(6, -1);
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            require(hparams.kv_reuse_layer_matching_attention_type((int32_t) il) == -1,
+                    "no shared KV returns no donor");
+        }
+    }
+
+    {
+        llama_hparams hparams = make_shared_kv_hparams(6, 6);
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            require(hparams.kv_reuse_layer_matching_attention_type((int32_t) il) == -1,
+                    "zero shared layers returns no donor");
+        }
+    }
+
+    {
+        llama_hparams hparams = make_shared_kv_hparams(12, 6);
+        hparams.set_swa_pattern(6, false);
+
+        require(hparams.kv_reuse_layer_matching_attention_type(0) == -1,
+                "physical SWA layer has no donor");
+        require(hparams.kv_reuse_layer_matching_attention_type(5) == -1,
+                "physical full-attention layer has no donor");
+        require(hparams.kv_reuse_layer_matching_attention_type(6) == 4,
+                "shared SWA layer reuses last physical SWA donor");
+        require(hparams.kv_reuse_layer_matching_attention_type(10) == 4,
+                "later shared SWA layer reuses last physical SWA donor");
+        require(hparams.kv_reuse_layer_matching_attention_type(11) == 5,
+                "shared full-attention layer reuses last physical full-attention donor");
+    }
+
+    {
+        llama_hparams hparams = make_shared_kv_hparams(8, 4);
+        hparams.is_swa_impl[0] = true;
+        hparams.is_swa_impl[1] = false;
+        hparams.is_swa_impl[2] = true;
+        hparams.is_swa_impl[3] = false;
+        hparams.is_swa_impl[4] = false;
+        hparams.is_swa_impl[5] = true;
+        hparams.is_swa_impl[6] = false;
+        hparams.is_swa_impl[7] = true;
+
+        require(hparams.kv_reuse_layer_matching_attention_type(4) == 3,
+                "nonstandard full-attention shared layer reuses matching donor");
+        require(hparams.kv_reuse_layer_matching_attention_type(5) == 2,
+                "nonstandard SWA shared layer reuses matching donor");
+        require(hparams.kv_reuse_layer_matching_attention_type(6) == 3,
+                "nonstandard later full-attention shared layer reuses same matching donor");
+        require(hparams.kv_reuse_layer_matching_attention_type(7) == 2,
+                "nonstandard later SWA shared layer reuses same matching donor");
+    }
+}
+
 static llama_ubatch make_test_ubatch(uint32_t n_tokens, llama_seq_id seq_id) {
     llama_ubatch ubatch = {};
     ubatch.b_equal_seqs = false;
@@ -290,6 +389,15 @@ static void test_memory_estimate() {
     require(est512.scale_bytes == 122880, "512-dim KVarN scale estimate");
     require(est512.total_bytes == 5103616, "512-dim KVarN total estimate");
 
+    llama_hparams hparams_high_gqa = make_test_hparams(128);
+    hparams_high_gqa.n_head_arr[0] = 16;
+    hparams_high_gqa.n_head_kv_arr[0] = 1;
+    const llama_kvarn_memory_estimate est_high_gqa = llama_kvarn_estimate_memory(params, hparams_high_gqa, 512);
+    require(est_high_gqa.fp16_sink_tail_bytes == 655360, "high-GQA KVarN sink/tail estimate");
+    require(est_high_gqa.body_packed_bytes == 139264, "high-GQA KVarN promoted K8 body estimate");
+    require(est_high_gqa.scale_bytes == 30720, "high-GQA KVarN scale estimate");
+    require(est_high_gqa.total_bytes == 825344, "high-GQA KVarN total estimate");
+
 }
 
 static void test_runtime_metadata() {
@@ -321,12 +429,8 @@ static void test_runtime_metadata() {
     require(view.body_v->ne[0] == (int64_t) view.layout_v.v_body_bytes, "KVarN layer view body V shape");
     require(view.scales_k->ne[0] == (int64_t) view.layout_k.k_scale_floats, "KVarN layer view scale K shape");
     require(view.scales_v->ne[0] == (int64_t) view.layout_v.v_scale_floats, "KVarN layer view scale V shape");
-    {
-        const size_t tile = size_t(128)*128;
-        const size_t per_pipeline = tile + 2*128 + 128 + 128 + 1;
-        const size_t expected = 2*tile + per_pipeline;
-        require(cache.body_store_scratch_floats(0) == expected, "128-dim multi-head KVarN body store scratch floats");
-    }
+    require(cache.body_store_scratch_floats(0) == expected_body_store_scratch_floats(view, params),
+            "128-dim multi-head KVarN body store scratch floats");
     size_t breakdown_bytes = 0;
     for (const auto & entry : cache.memory_breakdown()) {
         breakdown_bytes += entry.second;
@@ -370,12 +474,8 @@ static void test_runtime_metadata() {
     require(view256.layout_v.v_body_bytes == 8192, "256-dim KVarN layer view V body bytes");
     require(view256.scales_k->ne[0] == 640, "256-dim KVarN layer view scale K shape");
     require(view256.scales_v->ne[0] == 512, "256-dim KVarN layer view scale V shape");
-    {
-        const size_t tile = size_t(256)*128;
-        const size_t per_pipeline = tile + 2*256 + 256 + 128 + 1;
-        const size_t expected = 2*tile + 2*per_pipeline;
-        require(cache256.body_store_scratch_floats(0) == expected, "256-dim KVarN body store scratch floats");
-    }
+    require(cache256.body_store_scratch_floats(0) == expected_body_store_scratch_floats(view256, params),
+            "256-dim KVarN body store scratch floats");
 
     llama_hparams hparams512 = make_test_hparams(512);
     llama_kv_cache_kvarn cache512(nullptr, hparams512, params, false, 16, 4, 1, nullptr);
@@ -386,12 +486,8 @@ static void test_runtime_metadata() {
     require(view512.layout_v.v_body_bytes == 16384, "512-dim KVarN layer view V body bytes");
     require(view512.scales_k->ne[0] == 1152, "512-dim KVarN layer view scale K shape");
     require(view512.scales_v->ne[0] == 768, "512-dim KVarN layer view scale V shape");
-  {
-        const size_t tile = size_t(512)*128;
-        const size_t per_pipeline = tile + 2*512 + 512 + 128 + 1;
-        const size_t expected = 2*tile + 2*per_pipeline;
-        require(cache512.body_store_scratch_floats(0) == expected, "512-dim KVarN body store scratch floats");
-    }
+    require(cache512.body_store_scratch_floats(0) == expected_body_store_scratch_floats(view512, params),
+            "512-dim KVarN body store scratch floats");
 
     llama_hparams hparams_reuse = make_test_hparams(512);
     hparams_reuse.n_layer_kv_from_start = 1;
@@ -404,12 +500,8 @@ static void test_runtime_metadata() {
     require(view_reuse1.il == 0, "KVarN reuse layer view maps to physical source layer");
     require(view_reuse1.sink_tail_k == view_reuse0.sink_tail_k, "KVarN reuse layer shares sink K storage");
     require(view_reuse1.body_k == view_reuse0.body_k, "KVarN reuse layer shares body K storage");
-  {
-        const size_t tile = size_t(512)*128;
-        const size_t per_pipeline = tile + 2*512 + 512 + 128 + 1;
-        const size_t expected = 2*tile + 2*per_pipeline;
-        require(cache_reuse.body_store_scratch_floats(1) == expected, "KVarN reuse body scratch uses logical layer head dim");
-    }
+    require(cache_reuse.body_store_scratch_floats(1) == expected_body_store_scratch_floats(view_reuse1, params),
+            "KVarN reuse body scratch uses logical layer head dim");
 
     llama_hparams hparams_asym = make_test_hparams(256);
     hparams_asym.n_embd_head_v_full = 128;
@@ -421,6 +513,52 @@ static void test_runtime_metadata() {
         rejected_asym = std::strstr(e.what(), "equal K and V head dimensions") != nullptr;
     }
     require(rejected_asym, "KVarN rejects asymmetric K/V head dimensions");
+
+    llama_hparams hparams_high_gqa = make_test_hparams(128);
+    hparams_high_gqa.n_head_arr[0] = 16;
+    hparams_high_gqa.n_head_kv_arr[0] = 1;
+    llama_kv_cache_kvarn cache_high_gqa(nullptr, hparams_high_gqa, params, false, 512, 4, 1, nullptr);
+    const llama_kvarn_layer_view view_high_gqa = cache_high_gqa.get_layer_view(0);
+    const llama_kvarn_layer_view view_non_high_gqa = cache_high_gqa.get_layer_view(1);
+    require(view_high_gqa.layout_k.key_bits == 8, "high-GQA KVarN promotes low-bit K to K8");
+    require(view_high_gqa.layout_v.value_bits == params.value_bits, "high-GQA KVarN preserves requested V bits");
+    require(view_high_gqa.layout_k.k_body_bytes == 16384, "high-GQA KVarN K8 body bytes");
+    require(view_non_high_gqa.layout_k.key_bits == params.key_bits, "non-high-GQA KVarN layer preserves requested K bits");
+
+    set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", "0");
+    llama_kv_cache_kvarn cache_high_gqa_zero(nullptr, hparams_high_gqa, params, false, 512, 4, 1, nullptr);
+    set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", nullptr);
+    const llama_kvarn_layer_view view_high_gqa_zero = cache_high_gqa_zero.get_layer_view(0);
+    require(view_high_gqa_zero.layout_k.key_bits == 8, "high-GQA K8 policy treats opt-out flag 0 as disabled");
+
+    set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", "1");
+    llama_kv_cache_kvarn cache_high_gqa_optout(nullptr, hparams_high_gqa, params, false, 512, 4, 1, nullptr);
+    set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", nullptr);
+    const llama_kvarn_layer_view view_high_gqa_optout = cache_high_gqa_optout.get_layer_view(0);
+    require(view_high_gqa_optout.layout_k.key_bits == params.key_bits, "high-GQA K8 policy opt-out preserves requested K bits");
+
+    bool rejected_bad_high_gqa_env = false;
+    set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", "false");
+    try {
+        llama_kv_cache_kvarn cache_high_gqa_bad_env(nullptr, hparams_high_gqa, params, false, 512, 4, 1, nullptr);
+    } catch (const std::invalid_argument & e) {
+        rejected_bad_high_gqa_env = std::strstr(e.what(), "LLAMA_KVARN_DISABLE_HIGH_GQA_K8=false") != nullptr;
+    }
+    set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", nullptr);
+    require(rejected_bad_high_gqa_env, "high-GQA K8 opt-out rejects non-0/1 env values");
+
+    set_test_env("LLAMA_KVARN_LAYER_KEY_BITS", "0=4");
+    llama_kv_cache_kvarn cache_high_gqa_key_override(nullptr, hparams_high_gqa, params, false, 512, 4, 1, nullptr);
+    set_test_env("LLAMA_KVARN_LAYER_KEY_BITS", nullptr);
+    require(cache_high_gqa_key_override.get_layer_view(0).layout_k.key_bits == 8,
+            "high-GQA K8 policy still protects K after a low-bit layer override");
+
+    set_test_env("LLAMA_KVARN_LAYER_VALUE_BITS", "0=4");
+    llama_kv_cache_kvarn cache_high_gqa_v_override(nullptr, hparams_high_gqa, params, false, 512, 4, 1, nullptr);
+    set_test_env("LLAMA_KVARN_LAYER_VALUE_BITS", nullptr);
+    const llama_kvarn_layer_view view_high_gqa_v_override = cache_high_gqa_v_override.get_layer_view(0);
+    require(view_high_gqa_v_override.layout_k.key_bits == 8, "high-GQA K8 policy preserves K protection with V override");
+    require(view_high_gqa_v_override.layout_v.value_bits == 4, "high-GQA K8 policy preserves V override");
 
 }
 
@@ -521,8 +659,10 @@ static void test_runtime_sink_tail_graph_api() {
 
     ggml_tensor * k_store = cache.cpy_sink_tail_k(ctx.get(), k_cur, idxs, 0);
     ggml_tensor * v_store = cache.cpy_sink_tail_v(ctx.get(), v_cur, idxs, 0);
+    ggml_set_rows_add_dep(v_store, k_store);
     require(k_store->op == GGML_OP_SET_ROWS, "KVarN sink/tail K store op");
     require(v_store->op == GGML_OP_SET_ROWS, "KVarN sink/tail V store op");
+    require(v_store->src[3] == k_store, "KVarN sink/tail SET_ROWS dependency source");
     require(k_store->ne[0] == 256, "KVarN sink/tail K store row width");
     require(v_store->ne[0] == 256, "KVarN sink/tail V store row width");
     require(k_store->ne[1] == 6, "KVarN sink/tail K slot count");
@@ -671,6 +811,82 @@ static void test_runtime_body_plan_multi_record_seals() {
     }
 }
 
+static void test_runtime_body_plan_active_boundary_512() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = 128;
+    params.sink_tokens = 128;
+    params.tail_tokens = 896;
+
+    llama_hparams hparams = make_small_storage_hparams();
+    llama_kv_cache_kvarn cache(nullptr, hparams, params, false, 2048, 4, 1, nullptr);
+
+    llama_ubatch ubatch = make_test_ubatch(512, 0);
+    ubatch.data->pos.resize(512);
+    for (uint32_t i = 0; i < 512; ++i) {
+        ubatch.data->pos[i] = llama_pos(1024 + i);
+    }
+    ubatch.pos = ubatch.data->pos.data();
+
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ 64*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(init_params) };
+
+    ggml_tensor * plan = cache.build_input_body_plan(ctx.get(), ubatch);
+    ggml_tensor * offsets = cache.build_input_body_offsets(ctx.get(), ubatch);
+    ggml_tensor * tail_idxs = cache.build_input_tail_evict_idxs(ctx.get(), ubatch);
+    require(plan->ne[0] == 3 && plan->ne[1] == 512, "KVarN active-boundary body plan shape");
+    require(offsets->ne[0] == 512, "KVarN active-boundary body offsets shape");
+    require(tail_idxs->ne[0] == 512, "KVarN active-boundary tail idx shape");
+
+    ggml_backend_buffer_ptr buf {
+        ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type())
+    };
+    require(buf != nullptr, "KVarN active-boundary body plan buffer");
+
+    cache.set_input_body_plan(plan, &ubatch);
+    cache.set_input_body_offsets(offsets, &ubatch);
+    cache.set_input_tail_evict_idxs(tail_idxs, &ubatch);
+
+    const int64_t * data = (const int64_t *) plan->data;
+    const int64_t * offset_data = (const int64_t *) offsets->data;
+    const int32_t * tail_idx_data = (const int32_t *) tail_idxs->data;
+
+    uint32_t record_starts[4] = {};
+    uint32_t record_counts[4] = {};
+    bool record_seen[4] = {};
+    bool record_contiguous[4] = { true, true, true, true };
+
+    for (uint32_t i = 0; i < 512; ++i) {
+        const uint32_t expected_record = i/128;
+        const uint32_t expected_offset = i%128;
+        const size_t off = size_t(i)*3;
+        require(data[off + 0] == int64_t(expected_record), "KVarN active-boundary body plan record");
+        require(data[off + 1] == int64_t(expected_offset), "KVarN active-boundary body plan offset");
+        require(data[off + 2] == (expected_offset == 127 ? int64_t(expected_record) : -1),
+                "KVarN active-boundary body plan seal");
+        require(offset_data[i] == int64_t(expected_offset), "KVarN active-boundary body offset");
+        require(tail_idx_data[i] == int32_t(128 + i), "KVarN active-boundary tail idx");
+
+        if (!record_seen[expected_record]) {
+            record_seen[expected_record] = true;
+            record_starts[expected_record] = i;
+        } else if (record_starts[expected_record] + record_counts[expected_record] != i) {
+            record_contiguous[expected_record] = false;
+        }
+        ++record_counts[expected_record];
+    }
+
+    for (uint32_t record = 0; record < 4; ++record) {
+        require(record_seen[record], "KVarN active-boundary record seen");
+        require(record_starts[record] == record*128, "KVarN active-boundary record slice start");
+        require(record_counts[record] == 128, "KVarN active-boundary record slice count");
+        require(record_contiguous[record], "KVarN active-boundary record slice contiguous");
+    }
+}
+
 static float read_kq_mask_value(const ggml_tensor * mask, int64_t t, int64_t q) {
     const char * p = (const char *) mask->data + size_t(q)*mask->nb[1] + size_t(t)*mask->nb[0];
     if (mask->type == GGML_TYPE_F16) {
@@ -721,10 +937,16 @@ static void test_runtime_kq_mask_graph_api() {
     cache.set_input_kq_mask(causal_mask_f16, &ubatch, true);
 
     const llama_pos expected_pos[] = { 0, 1, 2, 5, 6 };
+    const int64_t invalid_key_pos = -1;
+    const int64_t expected_key_pos[] = {
+        0, 1, // sink
+        2, 3, 4, // pending body
+        5, 6, // tail
+        invalid_key_pos, invalid_key_pos, invalid_key_pos, invalid_key_pos, invalid_key_pos,
+    };
     for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
-        const int64_t visible = std::min<int64_t>(cache.get_size(), int64_t(expected_pos[q]) + 1);
         for (int64_t t = 0; t < int64_t(cache.get_size()); ++t) {
-            const bool keep = t < visible;
+            const bool keep = expected_key_pos[t] != invalid_key_pos && expected_key_pos[t] <= int64_t(expected_pos[q]);
             if (keep) {
                 require_mask_keep(read_kq_mask_value(causal_mask, t, q), "KVarN causal KQ mask keeps visible slot");
                 require_mask_keep(read_kq_mask_value(causal_mask_f16, t, q), "KVarN causal F16 KQ mask keeps visible slot");
@@ -753,13 +975,8 @@ static void test_runtime_body_record_graph_api() {
     require(view.layout_v.v_body_bytes == 8, "KVarN V body record bytes");
     require(view.layout_k.k_scale_floats == 20, "KVarN K scale record floats");
     require(view.layout_v.v_scale_floats == 16, "KVarN V scale record floats");
-    {
-        const size_t tile = size_t(view.head_dim_k)*params.group_size;
-        const size_t per_pipeline = tile + 2*std::max<uint32_t>(view.head_dim_k, params.group_size) +
-            view.head_dim_k + params.group_size + 1;
-        const size_t expected = 2*tile + per_pipeline;
-        require(cache.body_store_scratch_floats(0) == expected, "KVarN small multi-head body store scratch floats");
-    }
+    require(cache.body_store_scratch_floats(0) == expected_body_store_scratch_floats(view, params),
+            "KVarN small multi-head body store scratch floats");
 
     ggml_init_params init_params = {
         /*.mem_size   =*/ 64*1024,
@@ -846,6 +1063,11 @@ static void test_runtime_body_record_graph_api() {
     ggml_tensor * k_from_pending = cache.store_k_body_record_from_pending(ctx.get(), scratch, 0, ih, record);
     ggml_tensor * v_from_pending = cache.store_v_body_record_from_pending(ctx.get(), scratch, 0, ih, record);
     ggml_tensor * kv_from_pending = cache.store_kv_body_record_from_pending(ctx.get(), scratch, 0, ih, record);
+    ggml_tensor * k_pending_src = ggml_reshape_3d(ctx.get(), k_pending, view.head_dim_k, view.n_head_kv, params.group_size);
+    ggml_tensor * v_pending_src = ggml_reshape_3d(ctx.get(), v_pending, view.head_dim_v, view.n_head_kv, params.group_size);
+    ggml_tensor * kv_from_pending_dep = cache.store_kv_body_all_heads_from_pending(
+            ctx.get(), scratch, 0, record, k_pending_src, v_pending_src);
+    ggml_kvarn_store_kv_body_add_dep(kv_from_pending_dep, kv_from_pending);
 
     require(k_pending->op == GGML_OP_SET_ROWS, "KVarN pending K store op");
     require(v_pending->op == GGML_OP_SET_ROWS, "KVarN pending V store op");
@@ -859,6 +1081,10 @@ static void test_runtime_body_record_graph_api() {
     require(kv_from_pending->src[0]->type == GGML_TYPE_F32 && kv_from_pending->src[0]->ne[0] == (int64_t) params.group_size &&
             kv_from_pending->src[1]->type == GGML_TYPE_F32 && kv_from_pending->src[1]->ne[0] == (int64_t) view.head_dim_v,
             "KVarN pending fused KV body tile shapes");
+    require(kv_from_pending_dep->src[0] == k_pending_src && kv_from_pending_dep->src[1] == v_pending_src,
+            "KVarN pending fused KV body store accepts producer pending tensors");
+    require(kv_from_pending_dep->src[7] == kv_from_pending,
+            "KVarN fused KV body store dependency source");
 
     bool rejected_multi_record_pending = false;
     try {
@@ -958,12 +1184,14 @@ static void test_kvarn_mixed_attention_ggml_op() {
     ggml_tensor * scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, params.sink_tokens + n_records*params.group_size + n_pending + params.tail_tokens);
     ggml_tensor * kq_mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32,
             params.sink_tokens + n_records*params.group_size + n_pending + params.tail_tokens, n_tokens);
+    ggml_tensor * window = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 5);
+    ggml_tensor * q_body = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, head_dim, n_head, n_tokens);
 
     ggml_tensor * out = ggml_kvarn_attn_mixed(
             ctx.get(), q, sink_tail_k, sink_tail_v, body_k, body_v, scales_k, scales_v, pending_k, pending_v, scratch,
             kq_mask,
             params.sink_tokens, n_records, n_pending, params.tail_tokens, 1, head_dim, params.group_size,
-            params.key_bits, params.value_bits, 1.0f/std::sqrt(float(head_dim)));
+            params.key_bits, params.value_bits, 1.0f/std::sqrt(float(head_dim)), 0.0f);
 
     require(out->op == GGML_OP_KVARN_ATTN_MIXED, "KVarN mixed attention op");
     require(out->type == GGML_TYPE_F32, "KVarN mixed attention result type");
@@ -976,6 +1204,10 @@ static void test_kvarn_mixed_attention_ggml_op() {
             out->src[9] == scratch,
             "KVarN mixed attention cache sources");
     require(out->src[10] == kq_mask, "KVarN mixed attention mask source");
+    ggml_kvarn_attn_mixed_set_window(out, window);
+    ggml_kvarn_attn_mixed_set_q_body(out, q_body);
+    require(out->src[11] == window, "KVarN mixed attention window source");
+    require(out->src[12] == q_body, "KVarN mixed attention body-query source");
     require(out->op_params[0] == (int32_t) params.sink_tokens &&
             out->op_params[1] == n_records &&
             out->op_params[2] == n_pending &&
@@ -987,6 +1219,11 @@ static void test_kvarn_mixed_attention_ggml_op() {
             out->op_params[7] == (int32_t) params.key_bits &&
             out->op_params[8] == (int32_t) params.value_bits,
             "KVarN mixed attention layout params");
+    require(out->op_params[11] == GGML_KVARN_ATTN_FRAME_NONE,
+            "KVarN mixed attention default frame flags");
+    ggml_kvarn_attn_mixed_set_frame_flags(out, GGML_KVARN_ATTN_FRAME_FUSED_PAPER_FULL);
+    require(out->op_params[11] == GGML_KVARN_ATTN_FRAME_FUSED_PAPER_FULL,
+            "KVarN mixed attention frame flags setter");
 }
 
 static void test_cpu_backend_rejects_kvarn_ops() {
@@ -1032,7 +1269,7 @@ static void test_cpu_backend_rejects_kvarn_ops() {
             ctx.get(), q, sink_tail_k, sink_tail_v, body_k, body_v, scales_k, scales_v, pending_k, pending_v, logits,
             nullptr,
             params.sink_tokens, 1, 0, params.tail_tokens, 1, 128, params.group_size,
-            params.key_bits, params.value_bits, 1.0f/std::sqrt(128.0f));
+            params.key_bits, params.value_bits, 1.0f/std::sqrt(128.0f), 0.0f);
 
     require(!ggml_backend_dev_supports_op(cpu_dev, mixed),
             "CPU backend rejects KVarN mixed-attention op");
@@ -1048,12 +1285,14 @@ int main() {
     run_phase("test_hadamard_inverse", test_hadamard_inverse);
     run_phase("test_reference_store_dequant", test_reference_store_dequant);
     run_phase("test_reference_cache_sealing", test_reference_cache_sealing);
+    run_phase("test_shared_kv_reuse_layer_matching_attention_type", test_shared_kv_reuse_layer_matching_attention_type);
     run_phase("test_memory_estimate", test_memory_estimate);
     run_phase("test_runtime_metadata", test_runtime_metadata);
     run_phase("test_runtime_storage_sealing", test_runtime_storage_sealing);
     run_phase("test_runtime_sink_tail_graph_api", test_runtime_sink_tail_graph_api);
     run_phase("test_runtime_body_plan_graph_api", test_runtime_body_plan_graph_api);
     run_phase("test_runtime_body_plan_multi_record_seals", test_runtime_body_plan_multi_record_seals);
+    run_phase("test_runtime_body_plan_active_boundary_512", test_runtime_body_plan_active_boundary_512);
     run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
     run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);
     run_phase("test_kvarn_store_body_ggml_ops", test_kvarn_store_body_ggml_ops);

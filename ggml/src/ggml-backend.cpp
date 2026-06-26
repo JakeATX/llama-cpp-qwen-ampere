@@ -1239,6 +1239,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
+        if (*cur_backend_id == -1) {
+            fprintf(stderr, "%s: failed to assign backend for node op=%s name=%s type=%s ne=[%lld,%lld,%lld,%lld]\n",
+                    __func__, ggml_op_name(node->op), node->name, ggml_type_name(node->type),
+                    (long long) node->ne[0], (long long) node->ne[1],
+                    (long long) node->ne[2], (long long) node->ne[3]);
+        }
         GGML_ASSERT(*cur_backend_id != -1);
     }
 

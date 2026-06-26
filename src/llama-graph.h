@@ -542,6 +542,22 @@ public:
     std::vector<float> base_kvarn_hadamard_host;
     bool base_kvarn_hadamard_filled = false;
     uint32_t base_kvarn_hadamard_dim = 0;
+    ggml_tensor * base_kvarn_turbo_v_fwd = nullptr; // F32 [head_dim_v, head_dim_v]
+    std::vector<float> base_kvarn_turbo_v_fwd_host;
+    bool base_kvarn_turbo_v_fwd_filled = false;
+    uint32_t base_kvarn_turbo_v_fwd_dim = 0;
+    ggml_tensor * base_kvarn_turbo_v_inv = nullptr; // F32 [head_dim_v, head_dim_v]
+    std::vector<float> base_kvarn_turbo_v_inv_host;
+    bool base_kvarn_turbo_v_inv_filled = false;
+    uint32_t base_kvarn_turbo_v_inv_dim = 0;
+    ggml_tensor * base_kvarn_turbo_v_s1 = nullptr; // F32 [head_dim_v]
+    std::vector<float> base_kvarn_turbo_v_s1_host;
+    bool base_kvarn_turbo_v_s1_filled = false;
+    uint32_t base_kvarn_turbo_v_s1_dim = 0;
+    ggml_tensor * base_kvarn_turbo_v_s2 = nullptr; // F32 [head_dim_v]
+    std::vector<float> base_kvarn_turbo_v_s2_host;
+    bool base_kvarn_turbo_v_s2_filled = false;
+    uint32_t base_kvarn_turbo_v_s2_dim = 0;
     bool base_window_indirect = false;
     std::vector<ggml_tensor *> base_mixed_attn_nodes;
     std::vector<ggml_tensor *> base_mixed_attn_scores;

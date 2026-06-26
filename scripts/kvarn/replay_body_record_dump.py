@@ -106,6 +106,9 @@ def main() -> int:
     if bool(meta["input_already_rotated"]):
         k_frame_ref = k_input
         v_frame_ref = v_input
+    elif bool(meta.get("paper_mixed_frame", False)):
+        k_frame_ref = hadamard_last(k_input.T).T
+        v_frame_ref = v_input
     else:
         k_frame_ref = hadamard_last(k_input.T).T
         v_frame_ref = hadamard_last(v_input)

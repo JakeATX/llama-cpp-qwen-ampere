@@ -441,10 +441,21 @@ static bool common_kvarn_parse_preset(const std::string & preset, uint32_t & key
     }
 
     try {
-        const unsigned long k = std::stoul(preset.substr(prefix.size(), vpos - prefix.size()));
-        const unsigned long v = std::stoul(preset.substr(vpos + 1, gpos - (vpos + 1)));
-        const unsigned long g = std::stoul(preset.substr(gpos + 2));
-        if (k < 2 || k > 8 || v < 2 || v > 8 || g == 0) {
+        const auto parse_uint_exact = [](const std::string & value, unsigned long & out) {
+            size_t parsed = 0;
+            out = std::stoul(value, &parsed);
+            return parsed == value.size();
+        };
+
+        unsigned long k = 0;
+        unsigned long v = 0;
+        unsigned long g = 0;
+        if (!parse_uint_exact(preset.substr(prefix.size(), vpos - prefix.size()), k) ||
+                !parse_uint_exact(preset.substr(vpos + 1, gpos - (vpos + 1)), v) ||
+                !parse_uint_exact(preset.substr(gpos + 2), g)) {
+            return false;
+        }
+        if (k < 2 || k > 8 || v < 2 || v > 8 || g != 128) {
             return false;
         }
         key_bits   = uint32_t(k);
@@ -462,7 +473,7 @@ static void common_kvarn_apply_preset(common_params & params, const std::string 
     uint32_t group_size = 0;
     if (!common_kvarn_parse_preset(preset, key_bits, value_bits, group_size)) {
         throw std::runtime_error("Unsupported KVarN preset: " + preset +
-                " (expected kvarn_k<K>v<V>_g<G> with K,V in [2,8], e.g. kvarn_k4v2_g128)");
+                " (expected kvarn_k<K>v<V>_g128 with K,V in [2,8], e.g. kvarn_k4v4_g128)");
     }
 
     params.kvarn = llama_kvarn_default_params();
@@ -472,8 +483,8 @@ static void common_kvarn_apply_preset(common_params & params, const std::string 
 }
 
 static void common_kvarn_validate(const llama_kvarn_params & params) {
-    if (params.group_size == 0 || (params.group_size & (params.group_size - 1)) != 0) {
-        throw std::runtime_error("KVarN group size must be a positive power of two");
+    if (params.group_size != 128) {
+        throw std::runtime_error("KVarN group size must be 128; other group sizes are not enabled in this build");
     }
     if (params.key_bits < 2 || params.key_bits > 8 || params.value_bits < 2 || params.value_bits > 8) {
         throw std::runtime_error("KVarN key/value bits must each be in [2, 8]");
@@ -2170,7 +2181,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_CACHE_QUANT"));
     add_opt(common_arg(
         {"--kvarn-preset"}, "PRESET",
-        "KVarN preset to use with --kv-cache-quant kvarn, kvarn_k<K>v<V>_g<G> with K,V in [2,8] and power-of-two G (e.g. kvarn_k4v2_g128, kvarn_k4v4_g64)",
+        "KVarN preset to use with --kv-cache-quant kvarn, kvarn_k<K>v<V>_g128 with K,V in [2,8] (e.g. kvarn_k4v4_g128, kvarn_k8v8_g128; V2 presets are measurement-only on high-GQA routes)",
         [](common_params & params, const std::string & value) {
             common_kvarn_apply_preset(params, value);
             common_kvarn_validate(params.kvarn);
@@ -2908,7 +2919,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.parse_special = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_IMATRIX}));
+    ).set_examples({LLAMA_EXAMPLE_IMATRIX, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"-pps"},
         string_format("is the prompt shared across parallel sequences (default: %s)", params.is_pp_shared ? "true" : "false"),

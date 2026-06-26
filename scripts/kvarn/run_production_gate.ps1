@@ -1,14 +1,30 @@
 param(
     [Parameter(Mandatory = $true)] [string] $QwenModel,
     [Parameter(Mandatory = $true)] [string] $GemmaModel,
+    [string] $QwenDataset = "",
+    [string] $GemmaDataset = "",
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-static-vs"),
     [string] $MainlineBuildDir = (Join-Path (Get-Location) "..\llama.cpp-mainline\build-cuda-static-vs"),
     [string] $OutputDir = "",
-    [double] $Tier1MinRatio = 0.90,
+    [double] $Tier1MinRatio = 0.95,
     [int] $QwenRepetitions = 5,
     [int] $GemmaRepetitions = 3,
+    [string] $AccuracyPreset = "kvarn_k4v4_g128",
+    [int] $AccuracyContextSize = 16384,
+    [int] $AccuracyBatchSize = 512,
+    [int] $AccuracyChunks = 1,
+    [string] $SpeedPreset = "kvarn_k8v4_g128",
+    [string] $SpeedEvidenceCaseList = "pp512:512:0",
+    [double] $AccuracyMaxMeanKL = 0.02,
+    [double] $AccuracyMaxKLD99 = 1.0,
+    [double] $AccuracyMaxKLD999 = 1.0,
+    [double] $AccuracyMaxKLDMax = 1.0,
+    [double] $AccuracyMaxKLPplIncrease = -1.0,
+    [double] $AccuracyMaxKLPDiffRms = -1.0,
+    [double] $AccuracyMinKLSameTopP = -1.0,
     [switch] $SkipBuild,
     [switch] $SkipTests,
+    [switch] $SkipAccuracy,
     [switch] $RunGemmaExperimental,
     [switch] $RunTier2,
     [Alias("LogitsModel")]
@@ -19,6 +35,16 @@ param(
     [string[]] $QwenExtraArgs = @("-ncmoe", "34"),
     [int] $Tier2MinKvarnBodyRecords = 1,
     [int] $Tier2MinActiveKvarnBodyRecords = 0,
+    [string] $QwenLayerKeyBits = "",
+    [string] $QwenLayerValueBits = "",
+    [string] $GemmaLayerKeyBits = "",
+    [string] $GemmaLayerValueBits = "",
+    [string] $QwenExpectedEffectiveKvarnBits = "auto",
+    [string] $GemmaExpectedEffectiveKvarnBits = "auto",
+    [switch] $TraceFwhtEvidence,
+    [int] $MinFwhtTaken = 0,
+    [int] $MinBatchedStorePhaseUses = 1,
+    [switch] $RunGemmaFallbackDiagnostic,
     [switch] $AllowDiagnosticEnv
 )
 
@@ -27,8 +53,8 @@ $ErrorActionPreference = "Stop"
 if ($Tier1MinRatio -le 0.0 -or $Tier1MinRatio -gt 1.0) {
     throw "Tier1MinRatio must be in (0, 1]"
 }
-if ($Tier1MinRatio -lt 0.90) {
-    throw "Tier1MinRatio is the production gate threshold and must be >= 0.90. Use run_bench_matrix.ps1 directly for low-threshold diagnostics."
+if ($Tier1MinRatio -lt 0.95) {
+    throw "Tier1MinRatio is the production gate threshold and must be >= 0.95. Use run_bench_matrix.ps1 directly for low-threshold diagnostics."
 }
 if ($QwenRepetitions -le 0) {
     throw "QwenRepetitions must be positive"
@@ -41,6 +67,14 @@ if (-not (Test-Path -LiteralPath $QwenModel)) {
 }
 if (-not (Test-Path -LiteralPath $GemmaModel)) {
     throw "GemmaModel not found at $GemmaModel"
+}
+if (-not $SkipAccuracy.IsPresent) {
+    if ([string]::IsNullOrWhiteSpace($QwenDataset) -or -not (Test-Path -LiteralPath $QwenDataset)) {
+        throw "Production gate requires -QwenDataset for KL accuracy, or pass -SkipAccuracy for an explicit speed-only diagnostic run"
+    }
+    if ([string]::IsNullOrWhiteSpace($GemmaDataset) -or -not (Test-Path -LiteralPath $GemmaDataset)) {
+        throw "Production gate requires -GemmaDataset for KL accuracy, or pass -SkipAccuracy for an explicit speed-only diagnostic run"
+    }
 }
 if ($RunTier2.IsPresent -and [string]::IsNullOrWhiteSpace($Tier2Model)) {
     throw "RunTier2 requires -Tier2Model (or -LogitsModel)"
@@ -57,6 +91,48 @@ if ($Tier2MinActiveKvarnBodyRecords -lt 0) {
 if ($Tier2MinKvarnLayerLogs -lt -1) {
     throw "Tier2MinKvarnLayerLogs must be -1 for auto or non-negative"
 }
+if ($MinFwhtTaken -lt 0) {
+    throw "MinFwhtTaken must be non-negative"
+}
+if ($MinFwhtTaken -gt 0 -and -not $TraceFwhtEvidence.IsPresent) {
+    throw "MinFwhtTaken requires -TraceFwhtEvidence so the production evidence run can prove CUDA FWHT use"
+}
+if ($MinBatchedStorePhaseUses -lt 0) {
+    throw "MinBatchedStorePhaseUses must be non-negative"
+}
+if ($AccuracyMaxKLPplIncrease -lt -1.0) {
+    throw "AccuracyMaxKLPplIncrease must be -1 to disable or non-negative"
+}
+if ($AccuracyMaxKLPDiffRms -lt -1.0) {
+    throw "AccuracyMaxKLPDiffRms must be -1 to disable or non-negative"
+}
+if ($AccuracyMinKLSameTopP -lt -1.0 -or $AccuracyMinKLSameTopP -gt 1.0) {
+    throw "AccuracyMinKLSameTopP must be -1 to disable or in [0, 1]"
+}
+function Test-KvarnPresetRequestsV2([string] $Preset) {
+    $m = [regex]::Match($Preset, "(?i)^kvarn_k[0-9]+v([0-9]+)_g128$")
+    return $m.Success -and ([int] $m.Groups[1].Value) -eq 2
+}
+if ((Test-KvarnPresetRequestsV2 $AccuracyPreset) -or (Test-KvarnPresetRequestsV2 $SpeedPreset)) {
+    throw "V2 KVarN presets are measurement-only in this tree. Use run_accuracy_gate.ps1, run_safe_full_gate.ps1 -RunExperimentalAccuracy, or run_bench_matrix.ps1 for V2 diagnostics."
+}
+if (-not [string]::IsNullOrWhiteSpace($QwenLayerValueBits) -or -not [string]::IsNullOrWhiteSpace($GemmaLayerValueBits)) {
+    throw "Layer value-bit overrides are diagnostic-only for this production gate. Use run_accuracy_gate.ps1 or run_safe_full_gate.ps1 experimental lanes for V2/Boundary-V measurements."
+}
+
+function Resolve-ExpectedEffectiveBitsForHighGqa([string] $Preset, [string] $Override, [string] $LayerKeyBits, [string] $LayerValueBits) {
+    if ($Override -ne "auto") {
+        return $Override
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LayerKeyBits) -or -not [string]::IsNullOrWhiteSpace($LayerValueBits)) {
+        return ""
+    }
+    $m = [regex]::Match($Preset, "(?i)kvarn_k([0-9]+)v([0-9]+)")
+    if (-not $m.Success) {
+        return ""
+    }
+    return ("k8/v{0}" -f ([int] $m.Groups[2].Value))
+}
 
 $unsafeDiagnosticEnv = @(
     "LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK",
@@ -65,7 +141,15 @@ $unsafeDiagnosticEnv = @(
     "LLAMA_KVARN_ATTN_SPLIT_KERNELS",
     "LLAMA_KVARN_ATTN_SERIAL_FUSED",
     "LLAMA_KVARN_ATTN_REF_SCRATCH",
+    "LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE",
+    "LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR",
+    "LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR",
     "LLAMA_KVARN_ATTN_FUSED_BATCH",
+    "LLAMA_KVARN_ATTN_DISABLE_Q1_GQA_SCALAR",
+    "LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR",
+    "LLAMA_KVARN_DISABLE_FUSED_FWHT",
+    "LLAMA_KVARN_LAYER_KEY_BITS",
+    "LLAMA_KVARN_LAYER_VALUE_BITS",
     "LLAMA_KVARN_ATTN_BOUNDARY_DUMP",
     "LLAMA_KVARN_ATTN_BOUNDARY_DUMP_DIR",
     "LLAMA_KVARN_ATTN_BOUNDARY_DUMP_CALL",
@@ -86,6 +170,10 @@ $unsafeDiagnosticEnv = @(
     "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK",
     "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH",
     "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA",
+    "LLAMA_KVARN_EXPERIMENTAL_TURBO_V",
+    "LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT",
+    "LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES",
+    "LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES",
     "LLAMA_KVARN_DEBUG_UBATCH"
 )
 if (-not $AllowDiagnosticEnv.IsPresent) {
@@ -108,14 +196,14 @@ if ([string]::IsNullOrWhiteSpace($OutputDir)) {
 [void] [System.IO.Directory]::CreateDirectory($OutputDir)
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 
-$benchScript = Join-Path (Get-Location) "scripts/kvarn/run_bench_matrix.ps1"
-$mainlineParityScript = Join-Path (Get-Location) "scripts/kvarn/run_mainline_parity_matrix.ps1"
+$safeCliParityScript = Join-Path (Get-Location) "scripts/kvarn/run_safe_cli_parity_matrix.ps1"
+$accuracyScript = Join-Path (Get-Location) "scripts/kvarn/run_accuracy_gate.ps1"
 $logitsScript = Join-Path (Get-Location) "scripts/kvarn/compare_cuda_logits_ref.ps1"
-if (-not (Test-Path -LiteralPath $benchScript)) {
-    throw "Missing $benchScript"
+if (-not (Test-Path -LiteralPath $safeCliParityScript)) {
+    throw "Missing $safeCliParityScript"
 }
-if (-not (Test-Path -LiteralPath $mainlineParityScript)) {
-    throw "Missing $mainlineParityScript"
+if (-not $SkipAccuracy.IsPresent -and -not (Test-Path -LiteralPath $accuracyScript)) {
+    throw "Missing $accuracyScript"
 }
 if ($RunTier2.IsPresent -and -not (Test-Path -LiteralPath $logitsScript)) {
     throw "Missing $logitsScript"
@@ -173,6 +261,10 @@ $tier2EffectiveExpectedLayers = $Tier2ExpectedKvarnLayers
 $tier2EffectiveMinLayerLogs = $Tier2MinKvarnLayerLogs
 $tier2ResolvedModel = if ($RunTier2.IsPresent) { (Resolve-Path -LiteralPath $Tier2Model).Path } else { "" }
 $qwenResolvedModel = (Resolve-Path -LiteralPath $QwenModel).Path
+$qwenAccuracyExpectedEffectiveBits = Resolve-ExpectedEffectiveBitsForHighGqa $AccuracyPreset $QwenExpectedEffectiveKvarnBits $QwenLayerKeyBits $QwenLayerValueBits
+$gemmaAccuracyExpectedEffectiveBits = Resolve-ExpectedEffectiveBitsForHighGqa $AccuracyPreset $GemmaExpectedEffectiveKvarnBits $GemmaLayerKeyBits $GemmaLayerValueBits
+$qwenSpeedExpectedEffectiveBits = Resolve-ExpectedEffectiveBitsForHighGqa $SpeedPreset $QwenExpectedEffectiveKvarnBits $QwenLayerKeyBits $QwenLayerValueBits
+$gemmaSpeedExpectedEffectiveBits = Resolve-ExpectedEffectiveBitsForHighGqa $SpeedPreset $GemmaExpectedEffectiveKvarnBits $GemmaLayerKeyBits $GemmaLayerValueBits
 if ($RunTier2.IsPresent -and $tier2ResolvedModel -eq $qwenResolvedModel) {
     if ($tier2EffectiveExtraArgs.Count -eq 0) {
         $tier2EffectiveExtraArgs = @($qwenEffectiveExtraArgs)
@@ -206,7 +298,22 @@ $manifest = @(
     "allow_diagnostic_env=$($AllowDiagnosticEnv.IsPresent)",
     "qwen_extra_args=$($qwenEffectiveExtraArgs -join ' ')",
     "qwen_expected_kvarn_layers=3-39:4",
-    "gemma_production_mode=normal-iswa-fallback",
+    "qwen_kvarn_env_LLAMA_KVARN_ENABLE_PAPER_FRAME=1",
+    "qwen_layer_key_bits=$QwenLayerKeyBits",
+    "qwen_layer_value_bits=$QwenLayerValueBits",
+    "qwen_accuracy_expected_effective_kvarn_bits=$qwenAccuracyExpectedEffectiveBits",
+    "qwen_speed_expected_effective_kvarn_bits=$qwenSpeedExpectedEffectiveBits",
+    "gemma_production_mode=true-kvarn-iswa",
+    "gemma_layer_key_bits=$GemmaLayerKeyBits",
+    "gemma_layer_value_bits=$GemmaLayerValueBits",
+    "gemma_accuracy_expected_effective_kvarn_bits=$gemmaAccuracyExpectedEffectiveBits",
+    "gemma_speed_expected_effective_kvarn_bits=$gemmaSpeedExpectedEffectiveBits",
+    "speed_preset=$SpeedPreset",
+    "speed_evidence_case_list=$SpeedEvidenceCaseList",
+    "trace_fwht_evidence=$($TraceFwhtEvidence.IsPresent)",
+    "min_fwht_taken=$MinFwhtTaken",
+    "min_batched_store_phase_uses=$MinBatchedStorePhaseUses",
+    "run_gemma_fallback_diagnostic=$($RunGemmaFallbackDiagnostic.IsPresent)",
     "gemma_experimental_mode=true-kvarn-iswa-diagnostic"
 )
 [System.IO.File]::WriteAllText((Join-Path $OutputDir "manifest.txt"), ($manifest -join "`n") + "`n")
@@ -214,63 +321,258 @@ $manifest = @(
 if (-not $SkipBuild.IsPresent) {
     Invoke-Logged "build production and KVarN test targets" {
         cmake --build $BuildDir --config Release --target `
-            llama-bench `
+            llama-cli `
             llama-results `
+            llama-perplexity `
+            llama-tokenize `
             test-batch-split `
             test-kvarn-kv `
             test-kvarn-cuda-scratch-ref `
-            test-kvarn-cuda-mixed-tail `
             test-kvarn-server-load-failure `
             test-arg-parser `
-            -j 8
+            -j 1
     }
 }
 
 if (-not $SkipTests.IsPresent) {
     Invoke-Logged "ctest kvarn" {
-        ctest --test-dir $BuildDir -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure
+        ctest --test-dir $BuildDir -C Release -R "test-batch-split|test-kvarn-kv|test-kvarn-cuda-scratch-ref|test-kvarn-server-load-failure|test-arg-parser" --output-on-failure
     }
     Invoke-Logged "kv memory estimate self-test" {
         python scripts/kvarn/kv_memory_estimate.py --self-test
     }
 }
 
-Invoke-Logged "tier1 qwen mainline parity" {
-    & $mainlineParityScript `
-        -Model $QwenModel `
-        -MainlineBuildDir $MainlineBuildDir `
-        -KvarnBuildDir $BuildDir `
-        -CaseList "pp512:512:0,tg64:0:64" `
-        -FlashAttn off `
-        -Repetitions $QwenRepetitions `
-        -KvarnIters 4 `
-        -MinParityRatio $Tier1MinRatio `
-        -FailBelowMinParityRatio `
-        -MinKvarnLayerLogs 10 `
-        -ExpectedKvarnLayers "3-39:4" `
-        -OutputDir (Join-Path $OutputDir "qwen-tier1-mainline-parity") `
-        -GpuLayers 99 `
-        -ExtraArgs @($qwenEffectiveExtraArgs)
+if (-not $SkipAccuracy.IsPresent) {
+    Invoke-Logged "accuracy qwen kl" {
+        Invoke-WithProcessEnvironment @{
+            "LLAMA_KVARN_ENABLE_PAPER_FRAME" = "1"
+            "LLAMA_KVARN_LAYER_KEY_BITS" = $(if ([string]::IsNullOrWhiteSpace($QwenLayerKeyBits)) { $null } else { $QwenLayerKeyBits })
+            "LLAMA_KVARN_LAYER_VALUE_BITS" = $(if ([string]::IsNullOrWhiteSpace($QwenLayerValueBits)) { $null } else { $QwenLayerValueBits })
+        } {
+            & $accuracyScript `
+                -Model $QwenModel `
+                -Dataset $QwenDataset `
+                -BuildDir $BuildDir `
+                -OutputDir (Join-Path $OutputDir "qwen-accuracy-kl") `
+                -KvarnPreset $AccuracyPreset `
+                -KvarnIters 4 `
+                -ContextSize $AccuracyContextSize `
+                -BatchSize $AccuracyBatchSize `
+                -Chunks $AccuracyChunks `
+                -UseKLDivergence `
+                -MaxMeanKL $AccuracyMaxMeanKL `
+                -MaxKLD99 $AccuracyMaxKLD99 `
+                -MaxKLD999 $AccuracyMaxKLD999 `
+                -MaxKLDMax $AccuracyMaxKLDMax `
+                -MaxKLPplIncrease $AccuracyMaxKLPplIncrease `
+                -MaxKLPDiffRms $AccuracyMaxKLPDiffRms `
+                -MinKLSameTopP $AccuracyMinKLSameTopP `
+                -ExpectedKvarnLayers "3-39:4" `
+                -ExpectedEffectiveKvarnBits $qwenAccuracyExpectedEffectiveBits `
+                -MinKvarnBodyRecords 1 `
+                -ExtraArgs @($qwenEffectiveExtraArgs)
+        }
+    }
+
+    Invoke-Logged "accuracy gemma kl" {
+        Invoke-WithProcessEnvironment @{
+            "LLAMA_KVARN_ENABLE_PAPER_FRAME" = "1"
+            "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = "1"
+            "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = $null
+            "LLAMA_KVARN_LAYER_KEY_BITS" = $(if ([string]::IsNullOrWhiteSpace($GemmaLayerKeyBits)) { $null } else { $GemmaLayerKeyBits })
+            "LLAMA_KVARN_LAYER_VALUE_BITS" = $(if ([string]::IsNullOrWhiteSpace($GemmaLayerValueBits)) { $null } else { $GemmaLayerValueBits })
+        } {
+            & $accuracyScript `
+                -Model $GemmaModel `
+                -Dataset $GemmaDataset `
+                -BuildDir $BuildDir `
+                -OutputDir (Join-Path $OutputDir "gemma-accuracy-kl") `
+                -KvarnPreset $AccuracyPreset `
+                -KvarnIters 4 `
+                -ContextSize $AccuracyContextSize `
+                -BatchSize $AccuracyBatchSize `
+                -Chunks $AccuracyChunks `
+                -UseKLDivergence `
+                -ParseSpecial `
+                -MaxMeanKL $AccuracyMaxMeanKL `
+                -MaxKLD99 $AccuracyMaxKLD99 `
+                -MaxKLD999 $AccuracyMaxKLD999 `
+                -MaxKLDMax $AccuracyMaxKLDMax `
+                -MaxKLPplIncrease $AccuracyMaxKLPplIncrease `
+                -MaxKLPDiffRms $AccuracyMaxKLPDiffRms `
+                -MinKLSameTopP $AccuracyMinKLSameTopP `
+                -ExpectedKvarnLayers "5-47:6" `
+                -ExpectedEffectiveKvarnBits $gemmaAccuracyExpectedEffectiveBits `
+                -MinKvarnBodyRecords 1
+        }
+    }
 }
 
-Invoke-Logged "tier1 gemma production iswa fallback" {
+Invoke-Logged "tier1 qwen mainline parity" {
     Invoke-WithProcessEnvironment @{
-        "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = $null
-        "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = "1"
+        "LLAMA_KVARN_ENABLE_PAPER_FRAME" = "1"
+        "LLAMA_KVARN_LAYER_KEY_BITS" = $(if ([string]::IsNullOrWhiteSpace($QwenLayerKeyBits)) { $null } else { $QwenLayerKeyBits })
+        "LLAMA_KVARN_LAYER_VALUE_BITS" = $(if ([string]::IsNullOrWhiteSpace($QwenLayerValueBits)) { $null } else { $QwenLayerValueBits })
     } {
-        & $mainlineParityScript `
+        & $safeCliParityScript `
+            -Model $QwenModel `
+            -MainlineBuildDir $MainlineBuildDir `
+            -KvarnBuildDir $BuildDir `
+            -CaseList "pp512:512:0,tg64:0:64" `
+            -FlashAttn off `
+            -MainlineFlashAttn on `
+            -KvarnFlashAttn off `
+            -CacheTypeK q8_0 `
+            -CacheTypeV q8_0 `
+            -KvarnPreset $SpeedPreset `
+            -Repetitions $QwenRepetitions `
+            -KvarnIters 4 `
+            -MinParityRatio $Tier1MinRatio `
+            -FailBelowMinParityRatio `
+            -MinKvarnLayerLogs 10 `
+            -ExpectedKvarnLayers "3-39:4" `
+            -ExpectedEffectiveKvarnBits $qwenSpeedExpectedEffectiveBits `
+            -KvarnPaperFrame `
+            -KvarnDirectRecordBatch `
+            -NCpuMoe 34 `
+            -OutputDir (Join-Path $OutputDir "qwen-tier1-mainline-parity-timed") `
+            -GpuLayers 99 `
+            -ExtraArgs @($qwenEffectiveExtraArgs)
+    }
+}
+
+Invoke-Logged "tier1 qwen path evidence" {
+    Invoke-WithProcessEnvironment @{
+        "LLAMA_KVARN_ENABLE_PAPER_FRAME" = "1"
+        "LLAMA_KVARN_LAYER_KEY_BITS" = $(if ([string]::IsNullOrWhiteSpace($QwenLayerKeyBits)) { $null } else { $QwenLayerKeyBits })
+        "LLAMA_KVARN_LAYER_VALUE_BITS" = $(if ([string]::IsNullOrWhiteSpace($QwenLayerValueBits)) { $null } else { $QwenLayerValueBits })
+    } {
+        $params = @{
+            Model                         = $QwenModel
+            MainlineBuildDir              = $MainlineBuildDir
+            KvarnBuildDir                 = $BuildDir
+            CaseList                      = $SpeedEvidenceCaseList
+            FlashAttn                     = "off"
+            KvarnPreset                   = $SpeedPreset
+            Repetitions                   = 1
+            KvarnIters                    = 4
+            MinParityRatio                = 0.01
+            MinKvarnLayerLogs             = 10
+            ExpectedKvarnLayers           = "3-39:4"
+            ExpectedEffectiveKvarnBits    = $qwenSpeedExpectedEffectiveBits
+            KvarnPaperFrame               = $true
+            KvarnDirectRecordBatch        = $true
+            RequireDirectRecordBatchPhases = $true
+            NCpuMoe                       = 34
+            TraceStore                    = $true
+            MinBatchedStorePhaseUses      = $MinBatchedStorePhaseUses
+            OutputDir                     = (Join-Path $OutputDir "qwen-tier1-kvarn-path-evidence")
+            GpuLayers                     = 99
+            ExtraArgs                     = @($qwenEffectiveExtraArgs)
+        }
+        if ($TraceFwhtEvidence.IsPresent) {
+            $params["TraceFwht"] = $true
+            $params["MinFwhtTaken"] = $MinFwhtTaken
+        }
+        & $safeCliParityScript @params
+    }
+}
+
+Invoke-Logged "tier1 gemma production true kvarn iswa" {
+    Invoke-WithProcessEnvironment @{
+        "LLAMA_KVARN_ENABLE_PAPER_FRAME" = "1"
+        "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = "1"
+        "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = $null
+        "LLAMA_KVARN_LAYER_KEY_BITS" = $(if ([string]::IsNullOrWhiteSpace($GemmaLayerKeyBits)) { $null } else { $GemmaLayerKeyBits })
+        "LLAMA_KVARN_LAYER_VALUE_BITS" = $(if ([string]::IsNullOrWhiteSpace($GemmaLayerValueBits)) { $null } else { $GemmaLayerValueBits })
+    } {
+        & $safeCliParityScript `
             -Model $GemmaModel `
             -MainlineBuildDir $MainlineBuildDir `
             -KvarnBuildDir $BuildDir `
             -CaseList "pp512:512:0,tg64:0:64" `
             -FlashAttn off `
+            -MainlineFlashAttn on `
+            -KvarnFlashAttn off `
+            -CacheTypeK q8_0 `
+            -CacheTypeV q8_0 `
+            -KvarnPreset $SpeedPreset `
             -Repetitions $GemmaRepetitions `
             -KvarnIters 4 `
             -MinParityRatio $Tier1MinRatio `
             -FailBelowMinParityRatio `
-            -AllowKvarnFallback `
-            -OutputDir (Join-Path $OutputDir "gemma-tier1-production-iswa-fallback") `
+            -MinKvarnLayerLogs 8 `
+            -ExpectedKvarnLayers "5-47:6" `
+            -ExpectedEffectiveKvarnBits $gemmaSpeedExpectedEffectiveBits `
+            -KvarnPaperFrame `
+            -KvarnDirectRecordBatch `
+            -OutputDir (Join-Path $OutputDir "gemma-tier1-production-true-kvarn-iswa-timed") `
             -GpuLayers 99
+    }
+}
+
+Invoke-Logged "tier1 gemma path evidence" {
+    Invoke-WithProcessEnvironment @{
+        "LLAMA_KVARN_ENABLE_PAPER_FRAME" = "1"
+        "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = "1"
+        "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = $null
+        "LLAMA_KVARN_LAYER_KEY_BITS" = $(if ([string]::IsNullOrWhiteSpace($GemmaLayerKeyBits)) { $null } else { $GemmaLayerKeyBits })
+        "LLAMA_KVARN_LAYER_VALUE_BITS" = $(if ([string]::IsNullOrWhiteSpace($GemmaLayerValueBits)) { $null } else { $GemmaLayerValueBits })
+    } {
+        $params = @{
+            Model                         = $GemmaModel
+            MainlineBuildDir              = $MainlineBuildDir
+            KvarnBuildDir                 = $BuildDir
+            CaseList                      = $SpeedEvidenceCaseList
+            FlashAttn                     = "off"
+            KvarnPreset                   = $SpeedPreset
+            Repetitions                   = 1
+            KvarnIters                    = 4
+            MinParityRatio                = 0.01
+            MinKvarnLayerLogs             = 8
+            ExpectedKvarnLayers           = "5-47:6"
+            ExpectedEffectiveKvarnBits    = $gemmaSpeedExpectedEffectiveBits
+            KvarnPaperFrame               = $true
+            KvarnDirectRecordBatch        = $true
+            RequireDirectRecordBatchPhases = $true
+            TraceStore                    = $true
+            MinBatchedStorePhaseUses      = $MinBatchedStorePhaseUses
+            OutputDir                     = (Join-Path $OutputDir "gemma-tier1-kvarn-path-evidence")
+            GpuLayers                     = 99
+        }
+        if ($TraceFwhtEvidence.IsPresent) {
+            $params["TraceFwht"] = $true
+            $params["MinFwhtTaken"] = $MinFwhtTaken
+        }
+        & $safeCliParityScript @params
+    }
+}
+
+if ($RunGemmaFallbackDiagnostic.IsPresent) {
+    Invoke-Logged "tier1 gemma diagnostic normal iswa fallback" {
+        Invoke-WithProcessEnvironment @{
+            "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = $null
+            "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = "1"
+        } {
+            & $safeCliParityScript `
+                -Model $GemmaModel `
+                -MainlineBuildDir $MainlineBuildDir `
+                -KvarnBuildDir $BuildDir `
+                -CaseList "pp512:512:0,tg64:0:64" `
+                -FlashAttn off `
+                -MainlineFlashAttn on `
+                -KvarnFlashAttn off `
+                -CacheTypeK q8_0 `
+                -CacheTypeV q8_0 `
+                -Repetitions $GemmaRepetitions `
+                -KvarnIters 4 `
+                -MinParityRatio $Tier1MinRatio `
+                -FailBelowMinParityRatio `
+                -AllowKvarnFallback `
+                -OutputDir (Join-Path $OutputDir "gemma-tier1-diagnostic-iswa-fallback") `
+                -GpuLayers 99
+        }
     }
 }
 
@@ -280,15 +582,16 @@ if ($RunGemmaExperimental.IsPresent) {
             "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA" = "1"
             "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK" = $null
         } {
-            & $benchScript `
+            & $safeCliParityScript `
                 -Model $GemmaModel `
-                -BuildDir $BuildDir `
+                -MainlineBuildDir $MainlineBuildDir `
+                -KvarnBuildDir $BuildDir `
                 -CaseList "pp512:512:0,tg64:0:64" `
                 -FlashAttn off `
                 -Repetitions $GemmaRepetitions `
                 -KvarnIters 4 `
-                -MinKvarnRatio $Tier1MinRatio `
-                -FailBelowMinKvarnRatio `
+                -MinParityRatio $Tier1MinRatio `
+                -FailBelowMinParityRatio `
                 -MinKvarnLayerLogs 8 `
                 -ExpectedKvarnLayers "5-47:6" `
                 -OutputDir (Join-Path $OutputDir "gemma-tier1-experimental-true-kvarn-iswa-diagnostic") `

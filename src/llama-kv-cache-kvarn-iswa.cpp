@@ -114,7 +114,7 @@ llama_kv_cache_kvarn_iswa::llama_kv_cache_kvarn_iswa(
 
     if (has_diagnostic_full_normal) {
         LLAMA_LOG_WARN(
-                "%s: diagnostic KVarN+ISWA layer filter enabled; creating normal full-attention fallback KV cache, size = %u cells\n",
+                "%s: creating compatibility normal full-attention KV cache for KVarN+ISWA fallback, size = %u cells\n",
                 __func__, size_base);
 
         kv_full_normal = std::make_unique<llama_kv_cache>(

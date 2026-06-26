@@ -1022,6 +1022,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "KVARN_STORE_BODY",
     "KVARN_STORE_KV_BODY",
     "KVARN_ATTN_MIXED",
+    "KVARN_MATERIALIZE_KV",
     "DIAG",
     "DIAG_MASK_INF",
     "DIAG_MASK_ZERO",
@@ -1083,7 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1135,6 +1136,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "kvarn_store_body(x)",
     "kvarn_store_kv_body(x,y)",
     "kvarn_attn_mixed(q)",
+    "kvarn_materialize_kv(x)",
     "diag(x)",
     "diag_mask_inf(x)",
     "diag_mask_zero(x)",
@@ -1196,7 +1198,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3930,6 +3932,57 @@ struct ggml_tensor * ggml_set_rows(
     return result;
 }
 
+void ggml_set_rows_add_dep(
+        struct ggml_tensor * set_rows,
+        struct ggml_tensor * dep) {
+    GGML_ASSERT(set_rows != NULL && set_rows->op == GGML_OP_SET_ROWS);
+    GGML_ASSERT(dep != NULL);
+    for (int i = 3; i < GGML_MAX_SRC; ++i) {
+        if (set_rows->src[i] == NULL) {
+            set_rows->src[i] = dep;
+            return;
+        }
+    }
+    GGML_ABORT("SET_ROWS dependency slots exhausted");
+}
+
+enum {
+    GGML_KVARN_V_LAYOUT_LEGACY          = 0,
+    GGML_KVARN_V_LAYOUT_TURBO_CANONICAL = 1,
+};
+
+static bool ggml_kvarn_turbo_v_layout_enabled(void) {
+    const char * env = getenv("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT");
+    return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+}
+
+static int32_t ggml_kvarn_v_layout_for_is_v(int32_t is_v) {
+    return is_v && ggml_kvarn_turbo_v_layout_enabled() ?
+        GGML_KVARN_V_LAYOUT_TURBO_CANONICAL : GGML_KVARN_V_LAYOUT_LEGACY;
+}
+
+static int64_t ggml_kvarn_packed_body_bytes(int32_t head_dim, int32_t group_size, int32_t bits) {
+    return (int64_t) (((size_t) head_dim*group_size*bits + 7)/8);
+}
+
+static int64_t ggml_kvarn_v_body_bytes_for_layout(
+        int32_t head_dim,
+        int32_t group_size,
+        int32_t value_bits,
+        int32_t v_layout) {
+    if (v_layout == GGML_KVARN_V_LAYOUT_LEGACY) {
+        return ggml_kvarn_packed_body_bytes(head_dim, group_size, value_bits);
+    }
+    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    GGML_ASSERT(group_size == 128 && (head_dim % 128) == 0 && (value_bits == 2 || value_bits == 4));
+    const int64_t block_bytes = value_bits == 2 ? 34 : 68;
+    return (int64_t) group_size*(head_dim/128)*block_bytes;
+}
+
+static void ggml_kvarn_assert_v_body_shape(const struct ggml_tensor * body, int64_t body_bytes, int32_t v_layout) {
+    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL ? body->ne[0] == body_bytes : body->ne[0] >= body_bytes);
+}
+
 static struct ggml_tensor * ggml_kvarn_store_body_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * tile,
@@ -3958,9 +4011,12 @@ static struct ggml_tensor * ggml_kvarn_store_body_impl(
     GGML_ASSERT(ggml_nelements(tile) == (int64_t) head_dim*group_size);
     GGML_ASSERT(ggml_nelements(scratch) >= (int64_t) head_dim*group_size + 2*MAX(head_dim, group_size));
 
-    const int64_t body_bytes = (int64_t)(((size_t) head_dim*group_size*bits + 7)/8);
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(is_v);
+    const int64_t body_bytes = is_v ?
+        ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, bits, v_layout) :
+        ggml_kvarn_packed_body_bytes(head_dim, group_size, bits);
     const int64_t scale_floats = is_v ? head_dim + 2*group_size : 2*head_dim + group_size;
-    GGML_ASSERT(body->ne[0] >= body_bytes);
+    ggml_kvarn_assert_v_body_shape(body, body_bytes, v_layout);
     GGML_ASSERT(scales->ne[0] >= scale_floats);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, body);
@@ -3972,6 +4028,7 @@ static struct ggml_tensor * ggml_kvarn_store_body_impl(
         int32_t bits;
         int32_t sinkhorn_iters;
         float   rtn_quantile;
+        int32_t v_layout;
     } params = {
         is_v,
         head_dim,
@@ -3979,6 +4036,7 @@ static struct ggml_tensor * ggml_kvarn_store_body_impl(
         bits,
         sinkhorn_iters,
         rtn_quantile,
+        v_layout,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4054,12 +4112,13 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
     GGML_ASSERT(ggml_nelements(v_tile) == (int64_t) head_dim*group_size);
     GGML_ASSERT(ggml_nelements(scratch) >= (int64_t) head_dim*group_size + 2*MAX(head_dim, group_size));
 
-    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits   + 7)/8);
-    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
+    const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
+    const int64_t v_body_bytes = ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, v_layout);
     const int64_t k_scale_floats = 2*head_dim + group_size;
     const int64_t v_scale_floats = head_dim + 2*group_size;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
-    GGML_ASSERT(v_body->ne[0] >= v_body_bytes);
+    ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
     GGML_ASSERT(k_scales->ne[0] >= k_scale_floats);
     GGML_ASSERT(v_scales->ne[0] >= v_scale_floats);
 
@@ -4079,6 +4138,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
         int32_t record_2;
         int32_t record_3;
         int32_t src_layout;
+        int32_t v_layout;
     } params = {
         head_dim,
         group_size,
@@ -4090,6 +4150,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
         0,
         0, 0, 0, 0,
         0,
+        v_layout,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4147,8 +4208,9 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
     GGML_ASSERT(pending_k->ne[2] == group_size);
     GGML_ASSERT(pending_v->ne[2] == group_size);
 
-    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits   + 7)/8);
-    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
+    const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
+    const int64_t v_body_bytes = ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, v_layout);
     const int64_t k_scale_floats = 2*head_dim + group_size;
     const int64_t v_scale_floats = head_dim + 2*group_size;
     const int64_t tile_floats = (int64_t) head_dim*group_size;
@@ -4156,7 +4218,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
     const int64_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
     const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
-    GGML_ASSERT(v_body->ne[0] >= v_body_bytes);
+    ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
     GGML_ASSERT(k_body->ne[1] == n_heads);
     GGML_ASSERT(v_body->ne[1] == n_heads);
     GGML_ASSERT(k_scales->ne[0] >= k_scale_floats);
@@ -4181,6 +4243,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
         int32_t record_2;
         int32_t record_3;
         int32_t src_layout;
+        int32_t v_layout;
     } params = {
         head_dim,
         group_size,
@@ -4192,6 +4255,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
         0,
         record, 0, 0, 0,
         0,
+        v_layout,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4251,14 +4315,15 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_records(
     GGML_ASSERT(pending_k->ne[2] == group_size);
     GGML_ASSERT(pending_v->ne[2] == group_size);
 
-    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits   + 7)/8);
-    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
+    const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
+    const int64_t v_body_bytes = ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, v_layout);
     const int64_t tile_floats = (int64_t) head_dim*group_size;
     const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size);
     const int64_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
     const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
-    GGML_ASSERT(v_body->ne[0] >= v_body_bytes);
+    ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
     GGML_ASSERT(ggml_nelements(scratch) >= scratch_floats);
 
     for (int32_t i = 0; i < n_record_batch; ++i) {
@@ -4281,6 +4346,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_records(
         int32_t record_2;
         int32_t record_3;
         int32_t src_layout;
+        int32_t v_layout;
     } params = {
         head_dim,
         group_size,
@@ -4295,6 +4361,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_records(
         n_record_batch > 2 ? records[2] : 0,
         n_record_batch > 3 ? records[3] : 0,
         0,
+        v_layout,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4354,8 +4421,9 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
     GGML_ASSERT(k_tiles->ne[3] == n_records);
     GGML_ASSERT(v_tiles->ne[3] == n_records);
 
-    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits   + 7)/8);
-    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
+    const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
+    const int64_t v_body_bytes = ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, v_layout);
     const int64_t k_scale_floats = 2*head_dim + group_size;
     const int64_t v_scale_floats = head_dim + 2*group_size;
     const int64_t tile_floats = (int64_t) head_dim*group_size;
@@ -4363,7 +4431,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
     const int64_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
     const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
-    GGML_ASSERT(v_body->ne[0] >= v_body_bytes);
+    ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
     GGML_ASSERT(k_body->ne[1] >= n_records);
     GGML_ASSERT(v_body->ne[1] >= n_records);
     GGML_ASSERT(k_body->ne[2] == n_heads);
@@ -4392,6 +4460,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
         int32_t record_2;
         int32_t record_3;
         int32_t src_layout;
+        int32_t v_layout;
     } params = {
         head_dim,
         group_size,
@@ -4404,6 +4473,7 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
         record0,
         0, 0, 0,
         1,
+        v_layout,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4417,6 +4487,72 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
     result->src[6] = v_body;
 
     return result;
+}
+
+void ggml_kvarn_store_body_set_v_layout(
+        struct ggml_tensor * store,
+               int32_t       v_layout) {
+    GGML_ASSERT(store != NULL && store->op == GGML_OP_KVARN_STORE_BODY);
+    struct kvarn_store_body_params {
+        int32_t is_v;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t bits;
+        int32_t sinkhorn_iters;
+        float   rtn_quantile;
+        int32_t v_layout;
+    } params;
+    memcpy(&params, store->op_params, sizeof(params));
+    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    params.v_layout = params.is_v ? v_layout : GGML_KVARN_V_LAYOUT_LEGACY;
+    const int64_t body_bytes = params.is_v ?
+        ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.bits, params.v_layout) :
+        ggml_kvarn_packed_body_bytes(params.head_dim, params.group_size, params.bits);
+    ggml_kvarn_assert_v_body_shape(store, body_bytes, params.is_v ? params.v_layout : GGML_KVARN_V_LAYOUT_LEGACY);
+    ggml_set_op_params(store, &params, sizeof(params));
+}
+
+void ggml_kvarn_store_kv_body_set_v_layout(
+        struct ggml_tensor * store,
+               int32_t       v_layout) {
+    GGML_ASSERT(store != NULL && store->op == GGML_OP_KVARN_STORE_KV_BODY);
+    struct kvarn_store_kv_body_params {
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        int32_t sinkhorn_iters;
+        float   rtn_quantile;
+        int32_t n_heads;
+        int32_t n_record_batch;
+        int32_t record_0;
+        int32_t record_1;
+        int32_t record_2;
+        int32_t record_3;
+        int32_t src_layout;
+        int32_t v_layout;
+    } params;
+    memcpy(&params, store->op_params, sizeof(params));
+    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    params.v_layout = v_layout;
+    const int64_t v_body_bytes =
+        ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.value_bits, params.v_layout);
+    ggml_kvarn_assert_v_body_shape(store->src[6], v_body_bytes, params.v_layout);
+    ggml_set_op_params(store, &params, sizeof(params));
+}
+
+void ggml_kvarn_store_kv_body_add_dep(
+        struct ggml_tensor * store,
+        struct ggml_tensor * dep) {
+    GGML_ASSERT(store != NULL && store->op == GGML_OP_KVARN_STORE_KV_BODY);
+    GGML_ASSERT(dep != NULL);
+    for (int i = 7; i < GGML_MAX_SRC; ++i) {
+        if (store->src[i] == NULL) {
+            store->src[i] = dep;
+            return;
+        }
+    }
+    GGML_ABORT("KVarN fused body-store dependency slots exhausted");
 }
 
 struct ggml_tensor * ggml_kvarn_attn_mixed(
@@ -4441,7 +4577,8 @@ struct ggml_tensor * ggml_kvarn_attn_mixed(
                int32_t        group_size,
                int32_t        key_bits,
                int32_t        value_bits,
-               float          scale) {
+               float          scale,
+               float          logit_softcap) {
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(sink_tail_k->type == GGML_TYPE_F16);
     GGML_ASSERT(sink_tail_v->type == GGML_TYPE_F16);
@@ -4485,12 +4622,13 @@ struct ggml_tensor * ggml_kvarn_attn_mixed(
     GGML_ASSERT(ggml_nelements(scratch) >= n_kv);
     GGML_ASSERT(kq_mask == NULL || (kq_mask->ne[0] >= n_kv && kq_mask->ne[1] >= q->ne[2]));
 
-    const int64_t k_body_bytes = (int64_t)(((size_t) head_dim*group_size*key_bits + 7)/8);
-    const int64_t v_body_bytes = (int64_t)(((size_t) head_dim*group_size*value_bits + 7)/8);
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
+    const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
+    const int64_t v_body_bytes = ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, v_layout);
     const int64_t k_scale_floats = 2*head_dim + group_size;
     const int64_t v_scale_floats = head_dim + 2*group_size;
     GGML_ASSERT(body_k->ne[0] >= k_body_bytes);
-    GGML_ASSERT(body_v->ne[0] >= v_body_bytes);
+    ggml_kvarn_assert_v_body_shape(body_v, v_body_bytes, v_layout);
     GGML_ASSERT(scales_k->ne[0] >= k_scale_floats);
     GGML_ASSERT(scales_v->ne[0] >= v_scale_floats);
 
@@ -4507,6 +4645,9 @@ struct ggml_tensor * ggml_kvarn_attn_mixed(
         int32_t key_bits;
         int32_t value_bits;
         float   scale;
+        float   logit_softcap;
+        int32_t frame_flags;
+        int32_t v_layout;
     } params = {
         n_sink,
         n_records,
@@ -4518,6 +4659,9 @@ struct ggml_tensor * ggml_kvarn_attn_mixed(
         key_bits,
         value_bits,
         scale,
+        logit_softcap,
+        GGML_KVARN_ATTN_FRAME_NONE,
+        v_layout,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4544,6 +4688,200 @@ void ggml_kvarn_attn_mixed_set_window(
     GGML_ASSERT(window != NULL && window->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_nelements(window) >= 5);
     attn->src[11] = window;
+}
+
+void ggml_kvarn_attn_mixed_set_q_body(
+        struct ggml_tensor * attn,
+        struct ggml_tensor * q_body) {
+    GGML_ASSERT(attn != NULL && attn->op == GGML_OP_KVARN_ATTN_MIXED);
+    GGML_ASSERT(q_body != NULL && q_body->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_body->ne[0] == attn->ne[0]);
+    GGML_ASSERT(q_body->ne[1] == attn->ne[1]);
+    GGML_ASSERT(q_body->ne[2] == attn->ne[2]);
+    attn->src[12] = q_body;
+}
+
+void ggml_kvarn_attn_mixed_set_frame_flags(
+        struct ggml_tensor * attn,
+               int32_t       frame_flags) {
+    GGML_ASSERT(attn != NULL && attn->op == GGML_OP_KVARN_ATTN_MIXED);
+    GGML_ASSERT((frame_flags & ~GGML_KVARN_ATTN_FRAME_FUSED_PAPER_FULL) == 0);
+    struct kvarn_attn_params {
+        int32_t n_sink;
+        int32_t n_records;
+        int32_t n_pending;
+        int32_t n_tail;
+        int32_t tail_start;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        float   scale;
+        float   logit_softcap;
+        int32_t frame_flags;
+        int32_t v_layout;
+    } params;
+    memcpy(&params, attn->op_params, sizeof(params));
+    params.frame_flags = frame_flags;
+    ggml_set_op_params(attn, &params, sizeof(params));
+}
+
+void ggml_kvarn_attn_mixed_set_v_layout(
+        struct ggml_tensor * attn,
+               int32_t       v_layout) {
+    GGML_ASSERT(attn != NULL && attn->op == GGML_OP_KVARN_ATTN_MIXED);
+    struct kvarn_attn_params {
+        int32_t n_sink;
+        int32_t n_records;
+        int32_t n_pending;
+        int32_t n_tail;
+        int32_t tail_start;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        float   scale;
+        float   logit_softcap;
+        int32_t frame_flags;
+        int32_t v_layout;
+    } params;
+    memcpy(&params, attn->op_params, sizeof(params));
+    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    params.v_layout = v_layout;
+    const int64_t v_body_bytes =
+        ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.value_bits, params.v_layout);
+    ggml_kvarn_assert_v_body_shape(attn->src[4], v_body_bytes, params.v_layout);
+    ggml_set_op_params(attn, &params, sizeof(params));
+}
+
+struct ggml_tensor * ggml_kvarn_materialize_kv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * sink_tail,
+        struct ggml_tensor  * body,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * pending,
+               int32_t        is_v,
+               int32_t        n_sink,
+               int32_t        n_records,
+               int32_t        n_pending,
+               int32_t        n_tail,
+               int32_t        tail_start,
+               int32_t        head_dim,
+               int32_t        group_size,
+               int32_t        bits) {
+    GGML_ASSERT(sink_tail->type == GGML_TYPE_F16);
+    GGML_ASSERT(body->type == GGML_TYPE_I8);
+    GGML_ASSERT(scales->type == GGML_TYPE_F32);
+    GGML_ASSERT(pending->type == GGML_TYPE_F32);
+    GGML_ASSERT(is_v == 0 || is_v == 1);
+    GGML_ASSERT(n_sink >= 0 && n_records >= 0 && n_pending >= 0 && n_tail >= 0);
+    GGML_ASSERT(tail_start >= 0);
+    GGML_ASSERT(n_tail == 0 || tail_start < n_tail);
+    GGML_ASSERT(head_dim > 0 && group_size > 0 && bits > 0 && bits <= 8);
+    GGML_ASSERT(sink_tail->ne[0] == head_dim);
+    GGML_ASSERT(body->ne[2] == sink_tail->ne[1]);
+    GGML_ASSERT(scales->ne[2] == sink_tail->ne[1]);
+    GGML_ASSERT(pending->ne[0] == head_dim);
+    GGML_ASSERT(pending->ne[1] == sink_tail->ne[1]);
+    GGML_ASSERT(sink_tail->ne[2] >= n_sink + n_tail);
+    GGML_ASSERT(body->ne[1] >= n_records);
+    GGML_ASSERT(scales->ne[1] >= n_records);
+    GGML_ASSERT(pending->ne[2] >= n_pending);
+
+    const int64_t n_kv = (int64_t) n_sink + (int64_t) n_records*group_size + n_pending + n_tail;
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, head_dim, sink_tail->ne[1], n_kv);
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(is_v);
+    const int64_t body_bytes = is_v ?
+        ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, bits, v_layout) :
+        ggml_kvarn_packed_body_bytes(head_dim, group_size, bits);
+    const int64_t scale_floats = is_v ? head_dim + 2*group_size : 2*head_dim + group_size;
+    ggml_kvarn_assert_v_body_shape(body, body_bytes, v_layout);
+    GGML_ASSERT(scales->ne[0] >= scale_floats);
+
+    struct {
+        int32_t is_v;
+        int32_t n_sink;
+        int32_t n_records;
+        int32_t n_pending;
+        int32_t n_tail;
+        int32_t tail_start;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t bits;
+        int32_t v_layout;
+        int32_t debug_raw_body;
+    } params = {
+        is_v,
+        n_sink,
+        n_records,
+        n_pending,
+        n_tail,
+        tail_start,
+        head_dim,
+        group_size,
+        bits,
+        v_layout,
+        0,
+    };
+    ggml_set_op_params(result, &params, sizeof(params));
+
+    result->op     = GGML_OP_KVARN_MATERIALIZE_KV;
+    result->src[0] = sink_tail;
+    result->src[1] = body;
+    result->src[2] = scales;
+    result->src[3] = pending;
+
+    return result;
+}
+
+void ggml_kvarn_materialize_kv_set_v_layout(
+        struct ggml_tensor * materialize,
+               int32_t       v_layout) {
+    GGML_ASSERT(materialize != NULL && materialize->op == GGML_OP_KVARN_MATERIALIZE_KV);
+    struct kvarn_materialize_kv_params {
+        int32_t is_v;
+        int32_t n_sink;
+        int32_t n_records;
+        int32_t n_pending;
+        int32_t n_tail;
+        int32_t tail_start;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t bits;
+        int32_t v_layout;
+        int32_t debug_raw_body;
+    } params;
+    memcpy(&params, materialize->op_params, sizeof(params));
+    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    params.v_layout = params.is_v ? v_layout : GGML_KVARN_V_LAYOUT_LEGACY;
+    const int64_t body_bytes = params.is_v ?
+        ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.bits, params.v_layout) :
+        ggml_kvarn_packed_body_bytes(params.head_dim, params.group_size, params.bits);
+    ggml_kvarn_assert_v_body_shape(materialize->src[1], body_bytes, params.is_v ? params.v_layout : GGML_KVARN_V_LAYOUT_LEGACY);
+    ggml_set_op_params(materialize, &params, sizeof(params));
+}
+
+void ggml_kvarn_materialize_kv_set_debug_raw_body(
+        struct ggml_tensor * materialize,
+               int32_t       use_raw_body) {
+    GGML_ASSERT(materialize != NULL && materialize->op == GGML_OP_KVARN_MATERIALIZE_KV);
+    struct kvarn_materialize_kv_params {
+        int32_t is_v;
+        int32_t n_sink;
+        int32_t n_records;
+        int32_t n_pending;
+        int32_t n_tail;
+        int32_t tail_start;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t bits;
+        int32_t v_layout;
+        int32_t debug_raw_body;
+    } params;
+    memcpy(&params, materialize->op_params, sizeof(params));
+    GGML_ASSERT(use_raw_body == 0 || use_raw_body == 1);
+    params.debug_raw_body = use_raw_body;
+    ggml_set_op_params(materialize, &params, sizeof(params));
 }
 
 // ggml_diag

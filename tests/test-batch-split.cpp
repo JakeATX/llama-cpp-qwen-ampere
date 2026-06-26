@@ -148,10 +148,22 @@ static void test_tail_safe_ubatch_limit_pp512() {
 
     balloc.split_reset();
     const uint32_t chunk0 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
-    require(chunk0 == 512, "pp512 direct-prefill first chunk is 512 tokens");
+    require(chunk0 == 256, "pp512 direct-prefill first chunk keeps sink/tail row writes unique");
 
     auto ubatch0 = balloc.split_simple(chunk0);
-    require(ubatch0.n_tokens == 512, "pp512 direct-prefill split consumes 512 tokens");
+    require(ubatch0.n_tokens == 256, "pp512 direct-prefill first split consumes 256 tokens");
+
+    const uint32_t chunk1 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
+    require(chunk1 == 128, "pp512 direct-prefill second chunk is one tail span");
+
+    auto ubatch1 = balloc.split_simple(chunk1);
+    require(ubatch1.n_tokens == 128, "pp512 direct-prefill second split consumes 128 tokens");
+
+    const uint32_t chunk2 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
+    require(chunk2 == 128, "pp512 direct-prefill third chunk is one tail span");
+
+    auto ubatch2 = balloc.split_simple(chunk2);
+    require(ubatch2.n_tokens == 128, "pp512 direct-prefill third split consumes 128 tokens");
     require(balloc.get_n_used() == 512, "pp512 direct-prefill batch fully consumed");
 }
 
@@ -174,20 +186,26 @@ static void test_tail_safe_ubatch_limit_pp512_without_direct_prefill() {
     require(balloc.init(batch, fake_vocab(), nullptr, /*n_embd =*/ 1, /*n_seq_max =*/ 1, /*output_all =*/ false),
             "tail-safe pp512 no-direct batch init");
 
-    set_env_var("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN", "1");
+    set_env_var("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_STORE", "1");
     balloc.split_reset();
     const uint32_t chunk0 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
-    set_env_var("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN", "");
-    require(chunk0 == 384, "pp512 no-direct first chunk is 384 tokens");
+    set_env_var("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_STORE", "");
+    require(chunk0 == 256, "pp512 no-direct first chunk keeps sink/tail row writes unique");
 
     auto ubatch0 = balloc.split_simple(chunk0);
-    require(ubatch0.n_tokens == 384, "pp512 no-direct first split consumes 384 tokens");
+    require(ubatch0.n_tokens == 256, "pp512 no-direct first split consumes 256 tokens");
 
     const uint32_t chunk1 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
     require(chunk1 == 128, "pp512 no-direct second chunk is 128 tokens");
 
     auto ubatch1 = balloc.split_simple(chunk1);
     require(ubatch1.n_tokens == 128, "pp512 no-direct second split consumes 128 tokens");
+
+    const uint32_t chunk2 = kvarn_tail_safe_ubatch_limit(balloc, default_limit, sink, tail);
+    require(chunk2 == 128, "pp512 no-direct third chunk is 128 tokens");
+
+    auto ubatch2 = balloc.split_simple(chunk2);
+    require(ubatch2.n_tokens == 128, "pp512 no-direct third split consumes 128 tokens");
     require(balloc.get_n_used() == 512, "pp512 no-direct batch fully consumed");
 }
 

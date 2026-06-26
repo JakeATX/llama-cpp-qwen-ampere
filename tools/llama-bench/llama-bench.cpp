@@ -534,13 +534,21 @@ static bool kvarn_apply_preset(llama_kvarn_params & params, const std::string & 
     unsigned long v = 0;
     unsigned long g = 0;
     try {
-        k = std::stoul(preset.substr(prefix.size(), vpos - prefix.size()));
-        v = std::stoul(preset.substr(vpos + 1, gpos - (vpos + 1)));
-        g = std::stoul(preset.substr(gpos + 2));
+        const auto parse_uint_exact = [](const std::string & value, unsigned long & out) {
+            size_t parsed = 0;
+            out = std::stoul(value, &parsed);
+            return parsed == value.size();
+        };
+
+        if (!parse_uint_exact(preset.substr(prefix.size(), vpos - prefix.size()), k) ||
+                !parse_uint_exact(preset.substr(vpos + 1, gpos - (vpos + 1)), v) ||
+                !parse_uint_exact(preset.substr(gpos + 2), g)) {
+            return false;
+        }
     } catch (const std::exception &) {
         return false;
     }
-    if (k < 2 || k > 8 || v < 2 || v > 8 || g == 0) {
+    if (k < 2 || k > 8 || v < 2 || v > 8 || g != 128) {
         return false;
     }
 
@@ -578,6 +586,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.output_format        = cmd_params_defaults.output_format;
     params.output_format_stderr = cmd_params_defaults.output_format_stderr;
     params.reps                 = cmd_params_defaults.reps;
+    params.kvarn                = cmd_params_defaults.kvarn;
     params.numa                 = cmd_params_defaults.numa;
     params.prio                 = cmd_params_defaults.prio;
     params.delay                = cmd_params_defaults.delay;

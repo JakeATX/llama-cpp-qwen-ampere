@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)] [string] $Model,
     [Parameter(Mandatory = $true)] [string] $Dataset,
     [string] $BuildDir = (Join-Path (Get-Location) "build-kvarn-cuda-static-vs"),
+    [string] $PerplexityExe = "",
     [string] $OutputDir = "",
     [string] $KvarnPreset = "kvarn_k8v8_g128",
     [int] $KvarnIters = 16,
@@ -18,11 +19,21 @@ param(
     [int] $BodyRecordLimit = 30,
     [int] $BodySrcLayout = -1,
     [ValidateSet("auto", "earliest", "latest")] [string] $RecordSet = "auto",
+    [switch] $TensorDump,
+    [string] $TensorDumpFilter = "",
+    [int] $TensorDumpLimit = 16,
     [switch] $DumpFullQO,
+    [switch] $AllowDiagnosticEnv,
+    [switch] $ParseSpecial,
+    [switch] $AllowChatMarkers,
+    [switch] $SkipFixtureCheck,
     [switch] $ForceExperimentalIswa,
+    [switch] $PaperMixedFrame,
+    [switch] $DisablePaperFrame,
+    [switch] $DebugRawBody,
     [string] $LayerFilter = "",
-    [string] $ExpectedKvarnLayers = "3-39:4",
-    [string[]] $ExtraArgs = @("-ncmoe", "34"),
+    [string] $ExpectedKvarnLayers = "",
+    [string[]] $ExtraArgs = @(),
     [string[]] $KvarnExtraArgs = @()
 )
 
@@ -30,19 +41,22 @@ $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    $OutputDir = Join-Path (Get-Location) "artifacts/kvarn-rootcause/qwen36-$stamp"
+    $OutputDir = Join-Path (Get-Location) "artifacts/kvarn-rootcause/boundary-$stamp"
 }
 [void] [System.IO.Directory]::CreateDirectory($OutputDir)
 $OutputDir = (Resolve-Path -LiteralPath $OutputDir).Path
 
 $boundaryDir = Join-Path $OutputDir "boundary"
 $bodyDir = Join-Path $OutputDir "body-records"
+$tensorDir = Join-Path $OutputDir "tensor-dump"
 [void] [System.IO.Directory]::CreateDirectory($boundaryDir)
 [void] [System.IO.Directory]::CreateDirectory($bodyDir)
+if ($TensorDump) {
+    [void] [System.IO.Directory]::CreateDirectory($tensorDir)
+}
 
 $oldEnv = @{}
 $envSet = @{
-    "LLAMA_KVARN_ENABLE_PAPER_FRAME" = "1"
     "LLAMA_KVARN_ATTN_BOUNDARY_DUMP" = "1"
     "LLAMA_KVARN_ATTN_BOUNDARY_DUMP_DIR" = $boundaryDir
     "LLAMA_KVARN_ATTN_BOUNDARY_DUMP_LIMIT" = [string] $BoundaryDumpLimit
@@ -57,6 +71,17 @@ $envSet = @{
     "LLAMA_KVARN_DEBUG_BODY_HEAD" = [string] $DumpHead
 }
 
+if (-not $DisablePaperFrame) {
+    $envSet["LLAMA_KVARN_ENABLE_PAPER_FRAME"] = "1"
+}
+if ($PaperMixedFrame) {
+    $envSet["LLAMA_KVARN_PAPER_MIXED_FRAME"] = "1"
+}
+if ($DebugRawBody) {
+    $envSet["LLAMA_KVARN_DEBUG_RAW_BODY_K"] = "1"
+    $envSet["LLAMA_KVARN_DEBUG_RAW_BODY_V"] = "1"
+}
+
 if ($BodySrcLayout -ge 0) {
     $envSet["LLAMA_KVARN_DEBUG_BODY_SRC_LAYOUT"] = [string] $BodySrcLayout
 }
@@ -69,9 +94,17 @@ if ($DumpFullQO) {
 if ($ForceExperimentalIswa) {
     $envSet["LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA"] = "1"
 }
+if ($TensorDump) {
+    $envSet["LLAMA_KVARN_TENSOR_DUMP_DIR"] = $tensorDir
+    $envSet["LLAMA_KVARN_TENSOR_DUMP_LIMIT"] = [string] $TensorDumpLimit
+    if ([string]::IsNullOrWhiteSpace($TensorDumpFilter)) {
+        $TensorDumpFilter = "^(Kcur-$DumpLayer|Vcur-$DumpLayer)$"
+    }
+    $envSet["LLAMA_KVARN_TENSOR_DUMP_FILTER"] = $TensorDumpFilter
+}
 if (-not [string]::IsNullOrWhiteSpace($LayerFilter)) {
     $envSet["LLAMA_KVARN_LAYER_FILTER"] = $LayerFilter
-    if ($ExpectedKvarnLayers -eq "3-39:4") {
+    if ([string]::IsNullOrWhiteSpace($ExpectedKvarnLayers)) {
         $ExpectedKvarnLayers = $LayerFilter
     }
 }
@@ -86,6 +119,7 @@ try {
         -Model $Model `
         -Dataset $Dataset `
         -BuildDir $BuildDir `
+        -PerplexityExe $PerplexityExe `
         -OutputDir (Join-Path $OutputDir "accuracy") `
         -KvarnPreset $KvarnPreset `
         -KvarnIters $KvarnIters `
@@ -97,7 +131,11 @@ try {
         -BatchSize $BatchSize `
         -Chunks $Chunks `
         -MaxPplIncrease 1000 `
+        -AllowDiagnosticEnv:$($AllowDiagnosticEnv.IsPresent) `
         -ExpectedKvarnLayers $ExpectedKvarnLayers `
+        -ParseSpecial:$($ParseSpecial.IsPresent) `
+        -AllowChatMarkers:$($AllowChatMarkers.IsPresent) `
+        -SkipFixtureCheck:$($SkipFixtureCheck.IsPresent) `
         -ExtraArgs @($ExtraArgs) `
         -KvarnExtraArgs @($KvarnExtraArgs)
 } finally {

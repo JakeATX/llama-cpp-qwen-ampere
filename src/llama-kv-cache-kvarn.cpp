@@ -20,15 +20,226 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 static bool is_power_of_2(uint32_t n) {
     return n != 0 && (n & (n - 1)) == 0;
 }
 
+static size_t packed_nbytes(size_t n_values, uint32_t bits);
+
 static bool kvarn_env_flag_enabled(const char * name) {
     const char * env = std::getenv(name);
     return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
+static bool kvarn_env_flag_01_enabled(const char * name) {
+    const char * env = std::getenv(name);
+    if (env == nullptr) {
+        return false;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long value = std::strtol(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE ||
+            (value != 0 && value != 1)) {
+        throw std::invalid_argument(std::string("invalid KVarN environment flag ") + name +
+                "=" + env + "; expected integer 0 or 1");
+    }
+    return value != 0;
+}
+
+static bool kvarn_experimental_turbo_v_layout_enabled() {
+    return kvarn_env_flag_01_enabled("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT");
+}
+
+static size_t kvarn_turbo_v_block_bytes(uint32_t value_bits) {
+    if (value_bits == 2) {
+        return 2 + 128/4;
+    }
+    if (value_bits == 4) {
+        return 2 + 2 + 128/2;
+    }
+    throw std::invalid_argument("Turbo V layout currently supports only value_bits 2 or 4");
+}
+
+static size_t kvarn_v_body_bytes(uint32_t head_dim, uint32_t group_size, uint32_t value_bits) {
+    if (!kvarn_experimental_turbo_v_layout_enabled()) {
+        return packed_nbytes(size_t(head_dim)*group_size, value_bits);
+    }
+    if (group_size != 128 || (head_dim % 128) != 0) {
+        throw std::invalid_argument("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT requires group_size=128 and head_dim multiple of 128");
+    }
+    return size_t(group_size)*(head_dim/128u)*kvarn_turbo_v_block_bytes(value_bits);
+}
+
+static uint32_t kvarn_v_layout_id() {
+    return kvarn_experimental_turbo_v_layout_enabled() ?
+        LLAMA_KVARN_V_LAYOUT_TURBO_CANONICAL : LLAMA_KVARN_V_LAYOUT_LEGACY;
+}
+
+static std::string kvarn_trim(std::string s) {
+    const char * ws = " \t\r\n";
+    const size_t first = s.find_first_not_of(ws);
+    if (first == std::string::npos) {
+        return "";
+    }
+    const size_t last = s.find_last_not_of(ws);
+    return s.substr(first, last - first + 1);
+}
+
+static bool kvarn_parse_uint32_token(const std::string & text, uint32_t & out) {
+    if (text.empty()) {
+        return false;
+    }
+    char * end = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(text.c_str(), &end, 10);
+    if (end == nullptr || *end != '\0' || errno == ERANGE || value > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    out = uint32_t(value);
+    return true;
+}
+
+static bool kvarn_layer_spec_token_contains(const std::string & raw, uint32_t il) {
+    const std::string token = kvarn_trim(raw);
+    if (token.empty()) {
+        return false;
+    }
+
+    const size_t dash = token.find('-');
+    if (dash == std::string::npos) {
+        uint32_t single = 0;
+        if (!kvarn_parse_uint32_token(token, single)) {
+            throw std::invalid_argument("invalid KVarN layer-bit override layer id: " + token);
+        }
+        return single == il;
+    }
+
+    const size_t colon = token.find(':', dash + 1);
+    const std::string start_text = token.substr(0, dash);
+    const std::string end_text = colon == std::string::npos ? token.substr(dash + 1) : token.substr(dash + 1, colon - dash - 1);
+    const std::string step_text = colon == std::string::npos ? "1" : token.substr(colon + 1);
+
+    uint32_t start = 0;
+    uint32_t end = 0;
+    uint32_t step = 0;
+    if (!kvarn_parse_uint32_token(kvarn_trim(start_text), start) ||
+            !kvarn_parse_uint32_token(kvarn_trim(end_text), end) ||
+            !kvarn_parse_uint32_token(kvarn_trim(step_text), step) ||
+            step == 0 || end < start) {
+        throw std::invalid_argument("invalid KVarN layer-bit override range: " + token);
+    }
+
+    return il >= start && il <= end && ((il - start)%step) == 0;
+}
+
+static bool kvarn_layer_spec_contains(const std::string & spec, uint32_t il) {
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+        const size_t comma = spec.find(',', pos);
+        const std::string token = spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (kvarn_layer_spec_token_contains(token, il)) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return false;
+}
+
+static bool kvarn_apply_layer_bit_env(
+        const char * env_name,
+        uint32_t il,
+        uint32_t & bits) {
+    const char * env = std::getenv(env_name);
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+
+    bool changed = false;
+    const std::string rules(env);
+    size_t pos = 0;
+    while (pos <= rules.size()) {
+        const size_t semi = rules.find(';', pos);
+        const std::string rule = kvarn_trim(rules.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos));
+        if (!rule.empty()) {
+            const size_t eq = rule.find('=');
+            if (eq == std::string::npos) {
+                throw std::invalid_argument(std::string(env_name) + " rule must be '<layers>=<bits>': " + rule);
+            }
+
+            uint32_t parsed_bits = 0;
+            if (!kvarn_parse_uint32_token(kvarn_trim(rule.substr(eq + 1)), parsed_bits) || parsed_bits < 2 || parsed_bits > 8) {
+                throw std::invalid_argument(std::string(env_name) + " bits must be in [2,8]: " + rule);
+            }
+
+            if (kvarn_layer_spec_contains(rule.substr(0, eq), il)) {
+                bits = parsed_bits;
+                changed = true;
+            }
+        }
+        if (semi == std::string::npos) {
+            break;
+        }
+        pos = semi + 1;
+    }
+    return changed;
+}
+
+static llama_kvarn_params kvarn_params_for_layer(llama_kvarn_params params, uint32_t il, bool log_changes = false) {
+    const uint32_t old_k = params.key_bits;
+    const uint32_t old_v = params.value_bits;
+    const bool changed_k = kvarn_apply_layer_bit_env("LLAMA_KVARN_LAYER_KEY_BITS", il, params.key_bits);
+    const bool changed_v = kvarn_apply_layer_bit_env("LLAMA_KVARN_LAYER_VALUE_BITS", il, params.value_bits);
+    if (log_changes && (changed_k || changed_v) && (old_k != params.key_bits || old_v != params.value_bits)) {
+        std::fprintf(stderr,
+                "llama_kv_cache_kvarn: layer %u KVarN bit override k%u/v%u -> k%u/v%u\n",
+                il, old_k, old_v, params.key_bits, params.value_bits);
+    }
+    return params;
+}
+
+static llama_kvarn_params kvarn_apply_high_gqa_policy(
+        llama_kvarn_params params,
+        uint32_t il,
+        uint32_t n_head,
+        uint32_t n_head_kv,
+        bool log_changes = false) {
+    if (n_head_kv == 0 || params.key_bits >= 8 ||
+            kvarn_env_flag_01_enabled("LLAMA_KVARN_DISABLE_HIGH_GQA_K8")) {
+        return params;
+    }
+
+    const uint32_t gqa_ratio = n_head/n_head_kv;
+    if (n_head < 6*n_head_kv) {
+        return params;
+    }
+
+    const uint32_t old_k = params.key_bits;
+    params.key_bits = 8;
+    if (log_changes) {
+        std::fprintf(stderr,
+                "llama_kv_cache_kvarn: layer %u high-GQA ratio %u:%u promotes KVarN key bits k%u -> k8 "
+                "(set LLAMA_KVARN_DISABLE_HIGH_GQA_K8=1 only for ablations)\n",
+                il, n_head, n_head_kv, old_k);
+    }
+    GGML_UNUSED(gqa_ratio);
+    return params;
+}
+
+static llama_kvarn_params kvarn_params_for_layer(
+        llama_kvarn_params params,
+        const llama_hparams & hparams,
+        uint32_t il,
+        bool log_changes = false) {
+    params = kvarn_params_for_layer(params, il, log_changes);
+    return kvarn_apply_high_gqa_policy(params, il, hparams.n_head(il), hparams.n_head_kv(il), log_changes);
 }
 
 #ifdef LLAMA_BUILD
@@ -342,8 +553,9 @@ llama_kvarn_layout llama_kvarn_make_layout(const llama_kvarn_params & params, ui
         /*.group_size        =*/ params.group_size,
         /*.key_bits          =*/ params.key_bits,
         /*.value_bits        =*/ params.value_bits,
+        /*.v_layout          =*/ kvarn_v_layout_id(),
         /*.k_body_bytes      =*/ packed_nbytes(size_t(head_dim)*params.group_size, params.key_bits),
-        /*.v_body_bytes      =*/ packed_nbytes(size_t(head_dim)*params.group_size, params.value_bits),
+        /*.v_body_bytes      =*/ kvarn_v_body_bytes(head_dim, params.group_size, params.value_bits),
         /*.k_scale_floats    =*/ size_t(2)*head_dim + params.group_size,
         /*.v_scale_floats    =*/ head_dim + size_t(2)*params.group_size,
         /*.total_record_bytes=*/ 0,
@@ -495,6 +707,9 @@ llama_kvarn_body_record llama_kvarn_store_reference(
     if (k_tile.size() != n || v_tile.size() != n) {
         throw std::invalid_argument("KVarN tile size mismatch");
     }
+    if (layout.v_layout == LLAMA_KVARN_V_LAYOUT_TURBO_CANONICAL) {
+        throw std::runtime_error("KVarN CPU reference store does not implement canonical Turbo V layout");
+    }
 
     std::vector<float> k_rot;
     std::vector<float> v_rot;
@@ -545,6 +760,9 @@ void llama_kvarn_dequant_reference(
         std::vector<float> & k_tile,
         std::vector<float> & v_tile) {
     const llama_kvarn_layout & layout = record.layout;
+    if (layout.v_layout == LLAMA_KVARN_V_LAYOUT_TURBO_CANONICAL) {
+        throw std::runtime_error("KVarN CPU reference dequant does not implement canonical Turbo V layout");
+    }
     const size_t n = size_t(layout.head_dim)*layout.group_size;
 
     std::vector<uint8_t> k_q, v_q;
@@ -723,8 +941,9 @@ llama_kvarn_memory_estimate llama_kvarn_estimate_memory(
 
         result.fp16_sink_tail_bytes += size_t(n_head_kv)*n_sink_tail*(head_k + head_v)*sizeof(uint16_t);
 
-        const llama_kvarn_layout layout_k = llama_kvarn_make_layout(params, head_k);
-        const llama_kvarn_layout layout_v = llama_kvarn_make_layout(params, head_v);
+        const llama_kvarn_params layer_params = kvarn_params_for_layer(params, hparams, il);
+        const llama_kvarn_layout layout_k = llama_kvarn_make_layout(layer_params, head_k);
+        const llama_kvarn_layout layout_v = llama_kvarn_make_layout(layer_params, head_v);
         result.body_packed_bytes += size_t(n_head_kv)*n_records*(layout_k.k_body_bytes + layout_v.v_body_bytes);
         result.scale_bytes       += size_t(n_head_kv)*n_records*(layout_k.k_scale_floats + layout_v.v_scale_floats)*sizeof(float);
     }
@@ -1002,27 +1221,33 @@ ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_record_from_pending(
         ggml_tensor * scratch,
         int32_t il,
         uint32_t ih,
-        uint32_t record) const {
+        uint32_t record,
+        ggml_tensor * pending_k,
+        ggml_tensor * pending_v) const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
-    return kv->store_kv_body_record_from_pending(ctx, scratch, il, ih, record);
+    return kv->store_kv_body_record_from_pending(ctx, scratch, il, ih, record, pending_k, pending_v);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_all_heads_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
         int32_t il,
-        uint32_t record) const {
+        uint32_t record,
+        ggml_tensor * pending_k,
+        ggml_tensor * pending_v) const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
-    return kv->store_kv_body_all_heads_from_pending(ctx, scratch, il, record);
+    return kv->store_kv_body_all_heads_from_pending(ctx, scratch, il, record, pending_k, pending_v);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::store_kv_body_records_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
         int32_t il,
-        const std::vector<uint32_t> & records) const {
+        const std::vector<uint32_t> & records,
+        ggml_tensor * pending_k,
+        ggml_tensor * pending_v) const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
-    return kv->store_kv_body_records_from_pending(ctx, scratch, il, records);
+    return kv->store_kv_body_records_from_pending(ctx, scratch, il, records, pending_k, pending_v);
 }
 
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
@@ -1111,8 +1336,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         if (head_k != head_v) {
             throw std::invalid_argument("KVarN cache requires equal K and V head dimensions");
         }
-        const llama_kvarn_layout layout_k = llama_kvarn_make_layout(params, head_k);
-        const llama_kvarn_layout layout_v = llama_kvarn_make_layout(params, head_v);
+        const llama_kvarn_params layer_params = kvarn_params_for_layer(params, hparams, il, true);
+        const llama_kvarn_layout layout_k = llama_kvarn_make_layout(layer_params, head_k);
+        const llama_kvarn_layout layout_v = llama_kvarn_make_layout(layer_params, head_v);
         layer_heads.push_back(n_head_kv);
 
         layer_storage st = {};
@@ -1120,6 +1346,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         st.n_head_kv = n_head_kv;
         st.n_sink_tail = n_sink_tail;
         st.n_records = n_records;
+        st.layout_k = layout_k;
+        st.layout_v = layout_v;
         st.sink_tail_k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, head_k, n_head_kv, n_sink_tail_alloc);
         st.sink_tail_v = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, head_v, n_head_kv, n_sink_tail_alloc);
         st.body_k      = ggml_new_tensor_3d(ctx, GGML_TYPE_I8,  layout_k.k_body_bytes,   n_records_alloc, n_head_kv);
@@ -1138,9 +1366,10 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             const uint32_t n_records_w = std::min(n_body/params.group_size, n_records_alloc);
             const uint32_t n_pending = n_body%params.group_size;
             int64_t scratch_floats = int64_t(n_sink) + int64_t(n_records_w)*params.group_size + n_pending + n_tail;
-            const bool mirror_scratch = head_k >= 512 ||
+            const bool mirror_scratch =
                 kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_REF_SCRATCH") ||
-                (head_k == 256 && !kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR"));
+                kvarn_env_flag_enabled("LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE") ||
+                kvarn_env_flag_enabled("LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR");
             if (n_records_alloc > 0 && mirror_scratch) {
                 scratch_floats += 2*int64_t(n_head_kv)*int64_t(n_records_alloc)*int64_t(head_k)*int64_t(params.group_size);
             }
@@ -1163,12 +1392,16 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         caches.reserve(n_head_kv);
         for (uint32_t ih = 0; ih < n_head_kv; ++ih) {
             GGML_UNUSED(ih);
-            caches.emplace_back(params, kvarn_hparams_n_embd_head_k(hparams, il));
+            caches.emplace_back(layer_params, kvarn_hparams_n_embd_head_k(hparams, il));
         }
         runtime_cache.push_back(std::move(caches));
 
-        std::fprintf(stderr, "%s: KVarN layer %3u storage dev = %s, heads = %u, body records = %u\n",
-                __func__, il, dev_name, n_head_kv, n_records);
+        std::fprintf(stderr,
+                "%s: KVarN layer %3u storage dev = %s, heads = %u, body records = %u, "
+                "requested k%u/v%u effective k%u/v%u\n",
+                __func__, il, dev_name, n_head_kv, n_records,
+                params.key_bits, params.value_bits,
+                layout_k.key_bits, layout_v.value_bits);
     }
 
     if (reuse) {
@@ -1599,8 +1832,8 @@ llama_kvarn_layer_view llama_kv_cache_kvarn::get_layer_view(int32_t il) const {
         /*.n_records   =*/ st.n_records,
         /*.head_dim_k  =*/ head_k,
         /*.head_dim_v  =*/ head_v,
-        /*.layout_k    =*/ llama_kvarn_make_layout(params, head_k),
-        /*.layout_v    =*/ llama_kvarn_make_layout(params, head_v),
+        /*.layout_k    =*/ st.layout_k,
+        /*.layout_v    =*/ st.layout_v,
         /*.sink_tail_k =*/ st.sink_tail_k,
         /*.sink_tail_v =*/ st.sink_tail_v,
         /*.body_k      =*/ st.body_k,
@@ -1651,10 +1884,17 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
     const bool needs_pending_head_tiles = view.n_head_kv > 1 || view.head_dim_k >= 512;
     size_t result = needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
 
-    if (kvarn_env_flag_enabled("LLAMA_KVARN_ENABLE_DIRECT_RECORD_BATCH_PHASES")) {
+    // Direct prefill batches at most eight contiguous records per graph op.
+    // Production K4/K8 with V2/V4 now batches record x head phases by default,
+    // including exact log-std best-so-far state for both K and V.
+    if ((view.layout_k.key_bits == 4 || view.layout_k.key_bits == 8) &&
+            (view.layout_v.value_bits == 2 || view.layout_v.value_bits == 4)) {
         constexpr uint32_t direct_record_batch_max = 8;
-        const size_t batched_phase_scratch =
-            2*tile_floats*size_t(view.n_head_kv)*direct_record_batch_max;
+        const size_t n_tiles = size_t(view.n_head_kv)*direct_record_batch_max;
+        const size_t data_floats = n_tiles*tile_floats;
+        const size_t best_floats =
+            n_tiles*(size_t(view.head_dim_k) + params.group_size + 1);
+        const size_t batched_phase_scratch = 2*data_floats + 2*best_floats;
         result = std::max(result, batched_phase_scratch);
     }
     return result;
@@ -1727,7 +1967,7 @@ ggml_tensor * llama_kv_cache_kvarn::store_k_body_record(
     ggml_tensor * scales = view_k_scales_record(ctx, il, ih, record);
     return ggml_kvarn_store_k_body(
             ctx, k_tile, body, scales, scratch,
-            view.head_dim_k, params.group_size, params.key_bits, params.sinkhorn_iters, params.rtn_quantile);
+            view.head_dim_k, params.group_size, view.layout_k.key_bits, params.sinkhorn_iters, params.rtn_quantile);
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_v_body_record(
@@ -1740,9 +1980,11 @@ ggml_tensor * llama_kv_cache_kvarn::store_v_body_record(
     const llama_kvarn_layer_view view = get_layer_view(il);
     ggml_tensor * body   = view_v_body_record(ctx, il, ih, record);
     ggml_tensor * scales = view_v_scales_record(ctx, il, ih, record);
-    return ggml_kvarn_store_v_body(
+    ggml_tensor * store = ggml_kvarn_store_v_body(
             ctx, v_tile, body, scales, scratch,
-            view.head_dim_v, params.group_size, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+            view.head_dim_v, params.group_size, view.layout_v.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+    ggml_kvarn_store_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record(
@@ -1761,9 +2003,11 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record(
     ggml_tensor * v_body   = view_v_body_record(ctx, il, ih, record);
     ggml_tensor * k_scales = view_k_scales_record(ctx, il, ih, record);
     ggml_tensor * v_scales = view_v_scales_record(ctx, il, ih, record);
-    return ggml_kvarn_store_kv_body(
+    ggml_tensor * store = ggml_kvarn_store_kv_body(
             ctx, k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
-            view.head_dim_k, params.group_size, params.key_bits, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+            view.head_dim_k, params.group_size, view.layout_k.key_bits, view.layout_v.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+    ggml_kvarn_store_kv_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads(
@@ -1788,12 +2032,14 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads(
     ggml_tensor * v_body   = view_v_body_record_heads(ctx, il, record);
     ggml_tensor * k_scales = view_k_scales_record_heads(ctx, il, record);
     ggml_tensor * v_scales = view_v_scales_record_heads(ctx, il, record);
-    return ggml_kvarn_store_kv_body_pending_heads(
+    ggml_tensor * store = ggml_kvarn_store_kv_body_pending_heads(
             ctx, k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
             int32_t(view.n_head_kv), int32_t(record),
             int32_t(view.head_dim_k), int32_t(params.group_size),
-            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(view.layout_k.key_bits), int32_t(view.layout_v.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
+    ggml_kvarn_store_kv_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_all_heads(
@@ -1822,12 +2068,14 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_all_heads(
     ggml_tensor * v_body   = view_v_body_record_span_heads(ctx, il, record0, n_records);
     ggml_tensor * k_scales = view_k_scales_record_span_heads(ctx, il, record0, n_records);
     ggml_tensor * v_scales = view_v_scales_record_span_heads(ctx, il, record0, n_records);
-    return ggml_kvarn_store_kv_body_direct_records(
+    ggml_tensor * store = ggml_kvarn_store_kv_body_direct_records(
             ctx, k_tiles, v_tiles, k_body, v_body, k_scales, v_scales, scratch,
             int32_t(view.n_head_kv), int32_t(record0), int32_t(n_records),
             int32_t(view.head_dim_k), int32_t(params.group_size),
-            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(view.layout_k.key_bits), int32_t(view.layout_v.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
+    ggml_kvarn_store_kv_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_k_body_record_from_pending(
@@ -1994,7 +2242,9 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
         int32_t il,
-        const std::vector<uint32_t> & records) const {
+        const std::vector<uint32_t> & records,
+        ggml_tensor * pending_k,
+        ggml_tensor * pending_v) const {
     const size_t li = layer_storage_index(il);
     const llama_kvarn_layer_view view = get_layer_view(il);
     if (records.empty()) {
@@ -2015,22 +2265,28 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_from_pending(
     }
 
     std::vector<int32_t> record_ids(records.begin(), records.end());
-    return ggml_kvarn_store_kv_body_pending_records(
-            ctx, layer_tensors[li].pending_k, layer_tensors[li].pending_v,
+    ggml_tensor * pending_k_src = pending_k != nullptr ? pending_k : layer_tensors[li].pending_k;
+    ggml_tensor * pending_v_src = pending_v != nullptr ? pending_v : layer_tensors[li].pending_v;
+    ggml_tensor * store = ggml_kvarn_store_kv_body_pending_records(
+            ctx, pending_k_src, pending_v_src,
             layer_tensors[li].body_k, layer_tensors[li].body_v,
             layer_tensors[li].scales_k, layer_tensors[li].scales_v,
             scratch,
             record_ids.data(), int32_t(record_ids.size()),
             int32_t(view.head_dim_k), int32_t(params.group_size),
-            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(view.layout_k.key_bits), int32_t(view.layout_v.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
+    ggml_kvarn_store_kv_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads_from_pending(
         ggml_context * ctx,
         ggml_tensor * scratch,
         int32_t il,
-        uint32_t record) const {
+        uint32_t record,
+        ggml_tensor * pending_k,
+        ggml_tensor * pending_v) const {
     const size_t li = layer_storage_index(il);
     const llama_kvarn_layer_view view = get_layer_view(il);
     if (record >= view.n_records) {
@@ -2040,20 +2296,24 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads_from_pending(
         throw std::runtime_error("KVarN fused pending K/V body store requires equal K and V head dimensions");
     }
     if (view.n_head_kv <= 1) {
-        return store_kv_body_record_from_pending(ctx, scratch, il, 0, record);
+        return store_kv_body_record_from_pending(ctx, scratch, il, 0, record, pending_k, pending_v);
     }
 
+    ggml_tensor * pending_k_src = pending_k != nullptr ? pending_k : layer_tensors[li].pending_k;
+    ggml_tensor * pending_v_src = pending_v != nullptr ? pending_v : layer_tensors[li].pending_v;
     ggml_tensor * k_body   = view_k_body_record_heads(ctx, il, record);
     ggml_tensor * v_body   = view_v_body_record_heads(ctx, il, record);
     ggml_tensor * k_scales = view_k_scales_record_heads(ctx, il, record);
     ggml_tensor * v_scales = view_v_scales_record_heads(ctx, il, record);
-    return ggml_kvarn_store_kv_body_pending_heads(
-            ctx, layer_tensors[li].pending_k, layer_tensors[li].pending_v,
+    ggml_tensor * store = ggml_kvarn_store_kv_body_pending_heads(
+            ctx, pending_k_src, pending_v_src,
             k_body, v_body, k_scales, v_scales, scratch,
             int32_t(view.n_head_kv), int32_t(record),
             int32_t(view.head_dim_k), int32_t(params.group_size),
-            int32_t(params.key_bits), int32_t(params.value_bits),
+            int32_t(view.layout_k.key_bits), int32_t(view.layout_v.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
+    ggml_kvarn_store_kv_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record_from_pending(
@@ -2061,28 +2321,32 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record_from_pending(
         ggml_tensor * scratch,
         int32_t il,
         uint32_t ih,
-        uint32_t record) const {
+        uint32_t record,
+        ggml_tensor * pending_k,
+        ggml_tensor * pending_v) const {
     const size_t li = layer_storage_index(il);
     const llama_kvarn_layer_view view = get_layer_view(il);
     assert_kvarn_record_view_bounds(view, ih, record);
     if (view.head_dim_k != view.head_dim_v) {
         throw std::runtime_error("KVarN fused pending K/V body store requires equal K and V head dimensions");
     }
-    GGML_ASSERT(view.head_dim_k == uint32_t(layer_tensors[li].pending_k->ne[0]));
-    GGML_ASSERT(view.head_dim_v == uint32_t(layer_tensors[li].pending_v->ne[0]));
+    ggml_tensor * pending_k_src = pending_k != nullptr ? pending_k : layer_tensors[li].pending_k;
+    ggml_tensor * pending_v_src = pending_v != nullptr ? pending_v : layer_tensors[li].pending_v;
+    GGML_ASSERT(view.head_dim_k == uint32_t(pending_k_src->ne[0]));
+    GGML_ASSERT(view.head_dim_v == uint32_t(pending_v_src->ne[0]));
 
-    const size_t k_offset = size_t(ih)*layer_tensors[li].pending_k->nb[1];
+    const size_t k_offset = size_t(ih)*pending_k_src->nb[1];
     ggml_tensor * k_pending = ggml_view_2d(
-            ctx, layer_tensors[li].pending_k,
+            ctx, pending_k_src,
             view.head_dim_k, params.group_size,
-            layer_tensors[li].pending_k->nb[2], k_offset);
+            pending_k_src->nb[2], k_offset);
     ggml_tensor * k_tile = ggml_cont(ctx, ggml_transpose(ctx, k_pending));
 
-    const size_t v_offset = size_t(ih)*layer_tensors[li].pending_v->nb[1];
+    const size_t v_offset = size_t(ih)*pending_v_src->nb[1];
     ggml_tensor * v_pending = ggml_view_2d(
-            ctx, layer_tensors[li].pending_v,
+            ctx, pending_v_src,
             view.head_dim_v, params.group_size,
-            layer_tensors[li].pending_v->nb[2], v_offset);
+            pending_v_src->nb[2], v_offset);
     ggml_tensor * v_tile = ggml_cont(ctx, v_pending);
 
     return store_kv_body_record(ctx, k_tile, v_tile, scratch, il, ih, record);
@@ -2297,17 +2561,16 @@ void llama_kv_cache_kvarn::set_input_kq_mask(ggml_tensor * dst, const llama_ubat
         last_pos = ubatch->pos[n_tokens - 1];
     }
 
-    // KVarN mixed attention expands the active cache in logical token order:
-    // sink | sealed body | pending | tail. For single-sequence prefill this is
-    // still positions [0, n_seen), even though body storage is compressed.
-    //
-    // Some graph paths reuse a mask tensor whose ubatch positions describe the
-    // batch end more reliably than every individual row. Deriving the query row
-    // positions from the final position keeps multi-token KVarN prefill causal
-    // and avoids admitting future tail/body tokens.
     const llama_pos q_base = causal_attn && n_tokens > 0 && last_pos >= llama_pos(n_tokens - 1) ?
         last_pos - llama_pos(n_tokens - 1) :
         llama_pos(0);
+    bool use_contiguous_query_positions = causal_attn;
+    if (causal_attn && ubatch->pos != nullptr) {
+        use_contiguous_query_positions = last_pos >= llama_pos(n_tokens - 1);
+        for (int64_t q = 0; q < n_tokens && use_contiguous_query_positions; ++q) {
+            use_contiguous_query_positions = ubatch->pos[q] == q_base + llama_pos(q);
+        }
+    }
 
     const auto write = [&](int64_t t, int64_t q, float v) {
         char * p = (char *) dst->data + size_t(q)*dst->nb[1] + size_t(t)*dst->nb[0];
@@ -2318,12 +2581,54 @@ void llama_kv_cache_kvarn::set_input_kq_mask(ggml_tensor * dst, const llama_ubat
         }
     };
 
-    for (int64_t q = 0; q < dst->ne[1]; ++q) {
-        const llama_pos pos = causal_attn ? q_base + llama_pos(q) :
-            (ubatch->pos ? ubatch->pos[q] : llama_pos(q));
-        const int64_t visible = causal_attn && pos >= 0 ? std::min<int64_t>(n_kv, int64_t(pos) + 1) : n_kv;
+    llama_kvarn_params effective_params = params;
+    if (kv_size != 0 && uint64_t(effective_params.sink_tokens) + uint64_t(effective_params.tail_tokens) > kv_size) {
+        if (effective_params.sink_tokens >= kv_size) {
+            effective_params.tail_tokens = 0;
+        } else {
+            effective_params.tail_tokens = kv_size - effective_params.sink_tokens;
+        }
+    }
+
+    const int64_t invalid_key_pos = std::numeric_limits<int64_t>::max();
+    std::vector<int64_t> key_positions(size_t(n_kv), invalid_key_pos);
+    if (last_pos >= 0) {
+        const uint32_t n_seen = uint32_t(last_pos) + 1;
+        const uint32_t n_sink = std::min<uint32_t>(n_seen, effective_params.sink_tokens);
+        const uint32_t n_after_sink = n_seen - n_sink;
+        const uint32_t n_tail = std::min<uint32_t>(n_after_sink, effective_params.tail_tokens);
+        const uint32_t n_body_pending = n_after_sink - n_tail;
+        const uint32_t n_records = n_body_pending/effective_params.group_size;
+        const uint32_t n_pending = n_body_pending%effective_params.group_size;
+        const uint32_t n_body = n_records*effective_params.group_size;
+
+        uint32_t t = 0;
+        for (uint32_t i = 0; i < n_sink && t < uint32_t(n_kv); ++i, ++t) {
+            key_positions[t] = int64_t(i);
+        }
+        for (uint32_t i = 0; i < n_body && t < uint32_t(n_kv); ++i, ++t) {
+            key_positions[t] = int64_t(effective_params.sink_tokens) + i;
+        }
+        for (uint32_t i = 0; i < n_pending && t < uint32_t(n_kv); ++i, ++t) {
+            key_positions[t] = int64_t(effective_params.sink_tokens) + n_body + i;
+        }
+        for (uint32_t i = 0; i < n_tail && t < uint32_t(n_kv); ++i, ++t) {
+            key_positions[t] = int64_t(effective_params.sink_tokens) + n_body_pending + i;
+        }
+    } else if (!causal_attn) {
         for (int64_t t = 0; t < n_kv; ++t) {
-            write(t, q, t < visible ? 0.0f : -INFINITY);
+            key_positions[size_t(t)] = t;
+        }
+    }
+
+    for (int64_t q = 0; q < dst->ne[1]; ++q) {
+        const llama_pos pos = causal_attn ?
+            (use_contiguous_query_positions ? q_base + llama_pos(q) : ubatch->pos[q]) :
+            (ubatch->pos ? ubatch->pos[q] : llama_pos(q));
+        for (int64_t t = 0; t < n_kv; ++t) {
+            const bool visible = !causal_attn || (key_positions[size_t(t)] != invalid_key_pos &&
+                pos >= 0 && key_positions[size_t(t)] <= int64_t(pos));
+            write(t, q, visible ? 0.0f : -INFINITY);
         }
     }
 

@@ -17,7 +17,7 @@ Reference contracts:
 
 Run:
   python scripts/kvarn/kvarn_vllm_oracle.py --self-test
-  python scripts/kvarn/kvarn_vllm_oracle.py --self-test --head-dims 128,256,512 --presets k4v2,k4v4,k8v8
+  python scripts/kvarn/kvarn_vllm_oracle.py --self-test --head-dims 128,256,512 --presets k4v2,k4v4,k8v2,k8v4,k8v8
 """
 
 from __future__ import annotations
@@ -48,9 +48,13 @@ class Preset:
 PRESETS = {
     "kvarn_k4v2_g128": Preset("kvarn_k4v2_g128", 4, 2, 128),
     "kvarn_k4v4_g128": Preset("kvarn_k4v4_g128", 4, 4, 128),
+    "kvarn_k8v2_g128": Preset("kvarn_k8v2_g128", 8, 2, 128),
+    "kvarn_k8v4_g128": Preset("kvarn_k8v4_g128", 8, 4, 128),
     "kvarn_k8v8_g128": Preset("kvarn_k8v8_g128", 8, 8, 128),
     "k4v2": Preset("kvarn_k4v2_g128", 4, 2, 128),
     "k4v4": Preset("kvarn_k4v4_g128", 4, 4, 128),
+    "k8v2": Preset("kvarn_k8v2_g128", 8, 2, 128),
+    "k8v4": Preset("kvarn_k8v4_g128", 8, 4, 128),
     "k8v8": Preset("kvarn_k8v8_g128", 8, 8, 128),
 }
 
@@ -302,7 +306,7 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--head-dims", default="128,256,512")
-    ap.add_argument("--presets", default="k4v2,k4v4,k8v8")
+    ap.add_argument("--presets", default="k4v2,k4v4,k8v2,k8v4,k8v8")
     ap.add_argument("--iters", type=int, default=8)
     ap.add_argument("--queries", type=int, default=7)
     ap.add_argument("--seed", type=int, default=1234)

@@ -13,12 +13,15 @@ attention/store path on `kvarn-atx-integration`.
    the same build/model/dataset (perplexity delta, or `-UseKLDivergence` for a
    more sensitive per-token check).
 
-2. **Suspected correctness bug to verify first.** The Hadamard rotation is
-   applied to the quantized **body** K/V but not to Q, not to the plain-f16
-   **sink/tail** K/V, and the output is never un-rotated. Within one attention
-   op, body tokens use rotated K while sink/tail tokens use un-rotated K, both
-   dotted against the same un-rotated Q - the two cannot both be correct. Run
-   the gate; if KVarN perplexity is far above f16, this is the cause.
+2. **Gemma4 needed two separate fixes.** The first problem was the test
+   harness: Gemma was being judged on fixtures with literal `<unk>` and
+   mismatched chat/control-token surfaces, so the absolute baseline PPL was not
+   a valid model-health signal. The second problem was the forced
+   Gemma4+ISWA KVarN route and validation corpus. The old small sanity fixture
+   implicated donor layers 11 and 47, but a Gemma-rendered 16k chat fixture now
+   passes with all full-attention donors KVarN-routed. The all-full route is the
+   default; `LLAMA_KVARN_GEMMA4_ROUTE_CONSERVATIVE=1` keeps the old hybrid route
+   only for rollback/reproduction.
 
 3. **Why it is slower than mainline** is architectural, not a tuning miss: the
    "exact" production paths dequantize the cache to an f32/f16 scratch mirror
@@ -26,29 +29,47 @@ attention/store path on `kvarn-atx-integration`.
    than mainline f16 + flash-attention. The only path that could win (warp-QK
    reading packed/f16 directly) is disabled for 256d.
 
-## Finding 1 - Hadamard rotation is applied inconsistently
+## Finding 1 - Gemma fixture and route correctness
 
-Paper / vLLM premise: an orthonormal Hadamard rotation `H` in the channel
-dimension preserves attention because `(Hq)*(Hk) = q*k`. That identity only
-holds if **both** Q and K are rotated (and the V output un-rotated).
+The old Gemma absolute-PPL numbers were not trustworthy. The model and
+perplexity scorer can produce sane absolute PPL on the deliberately
+low-entropy sanity fixture:
 
-Store side rotates the body:
-- `src/llama-kv-cache-kvarn.cpp:347-348` - body K/V `llama_kvarn_hadamard_channels(...)`
-- `ggml/src/ggml-cuda/kvarn.cu:849-855, 900-906` - same on the CUDA store path
+- normal KV, Q4 GPU, `ctx=512`: `PPL = 1.1071 +/- 0.07188`
+- KVarN `kvarn_k4v2_g128`, conservative route: `PPL = 1.0724 +/- 0.03914`
+- KVarN `kvarn_k8v8_g128`, conservative route: `PPL = 1.0461 +/- 0.02530`
+- KVarN `kvarn_k8v8_g128`, all full-attention donors: `PPL = 484746.4909`
 
-Read side does **not** complete the transform:
-- `src/llama-graph.cpp:3255` - `q_cur` enters `ggml_kvarn_attn_mixed` un-rotated.
-  The `ggml_mul_mat_aux(q_cur, self_k_rot)` at `3287-3290` is in the *non-KVarN*
-  fall-through path, after the KVarN block returns.
-- `ggml/src/ggml-cuda/kvarn.cu:2964-2966` - body K is reconstructed as
-  `(kq*k_s_col[d] + k_zp[d])*k_s_row[g]` = `H*k`, dotted against raw `q`; no
-  inverse `H`.
-- `src/llama-kv-cache-kvarn.cpp:439-443` - sink/tail K/V stored raw
-  (`append_fp32_as_fp16`), i.e. **un-rotated**, while the body is rotated.
+Behavioral bisection on the old short fixture implicated full-attention physical
+donor layers 11 and 47 for this Gemma4-12B layout. That was not enough evidence
+to permanently bypass those layers: on the Gemma-rendered 16k chat fixture,
+all-full routing now passes for `kvarn_k4v2_g128`, `kvarn_k4v4_g128`, and
+`kvarn_k8v8_g128`, with sane baseline PPL:
 
-Because every existing test reconstructs the rotated body identically on both
-sides, they all pass while potentially being wrong vs true attention. Confirm
-with the gate before any further perf work.
+- `kvarn_k4v2_g128`: f16 `3.7114`, KVarN `3.2218`, delta `-13.19%`
+- `kvarn_k4v4_g128`: f16 `3.7114`, KVarN `3.6006`, delta `-2.99%`
+- `kvarn_k8v8_g128`: f16 `3.7114`, KVarN `3.6308`, delta `-2.17%`
+
+The default forced Gemma4+ISWA route in `src/llama-model.cpp` therefore routes
+all full-attention donors through KVarN. Set
+`LLAMA_KVARN_GEMMA4_ROUTE_CONSERVATIVE=1` only to reproduce the old hybrid
+rollback route (`5,17,23,29,35,41` KVarN; `11,47` normal full KV).
+
+The critic caveat remains important: the current 16k fixture is synthetic and
+negative PPL deltas mean it is not a broad quality proof by itself. It is,
+however, enough to reject the old "layers 11 and 47 must stay uncompressed"
+default and move the default route back to the production-relevant all-full
+path.
+
+## Finding 1b - Hadamard rotation still needs audit
+
+The earlier Hadamard concern remains a separate audit item, not the current
+explanation for the Gemma baseline PPL issue. The KVarN store path rotates the
+quantized body while sink/tail KV remain plain and the read path must preserve
+the attention identity across all segments. Existing packed-vs-split tests can
+miss a shared systematic transform error because both sides reconstruct the
+same stored representation. Keep this on the correctness checklist, but do not
+use it as the primary explanation for the fixed Gemma fixture results above.
 
 ## Finding 2 - the throughput gap is structural
 
@@ -115,3 +136,46 @@ The script forces `-np 1 -fit off` and sets `-b <= -c` for both f16 and KVarN
 runs because `llama-perplexity` derives its internal sequence count from
 `batch/context`; KVarN rejects multi-sequence execution, including hidden
 retries from the auto-fit path.
+
+## Baseline and fixture sanity
+
+The gate now refuses to compare KVarN against an unhealthy reference:
+
+- It runs a fixture preflight before perplexity. The preflight fails on
+  literal `<unk>` contamination, on chat markers that do not appear in the
+  model's GGUF chat template, and on actual tokenizer unknown-token ID rates
+  above `-MaxFixtureTokenUnkRate`.
+- In perplexity-delta mode, it runs the normal-KV baseline first and skips the
+  KVarN run when baseline PPL exceeds `-MaxBaselinePpl` (default `100`). Disable
+  this only with an explicit `-MaxBaselinePpl 0` when you have an external
+  reason to trust the corpus/model pairing.
+- In KL-divergence mode, the normal-KV logits are the reference distribution, so
+  the gate records baseline PPL but does not enforce `-MaxBaselinePpl` unless
+  you pass that parameter explicitly. This is the preferred correctness mode for
+  instruction-tuned Gemma fixtures where absolute next-token PPL on a
+  hand-written corpus is not a meaningful model-health score.
+- For Gemma/Qwen/etc. fixtures that contain literal control tokens such as
+  `<|turn>` or `<turn|>`, pass `-ParseSpecial`. `llama-perplexity` otherwise
+  tokenizes those strings as ordinary text, which invalidates chat-template
+  correctness measurements.
+
+Do not report Gemma KVarN correctness from the old
+`artifacts/kvarn-long-multiturn/multiturn_16k_4turns.txt` fixture. That file
+contains Qwen-style markers and a high literal `<unk>` rate, so Gemma's normal
+KV baseline is not a trustworthy reference on it.
+
+For a fast Gemma PPL harness sanity check, use
+`scripts/kvarn/fixtures/gemma4_predictable_sanity.txt`. It is deliberately
+low-entropy text and is not a benchmark-quality language-model evaluation, but
+it proves that the model, tokenizer, file-input path, and perplexity scorer can
+produce sane absolute PPL before long KVarN runs start.
+
+Also do not use
+`external/terminal-bench/tasks/word2vec-from-scratch/wikitext-data/validation.txt`
+as a Gemma health baseline. It is WikiText-style preprocessed text with thousands
+of literal `<unk>` placeholders and artifacts such as `@-@`, `@,@`, and spaced
+punctuation. In Gemma-family tokenizers, `<unk>` is a meaningful unknown-token
+surface form, while other model families may split the same string as ordinary
+text. That makes cross-model absolute PPL comparisons on this fixture
+misleading. Use it only after fixture preflight passes and the Gemma normal-KV
+baseline is independently sane.

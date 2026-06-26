@@ -42,19 +42,22 @@ inline static uint32_t kvarn_tail_safe_ubatch_limit(
         return 1;
     }
 
-    // The initial contiguous prompt can be stored directly from the current
-    // K/V tensors by the KVarN graph prefill path, so it is not constrained by
-    // tail-ring eviction staging.
-    const char * disable_direct_prefill = std::getenv("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN");
-    if ((disable_direct_prefill == nullptr || disable_direct_prefill[0] != '1') && i0 == 0 && first_pos == 0) {
-        return std::min<uint32_t>(default_limit, uint32_t(batch.n_tokens));
-    }
+    // Every KVarN graph writes the current K/V tokens into the sink/tail cache
+    // with one ggml_set_rows op.  Tail rows are a ring, so duplicate row indices
+    // inside the same ubatch are not chronological-order safe on parallel
+    // backends.  Bound contiguous chunks so each sink/tail destination row is
+    // written at most once.
+    const uint32_t sink_prefix =
+        uint32_t(first_pos) < n_sink_tokens ? n_sink_tokens - uint32_t(first_pos) : 0;
+    const uint32_t max_unique_sink_tail = sink_prefix + n_tail_tokens;
 
     uint32_t n_safe = 0;
     uint32_t n_tail_evict = 0;
     llama_pos expected_pos = first_pos;
 
-    for (uint32_t i = i0; i < uint32_t(batch.n_tokens) && n_safe < default_limit; ++i) {
+    for (uint32_t i = i0;
+            i < uint32_t(batch.n_tokens) && n_safe < default_limit && n_safe < max_unique_sink_tail;
+            ++i) {
         const llama_pos pos = batch.pos[i];
         if (pos < 0 || pos != expected_pos) {
             break;

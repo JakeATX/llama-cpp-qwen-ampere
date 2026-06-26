@@ -153,6 +153,48 @@ try {
     Invoke-ExpectFailure `
         $results `
         $commonKvarn `
+        @{ "LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE=bogus" `
+        "KVarN invalid f32 dequant-cache env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR=bogus" `
+        "KVarN invalid body f32 mirror env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_DISABLE_Q1_GQA_SCALAR" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ATTN_DISABLE_Q1_GQA_SCALAR=bogus" `
+        "KVarN invalid q1-GQA disable env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR=bogus" `
+        "KVarN invalid q1-GQA require env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES=bogus" `
+        "KVarN invalid direct-record require env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
+        @{ "LLAMA_KVARN_DISABLE_FUSED_FWHT" = "bogus" } `
+        "invalid KVarN environment flag LLAMA_KVARN_DISABLE_FUSED_FWHT=bogus" `
+        "KVarN invalid fused-FWHT rollback env rejection"
+
+    Invoke-ExpectFailure `
+        $results `
+        $commonKvarn `
         @{ "LLAMA_KVARN_ATTN_TRACE" = "2" } `
         "invalid KVarN environment flag LLAMA_KVARN_ATTN_TRACE=2" `
         "KVarN out-of-range trace env rejection"

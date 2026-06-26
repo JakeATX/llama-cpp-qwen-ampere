@@ -1,7 +1,7 @@
 param(
     [string] $Python = "python",
     [string] $HeadDims = "128,256,512",
-    [string] $Presets = "k4v2,k4v4,k8v8",
+    [string] $Presets = "k4v2,k4v4,k8v2,k8v4,k8v8",
     [int] $Iters = 8,
     [int] $Queries = 7,
     [int] $Seed = 1234

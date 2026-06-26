@@ -192,8 +192,33 @@ def reconstruct_kv(root: Path, meta: dict) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(k_rows, axis=0).astype(np.float32), np.concatenate(v_rows, axis=0).astype(np.float32)
 
 
-def replay_row(q: np.ndarray, mask: np.ndarray, k_all: np.ndarray, v_all: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    scores = (k_all @ q).astype(np.float32) * np.float32(scale) + mask
+def replay_row(
+    q: np.ndarray,
+    q_body: np.ndarray | None,
+    mask: np.ndarray,
+    k_all: np.ndarray,
+    v_all: np.ndarray,
+    meta: dict,
+    scale: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n_sink = int(meta["n_sink"])
+    n_records = int(meta["n_records"])
+    group_size = int(meta["group_size"])
+    n_pending = int(meta["n_pending"])
+    n_body = n_records * group_size
+    scores = np.zeros(k_all.shape[0], dtype=np.float32)
+    if n_sink:
+        scores[:n_sink] = (k_all[:n_sink] @ q).astype(np.float32)
+    if n_body:
+        body_q = q if q_body is None else q_body
+        scores[n_sink:n_sink + n_body] = (k_all[n_sink:n_sink + n_body] @ body_q).astype(np.float32)
+    pending0 = n_sink + n_body
+    pending1 = pending0 + n_pending
+    if n_pending:
+        scores[pending0:pending1] = (k_all[pending0:pending1] @ q).astype(np.float32)
+    if pending1 < k_all.shape[0]:
+        scores[pending1:] = (k_all[pending1:] @ q).astype(np.float32)
+    scores = scores * np.float32(scale) + mask
     probs = softmax(scores)
     replay_out = (probs.astype(np.float32) @ v_all.astype(np.float32)).astype(np.float32)
     return scores, probs, replay_out
@@ -214,6 +239,11 @@ def replay_full_qo(root: Path, meta: dict, k_all: np.ndarray, v_all: np.ndarray,
     selected_iq = int(meta["selected_iq"])
 
     full_q = np.fromfile(full_q_path, dtype=np.float32, count=n_queries * n_head * d).reshape(n_queries, n_head, d)
+    full_q_body_path = root / "full_q_body.bin"
+    full_q_body = (
+        np.fromfile(full_q_body_path, dtype=np.float32, count=n_queries * n_head * d).reshape(n_queries, n_head, d)
+        if full_q_body_path.exists() else None
+    )
     full_out = np.fromfile(full_out_path, dtype=np.float32, count=n_queries * n_head * d).reshape(n_queries, n_head, d)
     full_mask = read_full_mask(root, meta, n_queries, n_tokens)
     selected_mask = None if full_mask is not None else read_mask(root, meta, n_tokens)
@@ -226,7 +256,8 @@ def replay_full_qo(root: Path, meta: dict, k_all: np.ndarray, v_all: np.ndarray,
     for iq in covered_queries:
         mask = full_mask[iq] if full_mask is not None else selected_mask
         for ih in covered_heads:
-            _, _, replay_out = replay_row(full_q[iq, ih], mask, k_all, v_all, scale)
+            row_q_body = None if full_q_body is None else full_q_body[iq, ih]
+            _, _, replay_out = replay_row(full_q[iq, ih], row_q_body, mask, k_all, v_all, meta, scale)
             actual_out = full_out[iq, ih]
             row_nmse = nmse(replay_out, actual_out)
             row_mae, row_idx = max_abs(replay_out, actual_out)
@@ -292,6 +323,8 @@ def main() -> int:
     scale = float(meta["scale"])
 
     q = np.fromfile(root / "q.bin", dtype=np.float32, count=d).astype(np.float32)
+    q_body_path = root / "q_body.bin"
+    q_body = np.fromfile(q_body_path, dtype=np.float32, count=d).astype(np.float32) if q_body_path.exists() else None
     out_file = root / "mixed_out.bin"
     if not out_file.exists():
         out_file = root / "warpqk_out.bin"
@@ -304,7 +337,7 @@ def main() -> int:
         raise SystemExit(f"reconstructed V shape {v_all.shape} != {(n_tokens, d)}")
 
     mask = read_mask(root, meta, n_tokens)
-    scores, probs, replay_out = replay_row(q, mask, k_all, v_all, scale)
+    scores, probs, replay_out = replay_row(q, q_body, mask, k_all, v_all, meta, scale)
 
     out_nmse = nmse(replay_out, actual_out)
     out_mae, out_idx = max_abs(replay_out, actual_out)

@@ -51,6 +51,55 @@ static bool kvarn_graph_parse_env_flag(const char * name) {
     return value != 0;
 }
 
+static bool kvarn_graph_paper_mixed_frame_enabled() {
+    if (!kvarn_graph_parse_env_flag("LLAMA_KVARN_PAPER_MIXED_FRAME")) {
+        return false;
+    }
+    if (!kvarn_graph_parse_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_PAPER_MIXED_FRAME")) {
+        throw std::runtime_error(
+                "LLAMA_KVARN_PAPER_MIXED_FRAME is diagnostic-only because it can silently "
+                "disagree with graph/output frame handling. Set "
+                "LLAMA_KVARN_UNSAFE_ALLOW_PAPER_MIXED_FRAME=1 only for targeted frame A/B tests.");
+    }
+    return true;
+}
+
+static bool kvarn_graph_prefill_direct_store_disabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_STORE");
+}
+
+static bool kvarn_graph_prefill_direct_attn_disabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN");
+}
+
+static bool kvarn_graph_iswa_sinktail_mha_disabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_ISWA_SINKTAIL_MHA");
+}
+
+static bool kvarn_graph_iswa_prefill_direct_attn_allowed() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_UNSAFE_ENABLE_ISWA_PREFILL_DIRECT_ATTN");
+}
+
+static bool kvarn_graph_iswa_force_full_normal_attn() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN");
+}
+
+static bool kvarn_graph_iswa_materialize_mha_enabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_MATERIALIZE_MHA");
+}
+
+static bool kvarn_graph_iswa_dual_mha_compare_enabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_DUAL_MHA_COMPARE");
+}
+
+static bool kvarn_graph_iswa_raw_mha_compare_enabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_RAW_MHA_COMPARE");
+}
+
+static bool kvarn_graph_iswa_turbo_v_frame_enabled() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME");
+}
+
 static int kvarn_graph_parse_env_int(const char * name, int default_value) {
     const char * env = std::getenv(name);
     if (env == nullptr) {
@@ -177,7 +226,10 @@ static bool can_reuse_kq_mask(
 static ggml_tensor * ggml_mul_mat_aux(
         ggml_context * ctx,
         ggml_tensor * cur,
-        ggml_tensor * rot) {
+        ggml_tensor * rot,
+        bool hadamard_hint = true,
+        ggml_backend_sched_t sched = nullptr,
+        ggml_backend_t backend = nullptr) {
     const auto n = rot->ne[0];
 
     ggml_tensor * res;
@@ -188,7 +240,12 @@ static ggml_tensor * ggml_mul_mat_aux(
         res = ggml_reshape_2d(ctx, cur, n, ggml_nelements(cur)/n);
     }
     res = ggml_mul_mat   (ctx, rot, res);
-    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    if (sched != nullptr && backend != nullptr) {
+        ggml_backend_sched_set_tensor_backend(sched, res, backend);
+    }
+    if (hadamard_hint) {
+        ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    }
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;
@@ -682,6 +739,43 @@ static std::vector<uint32_t> kvarn_graph_seal_records(const llama_kvarn_params &
     return records;
 }
 
+struct kvarn_tail_evict_slice {
+    int64_t start = 0;
+    int64_t count = 0;
+    bool contiguous = true;
+};
+
+static kvarn_tail_evict_slice kvarn_graph_tail_evict_slice_for_record(
+        const llama_kvarn_params & params,
+        const llama_ubatch & ubatch,
+        uint32_t kv_size,
+        uint32_t target_record) {
+    const llama_kvarn_params p = kvarn_graph_effective_params(params, kv_size);
+    kvarn_tail_evict_slice result;
+    int64_t j = 0;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_pos pos = ubatch.pos ? ubatch.pos[i] : llama_pos(i);
+        if (pos < 0 || uint32_t(pos) < p.sink_tokens + p.tail_tokens) {
+            continue;
+        }
+
+        const uint32_t evicted_pos = uint32_t(pos) - p.tail_tokens;
+        const uint32_t body_pos = evicted_pos - p.sink_tokens;
+        const uint32_t record = body_pos/p.group_size;
+        if (record == target_record) {
+            if (result.count > 0 && result.start + result.count != j) {
+                result.contiguous = false;
+            }
+            if (result.count == 0) {
+                result.start = j;
+            }
+            ++result.count;
+        }
+        ++j;
+    }
+    return result;
+}
+
 static kvarn_active_window kvarn_graph_active_window(const llama_kvarn_params & params, const llama_ubatch & ubatch, uint32_t kv_size) {
     const llama_kvarn_params p = kvarn_graph_effective_params(params, kv_size);
     kvarn_active_window result;
@@ -766,9 +860,6 @@ static uint32_t kvarn_graph_reuse_mask_n_kv(
 static void kvarn_graph_update_mixed_attn_params(ggml_tensor * node, const kvarn_active_window & window) {
     GGML_ASSERT(node->op == GGML_OP_KVARN_ATTN_MIXED);
 
-    float scale = 0.0f;
-    std::memcpy(&scale, &node->op_params[9], sizeof(scale));
-
     struct {
         int32_t n_sink;
         int32_t n_records;
@@ -780,18 +871,17 @@ static void kvarn_graph_update_mixed_attn_params(ggml_tensor * node, const kvarn
         int32_t key_bits;
         int32_t value_bits;
         float   scale;
-    } params = {
-        window.n_sink,
-        window.n_records,
-        window.n_pending,
-        window.n_tail,
-        window.tail_start,
-        node->op_params[5],
-        node->op_params[6],
-        node->op_params[7],
-        node->op_params[8],
-        scale,
-    };
+        float   logit_softcap;
+        int32_t frame_flags;
+        int32_t v_layout;
+    } params;
+
+    std::memcpy(&params, node->op_params, sizeof(params));
+    params.n_sink    = window.n_sink;
+    params.n_records = window.n_records;
+    params.n_pending = window.n_pending;
+    params.n_tail    = window.n_tail;
+    params.tail_start = window.tail_start;
 
     std::memcpy(node->op_params, &params, sizeof(params));
 
@@ -812,11 +902,11 @@ static void kvarn_graph_update_mixed_attn_params(ggml_tensor * node, const kvarn
                 "KVarN graph mixed-attn trace: n_queries=%" PRId64 " n_head=%" PRId64
                 " n_head_kv=%" PRId64 " n_sink=%d n_records=%d n_pending=%d n_tail=%d"
                 " tail_start=%d n_kv=%" PRId64 " head_dim=%d group_size=%d k_bits=%d v_bits=%d"
-                " scale=%.9g scratch_elems=%" PRId64 "\n",
+                " scale=%.9g logit_softcap=%.9g frame_flags=%d scratch_elems=%" PRId64 "\n",
                 node->ne[2], node->ne[1], sink_tail_k ? sink_tail_k->ne[1] : 0,
                 params.n_sink, params.n_records, params.n_pending, params.n_tail,
                 params.tail_start, window.n_kv, params.head_dim, params.group_size,
-                params.key_bits, params.value_bits, double(params.scale),
+                params.key_bits, params.value_bits, double(params.scale), double(params.logit_softcap), params.frame_flags,
                 scratch ? ggml_nelements(scratch) : 0);
         kvarn_graph_attn_trace_tensor("q", q);
         kvarn_graph_attn_trace_tensor("sink_tail_k", sink_tail_k);
@@ -838,11 +928,12 @@ static bool kvarn_graph_use_attn_scratch_ref() {
 }
 
 static bool kvarn_graph_use_attn_f16_body_mirror(int64_t head_dim) {
-    if (head_dim >= 512) {
-        return true;
+    if (head_dim < 256) {
+        return false;
     }
-    return head_dim == 256 &&
-        !kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR");
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_REF_SCRATCH") ||
+        kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE") ||
+        kvarn_graph_parse_env_flag("LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR");
 }
 
 static bool kvarn_graph_reuse_unsafe_forced_512_fused(
@@ -896,6 +987,166 @@ static ggml_tensor * kvarn_graph_build_hadamard_input(
     return tensor;
 }
 
+static std::vector<float> kvarn_graph_turbo_wht_matrix(uint32_t head_dim, bool inverse) {
+    static constexpr int8_t signs1[128] = {
+        -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+        -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+        -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+        -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,
+    };
+    static constexpr int8_t signs2[128] = {
+         1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+         1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+         1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+         1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1,
+    };
+
+    if (head_dim == 0 || head_dim % 128 != 0) {
+        throw std::invalid_argument("Turbo V frame requires head_dim_v to be a non-zero multiple of 128");
+    }
+
+    const int8_t * first = inverse ? signs2 : signs1;
+    const int8_t * last  = inverse ? signs1 : signs2;
+    const float norm = 1.0f/std::sqrt(128.0f);
+
+    std::vector<float> M(size_t(head_dim)*head_dim, 0.0f);
+    std::vector<float> col(128, 0.0f);
+    for (uint32_t block = 0; block < head_dim; block += 128) {
+        for (uint32_t j = 0; j < 128; ++j) {
+            std::fill(col.begin(), col.end(), 0.0f);
+            col[j] = float(first[j]);
+            for (uint32_t step = 1; step < 128; step <<= 1) {
+                for (uint32_t base = 0; base < 128; base += 2*step) {
+                    for (uint32_t i = 0; i < step; ++i) {
+                        const uint32_t i0 = base + i;
+                        const uint32_t i1 = i0 + step;
+                        const float a = col[i0];
+                        const float b = col[i1];
+                        col[i0] = a + b;
+                        col[i1] = a - b;
+                    }
+                }
+            }
+            for (uint32_t r = 0; r < 128; ++r) {
+                M[size_t(block + r)*head_dim + (block + j)] = col[r]*norm*float(last[r]);
+            }
+        }
+    }
+    return M;
+}
+
+static std::vector<float> kvarn_graph_identity_matrix(uint32_t dim) {
+    std::vector<float> M(size_t(dim)*dim, 0.0f);
+    for (uint32_t i = 0; i < dim; ++i) {
+        M[size_t(i)*dim + i] = 1.0f;
+    }
+    return M;
+}
+
+static std::vector<float> kvarn_graph_turbo_sign_vector(uint32_t head_dim, int which) {
+    static constexpr int8_t signs1[128] = {
+        -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+        -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+        -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+        -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1,
+    };
+    static constexpr int8_t signs2[128] = {
+         1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+         1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+         1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+         1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1,
+    };
+    if (head_dim == 0 || head_dim % 128 != 0) {
+        throw std::invalid_argument("Turbo V sign vector requires head_dim_v to be a non-zero multiple of 128");
+    }
+    const int8_t * signs = which == 1 ? signs1 : signs2;
+    std::vector<float> out(head_dim);
+    for (uint32_t i = 0; i < head_dim; ++i) {
+        out[i] = float(signs[i % 128]);
+    }
+    return out;
+}
+
+static ggml_tensor * kvarn_graph_build_turbo_sign_input(
+        ggml_context * ctx,
+        uint32_t head_dim,
+        int which,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend,
+        ggml_tensor * & tensor,
+        std::vector<float> & host,
+        bool & filled,
+        uint32_t & dim,
+        const char * name) {
+    if (tensor != nullptr && dim != 0 && dim != head_dim) {
+        throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME does not support mixed head_dim_v in one graph input");
+    }
+    if (tensor == nullptr) {
+        tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_set_input(tensor);
+        ggml_set_name(tensor, name);
+        host = kvarn_graph_turbo_sign_vector(head_dim, which);
+        dim = head_dim;
+        filled = false;
+    }
+    if (sched != nullptr && backend != nullptr) {
+        ggml_backend_sched_set_tensor_backend(sched, tensor, backend);
+    }
+    return tensor;
+}
+
+static ggml_tensor * kvarn_graph_build_turbo_wht_input(
+        ggml_context * ctx,
+        uint32_t head_dim,
+        bool inverse,
+        bool identity,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend,
+        ggml_tensor * & tensor,
+        std::vector<float> & host,
+        bool & filled,
+        uint32_t & dim,
+        const char * name) {
+    if (tensor != nullptr && dim != 0 && dim != head_dim) {
+        throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME does not support mixed head_dim_v in one graph input");
+    }
+    if (tensor == nullptr) {
+        tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, head_dim);
+        ggml_set_input(tensor);
+        ggml_set_name(tensor, name);
+        host = identity ? kvarn_graph_identity_matrix(head_dim) : kvarn_graph_turbo_wht_matrix(head_dim, inverse);
+        dim = head_dim;
+        filled = false;
+    }
+    if (sched != nullptr && backend != nullptr) {
+        ggml_backend_sched_set_tensor_backend(sched, tensor, backend);
+    }
+    return tensor;
+}
+
+static ggml_tensor * kvarn_graph_apply_turbo_wht(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        ggml_tensor * H,
+        ggml_tensor * s1,
+        ggml_tensor * s2,
+        bool inverse,
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend) {
+    ggml_tensor * first = inverse ? s2 : s1;
+    ggml_tensor * last  = inverse ? s1 : s2;
+    cur = ggml_mul(ctx, cur, first);
+    if (sched != nullptr && backend != nullptr) {
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend);
+    }
+    cur = ggml_mul_mat_aux(ctx, cur, H, true, sched, backend);
+    cur = ggml_mul(ctx, cur, last);
+    if (sched != nullptr && backend != nullptr) {
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend);
+    }
+    return cur;
+}
+
 static ggml_tensor * kvarn_graph_apply_hadamard(
         ggml_context * ctx,
         ggml_tensor * H,
@@ -903,7 +1154,9 @@ static ggml_tensor * kvarn_graph_apply_hadamard(
     if (!ggml_is_contiguous(x)) {
         x = ggml_cont(ctx, x);
     }
-    return ggml_mul_mat(ctx, H, x);
+    ggml_tensor * res = ggml_mul_mat(ctx, H, x);
+    ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+    return res;
 }
 
 void llm_graph_input_attn_kvarn::set_input(const llama_ubatch * ubatch) {
@@ -1073,11 +1326,21 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
     if (mctx_kvarn_iswa != nullptr) {
         const auto * base_ctx = mctx_kvarn_iswa->get_base();
-        base_ctx->set_input_sink_tail_idxs(base_sink_tail_idxs, ubatch);
-        base_ctx->set_input_body_plan(base_body_plan, ubatch);
-        base_ctx->set_input_body_offsets(base_body_offsets, ubatch);
-        base_ctx->set_input_tail_evict_idxs(base_tail_evict_idxs, ubatch);
-        base_ctx->set_input_kq_mask(base_kvarn_kq_mask, ubatch, cparams.causal_attn);
+        const bool have_base_kvarn_inputs =
+            base_sink_tail_idxs  != nullptr && base_sink_tail_idxs->buffer  != nullptr &&
+            base_body_plan       != nullptr && base_body_plan->buffer       != nullptr &&
+            base_body_offsets    != nullptr && base_body_offsets->buffer    != nullptr &&
+            base_tail_evict_idxs != nullptr && base_tail_evict_idxs->buffer != nullptr &&
+            base_kvarn_kq_mask   != nullptr && base_kvarn_kq_mask->buffer   != nullptr;
+        if (have_base_kvarn_inputs) {
+            base_ctx->set_input_sink_tail_idxs(base_sink_tail_idxs, ubatch);
+            base_ctx->set_input_body_plan(base_body_plan, ubatch);
+            base_ctx->set_input_body_offsets(base_body_offsets, ubatch);
+            base_ctx->set_input_tail_evict_idxs(base_tail_evict_idxs, ubatch);
+            base_ctx->set_input_kq_mask(base_kvarn_kq_mask, ubatch, cparams.causal_attn);
+        } else if (!base_mixed_attn_nodes.empty()) {
+            throw std::runtime_error("KVarN+ISWA graph has mixed-attention nodes but missing base KVarN inputs");
+        }
         if (base_kvarn_hadamard != nullptr && base_kvarn_hadamard->buffer != nullptr && !base_kvarn_hadamard_filled) {
             ggml_backend_tensor_set(
                     base_kvarn_hadamard,
@@ -1086,10 +1349,42 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
                     base_kvarn_hadamard_host.size()*sizeof(float));
             base_kvarn_hadamard_filled = true;
         }
+        if (base_kvarn_turbo_v_fwd != nullptr && base_kvarn_turbo_v_fwd->buffer != nullptr) {
+            ggml_backend_tensor_set(
+                    base_kvarn_turbo_v_fwd,
+                    base_kvarn_turbo_v_fwd_host.data(),
+                    0,
+                    base_kvarn_turbo_v_fwd_host.size()*sizeof(float));
+            base_kvarn_turbo_v_fwd_filled = true;
+        }
+        if (base_kvarn_turbo_v_inv != nullptr && base_kvarn_turbo_v_inv->buffer != nullptr) {
+            ggml_backend_tensor_set(
+                    base_kvarn_turbo_v_inv,
+                    base_kvarn_turbo_v_inv_host.data(),
+                    0,
+                    base_kvarn_turbo_v_inv_host.size()*sizeof(float));
+            base_kvarn_turbo_v_inv_filled = true;
+        }
+        if (base_kvarn_turbo_v_s1 != nullptr && base_kvarn_turbo_v_s1->buffer != nullptr) {
+            ggml_backend_tensor_set(
+                    base_kvarn_turbo_v_s1,
+                    base_kvarn_turbo_v_s1_host.data(),
+                    0,
+                    base_kvarn_turbo_v_s1_host.size()*sizeof(float));
+            base_kvarn_turbo_v_s1_filled = true;
+        }
+        if (base_kvarn_turbo_v_s2 != nullptr && base_kvarn_turbo_v_s2->buffer != nullptr) {
+            ggml_backend_tensor_set(
+                    base_kvarn_turbo_v_s2,
+                    base_kvarn_turbo_v_s2_host.data(),
+                    0,
+                    base_kvarn_turbo_v_s2_host.size()*sizeof(float));
+            base_kvarn_turbo_v_s2_filled = true;
+        }
 
         const kvarn_active_window window = kvarn_graph_active_window(cparams.kvarn, *ubatch, base_ctx->get_size());
         GGML_ASSERT(window.valid);
-        if (base_window_indirect && base_kvarn_window != nullptr && base_kvarn_window->buffer != nullptr) {
+        if (have_base_kvarn_inputs && base_window_indirect && base_kvarn_window != nullptr && base_kvarn_window->buffer != nullptr) {
             // Frozen op_params + device-side live window: never rewrite the
             // node params here, or CUDA graph node properties change and the
             // captured decode graph re-captures every token.
@@ -1099,7 +1394,7 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
                 int32_t(window.n_tail), int32_t(window.tail_start), 0, 0, 0,
             };
             ggml_backend_tensor_set(base_kvarn_window, win, 0, sizeof(win));
-        } else {
+        } else if (have_base_kvarn_inputs) {
             for (ggml_tensor * node : base_mixed_attn_nodes) {
                 kvarn_graph_update_mixed_attn_params(node, window);
             }
@@ -3166,6 +3461,9 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & idxs = inp_kvarn->get_sink_tail_idxs();
         const llama_kvarn_layer_view layer = inp_kvarn->mctx_kvarn->get_layer_view(il);
         const bool kvarn_paper_frame = kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
+        if (kvarn_paper_frame) {
+            (void) kvarn_graph_paper_mixed_frame_enabled();
+        }
         ggml_tensor * kvarn_H = nullptr;
         if (kvarn_paper_frame) {
             if (layer.head_dim_k != layer.head_dim_v) {
@@ -3186,8 +3484,12 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.layout_k.key_bits >= 2 && layer.layout_k.key_bits <= 8);
         GGML_ASSERT(layer.layout_v.value_bits >= 2 && layer.layout_v.value_bits <= 8);
         GGML_ASSERT(inp_kvarn->mctx_kvarn->body_store_scratch_floats(il) > 0);
+        ggml_tensor * sink_tail_k_src = layer.sink_tail_k;
+        ggml_tensor * sink_tail_v_src = layer.sink_tail_v;
+        ggml_tensor * pending_k_src   = layer.pending_k;
+        ggml_tensor * pending_v_src   = layer.pending_v;
         bool contiguous_prefill_chunk = stores_kv &&
-            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            !kvarn_graph_prefill_direct_store_disabled() &&
             ubatch.pos != nullptr &&
             ubatch.n_tokens > 1 &&
             q_cur != nullptr && k_cur != nullptr && v_cur != nullptr &&
@@ -3207,6 +3509,26 @@ ggml_tensor * llm_graph_context::build_attn(
             const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size());
             bool direct_prefill_store = contiguous_prefill_chunk && !seal_records.empty();
             if (direct_prefill_store) {
+                const kvarn_active_window final_window =
+                    kvarn_graph_active_window(cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size());
+                if (!final_window.valid || final_window.n_pending != 0) {
+                    direct_prefill_store = false;
+                }
+            }
+            if (direct_prefill_store) {
+                const llama_pos chunk_start = ubatch.pos[0];
+                const llama_pos chunk_end = chunk_start + llama_pos(ubatch.n_tokens);
+                for (const uint32_t record : seal_records) {
+                    const llama_pos record_start =
+                        llama_pos(cparams.kvarn.sink_tokens) + llama_pos(record)*llama_pos(cparams.kvarn.group_size);
+                    const llama_pos record_end = record_start + llama_pos(cparams.kvarn.group_size);
+                    if (record_start < chunk_start || record_end > chunk_end) {
+                        direct_prefill_store = false;
+                        break;
+                    }
+                }
+            }
+            if (direct_prefill_store) {
                 const llama_pos chunk_start = ubatch.pos[0];
                 const llama_pos chunk_end = chunk_start + llama_pos(ubatch.n_tokens);
                 for (const uint32_t record : seal_records) {
@@ -3221,20 +3543,20 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, inp_kvarn->get_body_plan());
             ggml_build_forward_expand(gf, inp_kvarn->get_body_offsets());
             ggml_build_forward_expand(gf, inp_kvarn->get_tail_evict_idxs());
-            if (!direct_prefill_store && inp_kvarn->get_body_offsets()->ne[0] > 0) {
-                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_k(
-                            ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
-                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_v(
-                            ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il));
+            ggml_tensor * pending_k_copy = nullptr;
+            ggml_tensor * pending_v_copy = nullptr;
+            if (!direct_prefill_store && seal_records.empty() && inp_kvarn->get_body_offsets()->ne[0] > 0) {
+                pending_k_copy = inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_k(
+                            ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il);
+                pending_v_copy = inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_v(
+                            ctx0, inp_kvarn->get_tail_evict_idxs(), inp_kvarn->get_body_offsets(), il);
+                ggml_build_forward_expand(gf, pending_k_copy);
+                ggml_build_forward_expand(gf, pending_v_copy);
+                pending_k_src = ggml_reshape_3d(
+                        ctx0, pending_k_copy, layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size);
+                pending_v_src = ggml_reshape_3d(
+                        ctx0, pending_v_copy, layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size);
             }
-            ggml_tensor * k_st_src = k_cur;
-            ggml_tensor * v_st_src = v_cur;
-            if (kvarn_paper_frame) {
-                k_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, k_st_src);
-                v_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, v_st_src);
-            }
-            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_k(ctx0, k_st_src, idxs, il));
-            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_st_src, idxs, il));
 
             inp_kvarn->has_body_store_ops = !seal_records.empty();
             inp_kvarn->baked_seal_records = seal_records;
@@ -3243,6 +3565,44 @@ ggml_tensor * llm_graph_context::build_attn(
             if (!seal_records.empty() || direct_prefill_store) {
                 body_store_scratch = inp_kvarn->mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
+
+            ggml_tensor * last_body_store = nullptr;
+            const auto build_body_store = [&](ggml_tensor * store) {
+                if (last_body_store != nullptr) {
+                    ggml_kvarn_store_kv_body_add_dep(store, last_body_store);
+                }
+                ggml_build_forward_expand(gf, store);
+                last_body_store = store;
+            };
+            const auto copy_pending_slice_for_record = [&](uint32_t record) {
+                const kvarn_tail_evict_slice slice = kvarn_graph_tail_evict_slice_for_record(
+                        cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size(), record);
+                if (slice.count <= 0) {
+                    throw std::runtime_error("KVarN graph backend could not find evicted pending rows for sealed body record");
+                }
+                if (!slice.contiguous) {
+                    throw std::runtime_error("KVarN graph backend cannot seal non-contiguous pending rows for a body record");
+                }
+
+                ggml_tensor * tail_idxs = ggml_view_1d(
+                        ctx0, inp_kvarn->get_tail_evict_idxs(), slice.count,
+                        size_t(slice.start)*inp_kvarn->get_tail_evict_idxs()->nb[0]);
+                ggml_tensor * offsets = ggml_view_1d(
+                        ctx0, inp_kvarn->get_body_offsets(), slice.count,
+                        size_t(slice.start)*inp_kvarn->get_body_offsets()->nb[0]);
+                pending_k_copy = inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_k(ctx0, tail_idxs, offsets, il);
+                pending_v_copy = inp_kvarn->mctx_kvarn->cpy_tail_evict_pending_v(ctx0, tail_idxs, offsets, il);
+                if (last_body_store != nullptr) {
+                    ggml_set_rows_add_dep(pending_k_copy, last_body_store);
+                    ggml_set_rows_add_dep(pending_v_copy, last_body_store);
+                }
+                ggml_build_forward_expand(gf, pending_k_copy);
+                ggml_build_forward_expand(gf, pending_v_copy);
+                pending_k_src = ggml_reshape_3d(
+                        ctx0, pending_k_copy, layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size);
+                pending_v_src = ggml_reshape_3d(
+                        ctx0, pending_v_copy, layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size);
+            };
 
             if (direct_prefill_store) {
                 constexpr uint32_t direct_record_batch_max = 8;
@@ -3275,7 +3635,7 @@ ggml_tensor * llm_graph_context::build_attn(
                                 layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size, n_batch,
                                 v_cur->nb[1], v_cur->nb[2], size_t(cparams.kvarn.group_size)*v_cur->nb[2],
                                 size_t(pos0)*v_cur->nb[2]);
-                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_records_all_heads(
+                        build_body_store(inp_kvarn->mctx_kvarn->store_kv_body_records_all_heads(
                                     ctx0, k_tiles, v_tiles, body_store_scratch, il, record0, n_batch));
                         i_record += n_batch;
                     }
@@ -3290,36 +3650,64 @@ ggml_tensor * llm_graph_context::build_attn(
                                 ctx0, v_cur,
                                 layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
                                 v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
-                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads(
+                        build_body_store(inp_kvarn->mctx_kvarn->store_kv_body_all_heads(
                                     ctx0, k_tile, v_tile, body_store_scratch, il, record));
                     }
                 }
-            } else if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
-                ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_records_from_pending(
-                            ctx0, body_store_scratch, il, seal_records));
             } else {
                 for (const uint32_t seal_record : seal_records) {
                     if (seal_record >= layer.n_records) {
                         throw std::runtime_error("KVarN graph backend attempted to seal a body record outside cache capacity");
                     }
 
+                    copy_pending_slice_for_record(seal_record);
                     if (layer.head_dim_k >= 256 && layer.n_head_kv > 1) {
-                        ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_all_heads_from_pending(
-                                    ctx0, body_store_scratch, il, seal_record));
+                        build_body_store(inp_kvarn->mctx_kvarn->store_kv_body_all_heads_from_pending(
+                                    ctx0, body_store_scratch, il, seal_record, pending_k_src, pending_v_src));
                     } else {
                         for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                            ggml_build_forward_expand(gf, inp_kvarn->mctx_kvarn->store_kv_body_record_from_pending(
-                                        ctx0, body_store_scratch, il, ih, seal_record));
+                            build_body_store(inp_kvarn->mctx_kvarn->store_kv_body_record_from_pending(
+                                        ctx0, body_store_scratch, il, ih, seal_record, pending_k_src, pending_v_src));
                         }
                     }
                 }
+                const kvarn_active_window final_window =
+                    kvarn_graph_active_window(cparams.kvarn, ubatch, inp_kvarn->mctx_kvarn->get_size());
+                if (final_window.valid && final_window.n_pending > 0) {
+                    copy_pending_slice_for_record(uint32_t(final_window.n_records));
+                }
             }
+
+            ggml_tensor * k_st_src = k_cur;
+            ggml_tensor * v_st_src = v_cur;
+            if (kvarn_paper_frame) {
+                k_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, k_st_src);
+                v_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, v_st_src);
+            }
+            ggml_tensor * sink_k_copy = inp_kvarn->mctx_kvarn->cpy_sink_tail_k(ctx0, k_st_src, idxs, il);
+            ggml_tensor * sink_v_copy = inp_kvarn->mctx_kvarn->cpy_sink_tail_v(ctx0, v_st_src, idxs, il);
+            if (pending_k_copy != nullptr) {
+                ggml_set_rows_add_dep(sink_k_copy, pending_k_copy);
+            }
+            if (pending_v_copy != nullptr) {
+                ggml_set_rows_add_dep(sink_v_copy, pending_v_copy);
+            }
+            if (last_body_store != nullptr) {
+                ggml_set_rows_add_dep(sink_k_copy, last_body_store);
+                ggml_set_rows_add_dep(sink_v_copy, last_body_store);
+            }
+            ggml_build_forward_expand(gf, sink_k_copy);
+            ggml_build_forward_expand(gf, sink_v_copy);
+            sink_tail_k_src = ggml_reshape_3d(
+                    ctx0, sink_k_copy, layer.head_dim_k, layer.n_head_kv, layer.sink_tail_k->ne[2]);
+            sink_tail_v_src = ggml_reshape_3d(
+                    ctx0, sink_v_copy, layer.head_dim_v, layer.n_head_kv, layer.sink_tail_v->ne[2]);
         }
 
         const ggml_tensor * kq_mask = inp->get_kq_mask();
         const bool prefill_direct_attn =
             stores_kv &&
-            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            !kvarn_graph_prefill_direct_attn_disabled() &&
             q_cur != nullptr && k_cur != nullptr && v_cur != nullptr && kq_mask != nullptr &&
             q_cur->ne[2] > 1 &&
             k_cur->ne[2] == q_cur->ne[2] &&
@@ -3402,22 +3790,34 @@ ggml_tensor * llm_graph_context::build_attn(
         const int32_t op_n_tail     = window_indirect ? int32_t(effective_kvarn.tail_tokens) : int32_t(window.n_tail);
         const int32_t op_tail_start = window_indirect ? 0 : int32_t(window.tail_start);
 
+        const bool kvarn_fused_fwht =
+            kvarn_paper_frame &&
+            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_FUSED_FWHT") &&
+            (q_cur->ne[2] == 1 || layer.head_dim_k >= 512) &&
+            op_n_records == 0 &&
+            op_n_pending == 0;
+
         ggml_tensor * q_in = q_cur;
-        if (kvarn_paper_frame) {
+        if (kvarn_paper_frame && !kvarn_fused_fwht) {
             q_in = kvarn_graph_apply_hadamard(ctx0, kvarn_H, q_in);
         }
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
-                ctx0, q_in, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
-                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask(),
+                ctx0, q_in, sink_tail_k_src, sink_tail_v_src, layer.body_k, layer.body_v,
+                layer.scales_k, layer.scales_v, pending_k_src, pending_v_src, scores, inp->get_kq_mask(),
                 op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                 int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
-                int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);
+                int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_kvarn_attn_mixed_set_v_layout(cur, int32_t(layer.layout_v.v_layout));
+        if (kvarn_fused_fwht) {
+            ggml_kvarn_attn_mixed_set_frame_flags(cur, GGML_KVARN_ATTN_FRAME_FUSED_PAPER_FULL);
+        }
         if (window_indirect) {
             ggml_kvarn_attn_mixed_set_window(cur, inp_kvarn->kvarn_window);
         }
         inp_kvarn->mixed_attn_nodes.push_back(cur);
         cb(cur, "kvarn_kqv_out", il);
-        if (kvarn_paper_frame) {
+        if (kvarn_paper_frame && !kvarn_fused_fwht) {
             cur = kvarn_graph_apply_hadamard(ctx0, kvarn_H, cur);
             cb(cur, "kvarn_kqv_out_unrot", il);
         }
@@ -3722,7 +4122,8 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_build_forward_expand(gf, v_cur);
     }
 
-    if (!is_swa && inp->mctx_kvarn_iswa != nullptr && inp->mctx_kvarn_iswa->get_base()->has_layer(il)) {
+    if (!is_swa && inp->mctx_kvarn_iswa != nullptr && inp->mctx_kvarn_iswa->get_base()->has_layer(il) &&
+            !kvarn_graph_iswa_force_full_normal_attn()) {
         const auto * mctx_kvarn = inp->mctx_kvarn_iswa->get_base();
 
         if (inp->self_k_rot || inp->self_v_rot || kq_b || sinks) {
@@ -3737,10 +4138,16 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & idxs = inp->base_sink_tail_idxs;
         const llama_kvarn_layer_view layer = mctx_kvarn->get_layer_view(il);
         const bool kvarn_paper_frame = kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
+        const bool kvarn_paper_mixed_frame =
+            kvarn_paper_frame && kvarn_graph_paper_mixed_frame_enabled();
         ggml_tensor * kvarn_H = nullptr;
-        if (kvarn_paper_frame) {
+        ggml_tensor * turbo_v_fwd = nullptr;
+        ggml_tensor * turbo_v_inv = nullptr;
+        ggml_tensor * turbo_v_s1 = nullptr;
+        ggml_tensor * turbo_v_s2 = nullptr;
+        if (kvarn_paper_frame || kvarn_graph_iswa_turbo_v_frame_enabled()) {
             if (layer.head_dim_k != layer.head_dim_v) {
-                throw std::runtime_error("KVarN+ISWA paper-frame path requires equal K/V head dimensions");
+                throw std::runtime_error("KVarN+ISWA paper/Turbo-frame path requires equal K/V head dimensions");
             }
             kvarn_H = kvarn_graph_build_hadamard_input(
                     ctx0, layer.head_dim_k,
@@ -3750,6 +4157,59 @@ ggml_tensor * llm_graph_context::build_attn(
                     inp->base_kvarn_hadamard_dim,
                     "kvarn_iswa_hadamard");
         }
+        const bool turbo_v_frame = kvarn_graph_iswa_turbo_v_frame_enabled();
+        ggml_backend_t turbo_v_backend = nullptr;
+        const bool turbo_v_frame_identity =
+            turbo_v_frame && kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME_IDENTITY");
+        const bool turbo_v_frame_reverse =
+            turbo_v_frame && kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME_REVERSE");
+        const bool turbo_v_frame_keep_f32 =
+            turbo_v_frame && kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME_KEEP_F32");
+        const bool turbo_v_frame_dense =
+            turbo_v_frame && kvarn_graph_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME_DENSE");
+        if (turbo_v_frame) {
+            if (!kvarn_graph_iswa_materialize_mha_enabled()) {
+                throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME requires LLAMA_KVARN_ISWA_DEBUG_MATERIALIZE_MHA=1");
+            }
+            if (layer.head_dim_v % 128 != 0) {
+                throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME requires head_dim_v to be a multiple of 128");
+            }
+            if (v_mla != nullptr) {
+                throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME does not support MLA attention outputs");
+            }
+            turbo_v_backend = ggml_backend_sched_get_backend(sched, 0);
+            if (!turbo_v_frame_identity && turbo_v_frame_dense) {
+                turbo_v_fwd = kvarn_graph_build_turbo_wht_input(
+                        ctx0, layer.head_dim_v, turbo_v_frame_reverse, false, sched, turbo_v_backend,
+                        inp->base_kvarn_turbo_v_fwd,
+                        inp->base_kvarn_turbo_v_fwd_host,
+                        inp->base_kvarn_turbo_v_fwd_filled,
+                        inp->base_kvarn_turbo_v_fwd_dim,
+                        "kvarn_iswa_turbo_v_fwd");
+                turbo_v_inv = kvarn_graph_build_turbo_wht_input(
+                        ctx0, layer.head_dim_v, !turbo_v_frame_reverse, false, sched, turbo_v_backend,
+                        inp->base_kvarn_turbo_v_inv,
+                        inp->base_kvarn_turbo_v_inv_host,
+                        inp->base_kvarn_turbo_v_inv_filled,
+                        inp->base_kvarn_turbo_v_inv_dim,
+                        "kvarn_iswa_turbo_v_inv");
+            } else if (!turbo_v_frame_identity) {
+                turbo_v_s1 = kvarn_graph_build_turbo_sign_input(
+                        ctx0, layer.head_dim_v, 1, sched, turbo_v_backend,
+                        inp->base_kvarn_turbo_v_s1,
+                        inp->base_kvarn_turbo_v_s1_host,
+                        inp->base_kvarn_turbo_v_s1_filled,
+                        inp->base_kvarn_turbo_v_s1_dim,
+                        "kvarn_iswa_turbo_v_s1");
+                turbo_v_s2 = kvarn_graph_build_turbo_sign_input(
+                        ctx0, layer.head_dim_v, 2, sched, turbo_v_backend,
+                        inp->base_kvarn_turbo_v_s2,
+                        inp->base_kvarn_turbo_v_s2_host,
+                        inp->base_kvarn_turbo_v_s2_filled,
+                        inp->base_kvarn_turbo_v_s2_dim,
+                        "kvarn_iswa_turbo_v_s2");
+            }
+        }
         GGML_ASSERT(layer.body_k != nullptr);
         GGML_ASSERT(layer.body_v != nullptr);
         GGML_ASSERT(layer.scales_k != nullptr);
@@ -3757,9 +4217,13 @@ ggml_tensor * llm_graph_context::build_attn(
         GGML_ASSERT(layer.layout_k.key_bits >= 2 && layer.layout_k.key_bits <= 8);
         GGML_ASSERT(layer.layout_v.value_bits >= 2 && layer.layout_v.value_bits <= 8);
         GGML_ASSERT(mctx_kvarn->body_store_scratch_floats(il) > 0);
+        ggml_tensor * sink_tail_k_src = layer.sink_tail_k;
+        ggml_tensor * sink_tail_v_src = layer.sink_tail_v;
+        ggml_tensor * pending_k_src   = layer.pending_k;
+        ggml_tensor * pending_v_src   = layer.pending_v;
 
         bool contiguous_prefill_chunk = stores_kv &&
-            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            !kvarn_graph_prefill_direct_store_disabled() &&
             ubatch.pos != nullptr &&
             ubatch.n_tokens > 1 &&
             q_cur != nullptr && k_cur != nullptr && v_cur != nullptr &&
@@ -3779,6 +4243,36 @@ ggml_tensor * llm_graph_context::build_attn(
         if (stores_kv) {
             const std::vector<uint32_t> seal_records = kvarn_graph_seal_records(cparams.kvarn, ubatch, mctx_kvarn->get_size());
             bool direct_prefill_store = contiguous_prefill_chunk && !seal_records.empty();
+            if (kvarn_graph_prefill_direct_trace_enabled() && kvarn_graph_prefill_direct_trace_claim()) {
+                const llama_pos pos0_dbg = ubatch.pos != nullptr && ubatch.n_tokens > 0 ? ubatch.pos[0] : llama_pos(-1);
+                std::fprintf(stderr,
+                        "KVarN graph iswa store trace: layer=%d kv_size=%u ubatch_tokens=%u pos0=%d contiguous=%d "
+                        "seal_records=%u first_record=%d body_offsets=%" PRId64 "\n",
+                        il, mctx_kvarn->get_size(), ubatch.n_tokens, int(pos0_dbg),
+                        contiguous_prefill_chunk ? 1 : 0, uint32_t(seal_records.size()),
+                        seal_records.empty() ? -1 : int(seal_records.front()),
+                        inp->base_body_offsets ? inp->base_body_offsets->ne[0] : int64_t(-1));
+            }
+            if (direct_prefill_store) {
+                const kvarn_active_window final_window =
+                    kvarn_graph_active_window(cparams.kvarn, ubatch, mctx_kvarn->get_size());
+                if (!final_window.valid || final_window.n_pending != 0) {
+                    direct_prefill_store = false;
+                }
+            }
+            if (direct_prefill_store) {
+                const llama_pos chunk_start = ubatch.pos[0];
+                const llama_pos chunk_end = chunk_start + llama_pos(ubatch.n_tokens);
+                for (const uint32_t record : seal_records) {
+                    const llama_pos record_start =
+                        llama_pos(cparams.kvarn.sink_tokens) + llama_pos(record)*llama_pos(cparams.kvarn.group_size);
+                    const llama_pos record_end = record_start + llama_pos(cparams.kvarn.group_size);
+                    if (record_start < chunk_start || record_end > chunk_end) {
+                        direct_prefill_store = false;
+                        break;
+                    }
+                }
+            }
             if (direct_prefill_store) {
                 const llama_pos chunk_start = ubatch.pos[0];
                 const llama_pos chunk_end = chunk_start + llama_pos(ubatch.n_tokens);
@@ -3794,28 +4288,74 @@ ggml_tensor * llm_graph_context::build_attn(
             ggml_build_forward_expand(gf, inp->base_body_plan);
             ggml_build_forward_expand(gf, inp->base_body_offsets);
             ggml_build_forward_expand(gf, inp->base_tail_evict_idxs);
-            if (!direct_prefill_store && inp->base_body_offsets->ne[0] > 0) {
-                ggml_build_forward_expand(gf, mctx_kvarn->cpy_tail_evict_pending_k(
-                            ctx0, inp->base_tail_evict_idxs, inp->base_body_offsets, il));
-                ggml_build_forward_expand(gf, mctx_kvarn->cpy_tail_evict_pending_v(
-                            ctx0, inp->base_tail_evict_idxs, inp->base_body_offsets, il));
+            ggml_tensor * pending_k_copy = nullptr;
+            ggml_tensor * pending_v_copy = nullptr;
+            if (!direct_prefill_store && seal_records.empty() && inp->base_body_offsets->ne[0] > 0) {
+                pending_k_copy = mctx_kvarn->cpy_tail_evict_pending_k(
+                            ctx0, inp->base_tail_evict_idxs, inp->base_body_offsets, il);
+                pending_v_copy = mctx_kvarn->cpy_tail_evict_pending_v(
+                            ctx0, inp->base_tail_evict_idxs, inp->base_body_offsets, il);
+                ggml_build_forward_expand(gf, pending_k_copy);
+                ggml_build_forward_expand(gf, pending_v_copy);
+                pending_k_src = ggml_reshape_3d(
+                        ctx0, pending_k_copy, layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size);
+                pending_v_src = ggml_reshape_3d(
+                        ctx0, pending_v_copy, layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size);
             }
-            ggml_tensor * k_st_src = k_cur;
-            ggml_tensor * v_st_src = v_cur;
-            if (kvarn_paper_frame) {
-                k_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, k_st_src);
-                v_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, v_st_src);
-            }
-            ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_k(ctx0, k_st_src, idxs, il));
-            ggml_build_forward_expand(gf, mctx_kvarn->cpy_sink_tail_v(ctx0, v_st_src, idxs, il));
 
             inp->base_has_body_store_ops = !seal_records.empty();
             inp->base_baked_seal_records = seal_records;
+            if (kvarn_graph_prefill_direct_trace_enabled() && kvarn_graph_prefill_direct_trace_claim()) {
+                std::fprintf(stderr,
+                        "KVarN graph iswa store branch trace: layer=%d direct_prefill_store=%d pending_copy=%d "
+                        "seal_records=%u\n",
+                        il, direct_prefill_store ? 1 : 0,
+                        (!direct_prefill_store && inp->base_body_offsets->ne[0] > 0) ? 1 : 0,
+                        uint32_t(seal_records.size()));
+            }
 
             ggml_tensor * body_store_scratch = nullptr;
             if (!seal_records.empty() || direct_prefill_store) {
                 body_store_scratch = mctx_kvarn->build_body_store_scratch(ctx0, il);
             }
+
+            ggml_tensor * last_body_store = nullptr;
+            const auto build_body_store = [&](ggml_tensor * store) {
+                if (last_body_store != nullptr) {
+                    ggml_kvarn_store_kv_body_add_dep(store, last_body_store);
+                }
+                ggml_build_forward_expand(gf, store);
+                last_body_store = store;
+            };
+            const auto copy_pending_slice_for_record = [&](uint32_t record) {
+                const kvarn_tail_evict_slice slice = kvarn_graph_tail_evict_slice_for_record(
+                        cparams.kvarn, ubatch, mctx_kvarn->get_size(), record);
+                if (slice.count <= 0) {
+                    throw std::runtime_error("KVarN+ISWA graph backend could not find evicted pending rows for sealed body record");
+                }
+                if (!slice.contiguous) {
+                    throw std::runtime_error("KVarN+ISWA graph backend cannot seal non-contiguous pending rows for a body record");
+                }
+
+                ggml_tensor * tail_idxs = ggml_view_1d(
+                        ctx0, inp->base_tail_evict_idxs, slice.count,
+                        size_t(slice.start)*inp->base_tail_evict_idxs->nb[0]);
+                ggml_tensor * offsets = ggml_view_1d(
+                        ctx0, inp->base_body_offsets, slice.count,
+                        size_t(slice.start)*inp->base_body_offsets->nb[0]);
+                pending_k_copy = mctx_kvarn->cpy_tail_evict_pending_k(ctx0, tail_idxs, offsets, il);
+                pending_v_copy = mctx_kvarn->cpy_tail_evict_pending_v(ctx0, tail_idxs, offsets, il);
+                if (last_body_store != nullptr) {
+                    ggml_set_rows_add_dep(pending_k_copy, last_body_store);
+                    ggml_set_rows_add_dep(pending_v_copy, last_body_store);
+                }
+                ggml_build_forward_expand(gf, pending_k_copy);
+                ggml_build_forward_expand(gf, pending_v_copy);
+                pending_k_src = ggml_reshape_3d(
+                        ctx0, pending_k_copy, layer.head_dim_k, layer.n_head_kv, cparams.kvarn.group_size);
+                pending_v_src = ggml_reshape_3d(
+                        ctx0, pending_v_copy, layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size);
+            };
 
             if (direct_prefill_store) {
                 constexpr uint32_t direct_record_batch_max = 8;
@@ -3848,7 +4388,7 @@ ggml_tensor * llm_graph_context::build_attn(
                                 layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size, n_batch,
                                 v_cur->nb[1], v_cur->nb[2], size_t(cparams.kvarn.group_size)*v_cur->nb[2],
                                 size_t(pos0)*v_cur->nb[2]);
-                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_records_all_heads(
+                        build_body_store(mctx_kvarn->store_kv_body_records_all_heads(
                                     ctx0, k_tiles, v_tiles, body_store_scratch, il, record0, n_batch));
                         i_record += n_batch;
                     }
@@ -3863,36 +4403,65 @@ ggml_tensor * llm_graph_context::build_attn(
                                 ctx0, v_cur,
                                 layer.head_dim_v, layer.n_head_kv, cparams.kvarn.group_size,
                                 v_cur->nb[1], v_cur->nb[2], size_t(pos0)*v_cur->nb[2]);
-                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads(
+                        build_body_store(mctx_kvarn->store_kv_body_all_heads(
                                     ctx0, k_tile, v_tile, body_store_scratch, il, record));
                     }
                 }
-            } else if (layer.head_dim_k >= 512 && layer.n_head_kv == 1 && !seal_records.empty()) {
-                ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_records_from_pending(
-                            ctx0, body_store_scratch, il, seal_records));
             } else {
                 for (const uint32_t seal_record : seal_records) {
                     if (seal_record >= layer.n_records) {
                         throw std::runtime_error("KVarN+ISWA graph backend attempted to seal a body record outside cache capacity");
                     }
 
+                    copy_pending_slice_for_record(seal_record);
                     if (layer.head_dim_k >= 256 && layer.n_head_kv > 1) {
-                        ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_all_heads_from_pending(
-                                    ctx0, body_store_scratch, il, seal_record));
+                        build_body_store(mctx_kvarn->store_kv_body_all_heads_from_pending(
+                                    ctx0, body_store_scratch, il, seal_record, pending_k_src, pending_v_src));
                     } else {
                         for (uint32_t ih = 0; ih < layer.n_head_kv; ++ih) {
-                            ggml_build_forward_expand(gf, mctx_kvarn->store_kv_body_record_from_pending(
-                                        ctx0, body_store_scratch, il, ih, seal_record));
+                            build_body_store(mctx_kvarn->store_kv_body_record_from_pending(
+                                        ctx0, body_store_scratch, il, ih, seal_record, pending_k_src, pending_v_src));
                         }
                     }
                 }
+                const kvarn_active_window final_window =
+                    kvarn_graph_active_window(cparams.kvarn, ubatch, mctx_kvarn->get_size());
+                if (final_window.valid && final_window.n_pending > 0) {
+                    copy_pending_slice_for_record(uint32_t(final_window.n_records));
+                }
             }
+
+            ggml_tensor * k_st_src = k_cur;
+            ggml_tensor * v_st_src = v_cur;
+            if (kvarn_paper_frame && !kvarn_paper_mixed_frame) {
+                k_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, k_st_src);
+                v_st_src = kvarn_graph_apply_hadamard(ctx0, kvarn_H, v_st_src);
+            }
+            ggml_tensor * sink_k_copy = mctx_kvarn->cpy_sink_tail_k(ctx0, k_st_src, idxs, il);
+            ggml_tensor * sink_v_copy = mctx_kvarn->cpy_sink_tail_v(ctx0, v_st_src, idxs, il);
+            if (pending_k_copy != nullptr) {
+                ggml_set_rows_add_dep(sink_k_copy, pending_k_copy);
+            }
+            if (pending_v_copy != nullptr) {
+                ggml_set_rows_add_dep(sink_v_copy, pending_v_copy);
+            }
+            if (last_body_store != nullptr) {
+                ggml_set_rows_add_dep(sink_k_copy, last_body_store);
+                ggml_set_rows_add_dep(sink_v_copy, last_body_store);
+            }
+            ggml_build_forward_expand(gf, sink_k_copy);
+            ggml_build_forward_expand(gf, sink_v_copy);
+            sink_tail_k_src = ggml_reshape_3d(
+                    ctx0, sink_k_copy, layer.head_dim_k, layer.n_head_kv, layer.sink_tail_k->ne[2]);
+            sink_tail_v_src = ggml_reshape_3d(
+                    ctx0, sink_v_copy, layer.head_dim_v, layer.n_head_kv, layer.sink_tail_v->ne[2]);
         }
 
         const ggml_tensor * kq_mask = inp->get_kq_mask_kvarn();
         const bool prefill_direct_attn =
             stores_kv &&
-            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN") &&
+            kvarn_graph_iswa_prefill_direct_attn_allowed() &&
+            !kvarn_graph_prefill_direct_attn_disabled() &&
             q_cur != nullptr && k_cur != nullptr && v_cur != nullptr && kq_mask != nullptr &&
             q_cur->ne[2] > 1 &&
             k_cur->ne[2] == q_cur->ne[2] &&
@@ -3911,7 +4480,15 @@ ggml_tensor * llm_graph_context::build_attn(
                     kq_mask ? kq_mask->ne[1] : int64_t(-1));
         }
         if (prefill_direct_attn) {
-            ggml_tensor * cur = build_attn_mha(q_cur, k_cur, v_cur, kq_b, inp->get_kq_mask_kvarn(), sinks, v_mla, kq_scale, il);
+            ggml_tensor * k_direct = k_cur;
+            ggml_tensor * v_direct = v_cur;
+            if (k_direct->type == GGML_TYPE_F32) {
+                k_direct = ggml_cast(ctx0, k_direct, GGML_TYPE_F16);
+            }
+            if (v_direct->type == GGML_TYPE_F32) {
+                v_direct = ggml_cast(ctx0, v_direct, GGML_TYPE_F16);
+            }
+            ggml_tensor * cur = build_attn_mha(q_cur, k_direct, v_direct, kq_b, inp->get_kq_mask_kvarn(), sinks, v_mla, kq_scale, il);
             cb(cur, "kvarn_iswa_prefill_direct_kqv_out", il);
             cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
 
@@ -3938,6 +4515,42 @@ ggml_tensor * llm_graph_context::build_attn(
         }
         if (uint32_t(window.n_records) > layer.n_records) {
             throw std::runtime_error("KVarN+ISWA graph backend active body record count exceeds allocated cache capacity");
+        }
+
+        if (!kvarn_graph_iswa_sinktail_mha_disabled() &&
+                window.n_records == 0 && window.n_pending == 0 && window.tail_start == 0 &&
+                inp->get_kq_mask_kvarn()->ne[0] == window.n_kv) {
+            ggml_tensor * k_cache = ggml_view_3d(
+                    ctx0, sink_tail_k_src,
+                    layer.sink_tail_k->ne[0], layer.sink_tail_k->ne[1], window.n_kv,
+                    layer.sink_tail_k->nb[1], layer.sink_tail_k->nb[2], 0);
+            ggml_tensor * v_cache = ggml_view_3d(
+                    ctx0, sink_tail_v_src,
+                    layer.sink_tail_v->ne[0], layer.sink_tail_v->ne[1], window.n_kv,
+                    layer.sink_tail_v->nb[1], layer.sink_tail_v->nb[2], 0);
+            ggml_tensor * q_cache = q_cur;
+            if (kvarn_paper_frame && !kvarn_paper_mixed_frame) {
+                q_cache = kvarn_graph_apply_hadamard(ctx0, kvarn_H, q_cache);
+            }
+            ggml_tensor * cur = build_attn_mha(q_cache, k_cache, v_cache, kq_b, inp->get_kq_mask_kvarn(), sinks, v_mla, kq_scale, il);
+            cb(cur, "kvarn_iswa_sinktail_mha_kqv_out", il);
+            if (kvarn_paper_frame && !kvarn_paper_mixed_frame) {
+                cur = ggml_reshape_3d(ctx0, cur, layer.head_dim_v, q_cur->ne[1], q_cur->ne[2]);
+                cur = kvarn_graph_apply_hadamard(ctx0, kvarn_H, cur);
+                cb(cur, "kvarn_iswa_sinktail_mha_kqv_out_unrot", il);
+            }
+            cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+                cb(cur, "kvarn_iswa_sinktail_mha_kqv_wo", il);
+            }
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+                cb(cur, "kvarn_iswa_sinktail_mha_kqv_wo_b", il);
+            }
+
+            return cur;
         }
 
         const kvarn_active_window scratch_window = kvarn_graph_build_scratch_window(
@@ -3973,22 +4586,193 @@ ggml_tensor * llm_graph_context::build_attn(
         const int32_t op_n_tail     = window_indirect ? int32_t(effective_kvarn.tail_tokens) : int32_t(window.n_tail);
         const int32_t op_tail_start = window_indirect ? 0 : int32_t(window.tail_start);
 
+        const bool kvarn_fused_fwht =
+            kvarn_paper_frame &&
+            !kvarn_paper_mixed_frame &&
+            !kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_FUSED_FWHT") &&
+            (q_cur->ne[2] == 1 || layer.head_dim_k >= 512) &&
+            op_n_records == 0 &&
+            op_n_pending == 0;
+
         ggml_tensor * q_in = q_cur;
-        if (kvarn_paper_frame) {
-            q_in = kvarn_graph_apply_hadamard(ctx0, kvarn_H, q_in);
+        ggml_tensor * q_body = nullptr;
+        if (kvarn_paper_frame && !kvarn_fused_fwht) {
+            q_body = kvarn_graph_apply_hadamard(ctx0, kvarn_H, q_cur);
+        }
+        if (kvarn_paper_frame && !kvarn_paper_mixed_frame) {
+            q_in = kvarn_fused_fwht ? q_cur : q_body;
+        }
+        const bool debug_materialize_mha = kvarn_graph_iswa_materialize_mha_enabled();
+        const bool debug_dual_mha_compare = kvarn_graph_iswa_dual_mha_compare_enabled();
+        const bool debug_raw_mha_compare = kvarn_graph_iswa_raw_mha_compare_enabled();
+        if ((debug_materialize_mha || debug_dual_mha_compare || debug_raw_mha_compare) && !window_indirect) {
+            if (kvarn_paper_frame || kvarn_paper_mixed_frame || q_body != nullptr || kvarn_fused_fwht) {
+                throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_MATERIALIZE_MHA only supports the normal KVarN frame");
+            }
+            if ((debug_dual_mha_compare || debug_raw_mha_compare) && turbo_v_frame) {
+                throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_DUAL_MHA_COMPARE and LLAMA_KVARN_ISWA_DEBUG_RAW_MHA_COMPARE only support the normal KVarN frame");
+            }
+            ggml_tensor * compact_mask = inp->get_kq_mask_kvarn();
+            if (compact_mask == nullptr ||
+                    compact_mask->ne[0] != scratch_window.n_kv ||
+                    compact_mask->ne[1] != q_cur->ne[2]) {
+                throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_MATERIALIZE_MHA requires an exact-width compact KVarN mask");
+            }
+            if (turbo_v_frame && op_n_records > 0 &&
+                    (!kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_K") ||
+                     !kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_V"))) {
+                throw std::runtime_error(
+                        "LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME is a frame-only diagnostic and requires "
+                        "LLAMA_KVARN_DEBUG_RAW_BODY_K=1 and LLAMA_KVARN_DEBUG_RAW_BODY_V=1 when body records are active");
+            }
+            if (debug_raw_mha_compare && op_n_records > 0 &&
+                    !kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_CAPTURE_RAW_BODY_MIRROR") &&
+                    (!kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_K") ||
+                     !kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_V"))) {
+                throw std::runtime_error(
+                        "LLAMA_KVARN_ISWA_DEBUG_RAW_MHA_COMPARE requires "
+                        "LLAMA_KVARN_DEBUG_CAPTURE_RAW_BODY_MIRROR=1, or both "
+                        "LLAMA_KVARN_DEBUG_RAW_BODY_K=1 and LLAMA_KVARN_DEBUG_RAW_BODY_V=1, so the raw body mirror is captured");
+            }
+
+            ggml_tensor * k_mat = ggml_kvarn_materialize_kv(
+                    ctx0, sink_tail_k_src, layer.body_k, layer.scales_k, pending_k_src,
+                    0, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
+                    int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_k.key_bits));
+            if (!debug_raw_mha_compare && kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_K")) {
+                ggml_kvarn_materialize_kv_set_debug_raw_body(k_mat, 1);
+            }
+            cb(k_mat, "kvarn_iswa_materialized_k", il);
+
+            ggml_tensor * v_mat = ggml_kvarn_materialize_kv(
+                    ctx0, sink_tail_v_src, layer.body_v, layer.scales_v, pending_v_src,
+                    1, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
+                    int32_t(layer.head_dim_v), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_v.value_bits));
+            ggml_kvarn_materialize_kv_set_v_layout(v_mat, int32_t(layer.layout_v.v_layout));
+            if (!debug_raw_mha_compare && kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_V")) {
+                ggml_kvarn_materialize_kv_set_debug_raw_body(v_mat, 1);
+            }
+            cb(v_mat, "kvarn_iswa_materialized_v", il);
+            if (turbo_v_frame) {
+                if (!turbo_v_frame_identity) {
+                    if (turbo_v_frame_dense) {
+                        v_mat = ggml_mul_mat_aux(ctx0, v_mat, turbo_v_fwd, false, sched, turbo_v_backend);
+                    } else {
+                        v_mat = kvarn_graph_apply_turbo_wht(
+                                ctx0, v_mat, kvarn_H, turbo_v_s1, turbo_v_s2,
+                                turbo_v_frame_reverse, sched, turbo_v_backend);
+                    }
+                    cb(v_mat, "kvarn_iswa_materialized_v_turbo_rot", il);
+                    if (!turbo_v_frame_keep_f32) {
+                        v_mat = ggml_cast(ctx0, v_mat, GGML_TYPE_F16);
+                        cb(v_mat, "kvarn_iswa_materialized_v_turbo_rot_f16", il);
+                    }
+                }
+            }
+
+            if (kvarn_graph_attn_trace_enabled() && kvarn_graph_attn_trace_claim()) {
+                std::fprintf(stderr,
+                        "KVarN graph materialized-MHA trace: layer=%d q_tokens=%" PRId64
+                        " n_sink=%d n_records=%d n_pending=%d n_tail=%d tail_start=%d n_kv=%" PRId64
+                        " mask=[%" PRId64 ",%" PRId64 "] bits=k%d/v%d turbo_v_frame_only=%d turbo_v_identity=%d turbo_v_reverse=%d turbo_v_keep_f32=%d turbo_v_dense=%d turbo_v_compression=0\n",
+                        il, q_cur->ne[2], op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
+                        scratch_window.n_kv, compact_mask->ne[0], compact_mask->ne[1],
+                        int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits),
+                        turbo_v_frame ? 1 : 0, turbo_v_frame_identity ? 1 : 0,
+                        turbo_v_frame_reverse ? 1 : 0, turbo_v_frame_keep_f32 ? 1 : 0,
+                        turbo_v_frame_dense ? 1 : 0);
+                kvarn_graph_attn_trace_tensor("q_in", q_in);
+                kvarn_graph_attn_trace_tensor("k_mat", k_mat);
+                kvarn_graph_attn_trace_tensor("v_mat", v_mat);
+                kvarn_graph_attn_trace_tensor("mask", compact_mask);
+            }
+
+            ggml_tensor * cur = build_attn_mha(q_in, k_mat, v_mat, kq_b, compact_mask, sinks, v_mla, kq_scale, il);
+            cb(cur, "kvarn_iswa_materialized_mha_kqv_out", il);
+            if (turbo_v_frame) {
+                if (ggml_nelements(cur) % layer.head_dim_v != 0) {
+                    throw std::runtime_error("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME reached an attention output not divisible by head_dim_v");
+                }
+                if (!turbo_v_frame_identity) {
+                    if (turbo_v_frame_dense) {
+                        cur = ggml_mul_mat_aux(ctx0, cur, turbo_v_inv, false, sched, turbo_v_backend);
+                    } else {
+                        cur = kvarn_graph_apply_turbo_wht(
+                                ctx0, cur, kvarn_H, turbo_v_s1, turbo_v_s2,
+                                !turbo_v_frame_reverse, sched, turbo_v_backend);
+                    }
+                    cb(cur, "kvarn_iswa_materialized_mha_kqv_out_turbo_unrot", il);
+                }
+            }
+            cur = ggml_reshape_2d(ctx0, cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+            cb(cur, "kvarn_iswa_materialized_mha_kqv_out_2d", il);
+
+            if (wo) {
+                cur = build_lora_mm(wo, cur, wo_s);
+                cb(cur, "kvarn_iswa_materialized_mha_kqv_wo", il);
+            }
+            if (wo_b) {
+                cur = ggml_add(ctx0, cur, wo_b);
+                cb(cur, "kvarn_iswa_materialized_mha_kqv_wo_b", il);
+            }
+
+            if (debug_raw_mha_compare) {
+                ggml_tensor * k_raw = ggml_kvarn_materialize_kv(
+                        ctx0, sink_tail_k_src, layer.body_k, layer.scales_k, pending_k_src,
+                        0, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
+                        int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_k.key_bits));
+                ggml_kvarn_materialize_kv_set_debug_raw_body(k_raw, 1);
+                cb(k_raw, "kvarn_iswa_materialized_raw_k", il);
+
+                ggml_tensor * v_raw = ggml_kvarn_materialize_kv(
+                        ctx0, sink_tail_v_src, layer.body_v, layer.scales_v, pending_v_src,
+                        1, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
+                        int32_t(layer.head_dim_v), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_v.value_bits));
+                ggml_kvarn_materialize_kv_set_v_layout(v_raw, int32_t(layer.layout_v.v_layout));
+                ggml_kvarn_materialize_kv_set_debug_raw_body(v_raw, 1);
+                cb(v_raw, "kvarn_iswa_materialized_raw_v", il);
+
+                ggml_tensor * raw_cur = build_attn_mha(q_in, k_raw, v_raw, kq_b, compact_mask, sinks, v_mla, kq_scale, il);
+                cb(raw_cur, "kvarn_iswa_materialized_raw_mha_kqv_out", il);
+                raw_cur = ggml_reshape_2d(ctx0, raw_cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
+                cb(raw_cur, "kvarn_iswa_materialized_raw_mha_kqv_out_2d", il);
+                if (wo) {
+                    raw_cur = build_lora_mm(wo, raw_cur, wo_s);
+                    cb(raw_cur, "kvarn_iswa_materialized_raw_mha_kqv_wo", il);
+                }
+                if (wo_b) {
+                    raw_cur = ggml_add(ctx0, raw_cur, wo_b);
+                    cb(raw_cur, "kvarn_iswa_materialized_raw_mha_kqv_wo_b", il);
+                }
+                ggml_build_forward_expand(gf, raw_cur);
+            }
+
+            if (debug_materialize_mha) {
+                return cur;
+            }
+
+            ggml_build_forward_expand(gf, cur);
         }
         ggml_tensor * cur = ggml_kvarn_attn_mixed(
-                ctx0, q_in, layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
-                layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v, scores, inp->get_kq_mask_kvarn(),
+                ctx0, q_in, sink_tail_k_src, sink_tail_v_src, layer.body_k, layer.body_v,
+                layer.scales_k, layer.scales_v, pending_k_src, pending_v_src, scores, inp->get_kq_mask_kvarn(),
                 op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                 int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size),
-                int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale);
+                int32_t(layer.layout_k.key_bits), int32_t(layer.layout_v.value_bits), kq_scale,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        ggml_kvarn_attn_mixed_set_v_layout(cur, int32_t(layer.layout_v.v_layout));
+        if (kvarn_fused_fwht) {
+            ggml_kvarn_attn_mixed_set_frame_flags(cur, GGML_KVARN_ATTN_FRAME_FUSED_PAPER_FULL);
+        }
+        if (kvarn_paper_mixed_frame && q_body != nullptr) {
+            ggml_kvarn_attn_mixed_set_q_body(cur, q_body);
+        }
         if (window_indirect) {
             ggml_kvarn_attn_mixed_set_window(cur, inp->base_kvarn_window);
         }
         inp->base_mixed_attn_nodes.push_back(cur);
         cb(cur, "kvarn_iswa_kqv_out", il);
-        if (kvarn_paper_frame) {
+        if (kvarn_paper_frame && !kvarn_paper_mixed_frame && !kvarn_fused_fwht) {
             cur = kvarn_graph_apply_hadamard(ctx0, kvarn_H, cur);
             cb(cur, "kvarn_iswa_kqv_out_unrot", il);
         }

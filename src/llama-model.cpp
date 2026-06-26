@@ -2079,14 +2079,9 @@ static bool llama_kvarn_force_experimental_iswa() {
     return llama_kvarn_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA");
 }
 
-static llama_memory_i::layer_filter_cb llama_kvarn_layer_filter_from_env() {
-    const char * env = std::getenv("LLAMA_KVARN_LAYER_FILTER");
-    if (env == nullptr || env[0] == '\0') {
-        return nullptr;
-    }
-
-    auto layers = std::make_shared<std::vector<int32_t>>();
-    std::stringstream ss(env);
+static std::vector<int32_t> llama_kvarn_parse_layer_id_list(const char * value, const char * name) {
+    std::vector<int32_t> layers;
+    std::stringstream ss(value);
     std::string token;
     while (std::getline(ss, token, ',')) {
         std::stringstream parts(token);
@@ -2098,23 +2093,35 @@ static llama_memory_i::layer_filter_cb llama_kvarn_layer_filter_from_env() {
                 const int32_t end   = std::stoi(m[2].str());
                 const int32_t step  = m[3].matched ? std::stoi(m[3].str()) : 1;
                 if (end < start || step <= 0) {
-                    throw std::runtime_error(std::string("invalid LLAMA_KVARN_LAYER_FILTER range: ") + part);
+                    throw std::runtime_error(std::string("invalid ") + name + " range: " + part);
                 }
                 for (int32_t il = start; il <= end; il += step) {
-                    layers->push_back(il);
+                    layers.push_back(il);
                 }
             } else if (std::regex_match(part, m, std::regex("^([0-9]+)$"))) {
-                layers->push_back(std::stoi(m[1].str()));
+                layers.push_back(std::stoi(m[1].str()));
             } else {
-                throw std::runtime_error(std::string("invalid LLAMA_KVARN_LAYER_FILTER token: ") + part);
+                throw std::runtime_error(std::string("invalid ") + name + " token: " + part);
             }
         }
     }
-    if (layers->empty()) {
-        throw std::runtime_error("LLAMA_KVARN_LAYER_FILTER did not contain any layer ids");
+
+    std::sort(layers.begin(), layers.end());
+    layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+    if (layers.empty()) {
+        throw std::runtime_error(std::string(name) + " did not contain any layer ids");
     }
-    std::sort(layers->begin(), layers->end());
-    layers->erase(std::unique(layers->begin(), layers->end()), layers->end());
+    return layers;
+}
+
+static llama_memory_i::layer_filter_cb llama_kvarn_layer_filter_from_env() {
+    const char * env = std::getenv("LLAMA_KVARN_LAYER_FILTER");
+    if (env == nullptr || env[0] == '\0') {
+        return nullptr;
+    }
+
+    auto layers = std::make_shared<std::vector<int32_t>>(
+            llama_kvarn_parse_layer_id_list(env, "LLAMA_KVARN_LAYER_FILTER"));
 
     LLAMA_LOG_WARN("%s: diagnostic KVarN layer filter enabled: %s\n", __func__, env);
     return [layers](int32_t il) {
@@ -2162,11 +2169,7 @@ static llama_memory_i * llama_kvarn_create_normal_iswa_fallback(
 
     if (model.arch == LLM_ARCH_GEMMA4) {
         reuse = [&](int32_t il) {
-            if (il >= (int32_t) hparams.n_layer_kv_from_start) {
-                return (int32_t) hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
-            }
-
-            return -1;
+            return hparams.kv_reuse_layer_matching_attention_type(il);
         };
     }
 
@@ -2196,22 +2199,17 @@ static void llama_kvarn_validate_memory_support(
         const llama_hparams & hparams,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
-    if (params.kvarn.group_size == 0 || (params.kvarn.group_size & (params.kvarn.group_size - 1)) != 0 ||
+    if (params.kvarn.group_size != 128 ||
             params.kvarn.key_bits < 2 || params.kvarn.key_bits > 8 ||
             params.kvarn.value_bits < 2 || params.kvarn.value_bits > 8) {
-        throw std::runtime_error("KVarN backend requires power-of-two group size and key/value bits in [2, 8]");
+        throw std::runtime_error("KVarN backend requires group size 128 and key/value bits in [2, 8]");
     }
-
     if (hparams.is_mla()) {
         throw std::runtime_error("KVarN backend does not support MLA models yet");
     }
 
     if (hparams.use_alibi || hparams.f_max_alibi_bias > 0.0f) {
         throw std::runtime_error("KVarN backend does not support ALiBi attention bias yet");
-    }
-
-    if (hparams.attn_soft_cap) {
-        throw std::runtime_error("KVarN backend does not support attention logit soft-capping yet");
     }
 
     if (hparams.f_attn_out_scale != 0.0f) {
@@ -2305,11 +2303,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
             if (arch == LLM_ARCH_GEMMA4) {
                 reuse = [&](int32_t il) {
-                    if (il >= (int32_t) hparams.n_layer_kv_from_start) {
-                        return (int32_t) hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
-                    }
-
-                    return -1;
+                    return hparams.kv_reuse_layer_matching_attention_type(il);
                 };
             } else {
                 throw std::runtime_error("KVarN backend supports SWA/ISWA only for Gemma 4 models at this stage");
@@ -2319,29 +2313,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             auto full_normal_compat_filter = [&](int32_t il) {
                 return !hparams.is_swa(il);
             };
-            llama_memory_i::layer_filter_cb diagnostic_filter = llama_kvarn_layer_filter_from_env();
-            if (diagnostic_filter) {
-                auto route_contains = [](const std::shared_ptr<std::vector<int32_t>> & layers, int32_t il) {
-                    return std::binary_search(layers->begin(), layers->end(), il);
-                };
-                auto physical_kv_donor = [&](int32_t il) {
-                    if (hparams.n_layer_kv_from_start >= 0 && il >= hparams.n_layer_kv_from_start) {
-                        return hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
-                    }
-                    return il;
-                };
-
-                std::vector<int32_t> selected_donors;
-                for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
-                    if (hparams.is_swa(il) || !diagnostic_filter(il)) {
-                        continue;
-                    }
-                    selected_donors.push_back(physical_kv_donor(int32_t(il)));
-                }
+            auto route_contains = [](const std::shared_ptr<std::vector<int32_t>> & layers, int32_t il) {
+                return std::binary_search(layers->begin(), layers->end(), il);
+            };
+            auto physical_kv_donor = [&](int32_t il) {
+                const int32_t donor = hparams.kv_reuse_layer_matching_attention_type(il);
+                return donor >= 0 ? donor : il;
+            };
+            auto install_gemma_route = [&](std::vector<int32_t> selected_donors, const char * route_name) {
                 std::sort(selected_donors.begin(), selected_donors.end());
                 selected_donors.erase(std::unique(selected_donors.begin(), selected_donors.end()), selected_donors.end());
                 if (selected_donors.empty()) {
-                    throw std::runtime_error("LLAMA_KVARN_LAYER_FILTER selected no Gemma KVarN+ISWA full-attention layers");
+                    throw std::runtime_error(format("%s selected no Gemma KVarN+ISWA full-attention layers", route_name));
                 }
 
                 std::vector<int32_t> route_kvarn_layers;
@@ -2359,9 +2342,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
 
                 LLAMA_LOG_WARN(
-                        "%s: diagnostic Gemma KVarN+ISWA route map: selected physical donor layers [%s], "
+                        "%s: %s Gemma KVarN+ISWA route map: selected physical donor layers [%s], "
                         "expanded KVarN layers [%s], normal full-KV fallback layers [%s]\n",
                         __func__,
+                        route_name,
                         llama_kvarn_format_layer_ids(selected_donors).c_str(),
                         llama_kvarn_format_layer_ids(route_kvarn_layers).c_str(),
                         llama_kvarn_format_layer_ids(route_normal_layers).c_str());
@@ -2371,7 +2355,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 filter = [route_kvarn_layers_ptr, route_contains](int32_t il) {
                     return route_contains(route_kvarn_layers_ptr, il);
                 };
-                if (!route_normal_layers_ptr->empty()) {
+                if (llama_kvarn_env_flag("LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN")) {
+                    LLAMA_LOG_WARN(
+                            "%s: diagnostic LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN=1 creates normal full-KV "
+                            "compatibility cache for all Gemma full-attention layers\n",
+                            __func__);
+                    filter_full_normal = full_normal_compat_filter;
+                } else if (!route_normal_layers_ptr->empty()) {
                     filter_full_normal = [route_normal_layers_ptr, route_contains](int32_t il) {
                         return route_contains(route_normal_layers_ptr, il);
                     };
@@ -2382,6 +2372,74 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             __func__);
                     filter_full_normal = full_normal_compat_filter;
                 }
+            };
+            llama_memory_i::layer_filter_cb diagnostic_filter = llama_kvarn_layer_filter_from_env();
+            if (diagnostic_filter) {
+                std::vector<int32_t> selected_donors;
+                for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                    if (hparams.is_swa(il) || !diagnostic_filter(il)) {
+                        continue;
+                    }
+                    selected_donors.push_back(physical_kv_donor(int32_t(il)));
+                }
+                install_gemma_route(std::move(selected_donors), "diagnostic");
+            } else if (arch == LLM_ARCH_GEMMA4 && std::getenv("LLAMA_KVARN_GEMMA4_PROTECT_DONORS") != nullptr) {
+                const char * protected_env = std::getenv("LLAMA_KVARN_GEMMA4_PROTECT_DONORS");
+                const std::vector<int32_t> protected_donors =
+                        llama_kvarn_parse_layer_id_list(protected_env, "LLAMA_KVARN_GEMMA4_PROTECT_DONORS");
+                std::vector<int32_t> selected_donors;
+                std::vector<int32_t> unknown_protected;
+                std::vector<int32_t> all_full_donors;
+                for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                    if (hparams.is_swa(il)) {
+                        continue;
+                    }
+                    all_full_donors.push_back(physical_kv_donor(int32_t(il)));
+                }
+                std::sort(all_full_donors.begin(), all_full_donors.end());
+                all_full_donors.erase(std::unique(all_full_donors.begin(), all_full_donors.end()), all_full_donors.end());
+                for (const int32_t donor : all_full_donors) {
+                    if (!std::binary_search(protected_donors.begin(), protected_donors.end(), donor)) {
+                        selected_donors.push_back(donor);
+                    }
+                }
+                for (const int32_t donor : protected_donors) {
+                    if (!std::binary_search(all_full_donors.begin(), all_full_donors.end(), donor)) {
+                        unknown_protected.push_back(donor);
+                    }
+                }
+                if (!unknown_protected.empty()) {
+                    throw std::runtime_error(format(
+                            "LLAMA_KVARN_GEMMA4_PROTECT_DONORS includes non-full-attention Gemma donor layer(s): %s",
+                            llama_kvarn_format_layer_ids(unknown_protected).c_str()));
+                }
+                LLAMA_LOG_WARN(
+                        "%s: Gemma KVarN+ISWA protected physical donor layers [%s] will use normal full-KV fallback; "
+                        "remaining full-attention donors [%s] will use KVarN\n",
+                        __func__,
+                        llama_kvarn_format_layer_ids(protected_donors).c_str(),
+                        llama_kvarn_format_layer_ids(selected_donors).c_str());
+                install_gemma_route(std::move(selected_donors), "protected-donor");
+            } else if (arch == LLM_ARCH_GEMMA4 && llama_kvarn_env_flag("LLAMA_KVARN_GEMMA4_ROUTE_CONSERVATIVE")) {
+                std::vector<int32_t> selected_donors;
+                std::vector<int32_t> all_full_donors;
+                for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                    if (hparams.is_swa(il)) {
+                        continue;
+                    }
+                    all_full_donors.push_back(physical_kv_donor(int32_t(il)));
+                }
+                std::sort(all_full_donors.begin(), all_full_donors.end());
+                all_full_donors.erase(std::unique(all_full_donors.begin(), all_full_donors.end()), all_full_donors.end());
+                for (size_t i = 0; i < all_full_donors.size(); ++i) {
+                    // Rollback route from the pre-16K Gemma fixture diagnosis: skip the second
+                    // and final full-attention physical donors.
+                    if (i == 1 || i + 1 == all_full_donors.size()) {
+                        continue;
+                    }
+                    selected_donors.push_back(all_full_donors[i]);
+                }
+                install_gemma_route(std::move(selected_donors), "conservative-rollback");
             } else if (!llama_kvarn_env_flag("LLAMA_KVARN_ISWA_DISABLE_COMPAT_FULL_NORMAL")) {
                 LLAMA_LOG_WARN(
                         "%s: creating compatibility normal full-KV cache for Gemma KVarN+ISWA; "
@@ -2626,13 +2684,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                     if (arch == LLM_ARCH_GEMMA3N || arch == LLM_ARCH_GEMMA4) {
                         reuse = [&](uint32_t il) {
-                            GGML_ASSERT(hparams.n_layer_kv_from_start >= 2);
-
-                            if (il >= (uint32_t)hparams.n_layer_kv_from_start) {
-                                return hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+                            if (arch == LLM_ARCH_GEMMA4) {
+                                return hparams.kv_reuse_layer_matching_attention_type((int32_t) il);
                             }
-
-                            return -1;
+                            return int32_t(hparams.n_layer_kv_from_start) - 1;
                         };
                     }
 
@@ -2656,12 +2711,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             share = [&](int32_t il) {
                                 const llama_model * model_other = llama_get_model(cparams.ctx_other);
+                                const llama_hparams & hparams_other = model_other->hparams;
+                                const bool want_swa = hparams.is_swa(il);
 
-                                if (hparams.is_swa(il)) {
-                                    return llama_model_n_layer(model_other) - 2;
+                                for (int32_t donor = (int32_t) hparams_other.n_layer_all - 1; donor >= 0; --donor) {
+                                    if (hparams_other.has_kv((uint32_t) donor) &&
+                                            hparams_other.is_swa((uint32_t) donor) == want_swa) {
+                                        return donor;
+                                    }
                                 }
 
-                                return llama_model_n_layer(model_other) - 1;
+                                GGML_ABORT("%s: no Gemma4 assistant KV donor layer found for layer %d", __func__, il);
                             };
 
                             res = new llama_kv_cache_iswa(
