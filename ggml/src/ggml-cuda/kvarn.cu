@@ -267,12 +267,28 @@ static bool kvarn_debug_raw_body_scalar_qt_enabled() {
 }
 
 static bool kvarn_paper_frame_enabled() {
+    if (kvarn_env_flag("LLAMA_KVARN_DISABLE_PAPER_FRAME")) {
+        return false;
+    }
+
+    // CUDA paper-frame body storage is explicit opt-in until the Gemma 512d
+    // body-store/frame contract is corrected; default-on produced catastrophic
+    // donor5 KL tails in validation.
     return kvarn_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
 }
 
 static bool kvarn_paper_mixed_frame_enabled() {
-    return kvarn_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME") &&
-        kvarn_env_flag("LLAMA_KVARN_PAPER_MIXED_FRAME");
+    if (!kvarn_env_flag("LLAMA_KVARN_PAPER_MIXED_FRAME")) {
+        return false;
+    }
+    if (!kvarn_env_flag("LLAMA_KVARN_UNSAFE_ALLOW_PAPER_MIXED_FRAME")) {
+        std::fprintf(stderr,
+                "LLAMA_KVARN_PAPER_MIXED_FRAME is diagnostic-only because it can silently "
+                "change K/V store-attention frame contracts; also set "
+                "LLAMA_KVARN_UNSAFE_ALLOW_PAPER_MIXED_FRAME=1 only for targeted frame A/B tests.\n");
+        std::abort();
+    }
+    return kvarn_paper_frame_enabled();
 }
 
 static bool kvarn_experimental_turbo_v_enabled() {

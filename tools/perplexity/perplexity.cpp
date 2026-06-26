@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <clocale>
+#include <cerrno>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -2022,6 +2023,46 @@ static bool kl_divergence(llama_context * ctx, const common_params & params) {
 
             const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
 
+            const char * logit_dump_dir_env = std::getenv("LLAMA_KVARN_LOGIT_DUMP_DIR");
+            const char * logit_dump_row_env = std::getenv("LLAMA_KVARN_LOGIT_DUMP_TARGET_ROW");
+            if (logit_dump_dir_env != nullptr && logit_dump_dir_env[0] != '\0' &&
+                    logit_dump_row_env != nullptr && logit_dump_row_env[0] != '\0') {
+                char * end = nullptr;
+                errno = 0;
+                const long long dump_row_ll = std::strtoll(logit_dump_row_env, &end, 10);
+                if (end != logit_dump_row_env && end != nullptr && *end == '\0' && errno != ERANGE &&
+                        dump_row_ll >= first && dump_row_ll < n_ctx - 1) {
+                    const int dump_row = int(dump_row_ll);
+                    const int local = dump_row - first;
+                    const std::filesystem::path dump_dir(logit_dump_dir_env);
+                    std::error_code ec;
+                    std::filesystem::create_directories(dump_dir, ec);
+                    if (!ec) {
+                        std::ostringstream stem;
+                        stem << "actual_logits_chunk" << (i + seq) << "_row" << dump_row;
+                        const auto bin_path = dump_dir / (stem.str() + ".bin");
+                        const auto json_path = dump_dir / (stem.str() + ".json");
+                        {
+                            std::ofstream out(bin_path, std::ios::binary);
+                            out.write(reinterpret_cast<const char *>(all_logits + size_t(local)*n_vocab),
+                                    std::streamsize(size_t(n_vocab)*sizeof(float)));
+                        }
+                        {
+                            std::ofstream meta(json_path);
+                            meta << "{\n";
+                            meta << "  \"chunk\": " << (i + seq) << ",\n";
+                            meta << "  \"logit_pos\": " << dump_row << ",\n";
+                            meta << "  \"target_pos\": " << (dump_row + 1) << ",\n";
+                            meta << "  \"local_index\": " << local << ",\n";
+                            meta << "  \"n_vocab\": " << n_vocab << ",\n";
+                            meta << "  \"type\": \"f32\",\n";
+                            meta << "  \"bin\": \"" << bin_path.filename().string() << "\"\n";
+                            meta << "}\n";
+                        }
+                    }
+                }
+            }
+
             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr, base_log_prob_format);
             if (kl_dump_stream) {
@@ -2188,10 +2229,25 @@ struct kvarn_tensor_dump_state {
     std::vector<uint8_t> data;
     std::unordered_map<std::string, int> name_counts;
     std::unordered_map<std::string, int64_t> name_row_bases;
+    std::unordered_map<std::string, int> ask_name_counts;
+    std::unordered_map<std::string, int64_t> ask_name_row_bases;
     int                  limit = 16;
     int                  count = 0;
-    int                  row = -1;
-    int                  scored_row_offset = -1;
+    int64_t              source_row = -1;
+    int64_t              target_full_row = -1;
+    int64_t              target_scored_row = -1;
+    int64_t              scored_row_offset = -1;
+
+    struct selected_dump {
+        int     name_occurrence = -1;
+        int64_t name_row_base = 0;
+        int64_t source_nrows = 0;
+        int64_t source_row = -1;
+        int64_t inferred_full_row = -1;
+        int64_t inferred_scored_row = -1;
+        const char * selection_mode = "full-tensor";
+    };
+    std::unordered_map<const ggml_tensor *, selected_dump> selected;
 };
 
 static std::string kvarn_tensor_dump_sanitize(std::string name) {
@@ -2206,6 +2262,115 @@ static std::string kvarn_tensor_dump_sanitize(std::string name) {
         }
     }
     return name.empty() ? "unnamed" : name;
+}
+
+static int64_t kvarn_tensor_dump_parse_i64_env(
+        const char * name,
+        int64_t default_value,
+        bool * present = nullptr) {
+    const char * env = std::getenv(name);
+    if (present != nullptr) {
+        *present = env != nullptr && env[0] != '\0';
+    }
+    if (env == nullptr || env[0] == '\0') {
+        return default_value;
+    }
+
+    char * end = nullptr;
+    errno = 0;
+    const long long value = std::strtoll(env, &end, 10);
+    if (env[0] == '\0' || end == nullptr || *end != '\0' || errno == ERANGE || value < 0) {
+        throw std::runtime_error(std::string(name) + " must be a non-negative integer");
+    }
+    return int64_t(value);
+}
+
+static int64_t kvarn_tensor_dump_dim(int64_t v) {
+    return v > 0 ? v : 1;
+}
+
+static int64_t kvarn_tensor_dump_nrows(const ggml_tensor * t) {
+    return kvarn_tensor_dump_dim(t->ne[1])*
+           kvarn_tensor_dump_dim(t->ne[2])*
+           kvarn_tensor_dump_dim(t->ne[3]);
+}
+
+static size_t kvarn_tensor_dump_row_offset(const ggml_tensor * t, int64_t source_row) {
+    const int64_t n1 = kvarn_tensor_dump_dim(t->ne[1]);
+    const int64_t n2 = kvarn_tensor_dump_dim(t->ne[2]);
+    const int64_t i1 = source_row % n1;
+    const int64_t i2 = (source_row / n1) % n2;
+    const int64_t i3 = source_row / (n1*n2);
+    return size_t(i1)*t->nb[1] + size_t(i2)*t->nb[2] + size_t(i3)*t->nb[3];
+}
+
+static void kvarn_tensor_dump_row_coords(const ggml_tensor * t, int64_t source_row, int64_t & i1, int64_t & i2, int64_t & i3) {
+    const int64_t n1 = kvarn_tensor_dump_dim(t->ne[1]);
+    const int64_t n2 = kvarn_tensor_dump_dim(t->ne[2]);
+    i1 = source_row % n1;
+    i2 = (source_row / n1) % n2;
+    i3 = source_row / (n1*n2);
+}
+
+static bool kvarn_tensor_dump_source_row_from_target(
+        const kvarn_tensor_dump_state & state,
+        int64_t name_row_base,
+        int64_t source_nrows,
+        int64_t & source_row,
+        int64_t & inferred_full_row,
+        int64_t & inferred_scored_row,
+        const char * & selection_mode) {
+    if (state.source_row >= 0) {
+        source_row = state.source_row;
+        if (source_row < 0 || source_row >= source_nrows) {
+            return false;
+        }
+        inferred_full_row = name_row_base + source_row;
+        inferred_scored_row = state.scored_row_offset >= 0 ? inferred_full_row - state.scored_row_offset : -1;
+        selection_mode = "source";
+        return true;
+    }
+
+    if (state.target_full_row >= 0) {
+        source_row = state.target_full_row - name_row_base;
+        if (source_row >= 0 && source_row < source_nrows) {
+            inferred_full_row = state.target_full_row;
+            inferred_scored_row = state.scored_row_offset >= 0 ? state.target_full_row - state.scored_row_offset : -1;
+            selection_mode = "target-full";
+            return true;
+        }
+
+        // Output/logit tensors are often row-compressed to scored rows only.
+        // With a scored-row offset, bind the same target through its scored row.
+        if (state.scored_row_offset >= 0) {
+            const int64_t scored = state.target_full_row - state.scored_row_offset;
+            source_row = scored - name_row_base;
+            if (scored >= 0 && source_row >= 0 && source_row < source_nrows) {
+                inferred_full_row = state.target_full_row;
+                inferred_scored_row = scored;
+                selection_mode = "target-full-via-scored";
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (state.target_scored_row >= 0) {
+        source_row = state.target_scored_row - name_row_base;
+        if (source_row < 0 || source_row >= source_nrows) {
+            return false;
+        }
+        inferred_scored_row = state.target_scored_row;
+        inferred_full_row = state.scored_row_offset >= 0 ? state.scored_row_offset + state.target_scored_row : -1;
+        selection_mode = "target-scored";
+        return true;
+    }
+
+    source_row = -1;
+    inferred_full_row = -1;
+    inferred_scored_row = -1;
+    selection_mode = "full-tensor";
+    return true;
 }
 
 static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
@@ -2223,13 +2388,62 @@ static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * u
         return ask ? false : true;
     }
     if (ask) {
+        if (state->limit >= 0 && int(state->selected.size()) >= state->limit) {
+            return false;
+        }
+
+        const int name_occurrence = state->ask_name_counts[name]++;
+        const int64_t name_row_base = state->ask_name_row_bases[name];
+        const int64_t source_nrows = kvarn_tensor_dump_nrows(t);
+        state->ask_name_row_bases[name] = name_row_base + source_nrows;
+
+        int64_t source_row = -1;
+        int64_t inferred_full_row = -1;
+        int64_t inferred_scored_row = -1;
+        const char * selection_mode = "full-tensor";
+        if (!kvarn_tensor_dump_source_row_from_target(
+                    *state, name_row_base, source_nrows,
+                    source_row, inferred_full_row, inferred_scored_row, selection_mode)) {
+            return false;
+        }
+
+        if (source_row >= 0 && t->nb[0] != ggml_type_size(t->type)) {
+            return false;
+        }
+
+        state->selected[t] = {
+            name_occurrence,
+            name_row_base,
+            source_nrows,
+            source_row,
+            inferred_full_row,
+            inferred_scored_row,
+            selection_mode,
+        };
+        return true;
+    }
+
+    const auto selected_it = state->selected.find(t);
+    if (selected_it == state->selected.end()) {
+        return true;
+    }
+    const kvarn_tensor_dump_state::selected_dump selected = selected_it->second;
+    state->selected.erase(selected_it);
+
+    const int name_occurrence = selected.name_occurrence;
+    const int64_t name_row_base = selected.name_row_base;
+    const int64_t source_nrows = selected.source_nrows;
+    const int64_t source_row = selected.source_row;
+    const int64_t inferred_full_row = selected.inferred_full_row;
+    const int64_t inferred_scored_row = selected.inferred_scored_row;
+    const char * selection_mode = selected.selection_mode;
+
+    const bool row_only = source_row >= 0;
+    if (row_only && t->nb[0] != ggml_type_size(t->type)) {
         return true;
     }
 
     const int index = state->count++;
-    const int name_occurrence = state->name_counts[name]++;
-    const int64_t name_row_base = state->name_row_bases[name];
-    state->name_row_bases[name] = name_row_base + t->ne[1];
     std::ostringstream stem;
     stem << "tensor_" << std::setw(6) << std::setfill('0') << index
          << "_" << kvarn_tensor_dump_sanitize(name);
@@ -2237,17 +2451,16 @@ static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * u
     const auto bin_path  = state->dir / (stem.str() + ".bin");
     const auto json_path = state->dir / (stem.str() + ".json");
 
-    const bool row_only = state->row >= 0;
-    if (row_only && (state->row >= t->ne[1] || t->nb[0] != ggml_type_size(t->type))) {
-        return true;
+    int64_t source_i1 = -1;
+    int64_t source_i2 = -1;
+    int64_t source_i3 = -1;
+    if (row_only) {
+        kvarn_tensor_dump_row_coords(t, source_row, source_i1, source_i2, source_i3);
     }
-    const int64_t inferred_full_row = row_only ? name_row_base + state->row : -1;
-    const int64_t inferred_scored_row =
-        row_only && state->scored_row_offset >= 0 ? int64_t(state->scored_row_offset) + inferred_full_row : -1;
 
     const size_t n_bytes = row_only ? ggml_row_size(t->type, t->ne[0]) : ggml_nbytes(t);
     const bool is_host = t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer);
-    const size_t offset = row_only ? size_t(state->row)*t->nb[1] : 0;
+    const size_t offset = row_only ? kvarn_tensor_dump_row_offset(t, source_row) : 0;
     const void * src = static_cast<const uint8_t *>(t->data) + offset;
     if (!is_host) {
         state->data.resize(n_bytes);
@@ -2272,11 +2485,19 @@ static bool kvarn_tensor_dump_cb_eval(struct ggml_tensor * t, bool ask, void * u
         meta << "  \"nb\": [" << t->nb[0] << ", " << (row_only ? int64_t(n_bytes) : t->nb[1]) << ", " << (row_only ? int64_t(n_bytes) : t->nb[2]) << ", " << (row_only ? int64_t(n_bytes) : t->nb[3]) << "],\n";
         meta << "  \"source_ne\": [" << t->ne[0] << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "],\n";
         meta << "  \"source_nb\": [" << t->nb[0] << ", " << t->nb[1] << ", " << t->nb[2] << ", " << t->nb[3] << "],\n";
-        meta << "  \"source_row\": " << (row_only ? state->row : -1) << ",\n";
+        meta << "  \"source_nrows\": " << source_nrows << ",\n";
+        meta << "  \"source_row\": " << (row_only ? source_row : -1) << ",\n";
+        meta << "  \"source_i1\": " << source_i1 << ",\n";
+        meta << "  \"source_i2\": " << source_i2 << ",\n";
+        meta << "  \"source_i3\": " << source_i3 << ",\n";
         meta << "  \"name_row_base\": " << name_row_base << ",\n";
         meta << "  \"inferred_full_row\": " << inferred_full_row << ",\n";
         meta << "  \"inferred_scored_row\": " << inferred_scored_row << ",\n";
+        meta << "  \"target_full_row\": " << state->target_full_row << ",\n";
+        meta << "  \"target_scored_row\": " << state->target_scored_row << ",\n";
         meta << "  \"scored_row_offset\": " << state->scored_row_offset << ",\n";
+        meta << "  \"selection_mode\": \"" << selection_mode << "\",\n";
+        meta << "  \"row_offset_bytes\": " << (row_only ? int64_t(offset) : int64_t(0)) << ",\n";
         meta << "  \"bin\": \"" << bin_path.filename().string() << "\"\n";
         meta << "}\n";
     }
@@ -2288,6 +2509,15 @@ static std::unique_ptr<kvarn_tensor_dump_state> kvarn_tensor_dump_try_init(commo
     const char * dir_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_DIR");
     if (dir_env == nullptr || dir_env[0] == '\0') {
         return nullptr;
+    }
+    if (params.kl_divergence) {
+        const char * allow_perturb_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_ALLOW_PERTURB");
+        if (allow_perturb_env == nullptr || allow_perturb_env[0] == '\0' || std::atoi(allow_perturb_env) == 0) {
+            LOG_WRN("KVarN tensor dump disabled during KL divergence: scheduler cb_eval observation perturbs logits; "
+                    "use LLAMA_KVARN_LOGIT_DUMP_DIR for KL-surface dumps, or set "
+                    "LLAMA_KVARN_TENSOR_DUMP_ALLOW_PERTURB=1 for non-measured diagnostics\n");
+            return nullptr;
+        }
     }
 
     auto state = std::make_unique<kvarn_tensor_dump_state>();
@@ -2303,19 +2533,48 @@ static std::unique_ptr<kvarn_tensor_dump_state> kvarn_tensor_dump_try_init(commo
         if (limit_env != nullptr && limit_env[0] != '\0') {
             state->limit = std::max(0, std::atoi(limit_env));
         }
-        const char * row_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_ROW");
-        if (row_env != nullptr && row_env[0] != '\0') {
-            state->row = std::atoi(row_env);
-            if (state->row < 0) {
-                throw std::runtime_error("LLAMA_KVARN_TENSOR_DUMP_ROW must be non-negative");
-            }
+
+        bool has_legacy_row = false;
+        bool has_source_row = false;
+        bool has_target_row = false;
+        bool has_full_row = false;
+        bool has_scored_row = false;
+        bool has_scored_offset = false;
+
+        const int64_t legacy_row = kvarn_tensor_dump_parse_i64_env(
+                "LLAMA_KVARN_TENSOR_DUMP_ROW", -1, &has_legacy_row);
+        const int64_t source_row = kvarn_tensor_dump_parse_i64_env(
+                "LLAMA_KVARN_TENSOR_DUMP_SOURCE_ROW", -1, &has_source_row);
+        const int64_t target_row = kvarn_tensor_dump_parse_i64_env(
+                "LLAMA_KVARN_TENSOR_DUMP_TARGET_ROW", -1, &has_target_row);
+        const int64_t full_row = kvarn_tensor_dump_parse_i64_env(
+                "LLAMA_KVARN_TENSOR_DUMP_FULL_ROW", -1, &has_full_row);
+        const int64_t scored_row = kvarn_tensor_dump_parse_i64_env(
+                "LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW", -1, &has_scored_row);
+        state->scored_row_offset = kvarn_tensor_dump_parse_i64_env(
+                "LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW_OFFSET", -1, &has_scored_offset);
+
+        if (has_legacy_row && has_source_row) {
+            throw std::runtime_error("set only one of LLAMA_KVARN_TENSOR_DUMP_ROW or LLAMA_KVARN_TENSOR_DUMP_SOURCE_ROW");
         }
-        const char * scored_offset_env = std::getenv("LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW_OFFSET");
-        if (scored_offset_env != nullptr && scored_offset_env[0] != '\0') {
-            state->scored_row_offset = std::atoi(scored_offset_env);
-            if (state->scored_row_offset < 0) {
-                throw std::runtime_error("LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW_OFFSET must be non-negative");
+        const int selectors =
+            (has_legacy_row || has_source_row ? 1 : 0) +
+            (has_target_row ? 1 : 0) +
+            (has_full_row ? 1 : 0) +
+            (has_scored_row ? 1 : 0);
+        if (selectors > 1) {
+            throw std::runtime_error(
+                    "set only one tensor dump row selector: SOURCE/ROW, TARGET_ROW, FULL_ROW, or SCORED_ROW");
+        }
+        if (has_legacy_row || has_source_row) {
+            state->source_row = has_source_row ? source_row : legacy_row;
+        } else if (has_target_row || has_full_row) {
+            state->target_full_row = has_full_row ? full_row : target_row;
+        } else if (has_scored_row) {
+            if (!has_scored_offset) {
+                throw std::runtime_error("LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW requires LLAMA_KVARN_TENSOR_DUMP_SCORED_ROW_OFFSET");
             }
+            state->target_scored_row = scored_row;
         }
     } catch (const std::exception & ex) {
         LOG_ERR("KVarN tensor dump disabled: invalid dump configuration: %s\n", ex.what());
@@ -2324,8 +2583,12 @@ static std::unique_ptr<kvarn_tensor_dump_state> kvarn_tensor_dump_try_init(commo
 
     params.cb_eval           = kvarn_tensor_dump_cb_eval;
     params.cb_eval_user_data = state.get();
-    LOG_INF("KVarN tensor dump enabled: dir=%s filter=%s limit=%d row=%d scored_row_offset=%d\n",
-            state->dir.string().c_str(), filter.c_str(), state->limit, state->row, state->scored_row_offset);
+    LOG_INF("KVarN tensor dump enabled: dir=%s filter=%s limit=%d source_row=%lld target_full_row=%lld target_scored_row=%lld scored_row_offset=%lld\n",
+            state->dir.string().c_str(), filter.c_str(), state->limit,
+            (long long) state->source_row,
+            (long long) state->target_full_row,
+            (long long) state->target_scored_row,
+            (long long) state->scored_row_offset);
     return state;
 }
 

@@ -51,6 +51,19 @@ static bool kvarn_graph_parse_env_flag(const char * name) {
     return value != 0;
 }
 
+static bool kvarn_graph_paper_frame_enabled() {
+    if (kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PAPER_FRAME")) {
+        return false;
+    }
+
+    // Back-compat parser/validator only. Historically paper-frame was enabled
+    // by LLAMA_KVARN_ENABLE_PAPER_FRAME=1. The validated Gemma/Qwen quality
+    // paths now require paper-frame; require the explicit disable flag above
+    // for diagnostic no-paper negative controls.
+    (void) kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
+    return true;
+}
+
 static bool kvarn_graph_paper_mixed_frame_enabled() {
     if (!kvarn_graph_parse_env_flag("LLAMA_KVARN_PAPER_MIXED_FRAME")) {
         return false;
@@ -3460,7 +3473,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
         const auto & idxs = inp_kvarn->get_sink_tail_idxs();
         const llama_kvarn_layer_view layer = inp_kvarn->mctx_kvarn->get_layer_view(il);
-        const bool kvarn_paper_frame = kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
+        const bool kvarn_paper_frame = kvarn_graph_paper_frame_enabled();
         if (kvarn_paper_frame) {
             (void) kvarn_graph_paper_mixed_frame_enabled();
         }
@@ -4137,7 +4150,7 @@ ggml_tensor * llm_graph_context::build_attn(
         const bool stores_kv = k_cur != nullptr;
         const auto & idxs = inp->base_sink_tail_idxs;
         const llama_kvarn_layer_view layer = mctx_kvarn->get_layer_view(il);
-        const bool kvarn_paper_frame = kvarn_graph_parse_env_flag("LLAMA_KVARN_ENABLE_PAPER_FRAME");
+        const bool kvarn_paper_frame = kvarn_graph_paper_frame_enabled();
         const bool kvarn_paper_mixed_frame =
             kvarn_paper_frame && kvarn_graph_paper_mixed_frame_enabled();
         ggml_tensor * kvarn_H = nullptr;
