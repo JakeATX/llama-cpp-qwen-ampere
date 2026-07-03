@@ -336,6 +336,31 @@ static float log_std_scale_update(float prev, float stdv) {
     return std::exp(log_next);
 }
 
+// The reference log-std recipe clamps accumulated log scales to [-0.3, 10].
+// Raw K/V tiles with global RMS below ~0.74 pin every row/column scale at the
+// clamp floor, so no variance is equalized at all. Normalizing the tile by its
+// global RMS first keeps the clamps as degenerate-row guards while letting the
+// dual scaling act at any tile magnitude; the global factor is folded back into
+// the stored row scales so the packed format and dequant are unchanged.
+static bool kvarn_global_norm_enabled() {
+    return !kvarn_env_flag_enabled("LLAMA_KVARN_DISABLE_GLOBAL_NORM");
+}
+
+// MSE-optimal clip half-width in std units for uniform asymmetric RTN on
+// variance-normalized (~Gaussian) rows. Full range is already near-optimal
+// for bits >= 4; at 2 bits clipping recovers ~3x error energy.
+static float kvarn_rtn_clip_sigma(uint32_t bits) {
+    if (kvarn_env_flag_enabled("LLAMA_KVARN_DISABLE_RTN_CLIP")) {
+        return 0.0f;
+    }
+    switch (bits) {
+        case 1: return 1.0f;
+        case 2: return 1.5f;
+        case 3: return 2.05f;
+        default: return 0.0f;
+    }
+}
+
 static void sinkhorn_variance_normalize(
         std::vector<float> & data,
         std::vector<float> & row_scale,
@@ -349,6 +374,22 @@ static void sinkhorn_variance_normalize(
     constexpr float eps = 1.0e-6f;
 
     if (log_std_sinkhorn_enabled()) {
+        float global_scale = 1.0f;
+        if (iters > 0 && kvarn_global_norm_enabled()) {
+            double ss_all = 0.0;
+            for (const float v : data) {
+                ss_all += double(v)*double(v);
+            }
+            const float rms = float(std::sqrt(ss_all/(double(rows)*double(cols))));
+            if (rms > 1.0e-20f) {
+                global_scale = rms;
+                const float inv = 1.0f/rms;
+                for (float & v : data) {
+                    v *= inv;
+                }
+            }
+        }
+
         auto imbalance = [&](const std::vector<float> & tile) {
             float col_min = std::numeric_limits<float>::max();
             float col_max = 0.0f;
@@ -450,6 +491,11 @@ static void sinkhorn_variance_normalize(
         data = std::move(best_data);
         row_scale = std::move(best_row_scale);
         col_scale = std::move(best_col_scale);
+        if (global_scale != 1.0f) {
+            for (uint32_t r = 0; r < rows; ++r) {
+                row_scale[r] *= global_scale;
+            }
+        }
         return;
     }
 
@@ -498,6 +544,7 @@ static void quantize_asym_per_row(
 
     std::vector<float> work(cols);
     const float qt = clamp_quantile(quantile);
+    const float clip_sigma = qt >= 1.0f ? kvarn_rtn_clip_sigma(bits) : 0.0f;
 
     for (uint32_t r = 0; r < rows; ++r) {
         for (uint32_t c = 0; c < cols; ++c) {
@@ -507,8 +554,26 @@ static void quantize_asym_per_row(
 
         const size_t lo_i = size_t((1.0f - qt)*0.5f*(cols - 1));
         const size_t hi_i = size_t((1.0f - (1.0f - qt)*0.5f)*(cols - 1));
-        const float mn = work[lo_i];
-        const float mx = work[hi_i];
+        float mn = work[lo_i];
+        float mx = work[hi_i];
+        if (clip_sigma > 0.0f && cols > 1) {
+            double sum = 0.0;
+            double ss = 0.0;
+            for (uint32_t c = 0; c < cols; ++c) {
+                const float v = src[r*cols + c];
+                sum += double(v);
+                ss += double(v)*double(v);
+            }
+            const double n = double(cols);
+            const float mu = float(sum/n);
+            const float sd = float(std::sqrt(std::max(0.0, ss/n - (sum/n)*(sum/n))));
+            const float lo = std::max(mn, mu - clip_sigma*sd);
+            const float hi = std::min(mx, mu + clip_sigma*sd);
+            if (hi > lo) {
+                mn = lo;
+                mx = hi;
+            }
+        }
         const float s = (mx > mn) ? (mx - mn)/float(qmax) : 1.0f;
 
         scale[r] = s;
@@ -1875,9 +1940,10 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
     }
 
     const size_t tile_floats = size_t(view.head_dim_k)*params.group_size;
+    // Best-so-far scratch per tile: row scales + col scales + imbalance + global RMS.
     const size_t per_pipeline =
         tile_floats + 2*std::max<uint32_t>(view.head_dim_k, params.group_size) +
-        view.head_dim_k + params.group_size + 1;
+        view.head_dim_k + params.group_size + 2;
     const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
     // Multi-head stores gather one K and one V tile per head before the fused store kernel.
     // Reserve those transpose tiles for every multi-head layer, including 128-dim Qwen paths.
@@ -1885,15 +1951,15 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
     size_t result = needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
 
     // Direct prefill batches at most eight contiguous records per graph op.
-    // Production K4/K8 with V2/V4 now batches record x head phases by default,
+    // Production K2/K4/K8 with V2/V4/V8 batches record x head phases by default,
     // including exact log-std best-so-far state for both K and V.
-    if ((view.layout_k.key_bits == 4 || view.layout_k.key_bits == 8) &&
-            (view.layout_v.value_bits == 2 || view.layout_v.value_bits == 4)) {
+    if ((view.layout_k.key_bits == 2 || view.layout_k.key_bits == 4 || view.layout_k.key_bits == 8) &&
+            (view.layout_v.value_bits == 2 || view.layout_v.value_bits == 4 || view.layout_v.value_bits == 8)) {
         constexpr uint32_t direct_record_batch_max = 8;
         const size_t n_tiles = size_t(view.n_head_kv)*direct_record_batch_max;
         const size_t data_floats = n_tiles*tile_floats;
         const size_t best_floats =
-            n_tiles*(size_t(view.head_dim_k) + params.group_size + 1);
+            n_tiles*(size_t(view.head_dim_k) + params.group_size + 2);
         const size_t batched_phase_scratch = 2*data_floats + 2*best_floats;
         result = std::max(result, batched_phase_scratch);
     }
@@ -2095,7 +2161,9 @@ ggml_tensor * llama_kv_cache_kvarn::store_k_body_record_from_pending(
             view.head_dim_k, params.group_size,
             layer_tensors[li].pending_k->nb[2], offset);
     ggml_tensor * k_tile = ggml_cont(ctx, ggml_transpose(ctx, pending));
-    return store_k_body_record(ctx, k_tile, scratch, il, ih, record);
+    ggml_tensor * store = store_k_body_record(ctx, k_tile, scratch, il, ih, record);
+    ggml_kvarn_store_body_set_src_pending(store);
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::store_v_body_record_from_pending(
@@ -2115,7 +2183,9 @@ ggml_tensor * llama_kv_cache_kvarn::store_v_body_record_from_pending(
             view.head_dim_v, params.group_size,
             layer_tensors[li].pending_v->nb[2], offset);
     ggml_tensor * v_tile = ggml_cont(ctx, pending);
-    return store_v_body_record(ctx, v_tile, scratch, il, ih, record);
+    ggml_tensor * store = store_v_body_record(ctx, v_tile, scratch, il, ih, record);
+    ggml_kvarn_store_body_set_src_pending(store);
+    return store;
 }
 
 ggml_tensor * llama_kv_cache_kvarn::view_k_body_record_heads(
@@ -2277,6 +2347,7 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_records_from_pending(
             int32_t(view.layout_k.key_bits), int32_t(view.layout_v.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
     ggml_kvarn_store_kv_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    ggml_kvarn_store_kv_body_set_src_pending(store);
     return store;
 }
 
@@ -2313,6 +2384,7 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_all_heads_from_pending(
             int32_t(view.layout_k.key_bits), int32_t(view.layout_v.value_bits),
             int32_t(params.sinkhorn_iters), params.rtn_quantile);
     ggml_kvarn_store_kv_body_set_v_layout(store, int32_t(view.layout_v.v_layout));
+    ggml_kvarn_store_kv_body_set_src_pending(store);
     return store;
 }
 
@@ -2349,7 +2421,9 @@ ggml_tensor * llama_kv_cache_kvarn::store_kv_body_record_from_pending(
             pending_v_src->nb[2], v_offset);
     ggml_tensor * v_tile = ggml_cont(ctx, v_pending);
 
-    return store_kv_body_record(ctx, k_tile, v_tile, scratch, il, ih, record);
+    ggml_tensor * store = store_kv_body_record(ctx, k_tile, v_tile, scratch, il, ih, record);
+    ggml_kvarn_store_kv_body_set_src_pending(store);
+    return store;
 }
 
 void llama_kv_cache_kvarn::append_layer_tokens_reference(

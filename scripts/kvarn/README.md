@@ -4,6 +4,13 @@ This branch keeps KVarN separate from `ggml_type`. `--kv-cache-quant kvarn`
 selects a KV-cache backend mode and uses `llama_kvarn_params` for layout and
 runtime policy.
 
+> 2026-07-03: the store-side frame contract and the quantizer recipe changed;
+> read `docs/KVARN_FRAME_AND_QUANTIZER_FIX_20260703.md` before re-running any
+> quality or speed gates. Paper frame is default and frame-consistent end to
+> end (no `LLAMA_KVARN_ENABLE_PAPER_FRAME` needed); new kill switches for A/B:
+> `LLAMA_KVARN_DISABLE_GLOBAL_NORM=1`, `LLAMA_KVARN_DISABLE_RTN_CLIP=1`.
+> Default `--kvarn-iters` is now 8. `kvarn_k2v2_g128` is available.
+
 ## Mac Metal MoE residency baseline (ATX reference)
 
 Source: `ATX_FORK.md`, `docs/atx-runs.md`, branch `atx-expert-residency` @

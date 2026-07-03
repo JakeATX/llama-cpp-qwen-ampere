@@ -5,6 +5,8 @@
 #include "ggml-backend.h"
 
 #include <cmath>
+#include <random>
+#include <utility>
 #include <exception>
 #include <cstdio>
 #include <cstdlib>
@@ -169,6 +171,91 @@ static void test_reference_store_dequant() {
     }
 }
 
+// The global-RMS Sinkhorn pre-normalization and the bit-aware RTN clip must
+// strictly improve reconstruction NMSE on realistic small-magnitude tiles with
+// token-scale outliers (the paper's target failure mode). Uses env toggles to
+// A/B the same tiles through both quantizer configurations.
+static void test_reference_quantizer_fidelity() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.sinkhorn_iters = 8;
+
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+
+    for (const uint32_t head_dim : { 128u, 512u }) {
+        const uint32_t group = params.group_size;
+        std::vector<float> k_tile(size_t(head_dim)*group);
+        std::vector<float> v_tile(size_t(head_dim)*group);
+
+        // Small-magnitude tiles (raw RMS ~0.05) with 8x token outliers: the
+        // clamp-pinned reference recipe leaves these unnormalized.
+        for (uint32_t g = 0; g < group; ++g) {
+            const float token_scale = (g % 16 == 0) ? 0.4f : 0.05f;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                k_tile[size_t(d)*group + g] = token_scale*dist(rng);
+                v_tile[size_t(g)*head_dim + d] = token_scale*dist(rng);
+            }
+        }
+
+        // The reference dequant returns tiles in the rotated (paper) frame;
+        // compare against the same rotation of the source tiles.
+        std::vector<float> k_rot;
+        std::vector<float> v_rot;
+        llama_kvarn_hadamard_channels(k_tile, k_rot, head_dim, group, true);
+        llama_kvarn_hadamard_channels(v_tile, v_rot, group, head_dim, false);
+
+        const auto nmse = [&](const llama_kvarn_params & p) {
+            llama_kvarn_body_record record = llama_kvarn_store_reference(p, head_dim, k_tile, v_tile);
+            std::vector<float> k_deq;
+            std::vector<float> v_deq;
+            llama_kvarn_dequant_reference(record, k_deq, v_deq);
+            double k_err = 0.0, k_ref = 0.0, v_err = 0.0, v_ref = 0.0;
+            for (size_t i = 0; i < k_rot.size(); ++i) {
+                const double dk = double(k_deq[i]) - k_rot[i];
+                const double dv = double(v_deq[i]) - v_rot[i];
+                k_err += dk*dk; k_ref += double(k_rot[i])*k_rot[i];
+                v_err += dv*dv; v_ref += double(v_rot[i])*v_rot[i];
+            }
+            return std::pair<double, double>(k_err/k_ref, v_err/v_ref);
+        };
+
+        const auto with_env = [&](const char * name, const auto & fn) {
+#ifdef _WIN32
+            _putenv_s(name, "1");
+            auto result = fn();
+            _putenv_s(name, "");
+#else
+            setenv(name, "1", 1);
+            auto result = fn();
+            unsetenv(name);
+#endif
+            return result;
+        };
+
+        // K4/V2 default (global-norm + clip on)
+        const auto now = nmse(params);
+        // legacy: global-norm off
+        const auto no_norm = with_env("LLAMA_KVARN_DISABLE_GLOBAL_NORM", [&]() { return nmse(params); });
+        // legacy: clip off
+        const auto no_clip = with_env("LLAMA_KVARN_DISABLE_RTN_CLIP", [&]() { return nmse(params); });
+
+        require(std::isfinite(now.first) && std::isfinite(now.second), "fidelity NMSE finite");
+        // Global-norm must improve K NMSE substantially on this tile shape.
+        require(now.first < 0.75*no_norm.first, "global-norm improves K reconstruction");
+        // Clip must improve V2 NMSE substantially.
+        require(now.second < 0.6*no_clip.second, "RTN clip improves V2 reconstruction");
+        // Sanity ceilings for the default K4/V2 preset on Gaussianized tiles.
+        require(now.first < 0.03, "K4 reconstruction NMSE ceiling");
+        require(now.second < 0.2, "V2 reconstruction NMSE ceiling");
+
+        // K2/V2 must roundtrip and stay bounded as well.
+        llama_kvarn_params p22 = params;
+        p22.key_bits = 2;
+        const auto k2 = nmse(p22);
+        require(std::isfinite(k2.first) && k2.first < 0.25, "K2 reconstruction NMSE ceiling");
+    }
+}
+
 static void test_reference_cache_sealing() {
     llama_kvarn_params params = llama_kvarn_default_params();
     params.group_size = 4;
@@ -259,18 +346,19 @@ static size_t expected_body_store_scratch_floats(
         const llama_kvarn_layer_view & view,
         const llama_kvarn_params & params) {
     const size_t tile = size_t(view.head_dim_k)*params.group_size;
+    // Best-so-far scratch per tile: row scales + col scales + imbalance + global RMS.
     const size_t per_pipeline = tile + 2*std::max<uint32_t>(view.head_dim_k, params.group_size) +
-        view.head_dim_k + params.group_size + 1;
+        view.head_dim_k + params.group_size + 2;
     const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
     const bool needs_pending_head_tiles = view.n_head_kv > 1 || view.head_dim_k >= 512;
     size_t expected = needs_pending_head_tiles ? 2*tile + pipeline_scratch : pipeline_scratch;
 
-    if ((view.layout_k.key_bits == 4 || view.layout_k.key_bits == 8) &&
-            (view.layout_v.value_bits == 2 || view.layout_v.value_bits == 4)) {
+    if ((view.layout_k.key_bits == 2 || view.layout_k.key_bits == 4 || view.layout_k.key_bits == 8) &&
+            (view.layout_v.value_bits == 2 || view.layout_v.value_bits == 4 || view.layout_v.value_bits == 8)) {
         constexpr uint32_t direct_record_batch_max = 8;
         const size_t n_tiles = size_t(view.n_head_kv)*direct_record_batch_max;
         const size_t data_floats = n_tiles*tile;
-        const size_t best_floats = n_tiles*(size_t(view.head_dim_k) + params.group_size + 1);
+        const size_t best_floats = n_tiles*(size_t(view.head_dim_k) + params.group_size + 2);
         expected = std::max(expected, 2*data_floats + 2*best_floats);
     }
     return expected;
@@ -1284,6 +1372,7 @@ int main() {
     run_phase("test_pack_roundtrip", test_pack_roundtrip);
     run_phase("test_hadamard_inverse", test_hadamard_inverse);
     run_phase("test_reference_store_dequant", test_reference_store_dequant);
+    run_phase("test_reference_quantizer_fidelity", test_reference_quantizer_fidelity);
     run_phase("test_reference_cache_sealing", test_reference_cache_sealing);
     run_phase("test_shared_kv_reuse_layer_matching_attention_type", test_shared_kv_reuse_layer_matching_attention_type);
     run_phase("test_memory_estimate", test_memory_estimate);

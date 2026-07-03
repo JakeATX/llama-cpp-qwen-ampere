@@ -3440,6 +3440,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     int32_t sinkhorn_iters;
                     float   rtn_quantile;
                     int32_t v_layout;
+                    int32_t src_layout; // 0 = raw tile, 2 = pending-sourced (graph frame)
                 } params;
                 memcpy(&params, dst->op_params, sizeof(params));
 
@@ -3485,6 +3486,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             (float *) scratch->data,
                             params.head_dim, params.group_size, params.bits, params.sinkhorn_iters, params.rtn_quantile,
                             params.v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2u : 0u,
+                            params.src_layout == 2,
                             ctx.stream());
                 } else {
                     ggml_cuda_kvarn_store_k_body_reference_minmax(
@@ -3493,6 +3495,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             (float *) scales->data,
                             (float *) scratch->data,
                             params.head_dim, params.group_size, params.bits, params.sinkhorn_iters, params.rtn_quantile,
+                            params.src_layout == 2,
                             ctx.stream());
                 }
             } break;
@@ -3656,6 +3659,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             size_t(pending_group_stride),
                             size_t(pending_group_stride),
                             turbo_v_mode,
+                            params.src_layout == 2,
                             ctx.stream());
                 } else if (params.n_heads > 1) {
                     ggml_cuda_kvarn_debug_set_store_context(
@@ -3682,6 +3686,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             size_t(pending_group_stride),
                             size_t(pending_group_stride),
                             turbo_v_mode,
+                            params.src_layout == 2,
                             ctx.stream());
                 } else {
                     const int debug_record_from_name =
@@ -3707,6 +3712,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             params.head_dim, params.group_size, params.key_bits, params.value_bits,
                             params.sinkhorn_iters, params.rtn_quantile,
                             turbo_v_mode,
+                            params.src_layout == 2,
                             ctx.stream(), debug_record, debug_head);
                 }
             } break;

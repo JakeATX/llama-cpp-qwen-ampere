@@ -46,11 +46,13 @@ class Preset:
 
 
 PRESETS = {
+    "kvarn_k2v2_g128": Preset("kvarn_k2v2_g128", 2, 2, 128),
     "kvarn_k4v2_g128": Preset("kvarn_k4v2_g128", 4, 2, 128),
     "kvarn_k4v4_g128": Preset("kvarn_k4v4_g128", 4, 4, 128),
     "kvarn_k8v2_g128": Preset("kvarn_k8v2_g128", 8, 2, 128),
     "kvarn_k8v4_g128": Preset("kvarn_k8v4_g128", 8, 4, 128),
     "kvarn_k8v8_g128": Preset("kvarn_k8v8_g128", 8, 8, 128),
+    "k2v2": Preset("kvarn_k2v2_g128", 2, 2, 128),
     "k4v2": Preset("kvarn_k4v2_g128", 4, 2, 128),
     "k4v4": Preset("kvarn_k4v4_g128", 4, 4, 128),
     "k8v2": Preset("kvarn_k8v2_g128", 8, 2, 128),
@@ -149,19 +151,47 @@ def variance_normalize_rms_last_iter(tile: np.ndarray, iterations: int = 4):
     return data, col_scale, row_scale, _imbalance(data)
 
 
-def rtn_quantize_dequant_per_row(tile: np.ndarray, bits: int):
-    """Asymmetric per-row RTN. Returns q, scale, zp, dequantized tile."""
+def rtn_clip_sigma(bits: int) -> float:
+    """MSE-optimal clip half-width in std units for uniform asymmetric RTN on
+    variance-normalized rows. Matches kvarn_rtn_clip_sigma() in
+    src/llama-kv-cache-kvarn.cpp; 0 disables clipping (bits >= 4)."""
+    return {1: 1.0, 2: 1.5, 3: 2.05}.get(bits, 0.0)
+
+
+def rtn_quantize_dequant_per_row(tile: np.ndarray, bits: int, clip: bool = True):
+    """Asymmetric per-row RTN with optional bit-aware std clipping.
+    Returns q, scale, zp, dequantized tile."""
     qmax = float((1 << bits) - 1)
     lo = tile.min(axis=1, keepdims=True).astype(np.float32)
     hi = tile.max(axis=1, keepdims=True).astype(np.float32)
+    c = rtn_clip_sigma(bits) if clip else 0.0
+    if c > 0.0 and tile.shape[1] > 1:
+        mu = tile.mean(axis=1, keepdims=True).astype(np.float32)
+        sd = tile.std(axis=1, keepdims=True).astype(np.float32)
+        lo_c = np.maximum(lo, mu - c*sd)
+        hi_c = np.minimum(hi, mu + c*sd)
+        ok = hi_c > lo_c
+        lo = np.where(ok, lo_c, lo).astype(np.float32)
+        hi = np.where(ok, hi_c, hi).astype(np.float32)
     scale = np.maximum((hi - lo) / qmax, 1.0e-10).astype(np.float32)
-    q = np.rint((tile - lo) / scale).clip(0, qmax).astype(np.uint8)
+    q = np.rint((np.clip(tile, lo, hi) - lo) / scale).clip(0, qmax).astype(np.uint8)
     deq = (q.astype(np.float32) * scale + lo).astype(np.float32)
     return q, scale, lo, deq
 
 
+def variance_normalize_log_std_global(tile: np.ndarray, iterations: int = 8):
+    """Production default: global-RMS pre-normalization ahead of the log-std
+    Sinkhorn so the [-0.3, 10] log clamps act as degenerate-row guards instead
+    of pinning all scales for small-magnitude tiles. The global factor is
+    folded into the row scales; format and dequant are unchanged."""
+    m = np.asarray(tile, dtype=np.float32)
+    g = np.float32(max(float(np.sqrt((m.astype(np.float64) ** 2).mean())), 1.0e-20))
+    balanced, sc, sr, imb = variance_normalize_log_std(m / g, iterations)
+    return balanced, sc, sr * g, imb
+
+
 def store_dequant_k_vllm(k_rot_dg: np.ndarray, bits: int, iterations: int):
-    balanced, s_col, s_row, imb = variance_normalize_log_std(k_rot_dg, iterations)
+    balanced, s_col, s_row, imb = variance_normalize_log_std_global(k_rot_dg, iterations)
     q, rtn_scale, rtn_zp, deq_bal = rtn_quantize_dequant_per_row(balanced, bits)
     # K: s_col is per-token [1,G]; s_row is per-channel [D,1].
     s_col_K = (s_row * rtn_scale).squeeze(1).astype(np.float32)
@@ -179,7 +209,7 @@ def store_dequant_k_vllm(k_rot_dg: np.ndarray, bits: int, iterations: int):
 
 
 def store_dequant_v_vllm(v_rot_gd: np.ndarray, bits: int, iterations: int):
-    balanced, s_col, s_row, imb = variance_normalize_log_std(v_rot_gd, iterations)
+    balanced, s_col, s_row, imb = variance_normalize_log_std_global(v_rot_gd, iterations)
     q, rtn_scale, rtn_zp, deq_bal = rtn_quantize_dequant_per_row(balanced, bits)
     # V: s_col is per-channel [1,D]; s_row is per-token [G,1].
     s_col_V = s_col.squeeze(0).astype(np.float32)
@@ -269,8 +299,14 @@ def run_self_test(head_dims: Iterable[int], presets: Iterable[Preset], seed: int
             out, dbg = attention_oracle(q, k, v, preset, iterations)
             e = nmse(ref, out)
 
+            # Fidelity gate: synthetic output NMSE here tracks per-element V
+            # reconstruction NMSE. Clipped-RTN floors: V2 ~0.12, V4 ~0.007,
+            # V8 ~5e-5 (K error is second order at K>=4).
+            nmse_ceiling = {2: 0.17, 3: 0.05, 4: 0.02, 8: 5.0e-4}[preset.value_bits]
+
             # Internal shape/layout invariants.
             ok = True
+            ok &= e < nmse_ceiling
             ok &= dbg["k_rot_dg"].shape == (d, g)
             ok &= dbg["v_rot_gd"].shape == (g, d)
             ok &= dbg["k_deq_rot_dg"].shape == (d, g)

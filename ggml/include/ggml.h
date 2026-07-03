@@ -1806,6 +1806,14 @@ extern "C" {
     // kernel ignores these optional sources; they exist to keep graph side
     // effects ordered when the store reads from a persistent cache tensor that
     // was written by an earlier op in the same graph.
+    // Mark a body-store op whose K/V source tiles were gathered from the
+    // pending buffer (i.e. they already carry the graph paper-frame rotation).
+    GGML_API void ggml_kvarn_store_kv_body_set_src_pending(
+            struct ggml_tensor * store);
+
+    GGML_API void ggml_kvarn_store_body_set_src_pending(
+            struct ggml_tensor * store);
+
     GGML_API void ggml_kvarn_store_kv_body_add_dep(
             struct ggml_tensor * store,
             struct ggml_tensor * dep);

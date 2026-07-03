@@ -197,6 +197,24 @@ static void llama_kvarn_hadamard_channels(
     }
 }
 
+static bool kvarn_test_global_norm_enabled() {
+    return !env_enabled("LLAMA_KVARN_DISABLE_GLOBAL_NORM");
+}
+
+// Must match kvarn_rtn_clip_sigma() in src/llama-kv-cache-kvarn.cpp and
+// kvarn_rtn_clip_sigma_host() in ggml/src/ggml-cuda/kvarn.cu.
+static float kvarn_test_rtn_clip_sigma(uint32_t bits) {
+    if (env_enabled("LLAMA_KVARN_DISABLE_RTN_CLIP")) {
+        return 0.0f;
+    }
+    switch (bits) {
+        case 1: return 1.0f;
+        case 2: return 1.5f;
+        case 3: return 2.05f;
+        default: return 0.0f;
+    }
+}
+
 static void sinkhorn_variance_normalize(
         std::vector<float> & data,
         std::vector<float> & row_scale,
@@ -213,6 +231,21 @@ static void sinkhorn_variance_normalize(
         (std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN") == nullptr ||
          env_enabled("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN"));
     if (log_std_enabled) {
+        float global_scale = 1.0f;
+        if (iters > 0 && kvarn_test_global_norm_enabled()) {
+            double ss_all = 0.0;
+            for (const float v : data) {
+                ss_all += double(v)*double(v);
+            }
+            const float rms = float(std::sqrt(ss_all/(double(rows)*double(cols))));
+            if (rms > 1.0e-20f) {
+                global_scale = rms;
+                const float inv = 1.0f/rms;
+                for (float & v : data) {
+                    v *= inv;
+                }
+            }
+        }
         auto update_scale = [](float prev, float stdv) {
             stdv = std::min(1.0e3f, std::max(1.0e-3f, stdv));
             const float log_prev = std::log(std::max(prev, 1.0e-20f));
@@ -321,6 +354,11 @@ static void sinkhorn_variance_normalize(
         data = std::move(best_data);
         row_scale = std::move(best_row_scale);
         col_scale = std::move(best_col_scale);
+        if (global_scale != 1.0f) {
+            for (uint32_t r = 0; r < rows; ++r) {
+                row_scale[r] *= global_scale;
+            }
+        }
         return;
     }
 
@@ -369,6 +407,7 @@ static void quantize_asym_per_row(
 
     std::vector<float> work(cols);
     const float qt = clamp_quantile(quantile);
+    const float clip_sigma = qt >= 1.0f ? kvarn_test_rtn_clip_sigma(bits) : 0.0f;
 
     for (uint32_t r = 0; r < rows; ++r) {
         for (uint32_t c = 0; c < cols; ++c) {
@@ -378,8 +417,26 @@ static void quantize_asym_per_row(
 
         const size_t lo_i = size_t((1.0f - qt)*0.5f*(cols - 1));
         const size_t hi_i = size_t((1.0f - (1.0f - qt)*0.5f)*(cols - 1));
-        const float mn = work[lo_i];
-        const float mx = work[hi_i];
+        float mn = work[lo_i];
+        float mx = work[hi_i];
+        if (clip_sigma > 0.0f && cols > 1) {
+            double sum = 0.0;
+            double ss = 0.0;
+            for (uint32_t c = 0; c < cols; ++c) {
+                const float v = src[r*cols + c];
+                sum += double(v);
+                ss += double(v)*double(v);
+            }
+            const double n = double(cols);
+            const float mu = float(sum/n);
+            const float sd = float(std::sqrt(std::max(0.0, ss/n - (sum/n)*(sum/n))));
+            const float lo = std::max(mn, mu - clip_sigma*sd);
+            const float hi = std::min(mx, mu + clip_sigma*sd);
+            if (hi > lo) {
+                mn = lo;
+                mx = hi;
+            }
+        }
         const float s = (mx > mn) ? (mx - mn)/float(qmax) : 1.0f;
 
         scale[r] = s;
@@ -1548,10 +1605,10 @@ static void test_direct_record_batched_phases(
     float * v_tiles_d = cuda_upload(v_tiles);
     const size_t n_tiles = size_t(n_heads)*n_records;
     const size_t data_floats = n_tiles*n;
-    const size_t best_floats = n_tiles*(size_t(head_dim) + group + 1);
+    const size_t best_floats = n_tiles*(size_t(head_dim) + group + 2);
     const size_t batched_scratch_floats = 2*data_floats + 2*best_floats;
     const size_t tmp_rows = std::max<uint32_t>(head_dim, group);
-    const size_t per_pipeline_floats = n + 2*tmp_rows + head_dim + group + 1;
+    const size_t per_pipeline_floats = n + 2*tmp_rows + head_dim + group + 2;
     const size_t fallback_scratch_floats = 2*n + per_pipeline_floats;
     const size_t scratch_floats = std::max(batched_scratch_floats, fallback_scratch_floats);
 
@@ -1735,7 +1792,7 @@ static void test_fullrange_store_overwrites_prefilled_body(
     require_cuda(cudaMalloc(&v_scales_d, record.v_scales.size()*sizeof(float)), "cudaMalloc overwrite V scales");
 
     const size_t per_pipeline_store =
-        n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
+        n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
     const size_t store_scratch_floats =
         head_dim >= 256 ? 2*per_pipeline_store : per_pipeline_store;
     require_cuda(cudaMalloc(&scratch_d, store_scratch_floats*sizeof(float)), "cudaMalloc overwrite scratch");
@@ -1753,6 +1810,7 @@ static void test_fullrange_store_overwrites_prefilled_body(
                 params.key_bits, params.value_bits,
                 params.sinkhorn_iters, params.rtn_quantile,
                 0u,
+                false,
                 nullptr);
         require_cuda(cudaGetLastError(), "KVarN CUDA poisoned fullrange store launch");
         require_cuda(cudaDeviceSynchronize(), "KVarN CUDA poisoned fullrange store sync");
@@ -1848,7 +1906,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
     float * v_scales_d = nullptr;
     float * scratch_d = nullptr;
     const std::vector<int32_t> records = { 0 };
-    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
+    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
     const size_t scratch_floats = 2*n + 2*per_pipeline;
 
     require_cuda(cudaMalloc(&k_body_d, ref.k_body.size()), "cudaMalloc pending K body");
@@ -2001,7 +2059,7 @@ static void test_pending_heads_store(uint32_t head_dim) {
     float * k_scales_d = nullptr;
     float * v_scales_d = nullptr;
     float * scratch_d = nullptr;
-    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
+    const size_t per_pipeline = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
     const size_t pipeline_scratch = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
     const size_t scratch_floats = 2*n + pipeline_scratch;
     require_cuda(cudaMalloc(&k_body_d, k_body_ref.size()), "cudaMalloc pending-heads K body");
@@ -2104,7 +2162,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     require_cuda(cudaMemset(k_body_store_d, 0xa5, record.k_body.size()), "poison store K body");
     require_cuda(cudaMemset(v_body_store_d, 0xa5, record.v_body.size()), "poison store V body");
     const size_t per_pipeline_store =
-        n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 1;
+        n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
     const size_t store_scratch_floats =
         head_dim >= 256 ? 2*per_pipeline_store : per_pipeline_store;
     require_cuda(cudaMalloc(&store_scratch_d, store_scratch_floats*sizeof(float)),
@@ -2118,6 +2176,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             head_dim, group, params.key_bits, params.value_bits,
             params.sinkhorn_iters, params.rtn_quantile,
             0u,
+            false,
             nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA store-body launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA store-body sync");
@@ -4943,7 +5002,7 @@ static void test_experimental_turbo_v_codec(uint32_t head_dim, uint32_t bits, bo
     set_env_var("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", canonical_layout ? "1" : "0");
     ggml_cuda_kvarn_store_v_body_reference_minmax(
             v_tile_d, v_body_d, v_scales_d, scratch_d,
-            head_dim, group, bits, 0, 1.0f, canonical_layout ? 2u : 1u, nullptr);
+            head_dim, group, bits, 0, 1.0f, canonical_layout ? 2u : 1u, false, nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA experimental Turbo V store launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA experimental Turbo V store sync");
 

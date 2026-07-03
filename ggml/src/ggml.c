@@ -4029,6 +4029,7 @@ static struct ggml_tensor * ggml_kvarn_store_body_impl(
         int32_t sinkhorn_iters;
         float   rtn_quantile;
         int32_t v_layout;
+        int32_t src_layout; // 0 = raw tile, 2 = pending-sourced (graph frame)
     } params = {
         is_v,
         head_dim,
@@ -4037,6 +4038,7 @@ static struct ggml_tensor * ggml_kvarn_store_body_impl(
         sinkhorn_iters,
         rtn_quantile,
         v_layout,
+        0,
     };
     ggml_set_op_params(result, &params, sizeof(params));
 
@@ -4538,6 +4540,49 @@ void ggml_kvarn_store_kv_body_set_v_layout(
     const int64_t v_body_bytes =
         ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.value_bits, params.v_layout);
     ggml_kvarn_assert_v_body_shape(store->src[6], v_body_bytes, params.v_layout);
+    ggml_set_op_params(store, &params, sizeof(params));
+}
+
+void ggml_kvarn_store_kv_body_set_src_pending(
+        struct ggml_tensor * store) {
+    GGML_ASSERT(store != NULL && store->op == GGML_OP_KVARN_STORE_KV_BODY);
+    struct kvarn_store_kv_body_params {
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t key_bits;
+        int32_t value_bits;
+        int32_t sinkhorn_iters;
+        float   rtn_quantile;
+        int32_t n_heads;
+        int32_t n_record_batch;
+        int32_t record_0;
+        int32_t record_1;
+        int32_t record_2;
+        int32_t record_3;
+        int32_t src_layout;
+        int32_t v_layout;
+    } params;
+    memcpy(&params, store->op_params, sizeof(params));
+    GGML_ASSERT(params.src_layout != 1 && "direct-record body stores are raw-sourced by definition");
+    params.src_layout = 2;
+    ggml_set_op_params(store, &params, sizeof(params));
+}
+
+void ggml_kvarn_store_body_set_src_pending(
+        struct ggml_tensor * store) {
+    GGML_ASSERT(store != NULL && store->op == GGML_OP_KVARN_STORE_BODY);
+    struct kvarn_store_body_params {
+        int32_t is_v;
+        int32_t head_dim;
+        int32_t group_size;
+        int32_t bits;
+        int32_t sinkhorn_iters;
+        float   rtn_quantile;
+        int32_t v_layout;
+        int32_t src_layout;
+    } params;
+    memcpy(&params, store->op_params, sizeof(params));
+    params.src_layout = 2;
     ggml_set_op_params(store, &params, sizeof(params));
 }
 

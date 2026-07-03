@@ -63,7 +63,9 @@ struct llama_kvarn_params llama_kvarn_default_params(void) {
         /*.value_bits    =*/ 2,
         /*.sink_tokens   =*/ 128,
         /*.tail_tokens   =*/ 128,
-        /*.sinkhorn_iters=*/ 16,
+        // The reference config treats 8 log-std iterations as lossless-grade;
+        // with best-iteration selection extra iterations only add store cost.
+        /*.sinkhorn_iters=*/ 8,
         /*.rtn_quantile  =*/ 1.0f,
     };
 

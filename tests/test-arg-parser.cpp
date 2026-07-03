@@ -181,7 +181,12 @@ int main(void) {
     argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_g256"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
-    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k2v2_g128"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kvarn.key_bits == 2);
+    assert(params.kvarn.value_bits == 2);
+    assert(params.kvarn.group_size == 128);
+
     argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_g128"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN);

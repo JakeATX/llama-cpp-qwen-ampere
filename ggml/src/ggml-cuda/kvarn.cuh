@@ -29,6 +29,7 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         uint32_t turbo_v_mode,
+        bool input_already_rotated,
         void * stream,
         uint32_t debug_record = UINT32_MAX,
         uint32_t debug_head = UINT32_MAX);
@@ -60,6 +61,7 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
         uint32_t turbo_v_mode,
+        bool src_in_frame,
         void * stream);
 
 void ggml_cuda_kvarn_store_body_pending_heads_minmax(
@@ -84,6 +86,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         size_t pending_k_head_stride_floats,
         size_t pending_v_head_stride_floats,
         uint32_t turbo_v_mode,
+        bool src_in_frame,
         void * stream);
 
 void ggml_cuda_kvarn_store_body_direct_records_minmax(
@@ -130,6 +133,7 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
         uint32_t key_bits,
         uint32_t sinkhorn_iters,
         float rtn_quantile,
+        bool input_already_rotated,
         void * stream);
 
 void ggml_cuda_kvarn_store_v_body_reference_minmax(
@@ -143,6 +147,7 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
         uint32_t sinkhorn_iters,
         float rtn_quantile,
         uint32_t turbo_v_mode,
+        bool input_already_rotated,
         void * stream);
 
 void ggml_cuda_kvarn_dequant_body(
