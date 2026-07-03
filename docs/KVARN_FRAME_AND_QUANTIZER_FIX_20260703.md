@@ -216,3 +216,94 @@ memory/ubatch path, not in the KVarN math.
 - `tests/test-kvarn-cuda-dequant.cpp` - CPU mirror updated identically,
   signature updates, scratch sizes
 - `tests/test-arg-parser.cpp` - k2v2 preset assertion
+
+---
+
+# Round 2 - runtime state-machine audit and topology test harness (same day)
+
+A second audit pass targeted the paths real server usage exercises but
+perplexity/bench never do. Three defects found and fixed, plus a topology
+simulation test that pins the whole streaming contract.
+
+## Bugs found and fixed
+
+1. **Partial `seq_rm` accepted removals the layout cannot honor** (rollback
+   corruption). The tail is a position-derived ring (slot(p) == slot(p+tail)),
+   and the mask labels slots by position math, not cell metadata. After a
+   partial rollback (llama-server prompt-reuse trimming, speculative rejects),
+   the mask would attribute ring slots to positions whose f16 rows had already
+   been overwritten by the removed newer tokens - attention silently reads
+   future-token values until the ring refills. `seq_rm` now refuses (returns
+   false, so callers reprocess) everything except: full-range removal, no-op
+   ranges, and suffix rollbacks taken before any ring slot was ever reused
+   (those are exact). The ring-overwrite bookkeeping inside `apply_ubatch`
+   uses a private `seq_rm_cells()` that bypasses the guard.
+2. **`get_can_shift()` claimed shift support with no shift graph.** K is
+   stored post-RoPE (rotated f16 sink/tail + quantized records) and
+   `init_update()` fails the decode when cells carry a pending shift, so a
+   server context-shift would brick the session (or corrupt, had init_update
+   not guarded). Now returns false; ISWA/hybrid composition propagates it.
+3. **Cache-side input builders ignored the small-kv_size tail clamp.** The
+   graph-side window/seal math clamps `tail_tokens` when
+   `kv_size < sink+tail`; the eviction plans, pending offsets, and sink/tail
+   slot indices built in `llama-kv-cache-kvarn.cpp` used the raw params. The
+   disagreement is unreachable today only because positions are bounded by
+   kv_size; all five input builders now share `kvarn_effective_params()`
+   (and `set_input_kq_mask` reuses it instead of a local copy). The
+   `llama_kvarn_device_supports_ops` probe scratch formula was also one float
+   behind `kvarn_store_scratch_floats_one`.
+
+## New tests (tests/test-kvarn-kv.cpp)
+
+- `test_runtime_stream_consistency`: drives full contiguous streams through
+  the cache's real input-building machinery (sink/tail slot indices, tail
+  eviction plans, pending offsets) while tracking which logical position each
+  physical slot holds. After every ubatch it recomputes the active window and
+  causal mask (deliberate mirrors of `kvarn_graph_active_window` /
+  `kvarn_graph_seal_records`) and verifies the mixed-attention loader order
+  (sink | body records | pending | tail ring at tail_start) enumerates exactly
+  positions 0..last, and that the mask exposes exactly the causal prefix.
+  Runs four geometries: ring wrapped 10x with odd ubatch cycles, a
+  non-power-of-two tail ring (tail=5), a minimal decode-like shape, and the
+  clamped `kv_size < sink+tail` shape. This transitively pins the ring modulo
+  math, eviction slot reads, seal timing, tail_start, per-record pending
+  slice ordering, and mask labeling against each other.
+- `test_runtime_state_safety`: get_can_shift refusal; post-wrap suffix seq_rm
+  refused with state unchanged; mid-range refused; full-range and pre-wrap
+  suffix accepted.
+- `test_reference_store_scale_invariance`: store->dequant NMSE must be
+  invariant to raw tile magnitude (0.02x / 1x / 30x within 30% of each other) -
+  the direct regression for the Sinkhorn clamp-inertness fix.
+
+Note: while building the simulation, the per-record pending slice ordering in
+the graph (seal consumes its slice before the next record's evictions
+overwrite the one-group pending ring) was verified to be handled correctly by
+the existing set-rows dependency chain - initially it looked like an
+intra-ubatch overwrite bug, but the graph's slice-by-slice copies are sound;
+the simulation now models that ordering exactly.
+
+## Explicitly audited and found sound in this pass
+
+- Hybrid (Qwen MTP) wrapper: recurrent child already refuses partial seq_rm
+  ahead of the attention children; ubatch splitting always uses
+  `split_equal(n, true)` under recurrence, consistent with the limiter.
+- ISWA wrapper composition of seq_* / can_shift after the base-cache fixes.
+- Ring-overwrite metadata cascade in `apply_ubatch` (now guard-exempt by
+  design).
+- `kvarn_tail_slot` for `sink >= kv_size` degenerate geometry (unreachable
+  tail branch; window collapses to sink-only).
+- Batched hadamard butterfly kernels (read/sync/write pattern), the
+  fold/rms kernel scratch offsets, and the effective-params degenerate
+  tail=0 case.
+
+## Known remaining limitations (documented, not silent)
+
+- `state_write/state_read` (session save/restore) throw
+  "not implemented yet"; llama-server slot save/restore and
+  `llama_state_*` APIs are unavailable with `--kv-cache-quant kvarn`.
+- `kvarn_tail_safe_ubatch_limit` has no direct unit test (constructing a
+  `llama_batch_allocr` in tests is heavy); its downstream contract is pinned
+  by the stream simulation.
+- The mixed-attention CUDA kernels remain uncompilable in this container;
+  the GPU runbook in section 6 is unchanged and should be run before any
+  quality/speed claims.

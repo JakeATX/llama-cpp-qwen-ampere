@@ -2038,7 +2038,9 @@ static bool llama_kvarn_device_supports_ops(ggml_backend_dev_t dev, const llama_
     const int64_t n        = int64_t(head_dim)*group;
     const int64_t body     = (n*params.key_bits + 7)/8;
     const int64_t scales   = 2*int64_t(head_dim) + group;
-    const int64_t scratch  = n + 2*std::max<int64_t>(head_dim, group) + head_dim + group + 1;
+    // Matches kvarn_store_scratch_floats_one(): best-so-far scratch carries row
+    // scales + col scales + imbalance + global RMS per tile.
+    const int64_t scratch  = n + 2*std::max<int64_t>(head_dim, group) + head_dim + group + 2;
 
     ggml_tensor * tile      = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, group, head_dim);
     ggml_tensor * body_k    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8,  body);

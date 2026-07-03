@@ -370,6 +370,9 @@ public:
     ggml_tensor * view_v_scales_record_heads(ggml_context * ctx, int32_t il, uint32_t record) const;
 
     slot_info find_slot(const llama_ubatch & ubatch) const;
+    // Raw cell-metadata removal without the physical-layout safety guard;
+    // used by apply_ubatch when ring slots are overwritten in sequence order.
+    bool seq_rm_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches) const;
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 

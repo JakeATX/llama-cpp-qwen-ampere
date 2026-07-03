@@ -364,6 +364,7 @@ static size_t expected_body_store_scratch_floats(
     return expected;
 }
 
+
 static void test_shared_kv_reuse_layer_matching_attention_type() {
     {
         llama_hparams hparams = make_shared_kv_hparams(6, -1);
@@ -453,6 +454,321 @@ static llama_ubatch make_test_ubatch(uint32_t n_tokens, llama_seq_id seq_id) {
     return ubatch;
 }
 
+// ---------------------------------------------------------------------------
+// Stream-consistency simulation.
+//
+// Drives a full contiguous token stream through the cache's input-building
+// machinery (sink/tail slot indices, tail-eviction plans, pending offsets) and
+// tracks which logical position each physical slot holds. After every ubatch
+// it recomputes the active window and the causal mask and verifies that the
+// order the mixed-attention loader would read (sink | body records | pending |
+// tail ring at tail_start) yields exactly positions 0..last.
+//
+// The window and seal rules below deliberately mirror
+// kvarn_graph_active_window() / kvarn_graph_seal_records() in llama-graph.cpp;
+// if either side changes, this test fails.
+// ---------------------------------------------------------------------------
+
+struct kvarn_sim_window {
+    uint32_t n_sink = 0;
+    uint32_t n_records = 0;
+    uint32_t n_pending = 0;
+    uint32_t n_tail = 0;
+    uint32_t tail_start = 0;
+    uint32_t n_kv = 0;
+};
+
+static llama_kvarn_params kvarn_sim_effective(llama_kvarn_params p, uint32_t kv_size) {
+    if (kv_size != 0 && uint64_t(p.sink_tokens) + uint64_t(p.tail_tokens) > kv_size) {
+        p.tail_tokens = p.sink_tokens >= kv_size ? 0 : kv_size - p.sink_tokens;
+    }
+    return p;
+}
+
+static kvarn_sim_window kvarn_sim_active_window(const llama_kvarn_params & params, uint32_t kv_size, uint32_t last_pos) {
+    const llama_kvarn_params p = kvarn_sim_effective(params, kv_size);
+    kvarn_sim_window w;
+    const uint32_t n_seen = last_pos + 1;
+    w.n_sink = std::min<uint32_t>(n_seen, p.sink_tokens);
+    const uint32_t after_sink = n_seen - w.n_sink;
+    w.n_tail = std::min<uint32_t>(after_sink, p.tail_tokens);
+    const uint32_t body_pending = after_sink - w.n_tail;
+    w.n_records = body_pending/p.group_size;
+    w.n_pending = body_pending%p.group_size;
+    w.tail_start = w.n_tail == 0 ? 0 : body_pending%p.tail_tokens;
+    w.n_kv = w.n_sink + w.n_records*p.group_size + w.n_pending + w.n_tail;
+    return w;
+}
+
+static void kvarn_sim_run_stream(
+        uint32_t sink,
+        uint32_t tail,
+        uint32_t group,
+        uint32_t kv_size,
+        const std::vector<uint32_t> & ubatch_sizes_cycle,
+        uint32_t n_stream,
+        const char * label) {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.sink_tokens = sink;
+    params.tail_tokens = tail;
+    params.group_size = group;
+
+    const llama_kvarn_params eff = kvarn_sim_effective(params, kv_size);
+
+    llama_hparams hparams = make_test_hparams();
+    llama_kv_cache_kvarn cache(nullptr, hparams, params, false, kv_size, 4, 1, nullptr);
+
+    const uint32_t n_sink_tail = std::min<uint32_t>(kv_size, sink + tail);
+
+    constexpr int64_t kvarn_sim_unset = -1;
+    std::vector<int64_t> ring_model(n_sink_tail, kvarn_sim_unset);      // slot -> pos
+    std::vector<int64_t> pending_model(group, kvarn_sim_unset);         // offset -> pos
+    std::vector<std::vector<int64_t>> record_model;                     // record -> offsets -> pos
+
+    uint32_t next_pos = 0;
+    size_t cycle_i = 0;
+    while (next_pos < n_stream) {
+        const uint32_t n_tokens = std::min<uint32_t>(
+                ubatch_sizes_cycle[cycle_i++ % ubatch_sizes_cycle.size()], n_stream - next_pos);
+        llama_ubatch ubatch = make_test_ubatch(n_tokens, 0);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            ubatch.data->pos[i] = llama_pos(next_pos + i);
+        }
+        ubatch.pos = ubatch.data->pos.data();
+
+        ggml_init_params init_params = { 256*1024, nullptr, true };
+        ggml_context_ptr ctx { ggml_init(init_params) };
+
+        ggml_tensor * idxs      = cache.build_input_sink_tail_idxs(ctx.get(), ubatch);
+        ggml_tensor * plan      = cache.build_input_body_plan(ctx.get(), ubatch);
+        ggml_tensor * offsets   = cache.build_input_body_offsets(ctx.get(), ubatch);
+        ggml_tensor * tail_idxs = cache.build_input_tail_evict_idxs(ctx.get(), ubatch);
+        const kvarn_sim_window w = kvarn_sim_active_window(params, kv_size, next_pos + n_tokens - 1);
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, w.n_kv, n_tokens);
+        ggml_backend_buffer_ptr buf {
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_cpu_buffer_type())
+        };
+        require(buf != nullptr, "kvarn sim buffer");
+
+        cache.set_input_sink_tail_idxs(idxs, &ubatch);
+        cache.set_input_body_plan(plan, &ubatch);
+        cache.set_input_body_offsets(offsets, &ubatch);
+        cache.set_input_tail_evict_idxs(tail_idxs, &ubatch);
+        cache.set_input_kq_mask(mask, &ubatch, true);
+
+        // 1+2. Evictions and seals interleave exactly like the graph: the
+        //    pending buffer holds one group, and each seal's slice copy runs
+        //    before the next record's evictions overwrite the ring of pending
+        //    offsets (enforced in the graph with explicit set-rows deps).
+        //    Evictions read the sink/tail ring BEFORE this ubatch's writes.
+        const int64_t n_evict = offsets->ne[0];
+        const int64_t * offset_data = (const int64_t *) offsets->data;
+        const int32_t * tail_idx_data = (const int32_t *) tail_idxs->data;
+        {
+            int64_t j = 0;
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const uint32_t pos = next_pos + i;
+                if (pos < eff.sink_tokens + eff.tail_tokens) {
+                    continue;
+                }
+                require(j < n_evict, "kvarn sim eviction count");
+                const int32_t slot = tail_idx_data[j];
+                require(slot >= int32_t(eff.sink_tokens) && uint32_t(slot) < n_sink_tail,
+                        "kvarn sim eviction slot in tail range");
+                const int64_t evicted = ring_model[slot];
+                require(evicted == int64_t(pos) - int64_t(eff.tail_tokens),
+                        "kvarn sim eviction reads the displaced token");
+                const int64_t off = offset_data[j];
+                require(off >= 0 && off < int64_t(group), "kvarn sim pending offset range");
+                pending_model[size_t(off)] = evicted;
+                ++j;
+
+                // Seal fires when this eviction completes a record (mirror of
+                // kvarn_graph_seal_records), consuming the pending group
+                // before any later-record eviction can overwrite it.
+                const uint32_t body_pos = uint32_t(evicted) - eff.sink_tokens;
+                if (body_pos%eff.group_size + 1 != eff.group_size) {
+                    continue;
+                }
+                const uint32_t record = body_pos/eff.group_size;
+                require(record == record_model.size(), "kvarn sim records seal in order");
+                for (uint32_t g = 0; g < group; ++g) {
+                    require(pending_model[g] == int64_t(eff.sink_tokens) + int64_t(record)*group + g,
+                            "kvarn sim sealed record holds its group positions");
+                }
+                record_model.push_back(pending_model);
+            }
+            require(j == n_evict, "kvarn sim eviction plan length");
+        }
+
+        // 3. This ubatch's tokens land in their sink/tail slots.
+        const int64_t * idx_data = (const int64_t *) idxs->data;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const uint32_t pos = next_pos + i;
+            const int64_t slot = idx_data[i];
+            require(slot >= 0 && uint32_t(slot) < n_sink_tail, "kvarn sim sink/tail slot bounds");
+            if (pos < eff.sink_tokens) {
+                require(slot == int64_t(pos), "kvarn sim sink slot identity");
+            }
+            ring_model[size_t(slot)] = int64_t(pos);
+        }
+
+        // 4. Seal timing must agree with the active-window record count.
+        require(w.n_records == record_model.size(), "kvarn sim window records match seal timing");
+
+        // 5. The loader order (sink | records | pending | tail ring) must
+        //    enumerate exactly positions 0..last.
+        std::vector<int64_t> loader_pos(w.n_kv, kvarn_sim_unset);
+        for (uint32_t t = 0; t < w.n_kv; ++t) {
+            int64_t pos = kvarn_sim_unset;
+            if (t < w.n_sink) {
+                pos = ring_model[t];
+            } else if (t < w.n_sink + w.n_records*group) {
+                const uint32_t body_t = t - w.n_sink;
+                pos = record_model[body_t/group][body_t%group];
+            } else if (t < w.n_sink + w.n_records*group + w.n_pending) {
+                pos = pending_model[t - w.n_sink - w.n_records*group];
+            } else {
+                const uint32_t i = t - w.n_sink - w.n_records*group - w.n_pending;
+                const uint32_t slot = eff.sink_tokens + (w.tail_start + i)%w.n_tail;
+                pos = ring_model[slot];
+            }
+            require(pos == int64_t(t < w.n_sink ? t :
+                    t < w.n_kv - w.n_tail ? eff.sink_tokens + (t - w.n_sink) :
+                    (next_pos + n_tokens) - w.n_tail + (t - (w.n_kv - w.n_tail))),
+                    label);
+            loader_pos[t] = pos;
+        }
+
+        // 6. The causal mask must expose exactly the keys at loader positions
+        //    <= each query position.
+        const float * mask_data = (const float *) mask->data;
+        for (uint32_t q = 0; q < n_tokens; ++q) {
+            const int64_t q_pos = int64_t(next_pos + q);
+            for (uint32_t t = 0; t < w.n_kv; ++t) {
+                const bool visible = mask_data[size_t(q)*w.n_kv + t] > -1.0e20f;
+                require(visible == (loader_pos[t] <= q_pos), "kvarn sim mask matches loader positions");
+            }
+        }
+
+        next_pos += n_tokens;
+    }
+}
+
+static void test_runtime_stream_consistency() {
+    // Ring wraps many times, records seal across ubatch boundaries.
+    kvarn_sim_run_stream(2, 4, 4, 64, { 3, 1, 4, 2 }, 40, "kvarn sim loader positions (2/4/4)");
+    // Non-power-of-two tail ring stresses the modulo/tail_start math.
+    kvarn_sim_run_stream(3, 5, 4, 64, { 5, 2, 1, 3 }, 45, "kvarn sim loader positions (3/5/4)");
+    // Minimal decode-like geometry.
+    kvarn_sim_run_stream(1, 2, 2, 32, { 1, 2 }, 20, "kvarn sim loader positions (1/2/2)");
+    // kv_size smaller than sink+tail: effective-tail clamping must keep the
+    // plans, slots, window, and mask on the same geometry.
+    kvarn_sim_run_stream(4, 6, 4, 8, { 2, 1 }, 8, "kvarn sim loader positions (clamped tail)");
+}
+
+static void test_runtime_state_safety() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = 4;
+    params.sink_tokens = 2;
+    params.tail_tokens = 4;
+
+    llama_hparams hparams = make_test_hparams();
+    llama_kv_cache_kvarn cache(nullptr, hparams, params, false, 32, 4, 1, nullptr);
+
+    // No shift graph exists; advertising shift support would let context-shift
+    // silently mis-rotate stored K.
+    require(!cache.get_can_shift(), "KVarN refuses K-shift support");
+
+    // Fill positions 0..11: the tail ring (slots for pos 2..5) has wrapped
+    // (pos 6..11 reused the slots of pos 2..7).
+    for (uint32_t pos = 0; pos < 12; ++pos) {
+        llama_ubatch ubatch = make_test_ubatch(1, 0);
+        ubatch.data->pos[0] = llama_pos(pos);
+        ubatch.pos = ubatch.data->pos.data();
+        const auto sinfo = cache.find_slot(ubatch);
+        require(!sinfo.empty(), "KVarN state safety slot");
+        cache.apply_ubatch(sinfo, ubatch);
+    }
+
+    // Rolling back into a reused ring region would leave the mask pointing at
+    // slots holding future-token values; must be refused.
+    require(!cache.seq_rm(0, 8, -1), "KVarN post-wrap suffix seq_rm refused");
+    require(cache.seq_pos_max(0) == 11, "KVarN refused seq_rm left state unchanged");
+
+    // Mid-range removal breaks position contiguity; must be refused.
+    require(!cache.seq_rm(0, 3, 7), "KVarN mid-range seq_rm refused");
+
+    // Removing everything is always exact.
+    require(cache.seq_rm(0, 0, -1), "KVarN full-range seq_rm accepted");
+    require(cache.seq_pos_max(0) == -1, "KVarN full-range seq_rm cleared");
+
+    // Before any slot reuse, a suffix rollback is exact and accepted.
+    for (uint32_t pos = 0; pos < 5; ++pos) {
+        llama_ubatch ubatch = make_test_ubatch(1, 0);
+        ubatch.data->pos[0] = llama_pos(pos);
+        ubatch.pos = ubatch.data->pos.data();
+        const auto sinfo = cache.find_slot(ubatch);
+        require(!sinfo.empty(), "KVarN state safety refill slot");
+        cache.apply_ubatch(sinfo, ubatch);
+    }
+    require(cache.seq_rm(0, 3, -1), "KVarN pre-wrap suffix seq_rm accepted");
+    require(cache.seq_pos_max(0) == 2, "KVarN pre-wrap suffix seq_rm trimmed");
+}
+
+static void test_reference_store_scale_invariance() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.sinkhorn_iters = 8;
+
+    const uint32_t head_dim = 128;
+    const uint32_t group = params.group_size;
+    std::mt19937 rng(77);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+
+    std::vector<float> k_base(size_t(head_dim)*group);
+    std::vector<float> v_base(size_t(head_dim)*group);
+    for (size_t i = 0; i < k_base.size(); ++i) {
+        k_base[i] = dist(rng);
+        v_base[i] = dist(rng);
+    }
+
+    const auto nmse_at_scale = [&](float scale) {
+        std::vector<float> k_tile(k_base.size());
+        std::vector<float> v_tile(v_base.size());
+        for (size_t i = 0; i < k_base.size(); ++i) {
+            k_tile[i] = scale*k_base[i];
+            v_tile[i] = scale*v_base[i];
+        }
+        std::vector<float> k_rot;
+        std::vector<float> v_rot;
+        llama_kvarn_hadamard_channels(k_tile, k_rot, head_dim, group, true);
+        llama_kvarn_hadamard_channels(v_tile, v_rot, group, head_dim, false);
+        llama_kvarn_body_record record = llama_kvarn_store_reference(params, head_dim, k_tile, v_tile);
+        std::vector<float> k_deq;
+        std::vector<float> v_deq;
+        llama_kvarn_dequant_reference(record, k_deq, v_deq);
+        double err = 0.0, ref = 0.0;
+        for (size_t i = 0; i < k_rot.size(); ++i) {
+            const double dk = double(k_deq[i]) - k_rot[i];
+            const double dv = double(v_deq[i]) - v_rot[i];
+            err += dk*dk + dv*dv;
+            ref += double(k_rot[i])*k_rot[i] + double(v_rot[i])*v_rot[i];
+        }
+        return err/ref;
+    };
+
+    // With the global-RMS pre-normalization the quantizer must be invariant to
+    // the raw tile magnitude; the clamp-pinned recipe degraded badly at small
+    // scales.
+    const double e_small = nmse_at_scale(0.02f);
+    const double e_unit  = nmse_at_scale(1.0f);
+    const double e_large = nmse_at_scale(30.0f);
+    require(std::isfinite(e_small) && std::isfinite(e_unit) && std::isfinite(e_large),
+            "scale invariance NMSE finite");
+    require(e_small < 1.3*e_unit && e_unit < 1.3*e_small, "store NMSE invariant to small tile scale");
+    require(e_large < 1.3*e_unit && e_unit < 1.3*e_large, "store NMSE invariant to large tile scale");
+}
+
 static void test_memory_estimate() {
     llama_kvarn_params params = llama_kvarn_default_params();
     llama_hparams hparams = make_test_hparams();
@@ -538,8 +854,18 @@ static void test_runtime_metadata() {
     require(cache.seq_pos_min(1) == 1, "KVarN copied sequence min");
     require(cache.seq_pos_max(1) == 2, "KVarN copied sequence max");
 
-    cache.seq_rm(0, 0, 2);
-    require(cache.seq_pos_min(0) == 2, "KVarN sequence remove");
+    // Prefix removals cannot be honored by the position-derived layout (the
+    // mask labels slots by position math, not by cell metadata), so seq_rm
+    // must refuse and leave the state unchanged for the caller to reprocess.
+    require(!cache.seq_rm(0, 0, 2), "KVarN prefix seq_rm refused");
+    require(cache.seq_pos_min(0) == 0, "KVarN prefix seq_rm leaves state unchanged");
+
+    // A suffix rollback while every token still owns a unique sink/tail slot
+    // is exact and must be accepted.
+    require(cache.seq_rm(0, 2, -1), "KVarN pre-wrap suffix seq_rm accepted");
+    require(cache.seq_pos_max(0) == 1, "KVarN suffix seq_rm trimmed max");
+    require(cache.seq_rm(0, 0, -1), "KVarN full seq_rm accepted");
+    require(cache.seq_pos_min(0) == -1, "KVarN full seq_rm cleared sequence");
 
     cache.seq_keep(1);
     require(cache.seq_pos_min(0) == -1, "KVarN sequence keep removed old sequence");
@@ -1373,6 +1699,7 @@ int main() {
     run_phase("test_hadamard_inverse", test_hadamard_inverse);
     run_phase("test_reference_store_dequant", test_reference_store_dequant);
     run_phase("test_reference_quantizer_fidelity", test_reference_quantizer_fidelity);
+    run_phase("test_reference_store_scale_invariance", test_reference_store_scale_invariance);
     run_phase("test_reference_cache_sealing", test_reference_cache_sealing);
     run_phase("test_shared_kv_reuse_layer_matching_attention_type", test_shared_kv_reuse_layer_matching_attention_type);
     run_phase("test_memory_estimate", test_memory_estimate);
@@ -1382,6 +1709,8 @@ int main() {
     run_phase("test_runtime_body_plan_graph_api", test_runtime_body_plan_graph_api);
     run_phase("test_runtime_body_plan_multi_record_seals", test_runtime_body_plan_multi_record_seals);
     run_phase("test_runtime_body_plan_active_boundary_512", test_runtime_body_plan_active_boundary_512);
+    run_phase("test_runtime_stream_consistency", test_runtime_stream_consistency);
+    run_phase("test_runtime_state_safety", test_runtime_state_safety);
     run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
     run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);
     run_phase("test_kvarn_store_body_ggml_ops", test_kvarn_store_body_ggml_ops);

@@ -1612,7 +1612,13 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_update(llama_context * lctx,
 }
 
 bool llama_kv_cache_kvarn::get_can_shift() const {
-    return hparams.rope_type != LLAMA_ROPE_TYPE_MROPE && hparams.rope_type != LLAMA_ROPE_TYPE_IMROPE;
+    // K is stored post-RoPE (rotated f16 sink/tail + quantized body records)
+    // and there is no KVarN shift graph: init_update() fails the decode when
+    // cells carry a pending shift. Advertising shift support invites
+    // llama-server context-shift, which would either brick the session or
+    // silently attend with mis-rotated K. Refuse so callers fall back to
+    // reprocessing.
+    return false;
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
@@ -1644,6 +1650,46 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
+    // Physical storage is position-derived: the tail is a ring where slot(p)
+    // == slot(p + tail_tokens). After a partial rollback the mask would label
+    // ring slots with positions whose values were already overwritten by the
+    // removed (newer) tokens, so attention would read future-token garbage
+    // until the ring refills. Only removals that the layout can honor are
+    // accepted; anything else returns false so the caller reprocesses.
+    {
+        const auto & cells_ro = v_cells[0];
+        llama_pos cur_min = std::numeric_limits<llama_pos>::max();
+        llama_pos cur_max = -1;
+        for (uint32_t i = 0; i < cells_ro.size(); ++i) {
+            if (cells_ro.is_empty(i)) {
+                continue;
+            }
+            if (seq_id >= 0 && !cells_ro.seq_has(i, seq_id)) {
+                continue;
+            }
+            const llama_pos pos = cells_ro.pos_get(i);
+            cur_min = std::min(cur_min, pos);
+            cur_max = std::max(cur_max, pos);
+        }
+
+        if (cur_max >= 0 && p0 <= cur_max && p1 > cur_min) { // removal overlaps stored tokens
+            const bool full_removal   = p0 <= cur_min && p1 > cur_max;
+            const bool suffix_removal = p1 > cur_max;
+            const uint64_t n_sink_tail = uint64_t(params.sink_tokens) + params.tail_tokens;
+            // Before the ring ever reuses a slot (and before any eviction into
+            // pending/body), every stored position still owns a unique f16 row,
+            // so a suffix rollback is exact.
+            const bool ring_untouched = uint64_t(cur_max) < std::min<uint64_t>(n_sink_tail, kv_size);
+            if (!full_removal && !(suffix_removal && ring_untouched)) {
+                return false;
+            }
+        }
+    }
+
+    return seq_rm_cells(seq_id, p0, p1);
+}
+
+bool llama_kv_cache_kvarn::seq_rm_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto & cells = v_cells[0];
     auto & head  = v_heads[0];
     uint32_t new_head = cells.size();
@@ -2502,6 +2548,21 @@ ggml_tensor * llama_kv_cache_kvarn::build_input_sink_tail_idxs(ggml_context * ct
     return idxs;
 }
 
+// Must match kvarn_graph_effective_params() in llama-graph.cpp: with
+// kv_size < sink+tail the graph-side window/seal math clamps the tail, so
+// the eviction plans and slot indices built here have to use the same
+// geometry or the two sides disagree about when tokens leave the ring.
+static llama_kvarn_params kvarn_effective_params(llama_kvarn_params params, uint32_t kv_size) {
+    if (kv_size != 0 && uint64_t(params.sink_tokens) + uint64_t(params.tail_tokens) > kv_size) {
+        if (params.sink_tokens >= kv_size) {
+            params.tail_tokens = 0;
+        } else {
+            params.tail_tokens = kv_size - params.sink_tokens;
+        }
+    }
+    return params;
+}
+
 static uint32_t kvarn_count_tail_evictions(const llama_kvarn_params & params, const llama_ubatch & ubatch) {
     uint32_t n = 0;
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -2524,21 +2585,23 @@ void llama_kv_cache_kvarn::set_input_sink_tail_idxs(ggml_tensor * dst, const lla
     GGML_ASSERT(dst->type == GGML_TYPE_I64);
     GGML_ASSERT(dst->ne[0] == ubatch->n_tokens);
 
+    const llama_kvarn_params p = kvarn_effective_params(params, kv_size);
     int64_t * data = (int64_t *) dst->data;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos pos = ubatch->pos ? ubatch->pos[i] : llama_pos(i);
         if (pos < 0) {
             data[i] = 0;
-        } else if (uint32_t(pos) < params.sink_tokens) {
+        } else if (uint32_t(pos) < p.sink_tokens) {
             data[i] = int64_t(pos);
         } else {
-            data[i] = kvarn_tail_slot(params, uint32_t(pos));
+            data[i] = kvarn_tail_slot(p, uint32_t(pos));
         }
     }
 }
 
 ggml_tensor * llama_kv_cache_kvarn::build_input_body_plan(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    ggml_tensor * plan = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 3, kvarn_count_tail_evictions(params, ubatch));
+    ggml_tensor * plan = ggml_new_tensor_2d(ctx, GGML_TYPE_I64, 3,
+            kvarn_count_tail_evictions(kvarn_effective_params(params, kv_size), ubatch));
     ggml_set_input(plan);
     ggml_set_name(plan, "kvarn_body_plan");
     return plan;
@@ -2548,31 +2611,33 @@ void llama_kv_cache_kvarn::set_input_body_plan(ggml_tensor * dst, const llama_ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I64);
     GGML_ASSERT(dst->ne[0] == 3);
-    GGML_ASSERT(dst->ne[1] == kvarn_count_tail_evictions(params, *ubatch));
+    const llama_kvarn_params p = kvarn_effective_params(params, kv_size);
+    GGML_ASSERT(dst->ne[1] == kvarn_count_tail_evictions(p, *ubatch));
 
     int64_t * data = (int64_t *) dst->data;
     uint32_t j = 0;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos pos = ubatch->pos ? ubatch->pos[i] : llama_pos(i);
 
-        if (pos < 0 || uint32_t(pos) < params.sink_tokens + params.tail_tokens) {
+        if (pos < 0 || uint32_t(pos) < p.sink_tokens + p.tail_tokens) {
             continue;
         }
 
-        const uint32_t evicted_pos = uint32_t(pos) - params.tail_tokens;
-        const uint32_t body_pos = evicted_pos - params.sink_tokens;
-        const uint32_t record   = body_pos/params.group_size;
-        const uint32_t offset   = body_pos%params.group_size;
+        const uint32_t evicted_pos = uint32_t(pos) - p.tail_tokens;
+        const uint32_t body_pos = evicted_pos - p.sink_tokens;
+        const uint32_t record   = body_pos/p.group_size;
+        const uint32_t offset   = body_pos%p.group_size;
         const size_t off = size_t(j++)*3;
 
         data[off + 0] = int64_t(record);
         data[off + 1] = int64_t(offset);
-        data[off + 2] = offset + 1 == params.group_size ? int64_t(record) : -1;
+        data[off + 2] = offset + 1 == p.group_size ? int64_t(record) : -1;
     }
 }
 
 ggml_tensor * llama_kv_cache_kvarn::build_input_body_offsets(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    ggml_tensor * offsets = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, kvarn_count_tail_evictions(params, ubatch));
+    ggml_tensor * offsets = ggml_new_tensor_1d(ctx, GGML_TYPE_I64,
+            kvarn_count_tail_evictions(kvarn_effective_params(params, kv_size), ubatch));
     ggml_set_input(offsets);
     ggml_set_name(offsets, "kvarn_body_offsets");
     return offsets;
@@ -2581,23 +2646,25 @@ ggml_tensor * llama_kv_cache_kvarn::build_input_body_offsets(ggml_context * ctx,
 void llama_kv_cache_kvarn::set_input_body_offsets(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I64);
-    GGML_ASSERT(dst->ne[0] == kvarn_count_tail_evictions(params, *ubatch));
+    const llama_kvarn_params p = kvarn_effective_params(params, kv_size);
+    GGML_ASSERT(dst->ne[0] == kvarn_count_tail_evictions(p, *ubatch));
 
     int64_t * data = (int64_t *) dst->data;
     uint32_t j = 0;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos pos = ubatch->pos ? ubatch->pos[i] : llama_pos(i);
-        if (pos < 0 || uint32_t(pos) < params.sink_tokens + params.tail_tokens) {
+        if (pos < 0 || uint32_t(pos) < p.sink_tokens + p.tail_tokens) {
             continue;
         }
 
-        const uint32_t evicted_pos = uint32_t(pos) - params.tail_tokens;
-        data[j++] = int64_t((evicted_pos - params.sink_tokens)%params.group_size);
+        const uint32_t evicted_pos = uint32_t(pos) - p.tail_tokens;
+        data[j++] = int64_t((evicted_pos - p.sink_tokens)%p.group_size);
     }
 }
 
 ggml_tensor * llama_kv_cache_kvarn::build_input_tail_evict_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
-    ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kvarn_count_tail_evictions(params, ubatch));
+    ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+            kvarn_count_tail_evictions(kvarn_effective_params(params, kv_size), ubatch));
     ggml_set_input(idxs);
     ggml_set_name(idxs, "kvarn_tail_evict_idxs");
     return idxs;
@@ -2606,18 +2673,19 @@ ggml_tensor * llama_kv_cache_kvarn::build_input_tail_evict_idxs(ggml_context * c
 void llama_kv_cache_kvarn::set_input_tail_evict_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->ne[0] == kvarn_count_tail_evictions(params, *ubatch));
+    const llama_kvarn_params p = kvarn_effective_params(params, kv_size);
+    GGML_ASSERT(dst->ne[0] == kvarn_count_tail_evictions(p, *ubatch));
 
     int32_t * data = (int32_t *) dst->data;
     uint32_t j = 0;
     for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
         const llama_pos pos = ubatch->pos ? ubatch->pos[i] : llama_pos(i);
-        if (pos < 0 || uint32_t(pos) < params.sink_tokens + params.tail_tokens) {
+        if (pos < 0 || uint32_t(pos) < p.sink_tokens + p.tail_tokens) {
             continue;
         }
 
-        const uint32_t evicted_pos = uint32_t(pos) - params.tail_tokens;
-        data[j++] = int32_t(kvarn_tail_slot(params, evicted_pos));
+        const uint32_t evicted_pos = uint32_t(pos) - p.tail_tokens;
+        data[j++] = int32_t(kvarn_tail_slot(p, evicted_pos));
     }
 }
 
@@ -2655,14 +2723,7 @@ void llama_kv_cache_kvarn::set_input_kq_mask(ggml_tensor * dst, const llama_ubat
         }
     };
 
-    llama_kvarn_params effective_params = params;
-    if (kv_size != 0 && uint64_t(effective_params.sink_tokens) + uint64_t(effective_params.tail_tokens) > kv_size) {
-        if (effective_params.sink_tokens >= kv_size) {
-            effective_params.tail_tokens = 0;
-        } else {
-            effective_params.tail_tokens = kv_size - effective_params.sink_tokens;
-        }
-    }
+    const llama_kvarn_params effective_params = kvarn_effective_params(params, kv_size);
 
     const int64_t invalid_key_pos = std::numeric_limits<int64_t>::max();
     std::vector<int64_t> key_positions(size_t(n_kv), invalid_key_pos);
@@ -2956,7 +3017,7 @@ void llama_kv_cache_kvarn::apply_ubatch(const slot_info & sinfo, const llama_uba
 
     for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
         if (seq_pos_max_rm[s] != -1 && cells.seq_pos_min(s) <= seq_pos_max_rm[s]) {
-            seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
+            seq_rm_cells(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
         }
     }
 
