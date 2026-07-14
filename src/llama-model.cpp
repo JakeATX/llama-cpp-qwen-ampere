@@ -2322,6 +2322,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 const int32_t donor = hparams.kv_reuse_layer_matching_attention_type(il);
                 return donor >= 0 ? donor : il;
             };
+            auto route_normal_layers_ptr = std::make_shared<std::vector<int32_t>>();
             auto install_gemma_route = [&](std::vector<int32_t> selected_donors, const char * route_name) {
                 std::sort(selected_donors.begin(), selected_donors.end());
                 selected_donors.erase(std::unique(selected_donors.begin(), selected_donors.end()), selected_donors.end());
@@ -2353,27 +2354,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         llama_kvarn_format_layer_ids(route_normal_layers).c_str());
 
                 auto route_kvarn_layers_ptr = std::make_shared<std::vector<int32_t>>(std::move(route_kvarn_layers));
-                auto route_normal_layers_ptr = std::make_shared<std::vector<int32_t>>(std::move(route_normal_layers));
+                route_normal_layers_ptr = std::make_shared<std::vector<int32_t>>(std::move(route_normal_layers));
                 filter = [route_kvarn_layers_ptr, route_contains](int32_t il) {
                     return route_contains(route_kvarn_layers_ptr, il);
                 };
-                if (llama_kvarn_env_flag("LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN")) {
-                    LLAMA_LOG_WARN(
-                            "%s: diagnostic LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN=1 creates normal full-KV "
-                            "compatibility cache for all Gemma full-attention layers\n",
-                            __func__);
-                    filter_full_normal = full_normal_compat_filter;
-                } else if (!route_normal_layers_ptr->empty()) {
-                    filter_full_normal = [route_normal_layers_ptr, route_contains](int32_t il) {
-                        return route_contains(route_normal_layers_ptr, il);
-                    };
-                } else if (!llama_kvarn_env_flag("LLAMA_KVARN_ISWA_DISABLE_COMPAT_FULL_NORMAL")) {
-                    LLAMA_LOG_WARN(
-                            "%s: creating compatibility normal full-KV cache for all-KVarN Gemma+ISWA route; "
-                            "set LLAMA_KVARN_ISWA_DISABLE_COMPAT_FULL_NORMAL=1 only for crash reproduction\n",
-                            __func__);
-                    filter_full_normal = full_normal_compat_filter;
-                }
             };
             llama_memory_i::layer_filter_cb diagnostic_filter = llama_kvarn_layer_filter_from_env();
             if (diagnostic_filter) {
@@ -2442,12 +2426,25 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     selected_donors.push_back(all_full_donors[i]);
                 }
                 install_gemma_route(std::move(selected_donors), "conservative-rollback");
-            } else if (!llama_kvarn_env_flag("LLAMA_KVARN_ISWA_DISABLE_COMPAT_FULL_NORMAL")) {
+            }
+
+            const bool debug_full_normal = llama_kvarn_env_flag("LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN");
+            switch (llama_kvarn_iswa_choose_full_normal_policy(
+                        debug_full_normal, !route_normal_layers_ptr->empty())) {
+            case llama_kvarn_iswa_full_normal_policy::diagnostic_all:
                 LLAMA_LOG_WARN(
-                        "%s: creating compatibility normal full-KV cache for Gemma KVarN+ISWA; "
-                        "set LLAMA_KVARN_ISWA_DISABLE_COMPAT_FULL_NORMAL=1 only for crash reproduction\n",
+                        "%s: diagnostic LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN=1 creates normal full-KV "
+                        "compatibility cache for all Gemma full-attention layers\n",
                         __func__);
                 filter_full_normal = full_normal_compat_filter;
+                break;
+            case llama_kvarn_iswa_full_normal_policy::route_fallback:
+                filter_full_normal = [route_normal_layers_ptr, route_contains](int32_t il) {
+                    return route_contains(route_normal_layers_ptr, il);
+                };
+                break;
+            case llama_kvarn_iswa_full_normal_policy::none:
+                break;
             }
 
             return new llama_kv_cache_kvarn_iswa(

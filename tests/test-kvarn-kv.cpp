@@ -93,6 +93,19 @@ static void test_layout() {
     require(layout512.total_record_bytes == 56832, "512-dim total record bytes");
 }
 
+static void test_iswa_full_normal_policy() {
+    using policy = llama_kvarn_iswa_full_normal_policy;
+
+    require(llama_kvarn_iswa_choose_full_normal_policy(false, false) == policy::none,
+            "all-KVarN route does not allocate a normal full-KV cache");
+    require(llama_kvarn_iswa_choose_full_normal_policy(false, true) == policy::route_fallback,
+            "mixed route allocates only its normal fallback layers");
+    require(llama_kvarn_iswa_choose_full_normal_policy(true, false) == policy::diagnostic_all,
+            "diagnostic route allocates all normal full-KV layers");
+    require(llama_kvarn_iswa_choose_full_normal_policy(true, true) == policy::diagnostic_all,
+            "diagnostic full-normal route takes precedence over mixed fallback");
+}
+
 static void test_pack_roundtrip() {
     for (uint32_t bits : { 2u, 4u }) {
         std::vector<uint8_t> src(257);
@@ -1876,6 +1889,7 @@ int main() {
     trace_phase("llama_backend_init", "pass");
 
     run_phase("test_layout", test_layout);
+    run_phase("test_iswa_full_normal_policy", test_iswa_full_normal_policy);
     run_phase("test_pack_roundtrip", test_pack_roundtrip);
     run_phase("test_hadamard_inverse", test_hadamard_inverse);
     run_phase("test_reference_store_dequant", test_reference_store_dequant);

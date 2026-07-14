@@ -6,6 +6,20 @@
 #include <memory>
 #include <vector>
 
+enum class llama_kvarn_iswa_full_normal_policy {
+    none,
+    route_fallback,
+    diagnostic_all,
+};
+
+constexpr llama_kvarn_iswa_full_normal_policy llama_kvarn_iswa_choose_full_normal_policy(
+        bool debug_full_normal,
+        bool has_route_fallback) {
+    return debug_full_normal ? llama_kvarn_iswa_full_normal_policy::diagnostic_all
+         : has_route_fallback ? llama_kvarn_iswa_full_normal_policy::route_fallback
+                              : llama_kvarn_iswa_full_normal_policy::none;
+}
+
 // Composite cache for models that mix dense/full-attention layers with SWA
 // layers: KVarN owns non-SWA physical KV layers, while the existing SWA cache
 // owns sliding-window layers.
