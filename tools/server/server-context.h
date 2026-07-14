@@ -12,6 +12,18 @@
 
 struct server_context_impl; // private implementation
 
+bool server_context_has_rollback_strategy(
+        common_context_seq_rm_type target,
+        common_context_seq_rm_type draft,
+        bool has_draft);
+
+bool server_context_can_reuse_shifted_cache(
+        common_context_seq_rm_type target,
+        common_context_seq_rm_type draft,
+        bool has_draft,
+        bool target_can_shift,
+        bool draft_can_shift);
+
 struct server_context_meta {
     std::string build_info;
     std::string model_name;

@@ -1649,13 +1649,13 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
     if (p1 < 0) {
         p1 = std::numeric_limits<llama_pos>::max();
     }
+    if (p0 >= p1) {
+        return true;
+    }
 
-    // Physical storage is position-derived: the tail is a ring where slot(p)
-    // == slot(p + tail_tokens). After a partial rollback the mask would label
-    // ring slots with positions whose values were already overwritten by the
-    // removed (newer) tokens, so attention would read future-token garbage
-    // until the ring refills. Only removals that the layout can honor are
-    // accepted; anything else returns false so the caller reprocesses.
+    // Physical storage is position-derived. Refuse every overlapping partial
+    // removal so the advertised capability cannot change after the tail ring
+    // starts reusing slots. Full removal and true no-ops remain exact.
     {
         const auto & cells_ro = v_cells[0];
         llama_pos cur_min = std::numeric_limits<llama_pos>::max();
@@ -1673,14 +1673,8 @@ bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p
         }
 
         if (cur_max >= 0 && p0 <= cur_max && p1 > cur_min) { // removal overlaps stored tokens
-            const bool full_removal   = p0 <= cur_min && p1 > cur_max;
-            const bool suffix_removal = p1 > cur_max;
-            const uint64_t n_sink_tail = uint64_t(params.sink_tokens) + params.tail_tokens;
-            // Before the ring ever reuses a slot (and before any eviction into
-            // pending/body), every stored position still owns a unique f16 row,
-            // so a suffix rollback is exact.
-            const bool ring_untouched = uint64_t(cur_max) < std::min<uint64_t>(n_sink_tail, kv_size);
-            if (!full_removal && !(suffix_removal && ring_untouched)) {
+            const bool full_removal = p0 <= cur_min && p1 > cur_max;
+            if (!full_removal) {
                 return false;
             }
         }

@@ -1446,7 +1446,7 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
-    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+    common_context_seq_rm_type res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     llama_memory_clear(mem, true);
 
@@ -1462,17 +1462,65 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         goto done;
     }
 
-    if (llama_n_rs_seq(ctx) > 0) {
-        LOG_INF("%s: the context supports bounded partial sequence removal\n", __func__);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    // try to remove the last tokens
+    if (llama_memory_seq_rm(mem, 0, 1, -1)) {
+        if (llama_n_rs_seq(ctx) > 0) {
+            LOG_INF("%s: the context supports bounded partial sequence removal\n", __func__);
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+        } else {
+            LOG_INF("%s: the context supports partial sequence removal\n", __func__);
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_PART;
+        }
         goto done;
     }
 
-    // try to remove the last tokens
-    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        LOG_WRN("%s: the target context does not support partial sequence removal\n", __func__);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    // A failed removal may have partially changed a composite memory. Rebuild
+    // before proving the checkpoint protocol used by server rollback.
+    llama_memory_clear(mem, true);
+    llama_synchronize(ctx);
+    ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode() failed while rebuilding checkpoint probe state: %d\n", __func__, ret);
         goto done;
+    }
+
+    try {
+        constexpr llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, 0, flags);
+        if (ckpt_size == 0) {
+            LOG_WRN("%s: partial removal and sequence checkpoints are unavailable\n", __func__);
+            goto done;
+        }
+
+        std::vector<uint8_t> ckpt(ckpt_size);
+        if (llama_state_seq_get_data_ext(ctx, ckpt.data(), ckpt.size(), 0, flags) != ckpt.size()) {
+            LOG_WRN("%s: failed to save a sequence checkpoint\n", __func__);
+            goto done;
+        }
+
+        llama_token extra = 0;
+        llama_pos extra_pos = 2;
+        llama_batch extra_batch = llama_batch_get_one(&extra, 1);
+        extra_batch.pos = &extra_pos;
+        ret = llama_decode(ctx, extra_batch);
+        if (ret != 0) {
+            LOG_ERR("%s: llama_decode() failed while extending checkpoint probe state: %d\n", __func__, ret);
+            goto done;
+        }
+
+        if (llama_state_seq_set_data_ext(ctx, ckpt.data(), ckpt.size(), 0, flags) != ckpt.size()) {
+            LOG_WRN("%s: failed to restore a sequence checkpoint\n", __func__);
+            goto done;
+        }
+        if (!llama_memory_seq_rm(mem, 0, 2, -1)) {
+            LOG_WRN("%s: checkpoint restore did not make rollback removal safe\n", __func__);
+            goto done;
+        }
+
+        LOG_INF("%s: the context supports sequence removal through checkpoints\n", __func__);
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: checkpoint capability probe failed: %s\n", __func__, e.what());
     }
 
 done:

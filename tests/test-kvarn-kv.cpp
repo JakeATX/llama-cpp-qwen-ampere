@@ -699,11 +699,16 @@ static void test_runtime_state_safety() {
     // Mid-range removal breaks position contiguity; must be refused.
     require(!cache.seq_rm(0, 3, 7), "KVarN mid-range seq_rm refused");
 
+    require(cache.seq_rm(0, 20, 30), "KVarN non-overlapping seq_rm is a no-op");
+    require(cache.seq_rm(0, 5, 5), "KVarN empty-range seq_rm is a no-op");
+    require(cache.seq_pos_max(0) == 11, "KVarN no-op removals leave state unchanged");
+
     // Removing everything is always exact.
     require(cache.seq_rm(0, 0, -1), "KVarN full-range seq_rm accepted");
     require(cache.seq_pos_max(0) == -1, "KVarN full-range seq_rm cleared");
 
-    // Before any slot reuse, a suffix rollback is exact and accepted.
+    // Partial rollback is refused even before slot reuse so the capability
+    // probe cannot advertise support that disappears later in the session.
     for (uint32_t pos = 0; pos < 5; ++pos) {
         llama_ubatch ubatch = make_test_ubatch(1, 0);
         ubatch.data->pos[0] = llama_pos(pos);
@@ -712,8 +717,13 @@ static void test_runtime_state_safety() {
         require(!sinfo.empty(), "KVarN state safety refill slot");
         cache.apply_ubatch(sinfo, ubatch);
     }
-    require(cache.seq_rm(0, 3, -1), "KVarN pre-wrap suffix seq_rm accepted");
-    require(cache.seq_pos_max(0) == 2, "KVarN pre-wrap suffix seq_rm trimmed");
+    require(!cache.seq_rm(0, 3, -1), "KVarN pre-wrap suffix seq_rm refused consistently");
+    require(cache.seq_pos_max(0) == 4, "KVarN refused pre-wrap seq_rm left state unchanged");
+
+    cache.seq_cp(0, 1, 0, -1);
+    require(cache.seq_rm(-1, 0, -1), "KVarN all-sequence full removal accepted");
+    require(cache.seq_pos_max(0) == -1 && cache.seq_pos_max(1) == -1,
+            "KVarN all-sequence full removal cleared every sequence");
 }
 
 static void test_reference_store_scale_invariance() {
@@ -860,10 +870,10 @@ static void test_runtime_metadata() {
     require(!cache.seq_rm(0, 0, 2), "KVarN prefix seq_rm refused");
     require(cache.seq_pos_min(0) == 0, "KVarN prefix seq_rm leaves state unchanged");
 
-    // A suffix rollback while every token still owns a unique sink/tail slot
-    // is exact and must be accepted.
-    require(cache.seq_rm(0, 2, -1), "KVarN pre-wrap suffix seq_rm accepted");
-    require(cache.seq_pos_max(0) == 1, "KVarN suffix seq_rm trimmed max");
+    // Refuse pre-wrap suffix removal as well, otherwise the short capability
+    // probe advertises partial removal that fails after the tail ring wraps.
+    require(!cache.seq_rm(0, 2, -1), "KVarN pre-wrap suffix seq_rm refused");
+    require(cache.seq_pos_max(0) == 2, "KVarN refused suffix seq_rm leaves max unchanged");
     require(cache.seq_rm(0, 0, -1), "KVarN full seq_rm accepted");
     require(cache.seq_pos_min(0) == -1, "KVarN full seq_rm cleared sequence");
 
