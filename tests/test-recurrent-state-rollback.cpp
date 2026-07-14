@@ -177,6 +177,29 @@ int main(int argc, char ** argv) {
         }
     }
 
+    llama_memory_t mem_src = llama_get_memory(ctx_src);
+    if (last_pos > 0) {
+        if (llama_memory_seq_rm(mem_src, -1, 0, last_pos) ||
+            llama_memory_seq_pos_max(mem_src, 0) != last_pos) {
+            fprintf(stderr, "%s : finite partial prefix was not rejected atomically\n", __func__);
+            return 1;
+        }
+    }
+    if (llama_memory_seq_rm(mem_src, -1, last_pos, last_pos + 1) ||
+        llama_memory_seq_pos_max(mem_src, 0) != last_pos) {
+        fprintf(stderr, "%s : finite tail-only removal was not rejected atomically\n", __func__);
+        return 1;
+    }
+    if (!llama_memory_seq_rm(mem_src, -1, 0, last_pos + 1) ||
+        llama_memory_seq_pos_max(mem_src, 0) != -1) {
+        fprintf(stderr, "%s : finite whole-cache removal failed\n", __func__);
+        return 1;
+    }
+    if (!decode_one(ctx_src, tokens[0], 0)) {
+        fprintf(stderr, "%s : decode after finite whole-cache removal failed\n", __func__);
+        return 1;
+    }
+
     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
     llama_free(ctx_src);
     llama_free(ctx_dst);

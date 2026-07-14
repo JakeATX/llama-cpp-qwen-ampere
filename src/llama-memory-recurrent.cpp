@@ -160,22 +160,62 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
-    if (rm_all) {
-        if (seq_id >= 0) {
-            set_rs_idx(seq_id, 0);
-        } else {
-            std::fill(rs_idx.begin(), rs_idx.end(), 0);
-        }
-    }
-
     // models like Mamba or RWKV can't have a state partially erased at the end
     // of the sequence because their state isn't preserved for previous tokens
     if (seq_id >= (int64_t) size) {
         // could be fatal
         return false;
     }
-    if (0 <= seq_id) {
+
+    if (seq_id < 0) {
+        const llama_pos pos_max = std::numeric_limits<llama_pos>::max();
+
+        // Use the full reset path so per-sequence tails and rollback state are
+        // cleared together with the cells.
+        if (p0 == 0 && p1 == pos_max) {
+            clear(false);
+            return true;
+        }
+
+        if (p0 == p1) {
+            return true;
+        }
+
+        bool      has_cells  = false;
+        llama_pos latest_pos = -1;
+        for (const auto & cell : cells) {
+            if (cell.is_empty()) {
+                continue;
+            }
+            if (cell.pos < 0) {
+                return false;
+            }
+            has_cells  = true;
+            latest_pos = std::max(latest_pos, cell.pos);
+        }
+
+        if (!has_cells) {
+            return true;
+        }
+
+        // A prefix that covers every latest state covers the complete history
+        // represented by this recurrent cache.
+        if (p0 == 0 && latest_pos < p1) {
+            clear(false);
+            return true;
+        }
+
+        // A range strictly after every latest state is a no-op. All other
+        // finite ranges are ambiguous partial removals and must fail closed.
+        return p0 > latest_pos;
+    }
+
+    const bool rm_all = p0 == 0 && p1 == std::numeric_limits<llama_pos>::max();
+    if (rm_all) {
+        set_rs_idx(seq_id, 0);
+    }
+
+    {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
@@ -195,12 +235,6 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 tail_id = -1;
                 set_rs_idx(seq_id, 0);
             }
-        }
-    } else {
-        // seq_id is negative, then the range should include everything or nothing
-        if (p0 != p1 && (p0 != 0 || p1 != std::numeric_limits<llama_pos>::max())) {
-            //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: `seq_id` is negative, so returning false\n");
-            return false;
         }
     }
 
