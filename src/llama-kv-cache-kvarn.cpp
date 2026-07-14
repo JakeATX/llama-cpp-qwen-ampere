@@ -2097,6 +2097,32 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             }
         }
 
+        if (n_seq_max == 1) {
+            std::vector<bool> seen_positions(kv_size, false);
+            llama_pos max_pos = -1;
+            for (uint32_t i = 0; i < n_cells; ++i) {
+                if (staged_cells.is_empty(i)) {
+                    continue;
+                }
+
+                kvarn_state_require(staged_cells.seq_count(i) == 1 && staged_cells.seq_has(i, 0),
+                        "KVarN single-stream state cell must belong only to sequence 0");
+                const llama_pos pos = staged_cells.pos_get(i);
+                kvarn_state_require(pos >= 0 && uint64_t(pos) < uint64_t(kv_size),
+                        "KVarN single-stream state position is out of range");
+                kvarn_state_require(!seen_positions[size_t(pos)],
+                        "KVarN single-stream state contains a duplicate position");
+                seen_positions[size_t(pos)] = true;
+                max_pos = std::max(max_pos, pos);
+            }
+            if (max_pos >= 0) {
+                for (uint32_t pos = 0; pos <= uint32_t(max_pos); ++pos) {
+                    kvarn_state_require(seen_positions[size_t(pos)],
+                            "KVarN single-stream state positions are not dense from zero");
+                }
+            }
+        }
+
         struct tensor_restore {
             ggml_tensor * tensor;
             size_t nbytes;
@@ -3248,6 +3274,42 @@ llama_kv_cache_kvarn::slot_info llama_kv_cache_kvarn::find_slot(const llama_ubat
 }
 
 llama_kv_cache_kvarn::slot_info_vec_t llama_kv_cache_kvarn::prepare(const std::vector<llama_ubatch> & ubatches) const {
+    if (n_seq_max == 1) {
+        int64_t expected_pos = int64_t(seq_pos_max(0)) + 1;
+        const char * invalid_reason = nullptr;
+
+        for (const llama_ubatch & ubatch : ubatches) {
+            if (ubatch.pos == nullptr || ubatch.n_pos < 1) {
+                invalid_reason = "position data is missing";
+                break;
+            }
+            if (ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+                invalid_reason = "sequence metadata is missing";
+                break;
+            }
+
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i] == nullptr || ubatch.seq_id[i][0] != 0) {
+                    invalid_reason = "each token must belong only to sequence 0";
+                    break;
+                }
+                if (int64_t(ubatch.pos[i]) != expected_pos) {
+                    invalid_reason = "positions must append contiguously";
+                    break;
+                }
+                ++expected_pos;
+            }
+            if (invalid_reason != nullptr) {
+                break;
+            }
+        }
+
+        if (invalid_reason != nullptr) {
+            std::fprintf(stderr, "%s: invalid single-stream KVarN ubatch: %s\n", __func__, invalid_reason);
+            return {};
+        }
+    }
+
     llama_kv_cells cells = v_cells[0];
     uint32_t head = v_heads[0];
 

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -786,6 +787,31 @@ static void test_runtime_state_safety() {
 
     llama_hparams hparams = make_test_hparams();
     llama_kv_cache_kvarn cache(nullptr, hparams, params, false, 32, 4, 1, nullptr);
+    llama_kv_cache_kvarn single_stream_cache(nullptr, hparams, params, false, 32, 1, 1, nullptr);
+
+    const auto prepare_positions = [&](std::initializer_list<llama_pos> positions) {
+        llama_ubatch ubatch = make_test_ubatch(uint32_t(positions.size()), 0);
+        std::copy(positions.begin(), positions.end(), ubatch.data->pos.begin());
+        ubatch.pos = ubatch.data->pos.data();
+        return single_stream_cache.prepare({ ubatch });
+    };
+
+    require(prepare_positions({ 1 }).empty(), "KVarN initial offset position rejected");
+    require(prepare_positions({ 0, 2 }).empty(), "KVarN initial position gap rejected");
+    require(prepare_positions({ 0, 0 }).empty(), "KVarN duplicate position rejected");
+    require(prepare_positions({ -1 }).empty(), "KVarN negative position rejected");
+
+    llama_ubatch append0 = make_test_ubatch(3, 0);
+    llama_ubatch append1 = make_test_ubatch(2, 0);
+    append1.data->pos = { 3, 4 };
+    append1.pos = append1.data->pos.data();
+    const auto append_sinfos = single_stream_cache.prepare({ append0, append1 });
+    require(append_sinfos.size() == 2, "KVarN contiguous positions append across ubatches");
+    single_stream_cache.apply_ubatch(append_sinfos[0], append0);
+    single_stream_cache.apply_ubatch(append_sinfos[1], append1);
+    require(single_stream_cache.seq_pos_max(0) == 4, "KVarN contiguous multi-ubatch append applied");
+    require(prepare_positions({ 4 }).empty(), "KVarN rewind position rejected");
+    require(prepare_positions({ 6 }).empty(), "KVarN skipped append position rejected");
 
     // No shift graph exists; advertising shift support would let context-shift
     // silently mis-rotate stored K.
@@ -955,6 +981,42 @@ static void test_runtime_state_rejects_corruption() {
         require(std::all_of(tensor_bytes.begin(), tensor_bytes.end(), [](uint8_t b) { return b == 0; }),
                 "failed KVarN restore clears backend tensors");
     }
+
+    // The writer remains permissive, but a matching single-stream reader must
+    // reject sparse metadata produced through the low-level direct-apply API.
+    llama_kv_cache_kvarn sparse(nullptr, hparams, params, false, 16, 1, 1, nullptr);
+    llama_ubatch sparse_ubatch = make_test_ubatch(2, 0);
+    sparse_ubatch.data->pos = { 0, 2 };
+    sparse_ubatch.pos = sparse_ubatch.data->pos.data();
+    llama_kv_cache_kvarn::slot_info sparse_sinfo;
+    sparse_sinfo.idxs = { 0, 1 };
+    sparse.apply_ubatch(sparse_sinfo, sparse_ubatch);
+    kvarn_test_writer sparse_writer;
+    sparse.state_write(sparse_writer);
+
+    llama_kv_cache_kvarn sparse_destination(nullptr, hparams, params, false, 16, 1, 1, nullptr);
+    llama_ubatch existing = make_test_ubatch(1, 0);
+    llama_kv_cache_kvarn::slot_info existing_sinfo;
+    existing_sinfo.idxs = { 0 };
+    sparse_destination.apply_ubatch(existing_sinfo, existing);
+    const auto destination_tensors = kvarn_test_layer_tensors(sparse_destination.get_layer_view(0));
+    std::vector<uint8_t> nonzero(ggml_nbytes(destination_tensors[0]), uint8_t{ 0x5a });
+    ggml_backend_tensor_set(destination_tensors[0], nonzero.data(), 0, nonzero.size());
+
+    kvarn_test_reader sparse_reader(sparse_writer.data);
+    bool sparse_rejected = false;
+    try {
+        sparse_destination.state_read(sparse_reader);
+    } catch (const std::runtime_error & e) {
+        sparse_rejected = std::string(e.what()).find("not dense from zero") != std::string::npos;
+    }
+    require(sparse_rejected, "sparse single-stream KVarN state rejected by density validation");
+    require(sparse_destination.seq_pos_min(0) == -1,
+            "failed sparse KVarN restore clears cell metadata");
+    std::vector<uint8_t> cleared(nonzero.size());
+    ggml_backend_tensor_get(destination_tensors[0], cleared.data(), 0, cleared.size());
+    require(std::all_of(cleared.begin(), cleared.end(), [](uint8_t b) { return b == 0; }),
+            "failed sparse KVarN restore clears backend tensors");
 }
 
 static void test_reference_store_scale_invariance() {
