@@ -195,6 +195,45 @@ void ggml_cuda_kvarn_mark_body_store(const void * k_body) {
     ggml_cuda_kvarn_mark_body_store_records(k_body, 0, 0);
 }
 
+void ggml_cuda_kvarn_invalidate_restored_body(const void * k_body) {
+    if (k_body == nullptr) {
+        return;
+    }
+
+    const uint64_t epoch = g_kvarn_body_store_epoch_next.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+
+    kvarn_body_store_state & state = g_kvarn_body_store_states[k_body];
+    state.prev_epoch = state.epoch;
+    state.epoch = epoch;
+    state.dirty_from = 0;
+
+    for (auto it = g_kvarn_dequant_cache.begin(); it != g_kvarn_dequant_cache.end();) {
+        if (it->second.k_body == k_body) {
+            it = g_kvarn_dequant_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    const auto raw = g_kvarn_raw_body_mirrors.find(k_body);
+    if (raw != g_kvarn_raw_body_mirrors.end()) {
+        kvarn_cuda_free_checked(raw->second.k, "restored raw mirror K");
+        kvarn_cuda_free_checked(raw->second.v, "restored raw mirror V");
+        g_kvarn_raw_body_mirrors.erase(raw);
+    }
+
+    if (g_kvarn_debug_store_context.raw_mirror_key == k_body) {
+        g_kvarn_debug_store_context.raw_mirror_key = nullptr;
+    }
+}
+
+uint64_t ggml_cuda_kvarn_debug_get_body_epoch(const void * k_body) {
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+    const auto it = g_kvarn_body_store_states.find(k_body);
+    return it != g_kvarn_body_store_states.end() ? it->second.epoch : 0;
+}
+
 static kvarn_body_store_state kvarn_body_store_state_for_unlocked(const void * k_body) {
     auto it = g_kvarn_body_store_states.find(k_body);
     if (it != g_kvarn_body_store_states.end()) {

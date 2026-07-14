@@ -1061,9 +1061,21 @@ static void test_raw_mirror_exact_key_lifecycle() {
     require(count == baseline_count + 2 && bytes == baseline_bytes + 2*mirror_bytes, "raw mirror B allocation stats");
     materialize_v(k_body_a, v_body_a, v_scales_a, 1.0f);
     materialize_v(k_body_b, v_body_b, v_scales_b, -2.0f);
+
+    const uint64_t epoch_a_before_restore = ggml_cuda_kvarn_debug_get_body_epoch(k_body_a);
+    ggml_cuda_kvarn_invalidate_restored_body(k_body_a);
+    const uint64_t epoch_a_after_restore = ggml_cuda_kvarn_debug_get_body_epoch(k_body_a);
+    require(epoch_a_after_restore > epoch_a_before_restore, "restored body A advances its exact-key epoch");
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
+    require(count == baseline_count + 1 && bytes == baseline_bytes + mirror_bytes,
+            "restored body invalidation removes exactly raw mirror A");
+    materialize_v(k_body_b, v_body_b, v_scales_b, -2.0f);
+
     capture(k_body_a, v_tile_a_d, k_body_a, v_body_a, k_scales_a, v_scales_a, scratch_a);
     ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
-    require(count == baseline_count + 2 && bytes == baseline_bytes + 2*mirror_bytes, "raw mirror re-store is allocation-stable");
+    require(count == baseline_count + 2 && bytes == baseline_bytes + 2*mirror_bytes,
+            "raw mirror A recaptures after restored-body invalidation");
+    materialize_v(k_body_a, v_body_a, v_scales_a, 1.0f);
 
     ggml_cuda_kvarn_release_buffer_range(k_body_a, body_bytes);
     ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);

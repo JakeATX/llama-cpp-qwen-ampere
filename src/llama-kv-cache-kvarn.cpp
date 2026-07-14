@@ -2101,6 +2101,12 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             ggml_tensor * tensor;
             size_t nbytes;
         };
+        using invalidate_restored_body_fn = void (*)(ggml_backend_buffer_t owner, const void * key);
+        struct body_invalidation {
+            invalidate_restored_body_fn fn;
+            ggml_backend_buffer_t owner;
+            const void * key;
+        };
         std::vector<tensor_restore> restores;
         restores.reserve(size_t(n_layers)*KVAR_N_STATE_TENSORS_PER_LAYER);
         uint64_t max_nbytes = 0;
@@ -2122,10 +2128,39 @@ void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id,
             }
         }
 
+        // Resolve every device hook before reading the first payload byte so a
+        // GPU backend lacking restore invalidation cannot leave a partial state.
+        std::vector<body_invalidation> body_invalidations;
+        body_invalidations.reserve(layer_tensors.size());
+        for (const layer_storage & storage : layer_tensors) {
+            ggml_tensor * root = storage.body_k;
+            while (root->view_src != nullptr) {
+                root = root->view_src;
+            }
+            kvarn_state_require(root->buffer != nullptr, "KVarN state body root has no owner buffer");
+            ggml_backend_buffer_t owner = root->buffer;
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(owner);
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            kvarn_state_require(root->data != nullptr, "KVarN GPU state body root is not allocated");
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            kvarn_state_require(reg != nullptr, "KVarN GPU backend registry is unavailable during restore");
+            auto fn = reinterpret_cast<invalidate_restored_body_fn>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kvarn_invalidate_restored_body"));
+            kvarn_state_require(fn != nullptr, "KVarN GPU backend lacks restored-body invalidation");
+            body_invalidations.push_back({ fn, owner, root->data });
+        }
+
         std::vector<uint8_t> buffer(static_cast<size_t>(max_nbytes), uint8_t{});
         for (const tensor_restore & restore : restores) {
             io.read(buffer.data(), restore.nbytes);
             ggml_backend_tensor_set(restore.tensor, buffer.data(), 0, restore.nbytes);
+        }
+
+        for (const body_invalidation & invalidation : body_invalidations) {
+            invalidation.fn(invalidation.owner, invalidation.key);
         }
 
         v_cells[0].set(0, staged_cells);

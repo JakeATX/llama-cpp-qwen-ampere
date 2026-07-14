@@ -5,8 +5,10 @@
 
 void ggml_cuda_kvarn_mark_body_store(const void * k_body);
 void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first_record, uint32_t n_records);
+void ggml_cuda_kvarn_invalidate_restored_body(const void * k_body);
 void ggml_cuda_kvarn_release_buffer_range(const void * base, size_t size);
 void ggml_cuda_kvarn_debug_get_raw_mirror_stats(size_t * count, size_t * allocated_bytes);
+uint64_t ggml_cuda_kvarn_debug_get_body_epoch(const void * k_body);
 void ggml_cuda_kvarn_debug_set_store_context(
         int32_t layer,
         uint32_t record0,

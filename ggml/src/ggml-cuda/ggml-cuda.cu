@@ -7261,6 +7261,24 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static void ggml_backend_cuda_kvarn_invalidate_restored_body(
+        ggml_backend_buffer_t owner,
+        const void * key) {
+    GGML_ASSERT(owner != nullptr);
+    GGML_ASSERT(key != nullptr);
+    GGML_ASSERT(ggml_backend_buffer_is_cuda(owner));
+    GGML_ASSERT(owner->context != nullptr);
+
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) owner->context;
+    GGML_ASSERT(ctx->dev_ptr != nullptr);
+    const uintptr_t key_addr = reinterpret_cast<uintptr_t>(key);
+    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(ctx->dev_ptr);
+    GGML_ASSERT(key_addr >= base_addr && key_addr - base_addr < owner->size);
+
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_kvarn_invalidate_restored_body(key);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7283,6 +7301,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kvarn_invalidate_restored_body") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_invalidate_restored_body;
     }
     return nullptr;
 }
