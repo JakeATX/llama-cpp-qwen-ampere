@@ -1732,7 +1732,7 @@ void llama_kv_cache_kvarn::clear(bool data) {
 }
 
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+    GGML_ASSERT(seq_id < 0 || (size_t) seq_id < seq_to_stream.size());
 
     if (p0 < 0) {
         p0 = 0;

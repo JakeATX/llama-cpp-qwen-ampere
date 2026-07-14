@@ -190,7 +190,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : finite tail-only removal was not rejected atomically\n", __func__);
         return 1;
     }
-    if (!llama_memory_seq_rm(mem_src, -1, 0, last_pos + 1) ||
+    if (!llama_memory_seq_rm(mem_src, -2, 0, last_pos + 1) ||
         llama_memory_seq_pos_max(mem_src, 0) != -1) {
         fprintf(stderr, "%s : finite whole-cache removal failed\n", __func__);
         return 1;

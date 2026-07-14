@@ -862,7 +862,7 @@ static void test_runtime_state_safety() {
     require(cache.seq_pos_max(0) == 4, "KVarN refused pre-wrap seq_rm left state unchanged");
 
     cache.seq_cp(0, 1, 0, -1);
-    require(cache.seq_rm(-1, 0, -1), "KVarN all-sequence full removal accepted");
+    require(cache.seq_rm(-2, 0, -1), "KVarN arbitrary-negative all-sequence full removal accepted");
     require(cache.seq_pos_max(0) == -1 && cache.seq_pos_max(1) == -1,
             "KVarN all-sequence full removal cleared every sequence");
 }
