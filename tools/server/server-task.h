@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <functional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -625,7 +626,19 @@ struct server_prompt {
     }
 };
 
+enum class server_prompt_cache_save_result {
+    success,
+    already_present,
+    unavailable,
+    invalid_writer,
+    allocation_failed,
+    short_main,
+    short_draft,
+};
+
 struct server_prompt_cache {
+    using state_writer = std::function<size_t(uint8_t *, size_t)>;
+
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
@@ -643,7 +656,12 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_save_result save(
+            const server_prompt & prompt,
+            size_t state_size_main,
+            size_t state_size_drft,
+            const state_writer & write_main,
+            const state_writer & write_drft = {});
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 

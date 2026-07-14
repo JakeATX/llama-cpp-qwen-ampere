@@ -133,19 +133,38 @@ struct server_slot {
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        const auto result = prompt_cache.save(
+                prompt, cur_size_tgt, cur_size_dft,
+                [this](uint8_t * data, size_t size) {
+                    return llama_state_seq_get_data_ext(ctx_tgt, data, size, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                },
+                ctx_dft ? server_prompt_cache::state_writer([this](uint8_t * data, size_t size) {
+                    return llama_state_seq_get_data_ext(ctx_dft, data, size, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                }) : server_prompt_cache::state_writer {});
 
-        SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        switch (result) {
+            case server_prompt_cache_save_result::success: {
+                const size_t cur_size = cur_size_tgt + cur_size_dft;
+                SRV_WRN(" - saved prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                        (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+            } break;
+            case server_prompt_cache_save_result::already_present:
+                break;
+            case server_prompt_cache_save_result::unavailable:
+                SRV_WRN("%s", " - prompt state serialization is unavailable; skipping prompt cache save\n");
+                break;
+            case server_prompt_cache_save_result::invalid_writer:
+                SRV_ERR("%s", " - prompt cache state writer configuration is invalid\n");
+                break;
+            case server_prompt_cache_save_result::allocation_failed:
+                SRV_WRN("%s", " - prompt cache state allocation failed\n");
+                break;
+            case server_prompt_cache_save_result::short_main:
+                SRV_WRN("%s", " - prompt target state serialization returned an unexpected byte count\n");
+                break;
+            case server_prompt_cache_save_result::short_draft:
+                SRV_WRN("%s", " - prompt draft state serialization returned an unexpected byte count\n");
+                break;
         }
     }
 

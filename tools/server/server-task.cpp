@@ -2005,59 +2005,72 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_save_result server_prompt_cache::save(
+        const server_prompt & prompt,
+        size_t state_size_tgt,
+        size_t state_size_dft,
+        const state_writer & write_tgt,
+        const state_writer & write_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
             SRV_INF("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+            return server_prompt_cache_save_result::already_present;
         }
     }
 
-    // next, remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->tokens.get_common_prefix(prompt.tokens);
+    if (state_size_tgt == 0 || (write_dft && state_size_dft == 0)) {
+        return server_prompt_cache_save_result::unavailable;
+    }
+    if (!write_tgt || (state_size_dft > 0) != static_cast<bool>(write_dft)) {
+        return server_prompt_cache_save_result::invalid_writer;
+    }
 
+    server_prompt candidate;
+
+    try {
+        candidate.tokens      = prompt.tokens.clone();
+        candidate.checkpoints = prompt.checkpoints;
+        candidate.data.main.resize(state_size_tgt);
+        candidate.data.drft.resize(state_size_dft);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+        return server_prompt_cache_save_result::allocation_failed;
+    }
+
+    if (write_tgt(candidate.data.main.data(), state_size_tgt) != state_size_tgt) {
+        return server_prompt_cache_save_result::short_main;
+    }
+    if (write_dft && write_dft(candidate.data.drft.data(), state_size_dft) != state_size_dft) {
+        return server_prompt_cache_save_result::short_draft;
+    }
+
+    try {
+        states.push_back(std::move(candidate));
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to commit prompt cache state: %s\n", e.what());
+        return server_prompt_cache_save_result::allocation_failed;
+    }
+    const auto inserted = std::prev(states.end());
+
+    // Only remove obsolete entries after the complete replacement is committed.
+    for (auto it = states.begin(); it != states.end();) {
+        if (it == inserted) {
+            ++it;
+            continue;
+        }
+        const int len = it->tokens.get_common_prefix(prompt.tokens);
         if (len == (int) it->tokens.size()) {
             SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
-
             it = states.erase(it);
         } else {
             ++it;
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
-
-    // check if we can allocate enough memory for the new state
-    try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
-    } catch (const std::bad_alloc & e) {
-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-        limit_size = std::max<size_t>(1, 0.4*size());
-
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
-
-        return nullptr;
-    }
-
-    states.push_back({
-        /*.tokens      =*/ prompt.tokens.clone(),
-        /*.data        =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-        /*.checkpoints =*/ prompt.checkpoints,
-    });
-
-    return &states.back();
+    return server_prompt_cache_save_result::success;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
