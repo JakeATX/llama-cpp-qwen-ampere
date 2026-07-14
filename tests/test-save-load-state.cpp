@@ -60,7 +60,7 @@ static llama_tokens test_baseline(struct llama_model * model, const struct commo
     llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(params.sampling.seed));
 
     auto n_past = 0;
-    if (!common_prompt_batch_decode(ctx.get(), tokens, n_past, params.n_batch, params.out_file, true)) {
+    if (!common_prompt_batch_decode(ctx.get(), tokens, (int) tokens.size(), n_past, params.n_batch, params.out_file, true)) {
         LOG_ERR("%s: failed to decode prompt\n", __func__);
         return {};
     }
@@ -75,6 +75,41 @@ static llama_tokens test_baseline(struct llama_model * model, const struct commo
     LOG("\n");
 
     return result;
+}
+
+// Save after an already-decoded prefix when the final unmatched batch contains
+// exactly one token. This is the completion prompt-cache boundary case.
+static bool test_incremental_single_token_save(
+        struct llama_model * model, const struct common_params & params, const llama_tokens & tokens) {
+    if (tokens.size() < 2) {
+        LOG_ERR("%s: at least two prompt tokens are required\n", __func__);
+        return false;
+    }
+
+    auto ctx = llama_context_ptr{llama_init_from_model(model, common_context_params_to_llama(params))};
+    llama_tokens accumulated(tokens.begin(), tokens.end() - 1);
+    int n_past = 0;
+
+    if (!common_prompt_batch_decode(ctx.get(), accumulated, (int) accumulated.size(),
+                n_past, params.n_batch, params.out_file, false)) {
+        LOG_ERR("%s: failed to decode prefix\n", __func__);
+        return false;
+    }
+
+    accumulated.push_back(tokens.back());
+    if (!common_prompt_batch_decode(ctx.get(), accumulated, 1,
+                n_past, params.n_batch, params.out_file, true)) {
+        LOG_ERR("%s: failed to save and decode final token\n", __func__);
+        return false;
+    }
+
+    if (n_past != (int) tokens.size()) {
+        LOG_ERR("%s: n_past = %d, expected %zu\n", __func__, n_past, tokens.size());
+        return false;
+    }
+
+    LOG("\nPASS: incremental single-token save\n");
+    return true;
 }
 
 
@@ -104,7 +139,7 @@ static bool test_state_load(struct llama_model * model, const struct common_para
     LOG_TRC("%s: loaded state with %zu tokens\n", __func__, n_token_count_out);
 
     // Replay last token
-    int n_past = (int) n_token_count_out;
+    int n_past = (int) n_token_count_out - 1;
     if (!common_replay_last_token(ctx.get(), tokens.back(), n_past)) {
         return false;
     }
@@ -155,7 +190,7 @@ static bool test_seq_cp_host(struct llama_model * model, const struct common_par
     LOG_TRC("%s: loaded state with %zu tokens\n", __func__, n_token_count_out);
 
     // Replay last token
-    int n_past = (int) n_token_count_out;
+    int n_past = (int) n_token_count_out - 1;
     if (!common_replay_last_token(ctx.get(), tokens.back(), n_past)) {
         return false;
     }
@@ -227,7 +262,7 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     LOG_TRC("%s: loaded state with %zu tokens\n", __func__, n_token_count_out);
 
     // Replay last token
-    int n_past = (int) n_token_count_out;
+    int n_past = (int) n_token_count_out - 1;
     if (!common_replay_last_token(ctx.get(), tokens.back(), n_past)) {
         return false;
     }
@@ -334,6 +369,12 @@ int main(int argc, char ** argv) {
     // Test 1: baseline (saves state to disk)
     auto result_baseline = test_baseline(model, params, tokens);
     if (result_baseline.empty()) {
+        return 1;
+    }
+
+    // Overwrite the state using an incrementally decoded prefix and a
+    // one-token final batch. The load test below verifies replay parity.
+    if (!test_incremental_single_token_save(model, params, tokens)) {
         return 1;
     }
 

@@ -2087,36 +2087,49 @@ bool common_replay_last_token(struct llama_context * ctx, llama_token last_token
 
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & tokens,
+    const std::vector<llama_token> & all_tokens,
+                               int   n_new,
                                int & n_past,
                                int   n_batch,
                   std::string_view   state_path,
                               bool   save_state) {
-    const int n_eval = tokens.size();
-    if (n_eval == 0) {
+    if (n_new == 0) {
         return true;
     }
+    GGML_ASSERT(n_new > 0 && (size_t) n_new <= all_tokens.size());
+    const size_t offset = all_tokens.size() - n_new;
 
-    if (save_state && n_eval > 1) {
-        const int n_tokens_before_last = n_eval - 1;
+    if (save_state) {
+        if (n_past < 0 || (size_t) n_past + (size_t) n_new != all_tokens.size()) {
+            LOG_ERR("%s: session token count (%zu) does not match n_past (%d) + n_new (%d)\n",
+                    __func__, all_tokens.size(), n_past, n_new);
+            return false;
+        }
 
-        GGML_ASSERT(n_eval <= n_batch);
+        const int n_tokens_before_last = n_new - 1;
+
+        GGML_ASSERT(n_new <= n_batch);
 
         // Decode all but the last token so we can save the memory state before decoding the last token.
         // This is done so we can restore the session state later and replay the last token.
         // Memory implementations in recurrent/hybrid models don't support removing tokens from their
         // memory, so we can't just remove the last token from the memory and replay the last token which
         // is the reason for this logic.
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_tokens_before_last))) {
-            LOG_ERR("%s : failed to eval\n", __func__);
+        if (n_tokens_before_last > 0) {
+            if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(all_tokens.data() + offset), n_tokens_before_last))) {
+                LOG_ERR("%s : failed to eval\n", __func__);
+                return false;
+            }
+            n_past += n_tokens_before_last;
+        }
+
+        if (!llama_state_save_file(ctx, state_path.data(), all_tokens.data(), all_tokens.size())) {
+            LOG_ERR("%s: failed to save session state to %s\n", __func__, state_path.data());
             return false;
         }
-        n_past += n_tokens_before_last;
+        LOG_INF("saved session before last token to %s, n_tokens = %zu\n", state_path.data(), all_tokens.size());
 
-        llama_state_save_file(ctx, state_path.data(), tokens.data(), n_tokens_before_last);
-        LOG_INF("saved session before last token to %s, n_tokens = %d\n", state_path.data(), n_tokens_before_last);
-
-        llama_token last_token = tokens.back();
+        llama_token last_token = all_tokens.back();
         llama_batch batch = llama_batch_get_one(&last_token, 1);
         int32_t pos = n_past;
         batch.pos = &pos;
@@ -2127,11 +2140,11 @@ bool common_prompt_batch_decode(
         }
         n_past++;
     } else {
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(tokens.data()), n_eval))) {
+        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token *>(all_tokens.data() + offset), n_new))) {
             LOG_ERR("%s : failed to eval\n", __func__);
             return false;
         }
-        n_past += n_eval;
+        n_past += n_new;
     }
 
     return true;
