@@ -134,6 +134,31 @@ forbidden by the offline-first plan.
   quality rejection is therefore a measured codec outcome, not a broken
   executable or serialization failure.
 
+## Terminal SCR2 calibration result
+
+The preregistered SCR2 arm is also closed at its first-failure stop condition.
+`production_ready=false`; no SCR2 CUDA integration or promotion is authorized.
+
+- Protocol SHA-256:
+  `e6ef0bcf9c94911d2b2da08a0825fc5f643b01104009202a4de291aef643cf62`.
+- Successful 16K `gemma4-L11-KV0` capture receipt SHA-256:
+  `99e82b1675afe5b0c0b5eed19360673ac621c2485bf927f03c074578cfcb5959`.
+- Sealed source manifest SHA-256:
+  `544bab3c4d33b826467b3319b6c40e46b1549cd324550e7b3d1e4a393a1dd767`.
+- Exact terminal result:
+  `artifacts/kvarn-scr2-calibration-20260714/gemma4-L11-KV0.scr2.result.json`
+  (SHA-256 `27526d7ad90c8dc5e3c6a0185ece18b9b79bd686a15f86152e178afb43a33919`).
+- Capture replay, aggregate rate, every-record rate, and the no-overflow /
+  no-resize / no-truncation / no-fallback integrity gate passed. Allocated
+  body rate was `2.759982638888889` bits/value.
+- Quality failed decisively: mean output NMSE was
+  `0.01376441831072871` and maximum output NMSE was
+  `0.15791865566019775`. The `gemma_l11_call0`, `global_max`,
+  `paired_v4_mean`, and `paired_v4_max` gates all failed.
+- The protocol declares one unit failure terminal. No later SCR2 calibration
+  unit, aggregation, calibration freeze, holdout, tuning, or CUDA integration
+  was run or may be inferred from this result.
+
 ## Legacy validation rejection
 
 The existing Gemma layer-5 disjoint paper-frame capture was tested only as a
@@ -150,9 +175,9 @@ production-ready.
 
 ## Next causal action
 
-None within this frozen codec investigation. Do not tune either candidate on
-the exposed holdout, run additional product-VQ pilot donors, or implement a
-CUDA path for a candidate that failed its offline quality gate. Maintenance
-of the existing K8/V8 runtime remains separate. Any future codec family must
-begin as a new preregistered investigation with fresh untouched holdout
-evidence.
+None within these frozen codec investigations. Do not tune product-VQ,
+IQ2_S, or SCR2 on exposed evidence; run additional rejected-arm donors; or
+implement a CUDA path for a candidate that failed its offline quality gate.
+Maintenance of the existing K8/V8 runtime remains separate. Any future codec
+family must begin as a new preregistered investigation with fresh untouched
+holdout evidence.
