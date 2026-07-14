@@ -2206,6 +2206,13 @@ static void llama_kvarn_validate_memory_support(
             params.kvarn.value_bits < 2 || params.kvarn.value_bits > 8) {
         throw std::runtime_error("KVarN backend requires group size 128 and key/value bits in [2, 8]");
     }
+    if (params.kvarn.sink_tokens == 0 || params.kvarn.tail_tokens == 0 ||
+            params.kvarn.sinkhorn_iters == 0 ||
+            !(params.kvarn.rtn_quantile > 0.0f && params.kvarn.rtn_quantile <= 1.0f)) {
+        throw std::runtime_error(
+                "KVarN backend requires non-zero sink/tail tokens and Sinkhorn iterations, "
+                "with rtn_quantile in (0, 1]");
+    }
     if (hparams.is_mla()) {
         throw std::runtime_error("KVarN backend does not support MLA models yet");
     }
