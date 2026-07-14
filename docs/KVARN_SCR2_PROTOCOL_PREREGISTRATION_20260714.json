@@ -124,7 +124,7 @@
       "scripts/kvarn/analyze_product_vq.py": "88dfd2c70786861696c328fdafa6294e35feb4ce383d99734c8d23844148fa56",
       "scripts/kvarn/analyze_v2_clip_sweep.py": "e5334160a6dcbd7746377adecdbdae20082be373d41f455009770f90bdd57927",
       "scripts/kvarn/canonical_capture.py": "58a2932fca9f27c4ecdf5a646c169728af2ebbc00d54ab304b29fe8e76b3e240",
-      "scripts/kvarn/capture_receipt_contract.py": "92bc479d31eb4489e12243cb899a8e076d8ac336bfee6b68542bf0c7b9aa5979",
+      "scripts/kvarn/capture_receipt_contract.py": "3b7e0fe8dcfed343c6bfb83e56bd961a23a6e49eb9fad3ac33a8555703e18d07",
       "scripts/kvarn/capture_source_seal_core.py": "5ceafd41999b407653584373c52b6d5173b2f01b6d11ecc76b25a0c8b7171838",
       "scripts/kvarn/kvarn_vllm_oracle.py": "8a737eb66e775b83e3d363e3f4f3baca11a0a20d55f5dc3446c53ac3c4570297",
       "scripts/kvarn/product_vq_codec.py": "3e6575c65e5ff28ebc95daf42ea3f0305d217b99805cad86f06c359ad8712cfa",
@@ -150,9 +150,10 @@
     "operative_scripts": {
       "Assert-KvarnGpuIdle.ps1": "6aee1f5a4a9de8e9126fe7049189650d5e876904c49227550fada8ea1d552320",
       "Capture-Provenance.ps1": "6254bf339d6f385f829ddce1c72881bba53f7c067489ca946aff23a9eec50615",
+      "capture_receipt_contract.py": "3b7e0fe8dcfed343c6bfb83e56bd961a23a6e49eb9fad3ac33a8555703e18d07",
       "capture_replay_binding.py": "9f2badb417e14d386d6c24269e4c620d0c5b931661f6f1c8e72efda2fdeaa15a",
       "fixture_freeze.py": "ba1c3dbd2f7bb78f7341c67310b5ecbfde9fe061413415daf41d938e3b6e5a8e",
-      "product_vq_lifecycle.py": "450d7b8d5f6aff5577b148a2ed3a113e81cfba53e8adfc01823ce53794755092"
+      "product_vq_lifecycle.py": "80992c00d27171bea91de0a85b9586ad39639bf184e0263e2aafb300c92c3245"
     }
   },
   "calibration": {
