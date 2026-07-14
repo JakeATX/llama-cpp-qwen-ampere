@@ -4652,6 +4652,7 @@ ggml_tensor * llm_graph_context::build_attn(
                     ctx0, sink_tail_k_src, layer.body_k, layer.scales_k, pending_k_src,
                     0, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                     int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_k.key_bits));
+            ggml_kvarn_materialize_kv_set_debug_raw_body_key(k_mat, layer.body_k);
             if (!debug_raw_mha_compare && kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_K")) {
                 ggml_kvarn_materialize_kv_set_debug_raw_body(k_mat, 1);
             }
@@ -4661,6 +4662,7 @@ ggml_tensor * llm_graph_context::build_attn(
                     ctx0, sink_tail_v_src, layer.body_v, layer.scales_v, pending_v_src,
                     1, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                     int32_t(layer.head_dim_v), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_v.value_bits));
+            ggml_kvarn_materialize_kv_set_debug_raw_body_key(v_mat, layer.body_k);
             ggml_kvarn_materialize_kv_set_v_layout(v_mat, int32_t(layer.layout_v.v_layout));
             if (!debug_raw_mha_compare && kvarn_graph_parse_env_flag("LLAMA_KVARN_DEBUG_RAW_BODY_V")) {
                 ggml_kvarn_materialize_kv_set_debug_raw_body(v_mat, 1);
@@ -4734,6 +4736,7 @@ ggml_tensor * llm_graph_context::build_attn(
                         ctx0, sink_tail_k_src, layer.body_k, layer.scales_k, pending_k_src,
                         0, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                         int32_t(layer.head_dim_k), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_k.key_bits));
+                ggml_kvarn_materialize_kv_set_debug_raw_body_key(k_raw, layer.body_k);
                 ggml_kvarn_materialize_kv_set_debug_raw_body(k_raw, 1);
                 cb(k_raw, "kvarn_iswa_materialized_raw_k", il);
 
@@ -4741,6 +4744,7 @@ ggml_tensor * llm_graph_context::build_attn(
                         ctx0, sink_tail_v_src, layer.body_v, layer.scales_v, pending_v_src,
                         1, op_n_sink, op_n_records, op_n_pending, op_n_tail, op_tail_start,
                         int32_t(layer.head_dim_v), int32_t(cparams.kvarn.group_size), int32_t(layer.layout_v.value_bits));
+                ggml_kvarn_materialize_kv_set_debug_raw_body_key(v_raw, layer.body_k);
                 ggml_kvarn_materialize_kv_set_v_layout(v_raw, int32_t(layer.layout_v.v_layout));
                 ggml_kvarn_materialize_kv_set_debug_raw_body(v_raw, 1);
                 cb(v_raw, "kvarn_iswa_materialized_raw_v", il);

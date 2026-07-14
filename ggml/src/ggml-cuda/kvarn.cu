@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -82,9 +83,11 @@ struct kvarn_body_store_state {
     uint64_t prev_epoch = 0;
     uint32_t dirty_from = 0;
 };
-// Host dispatch for a given context is single-threaded; no mutex on the hot path.
+// Dispatch is single-threaded per context, but these registries are shared by
+// every CUDA context and by buffer teardown.
 static std::unordered_map<const void *, kvarn_body_store_state> g_kvarn_body_store_states;
 static std::unordered_map<const void *, kvarn_dequant_cache_entry> g_kvarn_dequant_cache;
+static std::mutex g_kvarn_registry_mutex;
 
 struct kvarn_raw_body_mirror_entry {
     float * k = nullptr;
@@ -97,6 +100,82 @@ struct kvarn_raw_body_mirror_entry {
 
 static std::unordered_map<const void *, kvarn_raw_body_mirror_entry> g_kvarn_raw_body_mirrors;
 
+static bool kvarn_pointer_in_range(const void * pointer, const void * base, size_t size) {
+    if (pointer == nullptr || base == nullptr || size == 0) {
+        return false;
+    }
+    const uintptr_t p = reinterpret_cast<uintptr_t>(pointer);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    return p >= b && p - b < size;
+}
+
+static void kvarn_cuda_free_checked(void * pointer, const char * label) {
+    if (pointer == nullptr) {
+        return;
+    }
+    const cudaError_t err = cudaFree(pointer);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "KVarN CUDA registry: cudaFree(%s) failed: %s\n", label, cudaGetErrorString(err));
+        std::abort();
+    }
+}
+
+void ggml_cuda_kvarn_release_buffer_range(const void * base, size_t size) {
+    if (base == nullptr || size == 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+
+    for (auto it = g_kvarn_raw_body_mirrors.begin(); it != g_kvarn_raw_body_mirrors.end();) {
+        if (!kvarn_pointer_in_range(it->first, base, size)) {
+            ++it;
+            continue;
+        }
+        kvarn_cuda_free_checked(it->second.k, "raw mirror K");
+        kvarn_cuda_free_checked(it->second.v, "raw mirror V");
+        it = g_kvarn_raw_body_mirrors.erase(it);
+    }
+
+    for (auto it = g_kvarn_body_store_states.begin(); it != g_kvarn_body_store_states.end();) {
+        if (kvarn_pointer_in_range(it->first, base, size)) {
+            it = g_kvarn_body_store_states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto it = g_kvarn_dequant_cache.begin(); it != g_kvarn_dequant_cache.end();) {
+        if (kvarn_pointer_in_range(it->first, base, size) ||
+                kvarn_pointer_in_range(it->second.k_body, base, size)) {
+            it = g_kvarn_dequant_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    if (kvarn_pointer_in_range(g_kvarn_debug_store_context.raw_mirror_key, base, size)) {
+        g_kvarn_debug_store_context.raw_mirror_key = nullptr;
+    }
+}
+
+void ggml_cuda_kvarn_debug_get_raw_mirror_stats(size_t * count, size_t * allocated_bytes) {
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+    size_t bytes = 0;
+    for (const auto & item : g_kvarn_raw_body_mirrors) {
+        const kvarn_raw_body_mirror_entry & entry = item.second;
+        const size_t elements = size_t(entry.n_records_cap)*entry.n_heads*entry.head_dim*entry.group_size;
+        bytes += (entry.k != nullptr ? elements*sizeof(float) : 0) +
+                 (entry.v != nullptr ? elements*sizeof(float) : 0);
+    }
+    if (count != nullptr) {
+        *count = g_kvarn_raw_body_mirrors.size();
+    }
+    if (allocated_bytes != nullptr) {
+        *allocated_bytes = bytes;
+    }
+}
+
 static bool kvarn_dequant_cache_trace_enabled();
 static int  kvarn_dequant_cache_trace_limit();
 
@@ -105,6 +184,7 @@ void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first
         return;
     }
     const uint64_t epoch = g_kvarn_body_store_epoch_next.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
     kvarn_body_store_state & state = g_kvarn_body_store_states[k_body];
     state.prev_epoch = state.epoch;
     state.epoch = epoch;
@@ -115,7 +195,7 @@ void ggml_cuda_kvarn_mark_body_store(const void * k_body) {
     ggml_cuda_kvarn_mark_body_store_records(k_body, 0, 0);
 }
 
-static kvarn_body_store_state kvarn_body_store_state_for(const void * k_body) {
+static kvarn_body_store_state kvarn_body_store_state_for_unlocked(const void * k_body) {
     auto it = g_kvarn_body_store_states.find(k_body);
     if (it != g_kvarn_body_store_states.end()) {
         return it->second;
@@ -135,7 +215,8 @@ static uint32_t kvarn_dequant_cache_refill_from(
         return 0;
     }
 
-    const kvarn_body_store_state store_state = kvarn_body_store_state_for(k_body);
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+    const kvarn_body_store_state store_state = kvarn_body_store_state_for_unlocked(k_body);
     const uint64_t epoch = store_state.epoch;
     kvarn_dequant_cache_entry & e = g_kvarn_dequant_cache[scratch_key];
     uint32_t dequant_from = 0;
@@ -2670,7 +2751,7 @@ static __global__ void kvarn_raw_body_store_k_token_major_kernel(
     k_mirror_token_major[i] = k_frame_channel_major[size_t(d)*group_size + g];
 }
 
-static void kvarn_raw_body_mirror_ensure(
+static void kvarn_raw_body_mirror_ensure_unlocked(
         const void * key,
         uint32_t n_records_cap,
         uint32_t n_heads,
@@ -2690,10 +2771,10 @@ static void kvarn_raw_body_mirror_ensure(
     }
 
     if (e.k != nullptr) {
-        cudaFree(e.k);
+        kvarn_cuda_free_checked(e.k, "resized raw mirror K");
     }
     if (e.v != nullptr) {
-        cudaFree(e.v);
+        kvarn_cuda_free_checked(e.v, "resized raw mirror V");
     }
 
     e = {};
@@ -2839,7 +2920,8 @@ static void kvarn_raw_body_mirror_store(
         return;
     }
 
-    kvarn_raw_body_mirror_ensure(key, n_records_cap, n_heads, head_dim, group_size);
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+    kvarn_raw_body_mirror_ensure_unlocked(key, n_records_cap, n_heads, head_dim, group_size);
     kvarn_raw_body_mirror_entry & e = g_kvarn_raw_body_mirrors[key];
     if (e.k == nullptr || e.v == nullptr) {
         return;
@@ -2862,15 +2944,16 @@ static void kvarn_raw_body_mirror_store(
     }
 }
 
-static const kvarn_raw_body_mirror_entry * kvarn_raw_body_mirror_find(
+static bool kvarn_raw_body_mirror_find_unlocked(
         const void * key,
         uint32_t n_records,
         uint32_t n_heads,
         uint32_t head_dim,
-        uint32_t group_size) {
+        uint32_t group_size,
+        kvarn_raw_body_mirror_entry & result) {
     auto it = g_kvarn_raw_body_mirrors.find(key);
     if (it == g_kvarn_raw_body_mirrors.end()) {
-        return nullptr;
+        return false;
     }
     const kvarn_raw_body_mirror_entry & e = it->second;
     if (e.k == nullptr || e.v == nullptr ||
@@ -2878,48 +2961,45 @@ static const kvarn_raw_body_mirror_entry * kvarn_raw_body_mirror_find(
             e.n_heads != n_heads ||
             e.head_dim != head_dim ||
             e.group_size != group_size) {
-        return nullptr;
+        return false;
     }
-    return &e;
+    result = e;
+    return true;
 }
 
-static const kvarn_raw_body_mirror_entry * kvarn_raw_body_mirror_find_compatible(
+static bool kvarn_raw_body_mirror_find(
+        const void * key,
+        uint32_t n_records,
+        uint32_t n_heads,
+        uint32_t head_dim,
+        uint32_t group_size,
+        kvarn_raw_body_mirror_entry & result) {
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+    return kvarn_raw_body_mirror_find_unlocked(
+            key, n_records, n_heads, head_dim, group_size, result);
+}
+
+static bool kvarn_raw_body_mirror_find_compatible(
         const void * raw_key,
         const void * k_body,
         uint32_t n_records,
         uint32_t n_heads,
         uint32_t head_dim,
-        uint32_t group_size) {
-    const kvarn_raw_body_mirror_entry * raw_body = kvarn_raw_body_mirror_find(
-            raw_key, n_records, n_heads, head_dim, group_size);
-    if (raw_body == nullptr && raw_key != k_body) {
-        raw_body = kvarn_raw_body_mirror_find(
-                k_body, n_records, n_heads, head_dim, group_size);
+        uint32_t group_size,
+        kvarn_raw_body_mirror_entry & result) {
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+    bool found = kvarn_raw_body_mirror_find_unlocked(
+            raw_key, n_records, n_heads, head_dim, group_size, result);
+    if (!found && raw_key != k_body) {
+        found = kvarn_raw_body_mirror_find_unlocked(
+                k_body, n_records, n_heads, head_dim, group_size, result);
     }
-    return raw_body;
+    return found;
 }
 
-static const kvarn_raw_body_mirror_entry * kvarn_raw_body_mirror_find_unique_compatible(
-        uint32_t n_records,
-        uint32_t n_heads,
-        uint32_t head_dim,
-        uint32_t group_size) {
-    const kvarn_raw_body_mirror_entry * result = nullptr;
-    for (const auto & it : g_kvarn_raw_body_mirrors) {
-        const kvarn_raw_body_mirror_entry & e = it.second;
-        if (e.k == nullptr || e.v == nullptr ||
-                e.n_records_cap < n_records ||
-                e.n_heads != n_heads ||
-                e.head_dim != head_dim ||
-                e.group_size != group_size) {
-            continue;
-        }
-        if (result != nullptr) {
-            return nullptr;
-        }
-        result = &e;
-    }
-    return result;
+static size_t kvarn_raw_body_mirror_count() {
+    std::lock_guard<std::mutex> lock(g_kvarn_registry_mutex);
+    return g_kvarn_raw_body_mirrors.size();
 }
 
 static bool ggml_cuda_kvarn_store_body_direct_records_batched_fullrange(
@@ -4113,6 +4193,7 @@ void ggml_cuda_kvarn_materialize_kv_f16(
         uint32_t bits,
         uint32_t turbo_v_mode,
         uint32_t debug_raw_body,
+        const void * raw_mirror_key,
         size_t sink_tail_stride_head_f16,
         size_t sink_tail_stride_token_f16,
         size_t body_stride_record_bytes,
@@ -4133,21 +4214,20 @@ void ggml_cuda_kvarn_materialize_kv_f16(
     const float * body_f32 = nullptr;
     size_t body_f32_stride_head_floats = 0;
     if (use_raw_body) {
-        const kvarn_raw_body_mirror_entry * raw_body = kvarn_raw_body_mirror_find_compatible(
-                (const void *) body, (const void *) body, n_records, n_head_kv, head_dim, group_size);
-        if (raw_body == nullptr) {
-            raw_body = kvarn_raw_body_mirror_find_unique_compatible(n_records, n_head_kv, head_dim, group_size);
-        }
-        if (raw_body == nullptr) {
+        kvarn_raw_body_mirror_entry raw_body;
+        const bool found_raw_body = raw_mirror_key != nullptr &&
+            kvarn_raw_body_mirror_find(
+                    raw_mirror_key, n_records, n_head_kv, head_dim, group_size, raw_body);
+        if (!found_raw_body) {
             std::fprintf(stderr,
-                    "KVarN materialize raw body requested but no unique compatible mirror was captured"
-                    " (body=%p mirror_count=%zu records=%u n_head_kv=%u head_dim=%u group_size=%u is_v=%u)\n",
-                    (const void *) body, g_kvarn_raw_body_mirrors.size(),
+                    "KVarN materialize raw body requested without an exact captured mirror"
+                    " (raw_key=%p body=%p mirror_count=%zu records=%u n_head_kv=%u head_dim=%u group_size=%u is_v=%u)\n",
+                    raw_mirror_key, (const void *) body, kvarn_raw_body_mirror_count(),
                     n_records, n_head_kv, head_dim, group_size, is_v);
             std::abort();
         }
-        body_f32 = is_v ? raw_body->v : raw_body->k;
-        body_f32_stride_head_floats = size_t(raw_body->n_records_cap)*group_size*head_dim;
+        body_f32 = is_v ? raw_body.v : raw_body.k;
+        body_f32_stride_head_floats = size_t(raw_body.n_records_cap)*group_size*head_dim;
     }
     const int block = 256;
     const int grid = int(std::min<uint64_t>((total + block - 1)/block, 65535));
@@ -7556,20 +7636,20 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             bool scalar_used_f32_body_mirror = false;
             const void * raw_key = raw_body_store_key != nullptr ? raw_body_store_key : (const void *) k_body;
             if (use_raw_body_scalar_qt) {
-                const kvarn_raw_body_mirror_entry * raw_body = kvarn_raw_body_mirror_find_compatible(
-                        raw_key, (const void *) k_body, n_records, n_head_kv, head_dim, group_size);
-                if (raw_body == nullptr) {
+                kvarn_raw_body_mirror_entry raw_body;
+                if (!kvarn_raw_body_mirror_find_compatible(
+                            raw_key, (const void *) k_body, n_records, n_head_kv, head_dim, group_size, raw_body)) {
                     std::fprintf(stderr,
                             "KVarN raw body scalar-QT ablation requested but no compatible mirror was captured"
                             " (raw_key=%p k_body=%p mirror_count=%zu records=%u n_head_kv=%u head_dim=%u group_size=%u raw_k=%d raw_v=%d)\n",
-                            raw_key, (const void *) k_body, g_kvarn_raw_body_mirrors.size(),
+                            raw_key, (const void *) k_body, kvarn_raw_body_mirror_count(),
                             n_records, n_head_kv, head_dim, group_size,
                             use_raw_body_k ? 1 : 0, use_raw_body_v ? 1 : 0);
                     std::abort();
                 }
-                scalar_body_f32_stride_head_elems = size_t(raw_body->n_records_cap)*group_size*head_dim;
-                scalar_body_k_f32 = use_raw_body_k ? raw_body->k : nullptr;
-                scalar_body_v_f32 = use_raw_body_v ? raw_body->v : nullptr;
+                scalar_body_f32_stride_head_elems = size_t(raw_body.n_records_cap)*group_size*head_dim;
+                scalar_body_k_f32 = use_raw_body_k ? raw_body.k : nullptr;
+                scalar_body_v_f32 = use_raw_body_v ? raw_body.v : nullptr;
                 scalar_used_f32_body_mirror = true;
             }
             const bool scalar_allow_f32_body_mirror =
@@ -8172,25 +8252,26 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         }
     }
 
-    const kvarn_raw_body_mirror_entry * raw_body = nullptr;
+    kvarn_raw_body_mirror_entry raw_body;
+    bool have_raw_body = false;
     if ((use_raw_body_k || use_raw_body_v) && n_records > 0) {
         const void * raw_key = raw_body_store_key != nullptr ? raw_body_store_key : (const void *) k_body;
-        raw_body = kvarn_raw_body_mirror_find_compatible(
-                raw_key, (const void *) k_body, n_records, n_head_kv, head_dim, group_size);
-        if (raw_body == nullptr) {
+        have_raw_body = kvarn_raw_body_mirror_find_compatible(
+                raw_key, (const void *) k_body, n_records, n_head_kv, head_dim, group_size, raw_body);
+        if (!have_raw_body) {
             std::fprintf(stderr,
                     "KVarN raw body ablation requested but no compatible mirror was captured"
                     " (raw_key=%p k_body=%p mirror_count=%zu records=%u n_head_kv=%u head_dim=%u group_size=%u raw_k=%d raw_v=%d)\n",
-                    raw_key, (const void *) k_body, g_kvarn_raw_body_mirrors.size(),
+                    raw_key, (const void *) k_body, kvarn_raw_body_mirror_count(),
                     n_records, n_head_kv, head_dim, group_size,
                     use_raw_body_k ? 1 : 0, use_raw_body_v ? 1 : 0);
             std::abort();
         }
     }
-    const float * raw_body_k_base = (use_raw_body_k && raw_body != nullptr) ? raw_body->k : nullptr;
-    const float * raw_body_v_base = (use_raw_body_v && raw_body != nullptr) ? raw_body->v : nullptr;
-    const size_t raw_body_stride_head_floats = raw_body != nullptr ?
-        size_t(raw_body->n_records_cap)*group_size*head_dim : 0;
+    const float * raw_body_k_base = (use_raw_body_k && have_raw_body) ? raw_body.k : nullptr;
+    const float * raw_body_v_base = (use_raw_body_v && have_raw_body) ? raw_body.v : nullptr;
+    const size_t raw_body_stride_head_floats = have_raw_body ?
+        size_t(raw_body.n_records_cap)*group_size*head_dim : 0;
 
     for (uint32_t iq = 0; iq < n_queries; ++iq) {
         for (uint32_t ih = 0; ih < n_head; ++ih) {

@@ -5,6 +5,8 @@
 
 void ggml_cuda_kvarn_mark_body_store(const void * k_body);
 void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first_record, uint32_t n_records);
+void ggml_cuda_kvarn_release_buffer_range(const void * base, size_t size);
+void ggml_cuda_kvarn_debug_get_raw_mirror_stats(size_t * count, size_t * allocated_bytes);
 void ggml_cuda_kvarn_debug_set_store_context(
         int32_t layer,
         uint32_t record0,
@@ -251,6 +253,7 @@ void ggml_cuda_kvarn_materialize_kv_f16(
         uint32_t bits,
         uint32_t turbo_v_mode,
         uint32_t debug_raw_body,
+        const void * raw_mirror_key,
         size_t sink_tail_stride_head_f16,
         size_t sink_tail_stride_token_f16,
         size_t body_stride_record_bytes,

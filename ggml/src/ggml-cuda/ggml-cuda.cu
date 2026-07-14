@@ -1219,6 +1219,9 @@ static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     dev_ctx->active_count--;
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_kvarn_release_buffer_range(ctx->dev_ptr, buffer->size);
+
     delete ctx;
 }
 
@@ -3737,6 +3740,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 const ggml_tensor * body      = dst->src[1];
                 const ggml_tensor * scales    = dst->src[2];
                 const ggml_tensor * pending   = dst->src[3];
+                const ggml_tensor * raw_key_tensor = dst->src[4];
+                while (raw_key_tensor != nullptr && raw_key_tensor->view_src != nullptr) {
+                    raw_key_tensor = raw_key_tensor->view_src;
+                }
+                const void * raw_mirror_key = raw_key_tensor != nullptr ? raw_key_tensor->data : nullptr;
                 ggml_cuda_kvarn_materialize_kv_f16(
                         (const uint16_t *) sink_tail->data,
                         (const uint8_t *) body->data,
@@ -3755,6 +3763,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                         uint32_t(params.bits),
                         uint32_t(params.v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2 : 0),
                         uint32_t(params.debug_raw_body != 0),
+                        raw_mirror_key,
                         size_t(sink_tail->nb[1]/sizeof(uint16_t)),
                         size_t(sink_tail->nb[2]/sizeof(uint16_t)),
                         size_t(body->nb[1]),
@@ -6731,7 +6740,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         op->src[0]->type != GGML_TYPE_F16 ||
                         op->src[1]->type != GGML_TYPE_I8 ||
                         op->src[2]->type != GGML_TYPE_F32 ||
-                        op->src[3]->type != GGML_TYPE_F32) {
+                        op->src[3]->type != GGML_TYPE_F32 ||
+                        (op->src[4] != nullptr && op->src[4]->type != GGML_TYPE_I8)) {
                     return false;
                 }
                 if ((params.is_v != 0 && params.is_v != 1) ||
@@ -6741,7 +6751,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         (params.n_tail > 0 && params.tail_start >= params.n_tail) ||
                         params.head_dim <= 0 || params.group_size <= 0 ||
                         params.bits <= 0 || params.bits > 8 ||
-                        (params.debug_raw_body != 0 && params.debug_raw_body != 1)) {
+                        (params.debug_raw_body != 0 && params.debug_raw_body != 1) ||
+                        (params.debug_raw_body != 0 && op->src[4] == nullptr)) {
                     return false;
                 }
 

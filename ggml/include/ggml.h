@@ -1896,6 +1896,11 @@ extern "C" {
             struct ggml_tensor * materialize,
                    int32_t       use_raw_body);
 
+    // Internal debug dependency used to identify the canonical K-body allocation.
+    GGML_API void ggml_kvarn_materialize_kv_set_debug_raw_body_key(
+            struct ggml_tensor * materialize,
+            struct ggml_tensor * canonical_k_body);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -908,7 +909,7 @@ static void test_materialize_kv_window(uint32_t key_bits, uint32_t value_bits) {
             sink_tail_k_d, k_body_d, k_scales_d, pending_k_d, k_out_d,
             0, n_sink, n_records, n_pending, n_tail, tail_start,
             n_head_kv, head_dim, group, key_bits,
-            0,
+            0, 0, nullptr,
             head_dim, size_t(head_dim)*n_head_kv,
             k_body_bytes, size_t(k_body_bytes)*n_records,
             k_scale_floats, size_t(k_scale_floats)*n_records,
@@ -921,7 +922,7 @@ static void test_materialize_kv_window(uint32_t key_bits, uint32_t value_bits) {
             sink_tail_v_d, v_body_d, v_scales_d, pending_v_d, v_out_d,
             1, n_sink, n_records, n_pending, n_tail, tail_start,
             n_head_kv, head_dim, group, value_bits,
-            0,
+            0, 0, nullptr,
             head_dim, size_t(head_dim)*n_head_kv,
             v_body_bytes, size_t(v_body_bytes)*n_records,
             v_scale_floats, size_t(v_scale_floats)*n_records,
@@ -963,6 +964,141 @@ static void test_materialize_kv_window(uint32_t key_bits, uint32_t value_bits) {
     cudaFree(pending_v_d);
     cudaFree(k_out_d);
     cudaFree(v_out_d);
+}
+
+static void test_raw_mirror_exact_key_lifecycle() {
+    constexpr uint32_t head_dim = 256;
+    constexpr uint32_t group = 128;
+    constexpr uint32_t n_records = 1;
+    constexpr uint32_t n_heads = 1;
+    constexpr uint32_t bits = 8;
+    const size_t tile_floats = size_t(head_dim)*group;
+    const size_t mirror_bytes = 2*tile_floats*sizeof(float);
+    const size_t body_bytes = tile_floats;
+    const size_t k_scale_floats = 2*head_dim + group;
+    const size_t v_scale_floats = head_dim + 2*group;
+    const size_t scratch_floats = 2*(tile_floats + 2*std::max<uint32_t>(head_dim, group) + head_dim + group + 2);
+
+    const char * capture_old_ptr = std::getenv("LLAMA_KVARN_DEBUG_CAPTURE_RAW_BODY_MIRROR");
+    const char * paper_old_ptr = std::getenv("LLAMA_KVARN_DISABLE_PAPER_FRAME");
+    const std::string capture_old = capture_old_ptr != nullptr ? capture_old_ptr : "";
+    const std::string paper_old = paper_old_ptr != nullptr ? paper_old_ptr : "";
+    set_env_var("LLAMA_KVARN_DEBUG_CAPTURE_RAW_BODY_MIRROR", "1");
+    set_env_var("LLAMA_KVARN_DISABLE_PAPER_FRAME", "1");
+
+    size_t baseline_count = 0;
+    size_t baseline_bytes = 0;
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&baseline_count, &baseline_bytes);
+
+    std::vector<float> k_tile(tile_floats, 0.25f);
+    std::vector<float> v_tile_a(tile_floats, 1.0f);
+    std::vector<float> v_tile_b(tile_floats, -2.0f);
+    float * k_tile_d = cuda_upload(k_tile);
+    float * v_tile_a_d = cuda_upload(v_tile_a);
+    float * v_tile_b_d = cuda_upload(v_tile_b);
+
+    uint8_t * k_body_a = nullptr;
+    uint8_t * k_body_b = nullptr;
+    uint8_t * v_body_a = nullptr;
+    uint8_t * v_body_b = nullptr;
+    float * k_scales_a = nullptr;
+    float * k_scales_b = nullptr;
+    float * v_scales_a = nullptr;
+    float * v_scales_b = nullptr;
+    float * scratch_a = nullptr;
+    float * scratch_b = nullptr;
+    uint16_t * out = nullptr;
+    require_cuda(cudaMalloc(&k_body_a, body_bytes), "cudaMalloc raw mirror key A");
+    require_cuda(cudaMalloc(&k_body_b, body_bytes), "cudaMalloc raw mirror key B");
+    require_cuda(cudaMalloc(&v_body_a, body_bytes), "cudaMalloc raw mirror body V A");
+    require_cuda(cudaMalloc(&v_body_b, body_bytes), "cudaMalloc raw mirror body V B");
+    require_cuda(cudaMalloc(&k_scales_a, k_scale_floats*sizeof(float)), "cudaMalloc raw mirror K scales A");
+    require_cuda(cudaMalloc(&k_scales_b, k_scale_floats*sizeof(float)), "cudaMalloc raw mirror K scales B");
+    require_cuda(cudaMalloc(&v_scales_a, v_scale_floats*sizeof(float)), "cudaMalloc raw mirror V scales A");
+    require_cuda(cudaMalloc(&v_scales_b, v_scale_floats*sizeof(float)), "cudaMalloc raw mirror V scales B");
+    require_cuda(cudaMalloc(&scratch_a, scratch_floats*sizeof(float)), "cudaMalloc raw mirror scratch A");
+    require_cuda(cudaMalloc(&scratch_b, scratch_floats*sizeof(float)), "cudaMalloc raw mirror scratch B");
+    require_cuda(cudaMalloc(&out, tile_floats*sizeof(uint16_t)), "cudaMalloc raw mirror output");
+
+    auto capture = [&](const void * key, float * v_tile, uint8_t * k_body, uint8_t * v_body,
+                       float * k_scales, float * v_scales, float * scratch) {
+        ggml_cuda_kvarn_debug_set_store_context(0, 0, 1, n_heads, 0, n_records, key);
+        ggml_cuda_kvarn_store_body_reference_minmax(
+                k_tile_d, v_tile, k_body, v_body, k_scales, v_scales, scratch,
+                head_dim, group, bits, bits, 0, 1.0f, 0, false, nullptr, 0, 0);
+        require_cuda(cudaGetLastError(), "raw mirror capture launch");
+        require_cuda(cudaDeviceSynchronize(), "raw mirror capture sync");
+    };
+    auto materialize_v = [&](const void * key, uint8_t * v_body, float * v_scales, float expected) {
+        ggml_cuda_kvarn_materialize_kv_f16(
+                nullptr, v_body, v_scales, nullptr, out,
+                1, 0, n_records, 0, 0, 0, n_heads, head_dim, group, bits,
+                0, 1, key,
+                head_dim, size_t(head_dim)*n_heads,
+                body_bytes, body_bytes*n_records,
+                v_scale_floats, v_scale_floats*n_records,
+                head_dim, size_t(head_dim)*n_heads,
+                head_dim, size_t(head_dim)*n_heads, nullptr);
+        require_cuda(cudaGetLastError(), "exact-key raw materialize launch");
+        require_cuda(cudaDeviceSynchronize(), "exact-key raw materialize sync");
+        std::vector<uint16_t> host(tile_floats);
+        require_cuda(cudaMemcpy(host.data(), out, host.size()*sizeof(uint16_t), cudaMemcpyDeviceToHost),
+                "copy exact-key raw materialize");
+        float max_err = 0.0f;
+        for (uint16_t value : host) {
+            max_err = std::max(max_err, std::fabs(f16_bits_to_f32(value) - expected));
+        }
+        require(max_err == 0.0f, "exact raw-mirror key selects distinguishable V data");
+    };
+
+    size_t count = 0;
+    size_t bytes = 0;
+    capture(k_body_a, v_tile_a_d, k_body_a, v_body_a, k_scales_a, v_scales_a, scratch_a);
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
+    require(count == baseline_count + 1 && bytes == baseline_bytes + mirror_bytes, "raw mirror A allocation stats");
+    capture(k_body_b, v_tile_b_d, k_body_b, v_body_b, k_scales_b, v_scales_b, scratch_b);
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
+    require(count == baseline_count + 2 && bytes == baseline_bytes + 2*mirror_bytes, "raw mirror B allocation stats");
+    materialize_v(k_body_a, v_body_a, v_scales_a, 1.0f);
+    materialize_v(k_body_b, v_body_b, v_scales_b, -2.0f);
+    capture(k_body_a, v_tile_a_d, k_body_a, v_body_a, k_scales_a, v_scales_a, scratch_a);
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
+    require(count == baseline_count + 2 && bytes == baseline_bytes + 2*mirror_bytes, "raw mirror re-store is allocation-stable");
+
+    ggml_cuda_kvarn_release_buffer_range(k_body_a, body_bytes);
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
+    require(count == baseline_count + 1 && bytes == baseline_bytes + mirror_bytes, "range release removes only mirror A");
+    materialize_v(k_body_b, v_body_b, v_scales_b, -2.0f);
+    require_cuda(cudaFree(k_body_a), "cudaFree released raw mirror key A");
+    require_cuda(cudaMalloc(&k_body_a, body_bytes), "cudaMalloc recreated raw mirror key A");
+    capture(k_body_a, v_tile_a_d, k_body_a, v_body_a, k_scales_a, v_scales_a, scratch_a);
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
+    require(count == baseline_count + 2 && bytes == baseline_bytes + 2*mirror_bytes,
+            "recreated raw mirror A restores two-mirror stats");
+    materialize_v(k_body_a, v_body_a, v_scales_a, 1.0f);
+    ggml_cuda_kvarn_release_buffer_range(k_body_a, body_bytes);
+    require_cuda(cudaFree(k_body_a), "cudaFree recreated raw mirror key A");
+
+    ggml_cuda_kvarn_release_buffer_range(k_body_b, body_bytes);
+    ggml_cuda_kvarn_debug_get_raw_mirror_stats(&count, &bytes);
+    require(count == baseline_count && bytes == baseline_bytes, "range release restores raw mirror baseline stats");
+    require_cuda(cudaFree(k_body_b), "cudaFree released raw mirror key B");
+
+    cudaFree(k_tile_d);
+    cudaFree(v_tile_a_d);
+    cudaFree(v_tile_b_d);
+    cudaFree(v_body_a);
+    cudaFree(v_body_b);
+    cudaFree(k_scales_a);
+    cudaFree(k_scales_b);
+    cudaFree(v_scales_a);
+    cudaFree(v_scales_b);
+    cudaFree(scratch_a);
+    cudaFree(scratch_b);
+    cudaFree(out);
+    ggml_cuda_kvarn_debug_set_store_context(-1, 0, 0, 0, 0, 0, nullptr);
+    set_env_var("LLAMA_KVARN_DEBUG_CAPTURE_RAW_BODY_MIRROR", capture_old.c_str());
+    set_env_var("LLAMA_KVARN_DISABLE_PAPER_FRAME", paper_old.c_str());
 }
 
 static float nmse(
@@ -1930,6 +2066,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
             layout.k_scale_floats, layout.v_scale_floats,
             head_dim, head_dim,
             0u,
+            false,
             nullptr);
     set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
@@ -1986,6 +2123,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
                 layout.k_scale_floats, layout.v_scale_floats,
                 head_dim, head_dim,
                 0u,
+                false,
                 nullptr);
     } catch (const std::invalid_argument &) {
         rejected_multi_record_pending = true;
@@ -2080,6 +2218,7 @@ static void test_pending_heads_store(uint32_t head_dim) {
             layout.k_scale_floats, layout.v_scale_floats,
             pending_token_stride, pending_token_stride,
             0u,
+            false,
             nullptr);
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
     require_cuda(cudaGetLastError(), "KVarN CUDA pending-heads store launch");
@@ -5093,6 +5232,7 @@ int main() {
     if (materialize_only != nullptr && std::strcmp(materialize_only, "0") != 0) {
         test_materialize_kv_window(8, 8);
         test_materialize_kv_window(8, 2);
+        test_raw_mirror_exact_key_lifecycle();
         return 0;
     }
 
@@ -5111,6 +5251,7 @@ int main() {
     test_gemma512_sinktail_production_shape_sampled();
     test_materialize_kv_window(8, 8);
     test_materialize_kv_window(8, 2);
+    test_raw_mirror_exact_key_lifecycle();
     const char * run_turbo_v_tests = std::getenv("LLAMA_KVARN_RUN_TURBO_V_TESTS");
     if (run_turbo_v_tests != nullptr && std::strcmp(run_turbo_v_tests, "0") != 0) {
         test_experimental_turbo_v_codec(128, 4, false);

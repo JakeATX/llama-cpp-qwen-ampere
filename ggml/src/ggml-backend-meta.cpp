@@ -941,6 +941,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ASSERT(split_states_equal(src_ss[0], src_ss[1]));
                 GGML_ASSERT(split_states_equal(src_ss[0], src_ss[2]));
                 GGML_ASSERT(split_states_equal(src_ss[0], src_ss[3]));
+                if (tensor->src[4] != nullptr) {
+                    GGML_ASSERT(split_states_equal(src_ss[1], src_ss[4]));
+                }
                 split_state = src_ss[0];
             } break;
             case GGML_OP_DIAG:

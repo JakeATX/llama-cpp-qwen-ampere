@@ -4934,6 +4934,14 @@ void ggml_kvarn_materialize_kv_set_debug_raw_body(
     ggml_set_op_params(materialize, &params, sizeof(params));
 }
 
+void ggml_kvarn_materialize_kv_set_debug_raw_body_key(
+        struct ggml_tensor * materialize,
+        struct ggml_tensor * canonical_k_body) {
+    GGML_ASSERT(materialize != NULL && materialize->op == GGML_OP_KVARN_MATERIALIZE_KV);
+    GGML_ASSERT(canonical_k_body != NULL);
+    materialize->src[4] = canonical_k_body;
+}
+
 // ggml_diag
 
 struct ggml_tensor * ggml_diag(
