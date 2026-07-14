@@ -182,13 +182,16 @@ void llama_memory_hybrid_kvarn::clear(bool data) {
 }
 
 bool llama_memory_hybrid_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (!mem_attn->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
     if (mem_attn_normal && !mem_attn_normal->seq_rm(seq_id, p0, p1)) {
         return false;
     }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    return true;
 }
 
 void llama_memory_hybrid_kvarn::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

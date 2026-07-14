@@ -241,13 +241,16 @@ void llama_kv_cache_kvarn_iswa::clear(bool data) {
 }
 
 bool llama_kv_cache_kvarn_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    bool res = true;
-    res = res & kv_base->seq_rm(seq_id, p0, p1);
-    res = res & kv_swa ->seq_rm(seq_id, p0, p1);
-    if (kv_full_normal) {
-        res = res & kv_full_normal->seq_rm(seq_id, p0, p1);
+    if (!kv_base->seq_rm(seq_id, p0, p1)) {
+        return false;
     }
-    return res;
+    if (!kv_swa->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    if (kv_full_normal && !kv_full_normal->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    return true;
 }
 
 void llama_kv_cache_kvarn_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

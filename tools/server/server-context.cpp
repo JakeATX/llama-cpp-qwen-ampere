@@ -41,6 +41,27 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+bool server_context_has_rollback_strategy(
+        common_context_seq_rm_type target,
+        common_context_seq_rm_type draft,
+        bool has_draft) {
+    return target != COMMON_CONTEXT_SEQ_RM_TYPE_NO &&
+        (!has_draft || draft != COMMON_CONTEXT_SEQ_RM_TYPE_NO);
+}
+
+bool server_context_can_reuse_shifted_cache(
+        common_context_seq_rm_type target,
+        common_context_seq_rm_type draft,
+        bool has_draft,
+        bool target_can_shift,
+        bool draft_can_shift) {
+    const auto is_direct = [](common_context_seq_rm_type type) {
+        return type == COMMON_CONTEXT_SEQ_RM_TYPE_PART || type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    };
+    return is_direct(target) && target_can_shift &&
+        (!has_draft || (is_direct(draft) && draft_can_shift));
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -1069,22 +1090,22 @@ private:
             SRV_WRN("%s", "speculative decoding will use checkpoints\n");
         }
 
+        if (ctx_dft) {
+            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
 
-        // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        // try speculative decoding only when every context has a rollback strategy
+        if (server_context_has_rollback_strategy(ctx_tgt_seq_rm_type, ctx_dft_seq_rm_type, ctx_dft != nullptr)) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }
-        }
-
-        if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
         }
 
         if (spec) {
@@ -2741,8 +2762,12 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                const bool can_cache_reuse = server_context_can_reuse_shifted_cache(
+                                        ctx_tgt_seq_rm_type,
+                                        ctx_dft_seq_rm_type,
+                                        ctx_dft != nullptr,
+                                        llama_memory_can_shift(llama_get_memory(ctx_tgt)),
+                                        !ctx_dft || llama_memory_can_shift(llama_get_memory(ctx_dft.get()))) &&
                                     !slot.prompt.tokens.has_mtmd;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
@@ -2806,6 +2831,16 @@ private:
                             } else {
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
+                            }
+
+                            // A context without any rollback strategy can still
+                            // clear its complete sequence. FULL is deliberately
+                            // excluded: its checkpoint path was proven by the
+                            // capability probe and remains usable here.
+                            if (!server_context_has_rollback_strategy(
+                                        ctx_tgt_seq_rm_type, ctx_dft_seq_rm_type, ctx_dft != nullptr)) {
+                                n_past = 0;
+                                slot.prompt.checkpoints.clear();
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
@@ -2954,9 +2989,11 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    common_context_seq_rm(ctx_tgt, slot.id, p0, -1);
+                    const bool force_full_remove = !server_context_has_rollback_strategy(
+                            ctx_tgt_seq_rm_type, ctx_dft_seq_rm_type, ctx_dft != nullptr);
+                    common_context_seq_rm(ctx_tgt, slot.id, force_full_remove ? -1 : p0, -1);
                     if (ctx_dft) {
-                        common_context_seq_rm(ctx_dft.get(), slot.id, p0, -1);
+                        common_context_seq_rm(ctx_dft.get(), slot.id, force_full_remove ? -1 : p0, -1);
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -2977,6 +3014,8 @@ private:
 
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+                    do_checkpoint = do_checkpoint && server_context_has_rollback_strategy(
+                            ctx_tgt_seq_rm_type, ctx_dft_seq_rm_type, ctx_dft != nullptr);
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
