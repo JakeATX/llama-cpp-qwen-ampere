@@ -1147,6 +1147,18 @@ static void test_runtime_metadata() {
         breakdown_bytes += entry.second;
     }
     require(breakdown_bytes >= cache.backend_tensor_bytes(), "KVarN memory breakdown covers backend tensors");
+
+    llama_hparams hparams_no_alloc = hparams;
+    hparams_no_alloc.no_alloc = true;
+    llama_kv_cache_kvarn cache_no_alloc(nullptr, hparams_no_alloc, params, false, 16, 4, 1, nullptr);
+    size_t breakdown_no_alloc_bytes = 0;
+    for (const auto & entry : cache_no_alloc.memory_breakdown()) {
+        breakdown_no_alloc_bytes += entry.second;
+    }
+    require(breakdown_no_alloc_bytes > 0, "KVarN no-alloc memory breakdown is nonzero");
+    require(breakdown_no_alloc_bytes == breakdown_bytes,
+            "KVarN no-alloc memory breakdown matches real allocation");
+
     require(cache.seq_pos_min(0) == -1, "empty sequence min");
 
     llama_ubatch ubatch = make_test_ubatch(3, 0);
