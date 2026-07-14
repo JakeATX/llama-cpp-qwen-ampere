@@ -1,6 +1,9 @@
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <clocale>
@@ -33,6 +36,27 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     const bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
     return ok;
+}
+
+static llama_memory_recurrent * get_recurrent_memory(llama_memory_t mem) {
+    if (auto * recurrent = dynamic_cast<llama_memory_recurrent *>(mem)) {
+        return recurrent;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_recr();
+    }
+    if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hybrid_iswa->get_mem_recr();
+    }
+    return nullptr;
+}
+
+static size_t recurrent_breakdown_bytes(const llama_memory_recurrent & mem) {
+    size_t result = 0;
+    for (const auto & entry : mem.memory_breakdown()) {
+        result += entry.second;
+    }
+    return result;
 }
 
 int main(int argc, char ** argv) {
@@ -70,6 +94,47 @@ int main(int argc, char ** argv) {
     if (ctx_src == nullptr || ctx_dst == nullptr) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
+    }
+
+    llama_memory_recurrent * recurrent_real = get_recurrent_memory(llama_get_memory(ctx_src));
+    if (recurrent_real == nullptr) {
+        fprintf(stderr, "%s : unsupported recurrent memory composition\n", __func__);
+        return 1;
+    }
+    if (recurrent_real->backend_buffer_bytes() == 0) {
+        fprintf(stderr, "%s : real recurrent memory has no backing allocation\n", __func__);
+        return 1;
+    }
+
+    {
+        llama_model_params mparams_no_alloc = common_model_params_to_llama(params);
+        mparams_no_alloc.no_alloc = true;
+        mparams_no_alloc.use_mmap = false;
+        llama_model_ptr model_no_alloc { llama_model_load_from_file(params.model.path.c_str(), mparams_no_alloc) };
+        if (!model_no_alloc) {
+            fprintf(stderr, "%s : failed to load no-alloc model\n", __func__);
+            return 1;
+        }
+
+        llama_context_ptr ctx_no_alloc { make_ctx(params, model_no_alloc.get()) };
+        if (!ctx_no_alloc) {
+            fprintf(stderr, "%s : failed to create no-alloc context\n", __func__);
+            return 1;
+        }
+
+        llama_memory_recurrent * recurrent_no_alloc = get_recurrent_memory(llama_get_memory(ctx_no_alloc.get()));
+        if (recurrent_no_alloc == nullptr) {
+            fprintf(stderr, "%s : unsupported no-alloc recurrent memory composition\n", __func__);
+            return 1;
+        }
+        const size_t bytes_real     = recurrent_breakdown_bytes(*recurrent_real);
+        const size_t bytes_no_alloc = recurrent_breakdown_bytes(*recurrent_no_alloc);
+        if (recurrent_no_alloc->backend_buffer_bytes() != 0 ||
+            bytes_no_alloc == 0 || bytes_no_alloc != bytes_real) {
+            fprintf(stderr, "%s : recurrent no-alloc sizing mismatch (%zu physical, %zu projected, %zu real)\n",
+                    __func__, recurrent_no_alloc->backend_buffer_bytes(), bytes_no_alloc, bytes_real);
+            return 1;
+        }
     }
 
     if (llama_n_rs_seq(ctx_src) == 0) {

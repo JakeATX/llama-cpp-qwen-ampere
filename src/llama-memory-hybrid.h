@@ -81,7 +81,7 @@ public:
     //
 
     llama_kv_cache * get_mem_attn() const;
-    llama_memory_recurrent * get_mem_recr() const;
+    LLAMA_API llama_memory_recurrent * get_mem_recr() const;
 
 private:
     const llama_hparams & hparams;
