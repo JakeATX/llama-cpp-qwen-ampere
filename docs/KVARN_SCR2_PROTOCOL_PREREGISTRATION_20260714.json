@@ -144,21 +144,21 @@
     "torch_threads": 1
   },
   "capture_toolchain": {
-    "capture_executable": "778dd411358a7f875bd44de6cb68fc96b3f8a2226306bf6c382dff6884d1d008",
+    "capture_executable": "d97452f7ef346e10140d8e786f043b0cdc5f2d1f8881980e30effd70e831a661",
     "capture_script": "1dd7e69d819ca9bcdf59442b962c972080d02282a4847f56ffda522c5739ca33",
-    "delegated_operative_script": "eb0c00f8c85dbc20d13c3da3fa831976d561e7b9caab0fdc21d0acf110180ef4",
+    "delegated_operative_script": "09e6fb46ede3e9161177a2cb915b7663955a22f289510c184884c11b89ea2842",
     "operative_scripts": {
       "Assert-KvarnGpuIdle.ps1": "6aee1f5a4a9de8e9126fe7049189650d5e876904c49227550fada8ea1d552320",
       "Capture-Provenance.ps1": "6254bf339d6f385f829ddce1c72881bba53f7c067489ca946aff23a9eec50615",
       "capture_replay_binding.py": "9f2badb417e14d386d6c24269e4c620d0c5b931661f6f1c8e72efda2fdeaa15a",
-      "fixture_freeze.py": "f37a4f347b8cde0ca2b2c8d226b77e4c9d1fd6bd425f107deba0fc2ef1b44c9c",
+      "fixture_freeze.py": "ba1c3dbd2f7bb78f7341c67310b5ecbfde9fe061413415daf41d938e3b6e5a8e",
       "product_vq_lifecycle.py": "fe8659744977bb1f4fffd8d6eda3d0ab890aed7a91a8f461b48faef4d91e1227"
     }
   },
   "calibration": {
     "fixture_registration": {
-      "path": "C:/Users/sjake/OneDrive/Documents/New project/llama.cpp-kvarn-pr-review/scripts/kvarn/fixtures/production_fixture_preregistration_v3.json",
-      "sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+      "path": "C:/Users/sjake/OneDrive/Documents/New project/llama.cpp-kvarn-pr-review/scripts/kvarn/fixtures/production_fixture_preregistration_v4.json",
+      "sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
     },
     "families": {
       "gemma4": {
@@ -264,7 +264,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "gemma4-L41-KV0": {
         "family": "gemma4",
@@ -315,7 +315,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L7-KV0": {
         "family": "qwen3.6",
@@ -369,7 +369,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L35-KV1": {
         "family": "qwen3.6",
@@ -423,7 +423,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "gemma4-L5-KV0": {
         "family": "gemma4",
@@ -474,7 +474,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "gemma4-L17-KV0": {
         "family": "gemma4",
@@ -525,7 +525,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "gemma4-L23-KV0": {
         "family": "gemma4",
@@ -576,7 +576,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "gemma4-L29-KV0": {
         "family": "gemma4",
@@ -627,7 +627,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "gemma4-L35-KV0": {
         "family": "gemma4",
@@ -678,7 +678,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "gemma4-L47-KV0": {
         "family": "gemma4",
@@ -729,7 +729,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "4b2f79a2021edaa2322e257a516f5398c770ea5830902e44ecdf24a9a2661abd",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L3-KV0": {
         "family": "qwen3.6",
@@ -783,7 +783,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L3-KV1": {
         "family": "qwen3.6",
@@ -837,7 +837,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L7-KV1": {
         "family": "qwen3.6",
@@ -891,7 +891,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L11-KV0": {
         "family": "qwen3.6",
@@ -945,7 +945,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L11-KV1": {
         "family": "qwen3.6",
@@ -999,7 +999,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L15-KV0": {
         "family": "qwen3.6",
@@ -1053,7 +1053,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L15-KV1": {
         "family": "qwen3.6",
@@ -1107,7 +1107,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L19-KV0": {
         "family": "qwen3.6",
@@ -1161,7 +1161,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L19-KV1": {
         "family": "qwen3.6",
@@ -1215,7 +1215,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L23-KV0": {
         "family": "qwen3.6",
@@ -1269,7 +1269,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L23-KV1": {
         "family": "qwen3.6",
@@ -1323,7 +1323,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L27-KV0": {
         "family": "qwen3.6",
@@ -1377,7 +1377,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L27-KV1": {
         "family": "qwen3.6",
@@ -1431,7 +1431,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L31-KV0": {
         "family": "qwen3.6",
@@ -1485,7 +1485,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L31-KV1": {
         "family": "qwen3.6",
@@ -1539,7 +1539,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L35-KV0": {
         "family": "qwen3.6",
@@ -1593,7 +1593,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L39-KV0": {
         "family": "qwen3.6",
@@ -1647,7 +1647,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       },
       "qwen36-L39-KV1": {
         "family": "qwen3.6",
@@ -1701,7 +1701,7 @@
         },
         "record_set": "earliest",
         "fixture_sha256": "8340947086e8c678c2022a59f594ad2a81704fd7fb231d72d2f2bd089f94c9cb",
-        "fixture_registration_sha256": "b08242ac829a3e29cc1c735594252e51f241bb7645d1e12af1485b86e6150b80"
+        "fixture_registration_sha256": "cd4df75a02da0f122010b8350669277d870799fd668f6104215b7afc60fb9122"
       }
     },
     "source_policy": "only the named calibration fixtures and create-new capture roots are admissible; every prior validation, holdout, result, and exposed capture is forbidden",
