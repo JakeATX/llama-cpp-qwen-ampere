@@ -62,6 +62,24 @@ def identity(path: Path) -> dict[str, Any]:
     return {"path": path.as_posix(), "bytes": path.stat().st_size, "sha256": sha256_file(path)}
 
 
+def load_sealed_full_queries(
+    boundary: Path, source_seal: dict[str, Any], n_queries: int, n_head: int, head_dim: int,
+) -> np.ndarray:
+    q_path = (boundary / "full_q.bin").resolve()
+    if not q_path.is_file():
+        raise EvaluationError("required canonical full_q.bin is missing")
+    expected_q_bytes = n_queries * n_head * head_dim * 4
+    if q_path.stat().st_size != expected_q_bytes:
+        raise EvaluationError("full_q.bin has an unexpected byte length")
+    q_sources = [
+        source for source in source_seal.get("sources", [])
+        if Path(source.get("path", "")).resolve() == q_path
+    ]
+    if len(q_sources) != 1 or q_sources[0].get("sha256") != sha256_file(q_path):
+        raise EvaluationError("full_q.bin is not uniquely bound by the source seal")
+    return np.fromfile(q_path, dtype="<f4").reshape(n_queries, n_head, head_dim)
+
+
 def read_bound_json(path: Path, expected_sha256: str) -> dict[str, Any]:
     if len(expected_sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in expected_sha256):
         raise EvaluationError("expected SHA-256 must contain exactly 64 hexadecimal characters")
@@ -403,21 +421,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         fit: scr2.SCR2Fit | None = None
         frozen_rotation_identity: dict[str, Any] | None = None
         if args.role == "calibration":
-            q_path = dump["boundary"] / "full_q_body.bin"
-            if not q_path.is_file():
-                raise EvaluationError("required canonical full_q_body.bin is missing")
-            expected_q_bytes = n_queries * n_head * head_dim * 4
-            if q_path.stat().st_size != expected_q_bytes:
-                raise EvaluationError("full-Q fitting source has an unexpected byte length")
-            q_sources = [
-                source for source in source_seal.get("sources", [])
-                if Path(source.get("path", "")).resolve() == q_path.resolve()
-            ]
-            if len(q_sources) != 1 or q_sources[0].get("sha256") != sha256_file(q_path):
-                raise EvaluationError("full_q_body.bin is not uniquely bound by the source seal")
-            full_q_body = np.fromfile(q_path, dtype="<f4").reshape(n_queries, n_head, head_dim)
+            full_q = load_sealed_full_queries(
+                dump["boundary"], source_seal, n_queries, n_head, head_dim,
+            )
             fit = scr2.fit_sst_rotation(
-                torch.from_numpy(full_q_body.copy()),
+                torch.from_numpy(full_q.copy()),
                 torch.from_numpy(dump["raw_body_k"].copy()),
                 torch.from_numpy(dump["raw_body_v"].copy()),
                 n_head=n_head,

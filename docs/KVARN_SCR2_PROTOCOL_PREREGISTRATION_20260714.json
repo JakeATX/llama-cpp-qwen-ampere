@@ -18,7 +18,7 @@
     "frame": "existing KVarN paper frame; paper_frame=true, paper_mixed_frame=false, input_already_rotated=true; K and protected sink/tail/pending unchanged",
     "sst": {
       "variant": "SCR2-specific per-KV-head",
-      "q": "all full_q_body query heads mapped to the selected KV head",
+      "q": "sealed full_q.bin complete current query block; fit uses the exact GQA query-head slice mapped to the selected KV head",
       "formulas": [
         "Cq=Qg.T@Qg/(Tq*gqa)",
         "w_t=K_t.T@Cq@K_t; material negative fails, roundoff-negative clamps to zero; normalize sum to body token count",
@@ -107,7 +107,7 @@
     },
     "evaluator": {
       "path": "C:/Users/sjake/OneDrive/Documents/New project/llama.cpp-kvarn-scr2-cpu/scripts/kvarn/scr2_evaluate.py",
-      "sha256": "33e525599f199fe4ed404777b872dc3cca658584b204b5f8e5856f657ca95276"
+      "sha256": "41049f75c912d864a9ba3d2790253d4533a03c6b4359b039384ce0515ac2e8d0"
     },
     "aggregator": {
       "path": "C:/Users/sjake/OneDrive/Documents/New project/llama.cpp-kvarn-scr2-cpu/scripts/kvarn/scr2_aggregate.py",
@@ -115,7 +115,7 @@
     },
     "tests": {
       "test_scr2_codec.py": "94062070df339157aeea0544d7e736a388d996476c7c424e3da5ca784796d4d2",
-      "test_scr2_evaluate.py": "52d2f25277be860f9c788bc67f1d2286694410d90e6be9f6cd4ce8c5b8ee93bb",
+      "test_scr2_evaluate.py": "2691431ab1973d5f2eca9d4f22aad1ec9f86e88f35a7fb86afced5d35d038cdd",
       "test_scr2_aggregate.py": "13c0f575d070ab88ae38412f1f7b06952238abdc9065f24b2e10aa6113e02e26"
     },
     "support_modules": {

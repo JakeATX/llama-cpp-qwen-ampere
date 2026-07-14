@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 import types
@@ -16,6 +17,25 @@ import scr2_evaluate as evaluate
 
 
 class EvaluatorContractTests(unittest.TestCase):
+    def test_full_queries_are_exactly_shaped_and_uniquely_sealed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            boundary = Path(temporary)
+            q_path = boundary / "full_q.bin"
+            values = np.arange(2 * 3 * 4, dtype="<f4").reshape(2, 3, 4)
+            q_path.write_bytes(values.tobytes())
+            source = {"path": str(q_path.resolve()), "sha256": evaluate.sha256_file(q_path)}
+            observed = evaluate.load_sealed_full_queries(boundary, {"sources": [source]}, 2, 3, 4)
+            np.testing.assert_array_equal(observed, values)
+
+            q_path.unlink()
+            with self.assertRaisesRegex(evaluate.EvaluationError, "missing"):
+                evaluate.load_sealed_full_queries(boundary, {"sources": [source]}, 2, 3, 4)
+            q_path.write_bytes((values + 1).astype("<f4").tobytes())
+            with self.assertRaisesRegex(evaluate.EvaluationError, "uniquely bound"):
+                evaluate.load_sealed_full_queries(boundary, {"sources": [source]}, 2, 3, 4)
+            current = {"path": str(q_path.resolve()), "sha256": evaluate.sha256_file(q_path)}
+            with self.assertRaisesRegex(evaluate.EvaluationError, "uniquely bound"):
+                evaluate.load_sealed_full_queries(boundary, {"sources": [current, current]}, 2, 3, 4)
     def test_ratio_zero_reference(self) -> None:
         self.assertTrue(evaluate.ratio_pass(0.0, 0.0, 1.5))
         self.assertFalse(evaluate.ratio_pass(1.0e-9, 0.0, 1.5))
