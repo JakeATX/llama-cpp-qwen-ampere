@@ -828,6 +828,10 @@ static void test_runtime_state_safety() {
         cache.apply_ubatch(sinfo, ubatch);
     }
 
+    cache.seq_add(0, 0, -1, 0);
+    require(cache.seq_pos_min(0) == 0 && cache.seq_pos_max(0) == 11,
+            "KVarN zero-shift seq_add is a no-op");
+
     // Rolling back into a reused ring region would leave the mask pointing at
     // slots holding future-token values; must be refused.
     require(!cache.seq_rm(0, 8, -1), "KVarN post-wrap suffix seq_rm refused");

@@ -1847,11 +1847,11 @@ void llama_kv_cache_kvarn::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache_kvarn::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(get_can_shift() && "seq_add() is only supported for n_pos_per_embd() == 1");
 
     if (shift == 0) {
         return;
     }
+    GGML_ASSERT(get_can_shift() && "seq_add() is only supported for n_pos_per_embd() == 1");
     if (p0 < 0) {
         p0 = 0;
     }
