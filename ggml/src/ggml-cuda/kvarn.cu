@@ -3267,24 +3267,6 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
                 g_kvarn_debug_store_context.records_cap,
                 g_kvarn_debug_store_context.n_heads,
                 head_dim, group_size, k_data, v_data, cuda_stream);
-        if (raw_key != (const void *) k_body) {
-            kvarn_raw_body_mirror_store(
-                    (const void *) k_body,
-                    raw_record,
-                    debug_head,
-                    g_kvarn_debug_store_context.records_cap,
-                    g_kvarn_debug_store_context.n_heads,
-                    head_dim, group_size, k_data, v_data, cuda_stream);
-        }
-        if (raw_key != (const void *) v_body && (const void *) k_body != (const void *) v_body) {
-            kvarn_raw_body_mirror_store(
-                    (const void *) v_body,
-                    raw_record,
-                    debug_head,
-                    g_kvarn_debug_store_context.records_cap,
-                    g_kvarn_debug_store_context.n_heads,
-                    head_dim, group_size, k_data, v_data, cuda_stream);
-        }
         cudaEventRecord(aux.main_ready, cuda_stream);
         cudaStreamWaitEvent(aux_stream, aux.main_ready, 0);
     }
