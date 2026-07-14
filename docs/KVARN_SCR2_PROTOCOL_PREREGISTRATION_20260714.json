@@ -152,7 +152,7 @@
       "Capture-Provenance.ps1": "6254bf339d6f385f829ddce1c72881bba53f7c067489ca946aff23a9eec50615",
       "capture_replay_binding.py": "9f2badb417e14d386d6c24269e4c620d0c5b931661f6f1c8e72efda2fdeaa15a",
       "fixture_freeze.py": "ba1c3dbd2f7bb78f7341c67310b5ecbfde9fe061413415daf41d938e3b6e5a8e",
-      "product_vq_lifecycle.py": "fe8659744977bb1f4fffd8d6eda3d0ab890aed7a91a8f461b48faef4d91e1227"
+      "product_vq_lifecycle.py": "450d7b8d5f6aff5577b148a2ed3a113e81cfba53e8adfc01823ce53794755092"
     }
   },
   "calibration": {
