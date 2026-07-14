@@ -364,6 +364,48 @@ static size_t expected_body_store_scratch_floats(
     return expected;
 }
 
+static int64_t store_pipeline_scratch_floats(int32_t head_dim, int32_t group_size) {
+    return int64_t(head_dim)*group_size + 2*std::max(head_dim, group_size) + head_dim + group_size + 2;
+}
+
+static int64_t fused_store_scratch_floats(int32_t head_dim, int32_t group_size) {
+    const int64_t per_pipeline = store_pipeline_scratch_floats(head_dim, group_size);
+    return head_dim >= 256 ? 2*per_pipeline : per_pipeline;
+}
+
+static int64_t batched_store_scratch_floats(int32_t head_dim, int32_t group_size) {
+    return 2*int64_t(head_dim)*group_size + fused_store_scratch_floats(head_dim, group_size);
+}
+
+static ggml_backend_dev_t find_cuda_device() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+static void require_cuda_scratch_boundary(
+        ggml_backend_dev_t cuda_dev,
+        ggml_tensor * op,
+        ggml_tensor * scratch,
+        const char * exact_msg,
+        const char * short_msg) {
+    if (cuda_dev == nullptr) {
+        return;
+    }
+
+    require(ggml_backend_dev_supports_op(cuda_dev, op), exact_msg);
+    require(scratch->ne[0] > 1, "KVarN scratch boundary has a decrementable extent");
+    --scratch->ne[0];
+    require(!ggml_backend_dev_supports_op(cuda_dev, op), short_msg);
+    ++scratch->ne[0];
+    require(ggml_backend_dev_supports_op(cuda_dev, op), exact_msg);
+}
+
 
 static void test_shared_kv_reuse_layer_matching_attention_type() {
     {
@@ -1541,7 +1583,8 @@ static void test_kvarn_store_body_ggml_ops() {
         ggml_tensor * v_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.v_body_bytes);
         ggml_tensor * k_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.k_scale_floats);
         ggml_tensor * v_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.v_scale_floats);
-        ggml_tensor * scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, head_dim*params.group_size + 2*std::max<int32_t>(head_dim, params.group_size));
+        ggml_tensor * scratch = ggml_new_tensor_1d(
+                ctx.get(), GGML_TYPE_F32, store_pipeline_scratch_floats(head_dim, params.group_size));
 
         ggml_tensor * k_store = ggml_kvarn_store_k_body(
                 ctx.get(), k_tile, k_body, k_scales, scratch,
@@ -1573,6 +1616,133 @@ static void test_kvarn_store_body_ggml_ops() {
         require(std::fabs(k_quantile - params.rtn_quantile) < 1.0e-6f &&
                 std::fabs(v_quantile - params.rtn_quantile) < 1.0e-6f,
                 "KVarN body store quantile params");
+    }
+}
+
+static void test_kvarn_store_body_scratch_contracts() {
+    const llama_kvarn_params params = llama_kvarn_default_params();
+    ggml_backend_dev_t cuda_dev = find_cuda_device();
+
+    for (const int32_t head_dim : { 128, 256, 512 }) {
+        const int32_t group_size = params.group_size;
+        const int32_t n_heads = 2;
+        const int32_t n_records = 2;
+        const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+
+        ggml_init_params init_params = {
+            /*.mem_size   =*/ 2*1024*1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(init_params) };
+
+        // Single K/V stores use one pipeline at every supported head dimension.
+        ggml_tensor * k_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, group_size, head_dim);
+        ggml_tensor * v_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, head_dim, group_size);
+        ggml_tensor * k_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.k_body_bytes);
+        ggml_tensor * v_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.v_body_bytes);
+        ggml_tensor * k_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.k_scale_floats);
+        ggml_tensor * v_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.v_scale_floats);
+        ggml_tensor * single_scratch = ggml_new_tensor_1d(
+                ctx.get(), GGML_TYPE_F32, store_pipeline_scratch_floats(head_dim, group_size));
+        ggml_tensor * k_store = ggml_kvarn_store_k_body(
+                ctx.get(), k_tile, k_body, k_scales, single_scratch,
+                head_dim, group_size, params.key_bits, params.sinkhorn_iters, params.rtn_quantile);
+        ggml_tensor * v_store = ggml_kvarn_store_v_body(
+                ctx.get(), v_tile, v_body, v_scales, single_scratch,
+                head_dim, group_size, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+        require_cuda_scratch_boundary(cuda_dev, k_store, single_scratch,
+                "CUDA supports exact-minimum KVarN single-K scratch",
+                "CUDA rejects one-short KVarN single-K scratch");
+        require_cuda_scratch_boundary(cuda_dev, v_store, single_scratch,
+                "CUDA supports exact-minimum KVarN single-V scratch",
+                "CUDA rejects one-short KVarN single-V scratch");
+
+        // A simple fused store uses two independent pipelines starting at 256d.
+        ggml_tensor * fused_scratch = ggml_new_tensor_1d(
+                ctx.get(), GGML_TYPE_F32, fused_store_scratch_floats(head_dim, group_size));
+        ggml_tensor * fused_store = ggml_kvarn_store_kv_body(
+                ctx.get(), k_tile, v_tile, k_body, v_body, k_scales, v_scales, fused_scratch,
+                head_dim, group_size, params.key_bits, params.value_bits,
+                params.sinkhorn_iters, params.rtn_quantile);
+        require_cuda_scratch_boundary(cuda_dev, fused_store, fused_scratch,
+                "CUDA supports exact-minimum KVarN simple fused scratch",
+                "CUDA rejects one-short KVarN simple fused scratch");
+
+        const int64_t batched_scratch_floats = batched_store_scratch_floats(head_dim, group_size);
+
+        // Pending-head sources gather one record across multiple heads.
+        ggml_tensor * pending_heads_k = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_heads, group_size);
+        ggml_tensor * pending_heads_v = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_heads, group_size);
+        ggml_tensor * heads_k_body = ggml_new_tensor_2d(
+                ctx.get(), GGML_TYPE_I8, layout.k_body_bytes, n_heads);
+        ggml_tensor * heads_v_body = ggml_new_tensor_2d(
+                ctx.get(), GGML_TYPE_I8, layout.v_body_bytes, n_heads);
+        ggml_tensor * heads_k_scales = ggml_new_tensor_2d(
+                ctx.get(), GGML_TYPE_F32, layout.k_scale_floats, n_heads);
+        ggml_tensor * heads_v_scales = ggml_new_tensor_2d(
+                ctx.get(), GGML_TYPE_F32, layout.v_scale_floats, n_heads);
+        ggml_tensor * pending_heads_scratch = ggml_new_tensor_1d(
+                ctx.get(), GGML_TYPE_F32, batched_scratch_floats);
+        ggml_tensor * pending_heads_store = ggml_kvarn_store_kv_body_pending_heads(
+                ctx.get(), pending_heads_k, pending_heads_v, heads_k_body, heads_v_body,
+                heads_k_scales, heads_v_scales, pending_heads_scratch,
+                n_heads, 0, head_dim, group_size, params.key_bits, params.value_bits,
+                params.sinkhorn_iters, params.rtn_quantile);
+        require_cuda_scratch_boundary(cuda_dev, pending_heads_store, pending_heads_scratch,
+                "CUDA supports exact-minimum KVarN pending-head scratch",
+                "CUDA rejects one-short KVarN pending-head scratch");
+
+        // Pending-record sources gather one selected record for one head.
+        ggml_tensor * pending_records_k = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, head_dim, 1, group_size);
+        ggml_tensor * pending_records_v = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, head_dim, 1, group_size);
+        ggml_tensor * records_k_body = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_I8, layout.k_body_bytes, n_records, 1);
+        ggml_tensor * records_v_body = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_I8, layout.v_body_bytes, n_records, 1);
+        ggml_tensor * records_k_scales = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, layout.k_scale_floats, n_records, 1);
+        ggml_tensor * records_v_scales = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, layout.v_scale_floats, n_records, 1);
+        ggml_tensor * pending_records_scratch = ggml_new_tensor_1d(
+                ctx.get(), GGML_TYPE_F32, batched_scratch_floats);
+        const int32_t record = 0;
+        ggml_tensor * pending_records_store = ggml_kvarn_store_kv_body_pending_records(
+                ctx.get(), pending_records_k, pending_records_v, records_k_body, records_v_body,
+                records_k_scales, records_v_scales, pending_records_scratch, &record, 1,
+                head_dim, group_size, params.key_bits, params.value_bits,
+                params.sinkhorn_iters, params.rtn_quantile);
+        require_cuda_scratch_boundary(cuda_dev, pending_records_store, pending_records_scratch,
+                "CUDA supports exact-minimum KVarN pending-record scratch",
+                "CUDA rejects one-short KVarN pending-record scratch");
+
+        // Direct-record sources batch multiple records and heads in a 4-D tile tensor.
+        ggml_tensor * direct_k = ggml_new_tensor_4d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_heads, group_size, n_records);
+        ggml_tensor * direct_v = ggml_new_tensor_4d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_heads, group_size, n_records);
+        ggml_tensor * direct_k_body = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_I8, layout.k_body_bytes, n_records, n_heads);
+        ggml_tensor * direct_v_body = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_I8, layout.v_body_bytes, n_records, n_heads);
+        ggml_tensor * direct_k_scales = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, layout.k_scale_floats, n_records, n_heads);
+        ggml_tensor * direct_v_scales = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, layout.v_scale_floats, n_records, n_heads);
+        ggml_tensor * direct_scratch = ggml_new_tensor_1d(
+                ctx.get(), GGML_TYPE_F32, batched_scratch_floats);
+        ggml_tensor * direct_store = ggml_kvarn_store_kv_body_direct_records(
+                ctx.get(), direct_k, direct_v, direct_k_body, direct_v_body,
+                direct_k_scales, direct_v_scales, direct_scratch,
+                n_heads, 0, n_records, head_dim, group_size, params.key_bits, params.value_bits,
+                params.sinkhorn_iters, params.rtn_quantile);
+        require_cuda_scratch_boundary(cuda_dev, direct_store, direct_scratch,
+                "CUDA supports exact-minimum KVarN direct-record scratch",
+                "CUDA rejects one-short KVarN direct-record scratch");
     }
 }
 
@@ -1664,7 +1834,8 @@ static void test_cpu_backend_rejects_kvarn_ops() {
     ggml_tensor * k_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, params.group_size, 128);
     ggml_tensor * k_body = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, layout.k_body_bytes);
     ggml_tensor * k_scales = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, layout.k_scale_floats);
-    ggml_tensor * scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 128*params.group_size + 2*128);
+    ggml_tensor * scratch = ggml_new_tensor_1d(
+            ctx.get(), GGML_TYPE_F32, store_pipeline_scratch_floats(128, params.group_size));
 
     ggml_tensor * k_store = ggml_kvarn_store_k_body(
             ctx.get(), k_tile, k_body, k_scales, scratch,
@@ -1724,6 +1895,7 @@ int main() {
     run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
     run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);
     run_phase("test_kvarn_store_body_ggml_ops", test_kvarn_store_body_ggml_ops);
+    run_phase("test_kvarn_store_body_scratch_contracts", test_kvarn_store_body_scratch_contracts);
     run_phase("test_kvarn_mixed_attention_ggml_op", test_kvarn_mixed_attention_ggml_op);
     run_phase("test_cpu_backend_rejects_kvarn_ops", test_cpu_backend_rejects_kvarn_ops);
 
