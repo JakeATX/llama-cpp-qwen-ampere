@@ -1,10 +1,12 @@
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-kvarn-iswa.h"
 #include "llama-hparams.h"
+#include "llama-io.h"
 #include "llama.h"
 #include "ggml-backend.h"
 
 #include <cmath>
+#include <array>
 #include <random>
 #include <utility>
 #include <exception>
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 static void require(bool ok, const char * msg) {
@@ -92,6 +95,59 @@ static void test_layout() {
     require(layout512.v_scale_floats == 768, "512-dim V scale float count");
     require(layout512.total_record_bytes == 56832, "512-dim total record bytes");
 }
+
+class kvarn_test_writer final : public llama_io_write_i {
+public:
+    void write(const void * src, size_t size) override {
+        const uint8_t * bytes = static_cast<const uint8_t *>(src);
+        data.insert(data.end(), bytes, bytes + size);
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        const size_t begin = data.size();
+        data.resize(begin + size);
+        ggml_backend_tensor_get(tensor, data.data() + begin, offset, size);
+    }
+
+    size_t n_bytes() override { return data.size(); }
+
+    std::vector<uint8_t> data;
+};
+
+class kvarn_test_sizer final : public llama_io_write_i {
+public:
+    void write(const void *, size_t size) override { count += size; }
+    void write_tensor(ggml_tensor *, size_t, size_t size) override { count += size; }
+    size_t n_bytes() override { return count; }
+
+private:
+    size_t count = 0;
+};
+
+class kvarn_test_reader final : public llama_io_read_i {
+public:
+    explicit kvarn_test_reader(const std::vector<uint8_t> & data) : data(data) {}
+
+    void read(void * dst, size_t size) override {
+        if (offset > data.size() || size > data.size() - offset) {
+            throw std::runtime_error("truncated KVarN test state");
+        }
+        std::memcpy(dst, data.data() + offset, size);
+        offset += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t tensor_offset, size_t size) override {
+        std::vector<uint8_t> bytes(size);
+        read(bytes.data(), size);
+        ggml_backend_tensor_set(tensor, bytes.data(), tensor_offset, size);
+    }
+
+    size_t n_bytes() override { return offset; }
+
+private:
+    const std::vector<uint8_t> & data;
+    size_t offset = 0;
+};
 
 static void test_iswa_full_normal_policy() {
     using policy = llama_kvarn_iswa_full_normal_policy;
@@ -779,6 +835,126 @@ static void test_runtime_state_safety() {
     require(cache.seq_rm(-1, 0, -1), "KVarN all-sequence full removal accepted");
     require(cache.seq_pos_max(0) == -1 && cache.seq_pos_max(1) == -1,
             "KVarN all-sequence full removal cleared every sequence");
+}
+
+static std::array<ggml_tensor *, 8> kvarn_test_layer_tensors(const llama_kvarn_layer_view & view) {
+    return { view.sink_tail_k, view.sink_tail_v, view.body_k, view.body_v,
+             view.scales_k, view.scales_v, view.pending_k, view.pending_v };
+}
+
+static void kvarn_test_seed_state(llama_kv_cache_kvarn & cache) {
+    llama_ubatch ubatch = make_test_ubatch(3, 0);
+    ubatch.n_pos = 4;
+    ubatch.data->pos.resize(12);
+    for (uint32_t i = 0; i < 3; ++i) {
+        ubatch.data->pos[i] = llama_pos(10 + i);
+        ubatch.data->pos[i + 3] = llama_pos(20 + i);
+        ubatch.data->pos[i + 6] = llama_pos(30 + i);
+        ubatch.data->pos[i + 9] = llama_pos(40 + i);
+    }
+    ubatch.pos = ubatch.data->pos.data();
+    llama_kv_cache_kvarn::slot_info sinfo;
+    sinfo.idxs = { 13, 14, 15 }; // exercises the valid one-past-end head
+    cache.apply_ubatch(sinfo, ubatch);
+    cache.seq_cp(0, 1, 10, 12);
+
+    for (uint32_t il = 0; il < cache.get_n_layer(); ++il) {
+        const auto tensors = kvarn_test_layer_tensors(cache.get_layer_view(int32_t(il)));
+        for (uint32_t it = 0; it < tensors.size(); ++it) {
+            ggml_tensor * tensor = tensors[it];
+            std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+            for (size_t i = 0; i < bytes.size(); ++i) {
+                bytes[i] = uint8_t((il*67 + it*29 + i*7 + 3) & 0xff);
+            }
+            ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
+        }
+    }
+}
+
+static void test_runtime_state_roundtrip() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = 4;
+    params.sink_tokens = 2;
+    params.tail_tokens = 2;
+    llama_hparams hparams = make_test_hparams();
+    llama_kv_cache_kvarn source(nullptr, hparams, params, false, 16, 4, 1, nullptr);
+    llama_kv_cache_kvarn restored(nullptr, hparams, params, false, 16, 4, 1, nullptr);
+    kvarn_test_seed_state(source);
+
+    kvarn_test_writer writer;
+    source.state_write(writer);
+    require(writer.n_bytes() == writer.data.size(), "KVarN state writer exact byte count");
+    kvarn_test_sizer sizer;
+    source.state_write(sizer);
+    require(sizer.n_bytes() == writer.n_bytes(), "KVarN state dummy and writer sizes match exactly");
+    kvarn_test_reader reader(writer.data);
+    restored.state_read(reader);
+    require(reader.n_bytes() == writer.data.size(), "KVarN state reader consumed exact byte count");
+
+    kvarn_test_writer rewritten;
+    restored.state_write(rewritten);
+    require(rewritten.data == writer.data, "KVarN full state roundtrip is byte exact");
+
+    bool unsupported = false;
+    try {
+        source.state_write(rewritten, 0, 0);
+    } catch (const std::runtime_error &) {
+        unsupported = true;
+    }
+    require(unsupported, "KVarN per-sequence state write rejected");
+
+    kvarn_test_reader unsupported_reader(writer.data);
+    unsupported = false;
+    try {
+        restored.state_read(unsupported_reader, 0, 0);
+    } catch (const std::runtime_error &) {
+        unsupported = true;
+    }
+    require(unsupported, "KVarN per-sequence state read rejected");
+    require(restored.seq_pos_min(0) == 10 && restored.seq_pos_max(0) == 12,
+            "unsupported KVarN per-sequence state read is non-mutating");
+}
+
+static void test_runtime_state_rejects_corruption() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = 4;
+    params.sink_tokens = 2;
+    params.tail_tokens = 2;
+    llama_hparams hparams = make_test_hparams();
+    llama_kv_cache_kvarn source(nullptr, hparams, params, false, 16, 4, 1, nullptr);
+    kvarn_test_seed_state(source);
+    kvarn_test_writer writer;
+    source.state_write(writer);
+
+    std::vector<std::vector<uint8_t>> corruptions;
+    corruptions.push_back(writer.data);
+    corruptions.back()[0] ^= 0xff; // magic
+    corruptions.push_back(writer.data);
+    corruptions.back()[8] ^= 0xff; // version
+    corruptions.push_back(writer.data);
+    corruptions.back()[12] ^= 0x01; // kv_size geometry
+    corruptions.push_back(writer.data);
+    corruptions.back().pop_back(); // payload truncation
+
+    for (const std::vector<uint8_t> & bytes : corruptions) {
+        llama_kv_cache_kvarn destination(nullptr, hparams, params, false, 16, 4, 1, nullptr);
+        kvarn_test_seed_state(destination);
+        kvarn_test_reader reader(bytes);
+        bool rejected = false;
+        try {
+            destination.state_read(reader);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        require(rejected, "corrupt KVarN state rejected");
+        require(destination.seq_pos_min(0) == -1 && destination.seq_pos_min(1) == -1,
+                "failed KVarN restore clears cell metadata");
+        const auto tensors = kvarn_test_layer_tensors(destination.get_layer_view(0));
+        std::vector<uint8_t> tensor_bytes(ggml_nbytes(tensors[0]));
+        ggml_backend_tensor_get(tensors[0], tensor_bytes.data(), 0, tensor_bytes.size());
+        require(std::all_of(tensor_bytes.begin(), tensor_bytes.end(), [](uint8_t b) { return b == 0; }),
+                "failed KVarN restore clears backend tensors");
+    }
 }
 
 static void test_reference_store_scale_invariance() {
@@ -1906,6 +2082,8 @@ int main() {
     run_phase("test_runtime_body_plan_active_boundary_512", test_runtime_body_plan_active_boundary_512);
     run_phase("test_runtime_stream_consistency", test_runtime_stream_consistency);
     run_phase("test_runtime_state_safety", test_runtime_state_safety);
+    run_phase("test_runtime_state_roundtrip", test_runtime_state_roundtrip);
+    run_phase("test_runtime_state_rejects_corruption", test_runtime_state_rejects_corruption);
     run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
     run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);
     run_phase("test_kvarn_store_body_ggml_ops", test_kvarn_store_body_ggml_ops);

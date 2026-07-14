@@ -5,12 +5,14 @@
 #include "llama-model.h"
 #endif
 #include "llama-hparams.h"
+#include "llama-io.h"
 #include "llama-kvarn-ubatch.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cerrno>
 #include <cmath>
@@ -19,8 +21,10 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 
 static bool is_power_of_2(uint32_t n) {
@@ -28,6 +32,93 @@ static bool is_power_of_2(uint32_t n) {
 }
 
 static size_t packed_nbytes(size_t n_values, uint32_t bits);
+
+namespace {
+
+constexpr std::array<uint8_t, 8> KVAR_N_STATE_MAGIC = { 'K', 'V', 'A', 'R', 'N', 'K', 'V', 0 };
+constexpr uint32_t KVAR_N_STATE_VERSION = 1;
+constexpr uint32_t KVAR_N_STATE_TENSORS_PER_LAYER = 8;
+
+template<typename T>
+void kvarn_state_write_uint(llama_io_write_i & io, T value) {
+    static_assert(std::is_unsigned_v<T>);
+    std::array<uint8_t, sizeof(T)> bytes = {};
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = uint8_t(value >> (8*i));
+    }
+    io.write(bytes.data(), bytes.size());
+}
+
+template<typename T>
+T kvarn_state_read_uint(llama_io_read_i & io) {
+    static_assert(std::is_unsigned_v<T>);
+    std::array<uint8_t, sizeof(T)> bytes = {};
+    io.read(bytes.data(), bytes.size());
+    T value = 0;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        value |= T(bytes[i]) << (8*i);
+    }
+    return value;
+}
+
+void kvarn_state_write_i64(llama_io_write_i & io, int64_t value) {
+    kvarn_state_write_uint(io, uint64_t(value));
+}
+
+int64_t kvarn_state_read_i64(llama_io_read_i & io) {
+    const uint64_t bits = kvarn_state_read_uint<uint64_t>(io);
+    int64_t value;
+    static_assert(sizeof(value) == sizeof(bits));
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+uint32_t kvarn_float_bits(float value) {
+    uint32_t bits;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void kvarn_state_write_layout(llama_io_write_i & io, const llama_kvarn_layout & layout) {
+    kvarn_state_write_uint(io, layout.head_dim);
+    kvarn_state_write_uint(io, layout.group_size);
+    kvarn_state_write_uint(io, layout.key_bits);
+    kvarn_state_write_uint(io, layout.value_bits);
+    kvarn_state_write_uint(io, layout.v_layout);
+    kvarn_state_write_uint(io, uint64_t(layout.k_body_bytes));
+    kvarn_state_write_uint(io, uint64_t(layout.v_body_bytes));
+    kvarn_state_write_uint(io, uint64_t(layout.k_scale_floats));
+    kvarn_state_write_uint(io, uint64_t(layout.v_scale_floats));
+    kvarn_state_write_uint(io, uint64_t(layout.total_record_bytes));
+}
+
+bool kvarn_state_read_layout_matches(llama_io_read_i & io, const llama_kvarn_layout & expected) {
+    return kvarn_state_read_uint<uint32_t>(io) == expected.head_dim &&
+           kvarn_state_read_uint<uint32_t>(io) == expected.group_size &&
+           kvarn_state_read_uint<uint32_t>(io) == expected.key_bits &&
+           kvarn_state_read_uint<uint32_t>(io) == expected.value_bits &&
+           kvarn_state_read_uint<uint32_t>(io) == expected.v_layout &&
+           kvarn_state_read_uint<uint64_t>(io) == uint64_t(expected.k_body_bytes) &&
+           kvarn_state_read_uint<uint64_t>(io) == uint64_t(expected.v_body_bytes) &&
+           kvarn_state_read_uint<uint64_t>(io) == uint64_t(expected.k_scale_floats) &&
+           kvarn_state_read_uint<uint64_t>(io) == uint64_t(expected.v_scale_floats) &&
+           kvarn_state_read_uint<uint64_t>(io) == uint64_t(expected.total_record_bytes);
+}
+
+std::array<ggml_tensor *, KVAR_N_STATE_TENSORS_PER_LAYER> kvarn_state_tensors(
+        const llama_kvarn_layer_view & layer) {
+    return { layer.sink_tail_k, layer.sink_tail_v, layer.body_k, layer.body_v,
+             layer.scales_k, layer.scales_v, layer.pending_k, layer.pending_v };
+}
+
+void kvarn_state_require(bool condition, const char * message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+} // namespace
 
 static bool kvarn_env_flag_enabled(const char * name) {
     const char * env = std::getenv(name);
@@ -1841,19 +1932,213 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    GGML_UNUSED(io);
-    GGML_UNUSED(seq_id);
-    GGML_UNUSED(flags);
+    if (seq_id != -1 || flags != 0) {
+        throw std::runtime_error("KVarN state serialization supports only full-cache state with no flags");
+    }
+    if (v_cells.size() != 1 || v_heads.size() != 1) {
+        throw std::runtime_error("KVarN state serialization requires exactly one metadata stream");
+    }
+    if (v_cells[0].get_has_shift()) {
+        throw std::runtime_error("KVarN state serialization does not support shifted cells");
+    }
 
-    throw std::runtime_error("KVarN state serialization is not implemented yet");
+    io.write(KVAR_N_STATE_MAGIC.data(), KVAR_N_STATE_MAGIC.size());
+    kvarn_state_write_uint(io, KVAR_N_STATE_VERSION);
+    kvarn_state_write_uint(io, kv_size);
+    kvarn_state_write_uint(io, n_seq_max);
+    kvarn_state_write_uint(io, n_pad);
+    kvarn_state_write_uint(io, params.group_size);
+    kvarn_state_write_uint(io, params.key_bits);
+    kvarn_state_write_uint(io, params.value_bits);
+    kvarn_state_write_uint(io, params.sink_tokens);
+    kvarn_state_write_uint(io, params.tail_tokens);
+    kvarn_state_write_uint(io, params.sinkhorn_iters);
+    kvarn_state_write_uint(io, kvarn_float_bits(params.rtn_quantile));
+    kvarn_state_write_uint(io, uint32_t(layer_tensors.size()));
+
+    std::set<uint32_t> unique_layers;
+    for (const layer_storage & layer : layer_tensors) {
+        if (!unique_layers.insert(layer.il).second) {
+            throw std::runtime_error("KVarN state serialization found duplicate physical layer id");
+        }
+        kvarn_state_write_uint(io, layer.il);
+        kvarn_state_write_uint(io, layer.n_head_kv);
+        kvarn_state_write_uint(io, layer.n_sink_tail);
+        kvarn_state_write_uint(io, layer.n_records);
+        kvarn_state_write_layout(io, layer.layout_k);
+        kvarn_state_write_layout(io, layer.layout_v);
+    }
+
+    kvarn_state_write_uint(io, v_heads[0]);
+    kvarn_state_write_uint(io, uint32_t(v_cells[0].size()));
+    for (uint32_t i = 0; i < v_cells[0].size(); ++i) {
+        const bool occupied = !v_cells[0].is_empty(i);
+        kvarn_state_write_uint<uint8_t>(io, occupied ? 1 : 0);
+        kvarn_state_write_i64(io, occupied ? int64_t(v_cells[0].pos_get(i)) : -1);
+        const llama_kv_cell_ext ext = occupied ? v_cells[0].ext_get(i) : llama_kv_cell_ext{};
+        kvarn_state_write_i64(io, int64_t(ext.x));
+        kvarn_state_write_i64(io, int64_t(ext.y));
+        std::vector<uint32_t> seq_ids;
+        if (occupied) {
+            for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (v_cells[0].seq_has(i, llama_seq_id(s))) {
+                    if (s >= n_seq_max) {
+                        throw std::runtime_error("KVarN state cell contains sequence id outside n_seq_max");
+                    }
+                    seq_ids.push_back(s);
+                }
+            }
+            if (seq_ids.size() != size_t(v_cells[0].seq_count(i))) {
+                throw std::runtime_error("KVarN state cell sequence metadata is inconsistent");
+            }
+        }
+        kvarn_state_write_uint(io, uint32_t(seq_ids.size()));
+        for (uint32_t s : seq_ids) {
+            kvarn_state_write_uint(io, s);
+        }
+    }
+
+    // Descriptors intentionally precede all payloads, allowing readers to
+    // reject every incompatibility before mutating backend storage.
+    for (const layer_storage & storage : layer_tensors) {
+        const auto tensors = kvarn_state_tensors(get_layer_view(storage.il));
+        for (uint32_t it = 0; it < tensors.size(); ++it) {
+            const ggml_tensor * tensor = tensors[it];
+            kvarn_state_write_uint(io, it);
+            kvarn_state_write_uint(io, uint32_t(tensor->type));
+            for (uint32_t d = 0; d < GGML_MAX_DIMS; ++d) {
+                kvarn_state_write_uint(io, uint64_t(tensor->ne[d]));
+            }
+            kvarn_state_write_uint(io, uint64_t(ggml_nbytes(tensor)));
+        }
+    }
+    for (const layer_storage & storage : layer_tensors) {
+        const auto tensors = kvarn_state_tensors(get_layer_view(storage.il));
+        for (ggml_tensor * tensor : tensors) {
+            io.write_tensor(tensor, 0, ggml_nbytes(tensor));
+        }
+    }
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    GGML_UNUSED(io);
-    GGML_UNUSED(seq_id);
-    GGML_UNUSED(flags);
+    if (seq_id != -1 || flags != 0) {
+        throw std::runtime_error("KVarN state deserialization supports only full-cache state with no flags");
+    }
 
-    throw std::runtime_error("KVarN state deserialization is not implemented yet");
+    try {
+        std::array<uint8_t, KVAR_N_STATE_MAGIC.size()> magic = {};
+        io.read(magic.data(), magic.size());
+        kvarn_state_require(magic == KVAR_N_STATE_MAGIC, "invalid KVarN state magic");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == KVAR_N_STATE_VERSION,
+                "unsupported KVarN state version");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == kv_size, "KVarN state kv_size mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == n_seq_max, "KVarN state n_seq_max mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == n_pad, "KVarN state n_pad mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == params.group_size, "KVarN state group_size mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == params.key_bits, "KVarN state key_bits mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == params.value_bits, "KVarN state value_bits mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == params.sink_tokens, "KVarN state sink_tokens mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == params.tail_tokens, "KVarN state tail_tokens mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == params.sinkhorn_iters, "KVarN state sinkhorn_iters mismatch");
+        kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == kvarn_float_bits(params.rtn_quantile),
+                "KVarN state rtn_quantile mismatch");
+
+        const uint32_t n_layers = kvarn_state_read_uint<uint32_t>(io);
+        kvarn_state_require(n_layers == layer_tensors.size(), "KVarN state physical layer count mismatch");
+        std::set<uint32_t> unique_layers;
+        for (uint32_t i = 0; i < n_layers; ++i) {
+            const layer_storage & layer = layer_tensors[i];
+            const uint32_t il = kvarn_state_read_uint<uint32_t>(io);
+            kvarn_state_require(unique_layers.insert(il).second, "KVarN state contains duplicate physical layer id");
+            kvarn_state_require(il == layer.il, "KVarN state physical layer order mismatch");
+            kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == layer.n_head_kv, "KVarN state layer head geometry mismatch");
+            kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == layer.n_sink_tail, "KVarN state sink/tail geometry mismatch");
+            kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == layer.n_records, "KVarN state record geometry mismatch");
+            kvarn_state_require(kvarn_state_read_layout_matches(io, layer.layout_k), "KVarN state K layout mismatch");
+            kvarn_state_require(kvarn_state_read_layout_matches(io, layer.layout_v), "KVarN state V layout mismatch");
+        }
+
+        const uint32_t staged_head = kvarn_state_read_uint<uint32_t>(io);
+        kvarn_state_require(staged_head <= kv_size, "KVarN state head is out of range");
+        const uint32_t n_cells = kvarn_state_read_uint<uint32_t>(io);
+        kvarn_state_require(n_cells == kv_size, "KVarN state cell count mismatch");
+        llama_kv_cells staged_cells;
+        staged_cells.resize(kv_size);
+        for (uint32_t i = 0; i < n_cells; ++i) {
+            const uint8_t occupied = kvarn_state_read_uint<uint8_t>(io);
+            kvarn_state_require(occupied <= 1, "KVarN state has invalid occupied marker");
+            const int64_t pos = kvarn_state_read_i64(io);
+            const int64_t ext_x = kvarn_state_read_i64(io);
+            const int64_t ext_y = kvarn_state_read_i64(io);
+            const uint32_t n_seq = kvarn_state_read_uint<uint32_t>(io);
+            kvarn_state_require(n_seq <= n_seq_max && n_seq <= LLAMA_MAX_SEQ,
+                    "KVarN state cell sequence count is out of range");
+            kvarn_state_require((occupied && pos >= 0) || (!occupied && pos == -1),
+                    "KVarN state cell position is inconsistent");
+            kvarn_state_require(occupied || (ext_x == 0 && ext_y == 0 && n_seq == 0),
+                    "KVarN empty cell contains metadata");
+            std::set<uint32_t> unique_seq;
+            for (uint32_t j = 0; j < n_seq; ++j) {
+                const uint32_t s = kvarn_state_read_uint<uint32_t>(io);
+                kvarn_state_require(s < n_seq_max && s < LLAMA_MAX_SEQ,
+                        "KVarN state sequence id is out of range");
+                kvarn_state_require(unique_seq.insert(s).second, "KVarN state cell contains duplicate sequence id");
+            }
+            if (occupied) {
+                kvarn_state_require(pos <= std::numeric_limits<llama_pos>::max(), "KVarN state position overflows llama_pos");
+                kvarn_state_require(ext_x >= std::numeric_limits<llama_pos>::min() && ext_x <= std::numeric_limits<llama_pos>::max() &&
+                                    ext_y >= std::numeric_limits<llama_pos>::min() && ext_y <= std::numeric_limits<llama_pos>::max(),
+                        "KVarN state cell extension overflows llama_pos");
+                staged_cells.pos_set(i, llama_pos(pos));
+                staged_cells.ext_set(i, { llama_pos(ext_x), llama_pos(ext_y) });
+                for (uint32_t s : unique_seq) {
+                    staged_cells.seq_add(i, llama_seq_id(s));
+                }
+            }
+        }
+
+        struct tensor_restore {
+            ggml_tensor * tensor;
+            size_t nbytes;
+        };
+        std::vector<tensor_restore> restores;
+        restores.reserve(size_t(n_layers)*KVAR_N_STATE_TENSORS_PER_LAYER);
+        uint64_t max_nbytes = 0;
+        for (const layer_storage & storage : layer_tensors) {
+            const auto tensors = kvarn_state_tensors(get_layer_view(storage.il));
+            for (uint32_t it = 0; it < tensors.size(); ++it) {
+                ggml_tensor * tensor = tensors[it];
+                kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == it, "KVarN state tensor order mismatch");
+                kvarn_state_require(kvarn_state_read_uint<uint32_t>(io) == uint32_t(tensor->type), "KVarN state tensor type mismatch");
+                for (uint32_t d = 0; d < GGML_MAX_DIMS; ++d) {
+                    kvarn_state_require(kvarn_state_read_uint<uint64_t>(io) == uint64_t(tensor->ne[d]),
+                            "KVarN state tensor shape mismatch");
+                }
+                const uint64_t nbytes = kvarn_state_read_uint<uint64_t>(io);
+                kvarn_state_require(nbytes == uint64_t(ggml_nbytes(tensor)), "KVarN state tensor byte size mismatch");
+                kvarn_state_require(nbytes <= uint64_t(std::numeric_limits<size_t>::max()), "KVarN state tensor is too large");
+                max_nbytes = std::max(max_nbytes, nbytes);
+                restores.push_back({ tensor, size_t(nbytes) });
+            }
+        }
+
+        std::vector<uint8_t> buffer(static_cast<size_t>(max_nbytes), uint8_t{});
+        for (const tensor_restore & restore : restores) {
+            io.read(buffer.data(), restore.nbytes);
+            ggml_backend_tensor_set(restore.tensor, buffer.data(), 0, restore.nbytes);
+        }
+
+        v_cells[0].set(0, staged_cells);
+        v_heads[0] = staged_head;
+        for (auto & layer : runtime_cache) {
+            for (auto & head : layer) {
+                head.clear();
+            }
+        }
+    } catch (...) {
+        clear(true);
+        throw;
+    }
 }
 
 uint32_t llama_kv_cache_kvarn::get_size() const {

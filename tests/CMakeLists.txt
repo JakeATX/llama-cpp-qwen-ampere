@@ -226,7 +226,7 @@ llama_build_and_test(test-regex-partial.cpp)
 llama_build_and_test(test-batch-split.cpp ../src/llama-batch.cpp)
 target_include_directories(test-batch-split PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-llama_build_and_test(test-kvarn-kv.cpp ../src/llama-kv-cache-kvarn.cpp ../src/llama-hparams.cpp)
+llama_build_and_test(test-kvarn-kv.cpp ../src/llama-kv-cache-kvarn.cpp ../src/llama-hparams.cpp ../src/llama-memory.cpp)
 target_include_directories(test-kvarn-kv PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 if (TARGET ggml-cuda)
