@@ -1,0 +1,40 @@
+{
+  "accounting": {
+    "alignment": 16,
+    "alignment_padding_bytes": 0,
+    "alignment_padding_per_record": 0,
+    "bits_per_value": 2.720703125,
+    "iq2_block_bytes": 82,
+    "iq2_block_scale_bytes": 0,
+    "iq2_block_scale_note": "included in iq2_payload_bytes; not added separately",
+    "iq2_blocks_per_record": 256,
+    "iq2_payload_bytes": 629760,
+    "kvarn_scale_bytes": 38400,
+    "kvarn_scale_bytes_per_record": 1280,
+    "kvarn_scale_format": "fp16",
+    "kvarn_scale_values_per_record": 640,
+    "record_bytes": 668640,
+    "record_header_bytes": 480,
+    "record_header_bytes_per_record": 16,
+    "records": 30,
+    "values": 1966080
+  },
+  "boundary": "C:\\Users\\sjake\\OneDrive\\Documents\\New project\\llama.cpp-kvarn-pr-review\\artifacts\\kvarn-production-captures-v4\\holdout\\gemma4-L11-KV0-20260713\\boundary\\call_000000",
+  "call0_gate": {
+    "max_limit": 0.023191,
+    "mean_limit": 0.000594,
+    "passed": false
+  },
+  "call_index": 0,
+  "group_size": 128,
+  "head_dim": 512,
+  "layer": 11,
+  "paired_max_abs": 1.0040321350097656,
+  "paired_max_nmse": 0.047938421569674414,
+  "paired_mean_nmse": 0.003144709379337122,
+  "queries": 2048,
+  "records": 30,
+  "scale_serialized_bytes": 38400,
+  "sinkhorn_iters": 16,
+  "type": "iq2_s"
+}
