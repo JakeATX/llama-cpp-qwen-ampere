@@ -266,13 +266,27 @@ void llama_memory_hybrid_kvarn::state_write(llama_io_write_i & io, llama_seq_id 
 }
 
 void llama_memory_hybrid_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    if (seq_id != -1 || flags != 0) {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            mem_attn->state_read(io, seq_id, flags);
+            if (mem_attn_normal) {
+                mem_attn_normal->state_read(io, seq_id, flags);
+            }
+        }
+        mem_recr->state_read(io, seq_id, flags);
+        return;
+    }
+
+    try {
         mem_attn->state_read(io, seq_id, flags);
         if (mem_attn_normal) {
             mem_attn_normal->state_read(io, seq_id, flags);
         }
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        clear(true);
+        throw;
     }
-    mem_recr->state_read(io, seq_id, flags);
 }
 
 llama_kv_cache_kvarn * llama_memory_hybrid_kvarn::get_mem_attn() const {

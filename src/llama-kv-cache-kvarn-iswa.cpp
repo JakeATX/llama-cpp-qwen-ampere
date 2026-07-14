@@ -318,14 +318,27 @@ void llama_kv_cache_kvarn_iswa::state_write(llama_io_write_i & io, llama_seq_id 
 }
 
 void llama_kv_cache_kvarn_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    if (seq_id != -1 || flags != 0) {
+        if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            kv_base->state_read(io, seq_id, flags);
+            if (kv_full_normal) {
+                kv_full_normal->state_read(io, seq_id, flags);
+            }
+        }
+        kv_swa->state_read(io, seq_id, flags);
+        return;
+    }
+
+    try {
         kv_base->state_read(io, seq_id, flags);
         if (kv_full_normal) {
             kv_full_normal->state_read(io, seq_id, flags);
         }
+        kv_swa->state_read(io, seq_id, flags);
+    } catch (...) {
+        clear(true);
+        throw;
     }
-
-    kv_swa->state_read(io, seq_id, flags);
 }
 
 llama_kv_cache_kvarn * llama_kv_cache_kvarn_iswa::get_base() const {

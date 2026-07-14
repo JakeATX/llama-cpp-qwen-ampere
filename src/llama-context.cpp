@@ -3059,10 +3059,13 @@ size_t llama_context::state_get_data(uint8_t * dst, size_t size) {
 }
 
 size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
-    llama_io_read_host io(src, size);
     try {
+        llama_io_read_host io(src, size);
         return state_read_data(io);
     } catch (const std::exception & err) {
+        if (memory) {
+            memory->clear(true);
+        }
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
     }
