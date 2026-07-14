@@ -6574,7 +6574,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 const int64_t scale_floats = params.is_v ? params.head_dim + 2*params.group_size : 2*params.head_dim + params.group_size;
                 const int64_t scratch_floats =
-                    n + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 1;
+                    n + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
                 return ggml_nelements(op->src[0]) == n &&
                        ggml_cuda_kvarn_v_body_shape_ok(op->ne[0], body_bytes, params.is_v ? params.v_layout : GGML_CUDA_KVARN_V_LAYOUT_LEGACY) &&
                        op->src[1]->ne[0] >= scale_floats &&
@@ -6632,8 +6632,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                     const int64_t tile_floats = int64_t(params.head_dim)*params.group_size;
                     const int64_t per_pipeline =
-                        tile_floats + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 1;
-                    const int64_t pipeline_scratch_floats = params.head_dim >= 512 ? 2*per_pipeline : per_pipeline;
+                        tile_floats + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
+                    const int64_t pipeline_scratch_floats = params.head_dim >= 256 ? 2*per_pipeline : per_pipeline;
                     const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
                     const int64_t v_body_bytes_direct = ggml_cuda_kvarn_v_body_bytes(params.head_dim, params.group_size, params.value_bits, params.v_layout);
                     if (v_body_bytes_direct < 0) {
@@ -6666,7 +6666,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 const int64_t per_pipeline =
-                    n + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 1;
+                    n + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
                 const int64_t pipeline_scratch_floats = params.head_dim >= 256 ? 2*per_pipeline : per_pipeline;
                 const int64_t batch_scratch_floats = 2*n + pipeline_scratch_floats;
 
@@ -6701,8 +6701,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            ggml_nelements(op->src[4]) >= batch_scratch_floats;
                 }
 
-                const int64_t scratch_floats =
-                    n + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 1;
+                const int64_t scratch_floats = params.head_dim >= 256 ? 2*per_pipeline : per_pipeline;
                 return ggml_nelements(op->src[0]) == n &&
                        ggml_nelements(op->src[1]) == n &&
                        op->src[5]->ne[0] >= k_body_bytes &&

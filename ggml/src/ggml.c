@@ -4009,7 +4009,9 @@ static struct ggml_tensor * ggml_kvarn_store_body_impl(
     GGML_ASSERT(ggml_is_contiguous(scales));
     GGML_ASSERT(ggml_is_contiguous(scratch));
     GGML_ASSERT(ggml_nelements(tile) == (int64_t) head_dim*group_size);
-    GGML_ASSERT(ggml_nelements(scratch) >= (int64_t) head_dim*group_size + 2*MAX(head_dim, group_size));
+    const int64_t scratch_floats = (int64_t) head_dim*group_size +
+        2*MAX(head_dim, group_size) + head_dim + group_size + 2;
+    GGML_ASSERT(ggml_nelements(scratch) >= scratch_floats);
 
     const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(is_v);
     const int64_t body_bytes = is_v ?
@@ -4112,7 +4114,10 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
     GGML_ASSERT(ggml_is_contiguous(scratch));
     GGML_ASSERT(ggml_nelements(k_tile) == (int64_t) head_dim*group_size);
     GGML_ASSERT(ggml_nelements(v_tile) == (int64_t) head_dim*group_size);
-    GGML_ASSERT(ggml_nelements(scratch) >= (int64_t) head_dim*group_size + 2*MAX(head_dim, group_size));
+    const int64_t per_pipeline = (int64_t) head_dim*group_size +
+        2*MAX(head_dim, group_size) + head_dim + group_size + 2;
+    const int64_t scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
+    GGML_ASSERT(ggml_nelements(scratch) >= scratch_floats);
 
     const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
     const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
@@ -4216,8 +4221,8 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
     const int64_t k_scale_floats = 2*head_dim + group_size;
     const int64_t v_scale_floats = head_dim + 2*group_size;
     const int64_t tile_floats = (int64_t) head_dim*group_size;
-    const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size);
-    const int64_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
+    const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size) + head_dim + group_size + 2;
+    const int64_t pipeline_scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
     const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
     ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
@@ -4321,8 +4326,8 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_records(
     const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
     const int64_t v_body_bytes = ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, v_layout);
     const int64_t tile_floats = (int64_t) head_dim*group_size;
-    const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size);
-    const int64_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
+    const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size) + head_dim + group_size + 2;
+    const int64_t pipeline_scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
     const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
     ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
@@ -4429,8 +4434,8 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
     const int64_t k_scale_floats = 2*head_dim + group_size;
     const int64_t v_scale_floats = head_dim + 2*group_size;
     const int64_t tile_floats = (int64_t) head_dim*group_size;
-    const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size);
-    const int64_t pipeline_scratch_floats = head_dim >= 512 ? 2*per_pipeline : per_pipeline;
+    const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size) + head_dim + group_size + 2;
+    const int64_t pipeline_scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
     const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
     ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
