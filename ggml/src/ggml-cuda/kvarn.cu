@@ -3177,7 +3177,6 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
         float rtn_quantile,
         bool input_already_rotated,
         void * stream) {
-    ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -3315,8 +3314,6 @@ static void ggml_cuda_kvarn_store_kv_body_pipelined(
         uint32_t debug_head,
         uint32_t turbo_v_mode,
         void * stream) {
-    ggml_cuda_kvarn_mark_body_store(k_body);
-
     const size_t n = size_t(head_dim)*group_size;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
@@ -3577,17 +3574,6 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
                 "the pending buffer has no per-record source dimension");
     }
 
-    uint32_t first_record = 0;
-    if (n_record_batch > 0) {
-        first_record = uint32_t(records[0]);
-        for (uint32_t bi = 1; bi < n_record_batch; ++bi) {
-            const uint32_t record = uint32_t(records[bi]);
-            if (record < first_record) {
-                first_record = record;
-            }
-        }
-    }
-    ggml_cuda_kvarn_mark_body_store_records(k_body, first_record, n_record_batch);
     const size_t tile_floats = size_t(head_dim)*group_size;
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
@@ -3661,7 +3647,6 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         uint32_t turbo_v_mode,
         bool src_in_frame,
         void * stream) {
-    ggml_cuda_kvarn_mark_body_store(k_body);
     const size_t tile_floats = size_t(head_dim)*group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
     float * k_tile = scratch;
@@ -3744,7 +3729,6 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
         size_t scratch_floats,
         uint32_t turbo_v_mode,
         void * stream) {
-    ggml_cuda_kvarn_mark_body_store_records(k_body, 0, n_records);
     const size_t tile_floats = size_t(head_dim)*group_size;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
     float * k_tile = scratch;
@@ -3851,8 +3835,6 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         void * stream,
         uint32_t debug_record,
         uint32_t debug_head) {
-    ggml_cuda_kvarn_mark_body_store(k_body);
-
     if (head_dim >= 256) {
         ggml_cuda_kvarn_store_kv_body_pipelined(
                 k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,

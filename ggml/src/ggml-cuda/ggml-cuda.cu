@@ -3668,7 +3668,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_kvarn_debug_set_store_context(
                             debug_store_layer, uint32_t(params.record_0), 1, uint32_t(params.n_heads), uint32_t(params.src_layout),
                             uint32_t(k_body_records_cap_store), k_body_store_key);
-                    ggml_cuda_kvarn_mark_body_store(k_body_store_key);
+                    ggml_cuda_kvarn_mark_body_store_records(
+                            k_body_store_key, uint32_t(params.record_0), 1);
                     const int64_t pending_group_stride = k_tile->nb[2]/sizeof(float);
                     ggml_cuda_kvarn_store_body_pending_heads_minmax(
                             (const float *) k_tile->data,
@@ -3703,7 +3704,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     ggml_cuda_kvarn_debug_set_store_context(
                             debug_store_layer, debug_record, 1, 1, uint32_t(params.src_layout),
                             uint32_t(k_body_records_cap_store), k_body_store_key);
-                    ggml_cuda_kvarn_mark_body_store(k_body_store_key);
+                    if (debug_record != UINT32_MAX) {
+                        ggml_cuda_kvarn_mark_body_store_records(k_body_store_key, debug_record, 1);
+                    } else {
+                        ggml_cuda_kvarn_mark_body_store(k_body_store_key);
+                    }
                     ggml_cuda_kvarn_store_body_reference_minmax(
                             (const float *) k_tile->data,
                             (const float *) v_tile->data,
