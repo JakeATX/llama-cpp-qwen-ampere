@@ -318,7 +318,9 @@ void llama_kv_cache_kvarn_iswa::state_write(llama_io_write_i & io, llama_seq_id 
 }
 
 void llama_kv_cache_kvarn_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (seq_id != -1 || flags != 0) {
+    const bool is_atomic_restore = flags == 0 &&
+            (seq_id == -1 || (seq_id == 0 && kv_base->get_n_seq_max() == 1));
+    if (!is_atomic_restore) {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             kv_base->state_read(io, seq_id, flags);
             if (kv_full_normal) {

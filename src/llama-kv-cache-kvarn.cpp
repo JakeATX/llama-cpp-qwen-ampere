@@ -1938,8 +1938,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_kvarn::memory_breakd
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if (seq_id != -1 || flags != 0) {
-        throw std::runtime_error("KVarN state serialization supports only full-cache state with no flags");
+    const bool is_full_state = seq_id == -1 && flags == 0;
+    const bool is_single_seq_state = n_seq_max == 1 && seq_id == 0 && flags == 0;
+    if (!is_full_state && !is_single_seq_state) {
+        throw std::runtime_error("KVarN state serialization supports only full-cache or single-stream sequence-0 state with no flags");
     }
     if (v_cells.size() != 1 || v_heads.size() != 1) {
         throw std::runtime_error("KVarN state serialization requires exactly one metadata stream");
@@ -2027,8 +2029,10 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (seq_id != -1 || flags != 0) {
-        throw std::runtime_error("KVarN state deserialization supports only full-cache state with no flags");
+    const bool is_full_state = seq_id == -1 && flags == 0;
+    const bool is_single_seq_state = n_seq_max == 1 && seq_id == 0 && flags == 0;
+    if (!is_full_state && !is_single_seq_state) {
+        throw std::runtime_error("KVarN state deserialization supports only full-cache or single-stream sequence-0 state with no flags");
     }
 
     try {

@@ -872,21 +872,28 @@ static std::array<ggml_tensor *, 8> kvarn_test_layer_tensors(const llama_kvarn_l
              view.scales_k, view.scales_v, view.pending_k, view.pending_v };
 }
 
-static void kvarn_test_seed_state(llama_kv_cache_kvarn & cache) {
+static void kvarn_test_seed_state(llama_kv_cache_kvarn & cache, bool single_stream = false) {
     llama_ubatch ubatch = make_test_ubatch(3, 0);
-    ubatch.n_pos = 4;
-    ubatch.data->pos.resize(12);
-    for (uint32_t i = 0; i < 3; ++i) {
-        ubatch.data->pos[i] = llama_pos(10 + i);
-        ubatch.data->pos[i + 3] = llama_pos(20 + i);
-        ubatch.data->pos[i + 6] = llama_pos(30 + i);
-        ubatch.data->pos[i + 9] = llama_pos(40 + i);
+    if (single_stream) {
+        ubatch.n_pos = 1;
+        ubatch.data->pos = { 0, 1, 2 };
+    } else {
+        ubatch.n_pos = 4;
+        ubatch.data->pos.resize(12);
+        for (uint32_t i = 0; i < 3; ++i) {
+            ubatch.data->pos[i] = llama_pos(10 + i);
+            ubatch.data->pos[i + 3] = llama_pos(20 + i);
+            ubatch.data->pos[i + 6] = llama_pos(30 + i);
+            ubatch.data->pos[i + 9] = llama_pos(40 + i);
+        }
     }
     ubatch.pos = ubatch.data->pos.data();
     llama_kv_cache_kvarn::slot_info sinfo;
-    sinfo.idxs = { 13, 14, 15 }; // exercises the valid one-past-end head
+    sinfo.idxs = single_stream ? std::vector<uint32_t>{ 0, 1, 2 } : std::vector<uint32_t>{ 13, 14, 15 };
     cache.apply_ubatch(sinfo, ubatch);
-    cache.seq_cp(0, 1, 10, 12);
+    if (!single_stream) {
+        cache.seq_cp(0, 1, 10, 12);
+    }
 
     for (uint32_t il = 0; il < cache.get_n_layer(); ++il) {
         const auto tensors = kvarn_test_layer_tensors(cache.get_layer_view(int32_t(il)));
@@ -943,6 +950,80 @@ static void test_runtime_state_roundtrip() {
     require(unsupported, "KVarN per-sequence state read rejected");
     require(restored.seq_pos_min(0) == 10 && restored.seq_pos_max(0) == 12,
             "unsupported KVarN per-sequence state read is non-mutating");
+}
+
+static void test_runtime_single_sequence_state_roundtrip() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = 4;
+    params.sink_tokens = 2;
+    params.tail_tokens = 2;
+    llama_hparams hparams = make_test_hparams();
+    llama_kv_cache_kvarn source(nullptr, hparams, params, false, 16, 1, 1, nullptr);
+    llama_kv_cache_kvarn restored(nullptr, hparams, params, false, 16, 1, 1, nullptr);
+    kvarn_test_seed_state(source, true);
+
+    kvarn_test_writer full_writer;
+    source.state_write(full_writer);
+    kvarn_test_writer seq_writer;
+    source.state_write(seq_writer, 0, 0);
+    require(seq_writer.data == full_writer.data,
+            "KVarN single-stream sequence-0 state is byte-identical to full state");
+
+    kvarn_test_reader seq_reader(seq_writer.data);
+    restored.state_read(seq_reader, 0, 0);
+    kvarn_test_writer rewritten;
+    restored.state_write(rewritten);
+    require(rewritten.data == full_writer.data, "KVarN sequence-0 state roundtrip is byte exact");
+
+    bool rejected = false;
+    try {
+        source.state_write(rewritten, 1, 0);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    require(rejected, "KVarN nonzero sequence state write rejected");
+    rejected = false;
+    try {
+        source.state_write(rewritten, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    require(rejected, "KVarN flagged sequence state write rejected");
+    kvarn_test_reader nonzero_seq_reader(seq_writer.data);
+    rejected = false;
+    try {
+        restored.state_read(nonzero_seq_reader, 1, 0);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    require(rejected, "KVarN nonzero sequence state read rejected");
+    kvarn_test_reader flagged_reader(seq_writer.data);
+    rejected = false;
+    try {
+        restored.state_read(flagged_reader, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    require(rejected, "KVarN flagged sequence state read rejected");
+
+    std::vector<uint8_t> truncated = seq_writer.data;
+    truncated.pop_back();
+    restored.clear(true);
+    kvarn_test_seed_state(restored, true);
+    kvarn_test_reader truncated_reader(truncated);
+    rejected = false;
+    try {
+        restored.state_read(truncated_reader, 0, 0);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    require(rejected, "truncated KVarN sequence-0 state rejected");
+    require(restored.seq_pos_min(0) == -1, "failed KVarN sequence-0 restore clears metadata");
+    const auto tensors = kvarn_test_layer_tensors(restored.get_layer_view(0));
+    std::vector<uint8_t> tensor_bytes(ggml_nbytes(tensors[0]));
+    ggml_backend_tensor_get(tensors[0], tensor_bytes.data(), 0, tensor_bytes.size());
+    require(std::all_of(tensor_bytes.begin(), tensor_bytes.end(), [](uint8_t b) { return b == 0; }),
+            "failed KVarN sequence-0 restore clears backend tensors");
 }
 
 static void test_runtime_state_rejects_corruption() {
@@ -2161,6 +2242,7 @@ int main() {
     run_phase("test_runtime_stream_consistency", test_runtime_stream_consistency);
     run_phase("test_runtime_state_safety", test_runtime_state_safety);
     run_phase("test_runtime_state_roundtrip", test_runtime_state_roundtrip);
+    run_phase("test_runtime_single_sequence_state_roundtrip", test_runtime_single_sequence_state_roundtrip);
     run_phase("test_runtime_state_rejects_corruption", test_runtime_state_rejects_corruption);
     run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
     run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);

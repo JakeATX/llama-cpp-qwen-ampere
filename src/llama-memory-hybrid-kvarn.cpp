@@ -266,7 +266,9 @@ void llama_memory_hybrid_kvarn::state_write(llama_io_write_i & io, llama_seq_id 
 }
 
 void llama_memory_hybrid_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if (seq_id != -1 || flags != 0) {
+    const bool is_atomic_restore = flags == 0 &&
+            (seq_id == -1 || (seq_id == 0 && mem_attn->get_n_seq_max() == 1));
+    if (!is_atomic_restore) {
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             mem_attn->state_read(io, seq_id, flags);
             if (mem_attn_normal) {

@@ -292,6 +292,7 @@ public:
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
     uint32_t get_size() const;
+    uint32_t get_n_seq_max() const { return n_seq_max; }
     uint32_t get_n_layer() const;
     bool has_layer(int32_t il) const;
     uint32_t get_sink_tokens() const { return params.sink_tokens; }
