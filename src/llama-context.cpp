@@ -2130,6 +2130,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
             }
 
+            bool memory_rollback_ok = true;
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
                 if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
                     continue;
@@ -2137,7 +2138,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
 
-                memory->seq_rm(s, pos_min[s], -1);
+                if (!memory->seq_rm(s, pos_min[s], -1)) {
+                    memory_rollback_ok = false;
+                }
+            }
+
+            if (!memory_rollback_ok && cparams.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+                LLAMA_LOG_WARN("%s: KVarN suffix rollback is unsupported; discarding prior context state after failed batch\n", __func__);
+                synchronize();
+                memory->clear(false);
             }
 
             switch (status) {
