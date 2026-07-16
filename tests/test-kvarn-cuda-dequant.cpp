@@ -27,6 +27,16 @@ static void set_env_var(const char * name, const char * value) {
 #endif
 }
 
+static void set_paper_frame_env(bool enabled) {
+    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", enabled ? "1" : "");
+    set_env_var("LLAMA_KVARN_DISABLE_PAPER_FRAME", enabled ? "" : "1");
+}
+
+static void clear_paper_frame_env() {
+    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+    set_env_var("LLAMA_KVARN_DISABLE_PAPER_FRAME", "");
+}
+
 static void require(bool ok, const char * msg) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", msg);
@@ -1781,7 +1791,7 @@ static void test_direct_record_batched_phases(
 
         set_env_var("LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES", rollback ? "1" : "");
         set_env_var("LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES", rollback ? "" : "1");
-    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "1");
+    set_paper_frame_env(true);
     ggml_cuda_kvarn_store_body_direct_records_minmax(
             k_tiles_d, v_tiles_d,
             k_body_d, v_body_d,
@@ -1800,7 +1810,7 @@ static void test_direct_record_batched_phases(
             scratch_floats,
             0u,
             nullptr);
-    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+    clear_paper_frame_env();
         set_env_var("LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES", "");
         set_env_var("LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES", "");
         require_cuda(cudaGetLastError(), label);
@@ -1913,7 +1923,7 @@ static void test_fullrange_store_overwrites_prefilled_body(
         const llama_kvarn_params & params) {
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "1");
     set_env_var("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", "");
-    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+    set_paper_frame_env(false);
 
     const uint32_t group = params.group_size;
     const size_t n = size_t(head_dim)*group;
@@ -2014,6 +2024,7 @@ static void test_fullrange_store_overwrites_prefilled_body(
     cudaFree(v_scales_d);
     cudaFree(scratch_d);
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
+    clear_paper_frame_env();
 }
 
 static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
@@ -2063,7 +2074,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
     require_cuda(cudaMalloc(&v_scales_d, ref.v_scales.size()*sizeof(float)), "cudaMalloc pending V scales");
     require_cuda(cudaMalloc(&scratch_d, scratch_floats*sizeof(float)), "cudaMalloc pending store scratch");
 
-    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", paper_frame ? "1" : "");
+    set_paper_frame_env(paper_frame);
     ggml_cuda_kvarn_store_body_pending_records_minmax(
             pending_k_d, pending_v_d,
             k_body_d, v_body_d,
@@ -2078,9 +2089,9 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
             layout.k_scale_floats, layout.v_scale_floats,
             head_dim, head_dim,
             0u,
-            false,
+            paper_frame,
             nullptr);
-    set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", "");
+    clear_paper_frame_env();
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
     require_cuda(cudaGetLastError(), "KVarN CUDA pending-record store launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA pending-record store sync");
@@ -2154,6 +2165,7 @@ static void test_pending_k_layout_store(uint32_t head_dim, bool paper_frame) {
 
 static void test_pending_heads_store(uint32_t head_dim) {
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "1");
+    set_paper_frame_env(false);
     llama_kvarn_params params = llama_kvarn_default_params();
     params.sinkhorn_iters = 4;
     params.rtn_quantile = 1.0f;
@@ -2232,6 +2244,7 @@ static void test_pending_heads_store(uint32_t head_dim) {
             0u,
             false,
             nullptr);
+    clear_paper_frame_env();
     set_env_var("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
     require_cuda(cudaGetLastError(), "KVarN CUDA pending-heads store launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA pending-heads store sync");
@@ -2319,6 +2332,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     require_cuda(cudaMalloc(&store_scratch_d, store_scratch_floats*sizeof(float)),
             "cudaMalloc store scratch");
 
+    set_paper_frame_env(false);
     ggml_cuda_kvarn_store_body_reference_minmax(
             k_tile_d, v_tile_d,
             k_body_store_d, v_body_store_d,
@@ -2329,6 +2343,7 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
             0u,
             false,
             nullptr);
+    clear_paper_frame_env();
     require_cuda(cudaGetLastError(), "KVarN CUDA store-body launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA store-body sync");
 
