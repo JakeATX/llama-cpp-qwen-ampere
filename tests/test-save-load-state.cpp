@@ -271,6 +271,10 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     // Migrate KV cache from seq 0 to seq 1 (on-device path)
     {
         std::vector<uint8_t> seq_store(llama_state_seq_get_size_ext(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE));
+        if (seq_store.empty()) {
+            LOG_ERR("\n%s: on-device seq state size is zero\n", __func__);
+            return false;
+        }
         const size_t ncopy = llama_state_seq_get_data_ext(ctx.get(), seq_store.data(), seq_store.size(), 0, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
         if (ncopy != seq_store.size()) {
             LOG_ERR("\n%s: seq copy data length %zd does not match expected length %zd\n", __func__, ncopy, seq_store.size());
@@ -280,6 +284,17 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
 
         llama_memory_clear(llama_get_memory(ctx.get()), true);
         LOG_TRC("%s: kv cache cleared\n", __func__);
+
+        const size_t nset_truncated = llama_state_seq_set_data_ext(
+                ctx.get(), seq_store.data(), seq_store.size() - 1, 1, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
+        if (nset_truncated != 0) {
+            LOG_ERR("\n%s: truncated on-device seq state unexpectedly restored %zd bytes\n",
+                    __func__, nset_truncated);
+            return false;
+        }
+        LOG_TRC("%s: truncated on-device seq state rejected without terminating\n", __func__);
+
+        llama_memory_clear(llama_get_memory(ctx.get()), true);
 
         const size_t nset = llama_state_seq_set_data_ext(ctx.get(), seq_store.data(), seq_store.size(), 1, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
         if (nset != seq_store.size()) {

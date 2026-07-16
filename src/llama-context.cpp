@@ -2989,10 +2989,17 @@ public:
     llama_io_read_device(const uint8_t * p, size_t len, const llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs) {
     }
 
-    ~llama_io_read_device() {
+    void commit() {
         llama_memory_buffers mbufs_new;
 
         for (const auto & rinfo : rinfos) {
+            if (rinfo.tensor == nullptr || rinfo.tensor->buffer == nullptr) {
+                throw std::runtime_error("sequence state references an unallocated tensor");
+            }
+            const size_t nbytes = ggml_nbytes(rinfo.tensor);
+            if (rinfo.offset > nbytes || rinfo.size > nbytes - rinfo.offset) {
+                throw std::runtime_error("sequence state tensor range is out of bounds");
+            }
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
             mbufs_new[buft].n_tensors++;
@@ -3000,12 +3007,24 @@ public:
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
-            const auto & mbuf_cur = mbufs.at(buft);
-
-            if (!mbuf_cur.buf || mbuf_cur.n_tensors != mbuf.n_tensors || mbuf_cur.total_size != mbuf.total_size) {
-                GGML_ABORT("%s: memory buffer mismatch\n", __func__);
+            const auto it = mbufs.find(buft);
+            if (it == mbufs.end()) {
+                throw std::runtime_error("sequence state device buffer is unavailable");
             }
+            const auto & mbuf_cur = it->second;
 
+            if (!mbuf_cur.buf ||
+                    mbuf_cur.n_tensors != mbuf.n_tensors ||
+                    mbuf_cur.total_size != mbuf.total_size ||
+                    mbuf_cur.org.size() != mbuf_cur.n_tensors ||
+                    mbuf_cur.cpy.size() != mbuf_cur.n_tensors) {
+                throw std::runtime_error("sequence state device buffer layout mismatch");
+            }
+        }
+
+        for (const auto & [buft, mbuf] : mbufs_new) {
+            GGML_UNUSED(mbuf);
+            const auto & mbuf_cur = mbufs.find(buft)->second;
             for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
                 ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf_cur.org[i]);
             }
@@ -3023,8 +3042,9 @@ public:
     }
 
     void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
-        // save for later during destruction
-        rinfos.push_back({tensor, ptr, size, offset});
+        // ON_DEVICE tensor contents live in mbufs, outside the host byte stream.
+        // Queue the restore until parsing and buffer validation both succeed.
+        rinfos.push_back({tensor, size, offset});
     }
 
     size_t n_bytes() override {
@@ -3038,7 +3058,6 @@ private:
 
     struct read_info {
         ggml_tensor * tensor;
-        const uint8_t * ptr;
         size_t size;
         size_t offset;
     };
@@ -3117,6 +3136,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     try {
         std::unique_ptr<llama_io_read_i> io;
+        llama_io_read_device * io_device = nullptr;
         if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
             // create a temporary io to read the magic and the src seq_id
             io = std::make_unique<llama_io_read_host>(src, size);
@@ -3135,7 +3155,9 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
                 throw std::runtime_error("sequence state source id has no device storage");
             }
 
-            io = std::make_unique<llama_io_read_device>(src, size, it->second);
+            auto device_reader = std::make_unique<llama_io_read_device>(src, size, it->second);
+            io_device = device_reader.get();
+            io = std::move(device_reader);
         } else {
             io = std::make_unique<llama_io_read_host>(src, size);
         }
@@ -3154,7 +3176,11 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
             throw std::runtime_error("wrong sequence id");
         }
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const size_t nread = state_seq_read_data(*io, seq_id, flags);
+        if (io_device != nullptr) {
+            io_device->commit();
+        }
+        return nread;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
