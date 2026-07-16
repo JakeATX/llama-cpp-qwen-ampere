@@ -1950,13 +1950,21 @@ void llama_kv_cache_kvarn::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos 
 }
 
 llama_pos llama_kv_cache_kvarn::seq_pos_min(llama_seq_id seq_id) const {
-    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < LLAMA_MAX_SEQ);
+
+    if ((size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
 
     return v_cells[0].seq_pos_min(seq_id);
 }
 
 llama_pos llama_kv_cache_kvarn::seq_pos_max(llama_seq_id seq_id) const {
-    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < LLAMA_MAX_SEQ);
+
+    if ((size_t) seq_id >= seq_to_stream.size()) {
+        return -1;
+    }
 
     return v_cells[0].seq_pos_max(seq_id);
 }

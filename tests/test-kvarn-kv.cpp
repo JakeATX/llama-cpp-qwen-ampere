@@ -790,6 +790,12 @@ static void test_runtime_state_safety() {
     llama_kv_cache_kvarn cache(nullptr, hparams, params, false, 32, 4, 1, nullptr);
     llama_kv_cache_kvarn single_stream_cache(nullptr, hparams, params, false, 32, 1, 1, nullptr);
 
+    require(single_stream_cache.seq_pos_min(1) == -1 && single_stream_cache.seq_pos_max(1) == -1,
+            "KVarN reports inactive unified sequence empty");
+    require(single_stream_cache.seq_pos_min(LLAMA_MAX_SEQ - 1) == -1 &&
+                    single_stream_cache.seq_pos_max(LLAMA_MAX_SEQ - 1) == -1,
+            "KVarN reports boundary unified sequence empty");
+
     const auto prepare_positions = [&](std::initializer_list<llama_pos> positions) {
         llama_ubatch ubatch = make_test_ubatch(uint32_t(positions.size()), 0);
         std::copy(positions.begin(), positions.end(), ubatch.data->pos.begin());
@@ -811,6 +817,11 @@ static void test_runtime_state_safety() {
     single_stream_cache.apply_ubatch(append_sinfos[0], append0);
     single_stream_cache.apply_ubatch(append_sinfos[1], append1);
     require(single_stream_cache.seq_pos_max(0) == 4, "KVarN contiguous multi-ubatch append applied");
+    require(single_stream_cache.seq_pos_min(1) == -1 && single_stream_cache.seq_pos_max(1) == -1,
+            "KVarN keeps inactive unified sequence empty after append");
+    require(single_stream_cache.seq_pos_min(LLAMA_MAX_SEQ - 1) == -1 &&
+                    single_stream_cache.seq_pos_max(LLAMA_MAX_SEQ - 1) == -1,
+            "KVarN keeps boundary unified sequence empty after append");
     require(prepare_positions({ 4 }).empty(), "KVarN rewind position rejected");
     require(prepare_positions({ 6 }).empty(), "KVarN skipped append position rejected");
 
