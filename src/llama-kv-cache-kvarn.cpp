@@ -118,6 +118,53 @@ void kvarn_state_require(bool condition, const char * message) {
     }
 }
 
+struct kvarn_state_byte_range {
+    size_t begin;
+    size_t end;
+};
+
+void kvarn_state_write_zeros(llama_io_write_i & io, size_t size) {
+    static constexpr std::array<uint8_t, 4096> zeros = {};
+    while (size > 0) {
+        const size_t chunk = std::min(size, zeros.size());
+        io.write(zeros.data(), chunk);
+        size -= chunk;
+    }
+}
+
+void kvarn_state_write_live_ranges(
+        llama_io_write_i & io,
+        ggml_tensor * tensor,
+        std::vector<kvarn_state_byte_range> ranges) {
+    const size_t nbytes = ggml_nbytes(tensor);
+    std::sort(ranges.begin(), ranges.end(), [](const auto & a, const auto & b) {
+        return a.begin < b.begin;
+    });
+
+    std::vector<kvarn_state_byte_range> merged;
+    merged.reserve(ranges.size());
+    for (const kvarn_state_byte_range & range : ranges) {
+        kvarn_state_require(range.begin <= range.end && range.end <= nbytes,
+                "KVarN state live tensor range is out of bounds");
+        if (range.begin == range.end) {
+            continue;
+        }
+        if (!merged.empty() && range.begin <= merged.back().end) {
+            merged.back().end = std::max(merged.back().end, range.end);
+        } else {
+            merged.push_back(range);
+        }
+    }
+
+    size_t offset = 0;
+    for (const kvarn_state_byte_range & range : merged) {
+        kvarn_state_write_zeros(io, range.begin - offset);
+        io.write_tensor(tensor, range.begin, range.end - range.begin);
+        offset = range.end;
+    }
+    kvarn_state_write_zeros(io, nbytes - offset);
+}
+
 } // namespace
 
 static bool kvarn_env_flag_enabled(const char * name) {
@@ -2020,10 +2067,47 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
             kvarn_state_write_uint(io, uint64_t(ggml_nbytes(tensor)));
         }
     }
+
+    if (n_seq_max != 1) {
+        for (const layer_storage & storage : layer_tensors) {
+            const auto tensors = kvarn_state_tensors(get_layer_view(storage.il));
+            for (ggml_tensor * tensor : tensors) {
+                io.write_tensor(tensor, 0, ggml_nbytes(tensor));
+            }
+        }
+        return;
+    }
+
+    const llama_pos max_pos = v_cells[0].seq_pos_max(0);
+    kvarn_state_require(max_pos >= -1 && (max_pos < 0 || uint64_t(max_pos) < uint64_t(kv_size)),
+            "KVarN state position is out of range");
+    const uint32_t n_seen = max_pos >= 0 ? uint32_t(max_pos) + 1 : 0;
+    const uint32_t n_sink = std::min(n_seen, params.sink_tokens);
+    const uint32_t n_after_sink = n_seen - n_sink;
+    const uint32_t n_tail = std::min(n_after_sink, params.tail_tokens);
+    const uint32_t n_body_pending = n_after_sink - n_tail;
+    const uint32_t n_records = n_body_pending/params.group_size;
+    const uint32_t n_pending = n_body_pending%params.group_size;
+
     for (const layer_storage & storage : layer_tensors) {
         const auto tensors = kvarn_state_tensors(get_layer_view(storage.il));
-        for (ggml_tensor * tensor : tensors) {
-            io.write_tensor(tensor, 0, ggml_nbytes(tensor));
+        for (uint32_t it = 0; it < tensors.size(); ++it) {
+            ggml_tensor * tensor = tensors[it];
+            std::vector<kvarn_state_byte_range> ranges;
+            if (it < 2) {
+                ranges.push_back({ 0, size_t(n_sink + n_tail)*tensor->nb[2] });
+            } else if (it < 6) {
+                kvarn_state_require(n_records <= storage.n_records,
+                        "KVarN state live record count exceeds storage");
+                ranges.reserve(storage.n_head_kv);
+                for (uint32_t ih = 0; ih < storage.n_head_kv; ++ih) {
+                    const size_t begin = size_t(ih)*tensor->nb[2];
+                    ranges.push_back({ begin, begin + size_t(n_records)*tensor->nb[1] });
+                }
+            } else {
+                ranges.push_back({ 0, size_t(n_pending)*tensor->nb[2] });
+            }
+            kvarn_state_write_live_ranges(io, tensor, std::move(ranges));
         }
     }
 }

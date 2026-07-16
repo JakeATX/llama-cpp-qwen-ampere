@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <array>
 #include <random>
@@ -872,11 +873,24 @@ static std::array<ggml_tensor *, 8> kvarn_test_layer_tensors(const llama_kvarn_l
              view.scales_k, view.scales_v, view.pending_k, view.pending_v };
 }
 
-static void kvarn_test_seed_state(llama_kv_cache_kvarn & cache, bool single_stream = false) {
-    llama_ubatch ubatch = make_test_ubatch(3, 0);
+static std::vector<uint8_t> kvarn_test_tensor_bytes(ggml_tensor * tensor) {
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, bytes.data(), 0, bytes.size());
+    return bytes;
+}
+
+static void kvarn_test_seed_state(
+        llama_kv_cache_kvarn & cache,
+        bool single_stream = false,
+        uint32_t single_stream_tokens = 3) {
+    const uint32_t n_tokens = single_stream ? single_stream_tokens : 3;
+    llama_ubatch ubatch = make_test_ubatch(n_tokens, 0);
     if (single_stream) {
         ubatch.n_pos = 1;
-        ubatch.data->pos = { 0, 1, 2 };
+        ubatch.data->pos.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            ubatch.data->pos[i] = llama_pos(i);
+        }
     } else {
         ubatch.n_pos = 4;
         ubatch.data->pos.resize(12);
@@ -889,7 +903,14 @@ static void kvarn_test_seed_state(llama_kv_cache_kvarn & cache, bool single_stre
     }
     ubatch.pos = ubatch.data->pos.data();
     llama_kv_cache_kvarn::slot_info sinfo;
-    sinfo.idxs = single_stream ? std::vector<uint32_t>{ 0, 1, 2 } : std::vector<uint32_t>{ 13, 14, 15 };
+    if (single_stream) {
+        sinfo.idxs.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            sinfo.idxs[i] = i;
+        }
+    } else {
+        sinfo.idxs = { 13, 14, 15 };
+    }
     cache.apply_ubatch(sinfo, ubatch);
     if (!single_stream) {
         cache.seq_cp(0, 1, 10, 12);
@@ -1024,6 +1045,68 @@ static void test_runtime_single_sequence_state_roundtrip() {
     ggml_backend_tensor_get(tensors[0], tensor_bytes.data(), 0, tensor_bytes.size());
     require(std::all_of(tensor_bytes.begin(), tensor_bytes.end(), [](uint8_t b) { return b == 0; }),
             "failed KVarN sequence-0 restore clears backend tensors");
+}
+
+static void test_runtime_single_sequence_state_excludes_inactive_storage() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = 4;
+    params.sink_tokens = 2;
+    params.tail_tokens = 2;
+    llama_hparams hparams = make_test_hparams();
+    llama_kv_cache_kvarn source(nullptr, hparams, params, false, 16, 1, 1, nullptr);
+    llama_kv_cache_kvarn restored(nullptr, hparams, params, false, 16, 1, 1, nullptr);
+
+    // Ten dense tokens leave one sealed body record and two pending tokens.
+    // Seed every allocated byte so inactive storage cannot pass by accident.
+    kvarn_test_seed_state(source, true, 10);
+    kvarn_test_writer writer;
+    source.state_write(writer);
+    kvarn_test_reader reader(writer.data);
+    restored.state_read(reader);
+
+    for (uint32_t il = 0; il < source.get_n_layer(); ++il) {
+        const llama_kvarn_layer_view source_view = source.get_layer_view(int32_t(il));
+        const auto source_tensors = kvarn_test_layer_tensors(source_view);
+        const auto restored_tensors = kvarn_test_layer_tensors(restored.get_layer_view(int32_t(il)));
+        for (uint32_t it = 0; it < source_tensors.size(); ++it) {
+            ggml_tensor * tensor = source_tensors[it];
+            const std::vector<uint8_t> source_bytes = kvarn_test_tensor_bytes(tensor);
+            std::vector<uint8_t> expected(source_bytes.size(), 0);
+            if (it < 2) {
+                const size_t live_bytes = 4*tensor->nb[2];
+                std::memcpy(expected.data(), source_bytes.data(), live_bytes);
+            } else if (it < 6) {
+                for (uint32_t ih = 0; ih < source_view.n_head_kv; ++ih) {
+                    const size_t begin = size_t(ih)*tensor->nb[2];
+                    std::memcpy(expected.data() + begin, source_bytes.data() + begin, tensor->nb[1]);
+                }
+            } else {
+                const size_t live_bytes = 2*tensor->nb[2];
+                std::memcpy(expected.data(), source_bytes.data(), live_bytes);
+            }
+            require(kvarn_test_tensor_bytes(restored_tensors[it]) == expected,
+                    "KVarN state excludes inactive tensor storage");
+        }
+    }
+
+    source.clear(false);
+    kvarn_test_writer empty_writer;
+    source.state_write(empty_writer);
+    kvarn_test_sizer empty_sizer;
+    source.state_write(empty_sizer);
+    require(empty_sizer.n_bytes() == empty_writer.data.size(),
+            "empty KVarN state dummy and writer sizes match exactly");
+    kvarn_test_reader empty_reader(empty_writer.data);
+    restored.state_read(empty_reader);
+    require(restored.seq_pos_min(0) == -1, "empty KVarN state restores empty metadata");
+    for (uint32_t il = 0; il < restored.get_n_layer(); ++il) {
+        const auto tensors = kvarn_test_layer_tensors(restored.get_layer_view(int32_t(il)));
+        for (ggml_tensor * tensor : tensors) {
+            const std::vector<uint8_t> bytes = kvarn_test_tensor_bytes(tensor);
+            require(std::all_of(bytes.begin(), bytes.end(), [](uint8_t byte) { return byte == 0; }),
+                    "empty KVarN state excludes all inactive tensor storage");
+        }
+    }
 }
 
 static void test_runtime_state_rejects_corruption() {
@@ -2243,6 +2326,8 @@ int main() {
     run_phase("test_runtime_state_safety", test_runtime_state_safety);
     run_phase("test_runtime_state_roundtrip", test_runtime_state_roundtrip);
     run_phase("test_runtime_single_sequence_state_roundtrip", test_runtime_single_sequence_state_roundtrip);
+    run_phase("test_runtime_single_sequence_state_excludes_inactive_storage",
+            test_runtime_single_sequence_state_excludes_inactive_storage);
     run_phase("test_runtime_state_rejects_corruption", test_runtime_state_rejects_corruption);
     run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
     run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);
