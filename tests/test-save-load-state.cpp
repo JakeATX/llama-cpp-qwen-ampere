@@ -282,8 +282,7 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
         }
         LOG_TRC("%s: seq 0 copied, %zd bytes\n", __func__, ncopy);
 
-        llama_memory_clear(llama_get_memory(ctx.get()), true);
-        LOG_TRC("%s: kv cache cleared\n", __func__);
+        LOG_TRC("%s: retaining seq 0 to force distinct seq 1 destination slots\n", __func__);
 
         const size_t nset_truncated = llama_state_seq_set_data_ext(
                 ctx.get(), seq_store.data(), seq_store.size() - 1, 1, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
@@ -294,7 +293,10 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
         }
         LOG_TRC("%s: truncated on-device seq state rejected without terminating\n", __func__);
 
-        llama_memory_clear(llama_get_memory(ctx.get()), true);
+        if (!llama_memory_seq_rm(llama_get_memory(ctx.get()), 1, -1, -1)) {
+            LOG_ERR("\n%s: failed to clear destination seq after truncated restore\n", __func__);
+            return false;
+        }
 
         const size_t nset = llama_state_seq_set_data_ext(ctx.get(), seq_store.data(), seq_store.size(), 1, LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
         if (nset != seq_store.size()) {

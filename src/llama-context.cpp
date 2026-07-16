@@ -3022,11 +3022,61 @@ public:
             }
         }
 
-        for (const auto & [buft, mbuf] : mbufs_new) {
-            GGML_UNUSED(mbuf);
-            const auto & mbuf_cur = mbufs.find(buft)->second;
-            for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf_cur.org[i]);
+        for (auto & [buft, mbuf] : mbufs_new) {
+            GGML_UNUSED(buft);
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(mbuf.n_tensors)*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            mbuf.ctx.reset(ggml_init(params));
+            if (!mbuf.ctx) {
+                throw std::runtime_error("failed to allocate sequence state destination views");
+            }
+            mbuf.org.reserve(mbuf.n_tensors);
+        }
+
+        std::map<ggml_backend_buffer_type_t, size_t> buffer_indices;
+        for (const auto & rinfo : rinfos) {
+            auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
+            auto & mbuf_dst = mbufs_new.find(buft)->second;
+            const auto & mbuf_src = mbufs.find(buft)->second;
+            const size_t index = buffer_indices[buft]++;
+            if (index >= mbuf_src.cpy.size()) {
+                throw std::runtime_error("sequence state device tensor order mismatch");
+            }
+
+            ggml_tensor * tensor_src = mbuf_src.cpy[index];
+            const size_t type_size = ggml_type_size(rinfo.tensor->type);
+            if (tensor_src == nullptr || type_size == 0 ||
+                    rinfo.tensor->type != tensor_src->type ||
+                    rinfo.offset%type_size != 0 || rinfo.size%type_size != 0 ||
+                    ggml_nbytes(tensor_src) != rinfo.size) {
+                throw std::runtime_error("sequence state destination tensor layout mismatch");
+            }
+
+            ggml_tensor * tensor_dst = ggml_view_1d(
+                    mbuf_dst.ctx.get(), rinfo.tensor, ggml_nelements(tensor_src), rinfo.offset);
+            if (tensor_dst->type != tensor_src->type ||
+                    !ggml_are_same_shape(tensor_dst, tensor_src) ||
+                    ggml_nbytes(tensor_dst) != rinfo.size ||
+                    ggml_backend_view_init(tensor_dst) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to initialize sequence state destination view");
+            }
+            mbuf_dst.org.push_back(tensor_dst);
+        }
+
+        for (const auto & [buft, mbuf_dst] : mbufs_new) {
+            const auto & mbuf_src = mbufs.find(buft)->second;
+            if (mbuf_dst.org.size() != mbuf_src.cpy.size()) {
+                throw std::runtime_error("sequence state destination tensor count mismatch");
+            }
+        }
+
+        for (const auto & [buft, mbuf_dst] : mbufs_new) {
+            const auto & mbuf_src = mbufs.find(buft)->second;
+            for (size_t i = 0; i < mbuf_dst.org.size(); ++i) {
+                ggml_backend_tensor_copy(mbuf_src.cpy[i], mbuf_dst.org[i]);
             }
         }
     }
