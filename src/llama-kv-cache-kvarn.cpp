@@ -1181,6 +1181,10 @@ bool llama_kv_cache_kvarn_context::next() {
 bool llama_kv_cache_kvarn_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
+    if (status == LLAMA_MEMORY_STATUS_NO_UPDATE) {
+        return true;
+    }
+
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     return true;
 }

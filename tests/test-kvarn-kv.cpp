@@ -164,6 +164,15 @@ static void test_iswa_full_normal_policy() {
             "diagnostic full-normal route takes precedence over mixed fallback");
 }
 
+static void test_no_update_context_apply() {
+    llama_kv_cache_kvarn_context context(LLAMA_MEMORY_STATUS_NO_UPDATE);
+
+    require(context.get_status() == LLAMA_MEMORY_STATUS_NO_UPDATE,
+            "KVarN no-update context preserves its status");
+    require(context.apply(),
+            "KVarN no-update context applies as a no-op");
+}
+
 static void test_pack_roundtrip() {
     for (uint32_t bits : { 2u, 4u }) {
         std::vector<uint8_t> src(257);
@@ -2319,6 +2328,7 @@ int main() {
 
     run_phase("test_layout", test_layout);
     run_phase("test_iswa_full_normal_policy", test_iswa_full_normal_policy);
+    run_phase("test_no_update_context_apply", test_no_update_context_apply);
     run_phase("test_pack_roundtrip", test_pack_roundtrip);
     run_phase("test_hadamard_inverse", test_hadamard_inverse);
     run_phase("test_reference_store_dequant", test_reference_store_dequant);
