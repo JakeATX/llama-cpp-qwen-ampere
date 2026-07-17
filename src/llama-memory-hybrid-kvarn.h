@@ -13,6 +13,16 @@
 // Hybrid memory for architectures that mix recurrent layers with full
 // attention layers, using KVarN for the attention side.
 
+enum class llama_kvarn_qwen_hybrid_policy {
+    normal_hybrid,
+    experimental_kvarn,
+};
+
+constexpr llama_kvarn_qwen_hybrid_policy llama_kvarn_choose_qwen_hybrid_policy(bool force_experimental) {
+    return force_experimental ? llama_kvarn_qwen_hybrid_policy::experimental_kvarn
+                              : llama_kvarn_qwen_hybrid_policy::normal_hybrid;
+}
+
 class llama_memory_hybrid_kvarn : public llama_memory_i {
 public:
     llama_memory_hybrid_kvarn(

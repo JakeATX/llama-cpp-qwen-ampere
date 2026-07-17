@@ -2289,6 +2289,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     llama_memory_i * res;
 
     if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+        const bool qwen_hybrid = arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
+        if (qwen_hybrid && llama_kvarn_choose_qwen_hybrid_policy(
+                    llama_kvarn_force_experimental_iswa()) == llama_kvarn_qwen_hybrid_policy::normal_hybrid) {
+            LLAMA_LOG_WARN(
+                    "%s: Qwen 3.5/3.6 hybrid KVarN is below production parity; "
+                    "using the normal F16 KV memory path. Set the legacy experimental-hybrid opt-in "
+                    "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 only for benchmarking/development.\n",
+                    __func__);
+
+            llama_memory_params safe_params = params;
+            safe_params.kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_NONE;
+            safe_params.type_k = GGML_TYPE_F16;
+            safe_params.type_v = GGML_TYPE_F16;
+            return create_memory(safe_params, cparams);
+        }
+
         llama_kvarn_validate_memory_support(*this, hparams, params, cparams);
 
         const bool mtp_on_hybrid_qwen35 =

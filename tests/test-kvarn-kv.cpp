@@ -1,5 +1,6 @@
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-kvarn-iswa.h"
+#include "llama-memory-hybrid-kvarn.h"
 #include "llama-hparams.h"
 #include "llama-io.h"
 #include "llama.h"
@@ -162,6 +163,15 @@ static void test_iswa_full_normal_policy() {
             "diagnostic route allocates all normal full-KV layers");
     require(llama_kvarn_iswa_choose_full_normal_policy(true, true) == policy::diagnostic_all,
             "diagnostic full-normal route takes precedence over mixed fallback");
+}
+
+static void test_qwen_hybrid_policy() {
+    using policy = llama_kvarn_qwen_hybrid_policy;
+
+    require(llama_kvarn_choose_qwen_hybrid_policy(false) == policy::normal_hybrid,
+            "Qwen hybrid KVarN defaults to the production-safe normal cache");
+    require(llama_kvarn_choose_qwen_hybrid_policy(true) == policy::experimental_kvarn,
+            "Qwen hybrid KVarN requires an explicit experimental opt-in");
 }
 
 static void test_no_update_context_apply() {
@@ -2328,6 +2338,7 @@ int main() {
 
     run_phase("test_layout", test_layout);
     run_phase("test_iswa_full_normal_policy", test_iswa_full_normal_policy);
+    run_phase("test_qwen_hybrid_policy", test_qwen_hybrid_policy);
     run_phase("test_no_update_context_apply", test_no_update_context_apply);
     run_phase("test_pack_roundtrip", test_pack_roundtrip);
     run_phase("test_hadamard_inverse", test_hadamard_inverse);
