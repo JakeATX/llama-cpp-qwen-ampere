@@ -3739,7 +3739,15 @@ ggml_tensor * llm_graph_context::build_attn(
                     kq_mask ? kq_mask->ne[1] : int64_t(-1));
         }
         if (prefill_direct_attn) {
-            ggml_tensor * cur = build_attn_mha(q_cur, k_cur, v_cur, kq_b, inp->get_kq_mask(), sinks, v_mla, kq_scale, il);
+            ggml_tensor * k_direct = k_cur;
+            ggml_tensor * v_direct = v_cur;
+            if (k_direct->type == GGML_TYPE_F32) {
+                k_direct = ggml_cast(ctx0, k_direct, GGML_TYPE_F16);
+            }
+            if (v_direct->type == GGML_TYPE_F32) {
+                v_direct = ggml_cast(ctx0, v_direct, GGML_TYPE_F16);
+            }
+            ggml_tensor * cur = build_attn_mha(q_cur, k_direct, v_direct, kq_b, inp->get_kq_mask(), sinks, v_mla, kq_scale, il);
             cb(cur, "kvarn_prefill_direct_kqv_out", il);
 
             if (wo) {
