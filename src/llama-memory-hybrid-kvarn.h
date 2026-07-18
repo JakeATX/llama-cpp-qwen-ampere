@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cache.h"
@@ -17,6 +18,18 @@ enum class llama_kvarn_qwen_hybrid_policy {
     normal_hybrid,
     experimental_kvarn,
 };
+
+constexpr bool llama_kvarn_is_qwen35_family(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN35_MTP:
+        case LLM_ARCH_QWEN35MOE_MTP:
+            return true;
+        default:
+            return false;
+    }
+}
 
 constexpr llama_kvarn_qwen_hybrid_policy llama_kvarn_choose_qwen_hybrid_policy(bool force_experimental) {
     return force_experimental ? llama_kvarn_qwen_hybrid_policy::experimental_kvarn

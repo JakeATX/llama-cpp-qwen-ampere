@@ -168,6 +168,12 @@ static void test_iswa_full_normal_policy() {
 static void test_qwen_hybrid_policy() {
     using policy = llama_kvarn_qwen_hybrid_policy;
 
+    require(llama_kvarn_is_qwen35_family(LLM_ARCH_QWEN35), "Qwen 3.5 is in the fail-closed family");
+    require(llama_kvarn_is_qwen35_family(LLM_ARCH_QWEN35MOE), "Qwen 3.5 MoE is in the fail-closed family");
+    require(llama_kvarn_is_qwen35_family(LLM_ARCH_QWEN35_MTP), "Qwen 3.5 MTP is in the fail-closed family");
+    require(llama_kvarn_is_qwen35_family(LLM_ARCH_QWEN35MOE_MTP), "Qwen 3.5 MoE MTP is in the fail-closed family");
+    require(!llama_kvarn_is_qwen35_family(LLM_ARCH_GEMMA4), "Gemma 4 is outside the Qwen fail-closed family");
+
     require(llama_kvarn_choose_qwen_hybrid_policy(false) == policy::normal_hybrid,
             "Qwen hybrid KVarN defaults to the production-safe normal cache");
     require(llama_kvarn_choose_qwen_hybrid_policy(true) == policy::experimental_kvarn,

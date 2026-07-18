@@ -2289,7 +2289,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     llama_memory_i * res;
 
     if (params.kv_cache_quant_type == LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
-        const bool qwen_hybrid = arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE;
+        const bool qwen_hybrid = llama_kvarn_is_qwen35_family(arch);
         if (qwen_hybrid && llama_kvarn_choose_qwen_hybrid_policy(
                     llama_kvarn_force_experimental_iswa()) == llama_kvarn_qwen_hybrid_policy::normal_hybrid) {
             LLAMA_LOG_WARN(
