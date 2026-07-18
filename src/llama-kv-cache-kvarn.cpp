@@ -349,25 +349,35 @@ static llama_kvarn_params kvarn_apply_high_gqa_policy(
         uint32_t n_head,
         uint32_t n_head_kv,
         bool log_changes = false) {
-    if (n_head_kv == 0 || params.key_bits >= 8 ||
-            kvarn_env_flag_01_enabled("LLAMA_KVARN_DISABLE_HIGH_GQA_K8")) {
+    if (n_head_kv == 0 || uint64_t(n_head) < uint64_t(6)*uint64_t(n_head_kv)) {
         return params;
     }
 
-    const uint32_t gqa_ratio = n_head/n_head_kv;
-    if (n_head < 6*n_head_kv) {
-        return params;
-    }
+    const bool promote_k = params.key_bits < 8 &&
+        !kvarn_env_flag_01_enabled("LLAMA_KVARN_DISABLE_HIGH_GQA_K8");
+    const bool promote_v = kvarn_experimental_turbo_v_layout_enabled() && params.value_bits == 2 &&
+        !kvarn_env_flag_01_enabled("LLAMA_KVARN_DISABLE_HIGH_GQA_V4");
 
-    const uint32_t old_k = params.key_bits;
-    params.key_bits = 8;
-    if (log_changes) {
-        std::fprintf(stderr,
-                "llama_kv_cache_kvarn: layer %u high-GQA ratio %u:%u promotes KVarN key bits k%u -> k8 "
-                "(set LLAMA_KVARN_DISABLE_HIGH_GQA_K8=1 only for ablations)\n",
-                il, n_head, n_head_kv, old_k);
+    if (promote_k) {
+        const uint32_t old_k = params.key_bits;
+        params.key_bits = 8;
+        if (log_changes) {
+            std::fprintf(stderr,
+                    "llama_kv_cache_kvarn: layer %u high-GQA ratio %u:%u promotes KVarN key bits k%u -> k8 "
+                    "(set LLAMA_KVARN_DISABLE_HIGH_GQA_K8=1 only for ablations)\n",
+                    il, n_head, n_head_kv, old_k);
+        }
     }
-    GGML_UNUSED(gqa_ratio);
+    if (promote_v) {
+        const uint32_t old_v = params.value_bits;
+        params.value_bits = 4;
+        if (log_changes) {
+            std::fprintf(stderr,
+                    "llama_kv_cache_kvarn: layer %u high-GQA ratio %u:%u promotes canonical KVarN value bits v%u -> v4 "
+                    "(set LLAMA_KVARN_DISABLE_HIGH_GQA_V4=1 only for ablations)\n",
+                    il, n_head, n_head_kv, old_v);
+        }
+    }
     return params;
 }
 

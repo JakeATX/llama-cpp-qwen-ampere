@@ -267,6 +267,7 @@ llama_context::llama_context(
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME_KEEP_F32");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME_DENSE");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DISABLE_HIGH_GQA_K8");
+            (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DISABLE_HIGH_GQA_V4");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DISABLE_FUSED_FWHT");
             (void) llama_kvarn_parse_env_flag("LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES");
