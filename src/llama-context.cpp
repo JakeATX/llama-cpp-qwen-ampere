@@ -11,6 +11,7 @@
 #include "llama-ext.h"
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-kvarn-iswa.h"
+#include "llama-memory-hybrid-kvarn.h"
 #include "llama.h"
 
 #include <cerrno>
@@ -3744,11 +3745,57 @@ llama_context_params llama_context_default_params() {
     return result;
 }
 
+static void llama_kvarn_resolve_effective_cache_policy(
+        const llama_model & model,
+        llama_context_params & params) {
+    if (params.kv_cache_quant_type != LLAMA_KV_CACHE_QUANT_TYPE_KVARN) {
+        return;
+    }
+
+    if (llama_kvarn_is_qwen35_family(model.arch)) {
+        if (llama_kvarn_choose_qwen_hybrid_policy(
+                    llama_kvarn_parse_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA")) ==
+                llama_kvarn_qwen_hybrid_policy::normal_hybrid) {
+            LLAMA_LOG_WARN(
+                    "%s: Qwen 3.5/3.6 hybrid KVarN is below production parity; "
+                    "using the normal F16 KV memory path. Set the legacy experimental-hybrid opt-in "
+                    "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 only for benchmarking/development.\n",
+                    __func__);
+            params.kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_NONE;
+            params.type_k = GGML_TYPE_F16;
+            params.type_v = GGML_TYPE_F16;
+        }
+        return;
+    }
+
+    if (model.arch == LLM_ARCH_GEMMA4) {
+        const bool force_experimental =
+                llama_kvarn_parse_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA");
+        const bool force_normal = force_experimental &&
+                llama_kvarn_parse_env_flag("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK");
+        if (llama_kvarn_gemma4_use_normal_iswa(force_experimental, force_normal)) {
+            LLAMA_LOG_WARN(
+                    "%s: Gemma 4 KVarN+ISWA is below production parity; "
+                    "using normal ISWA KV cache. Set LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 "
+                    "to opt into true KVarN+ISWA for benchmarking/development.\n",
+                    __func__);
+            params.kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_NONE;
+        }
+    }
+}
+
 llama_context * llama_init_from_model(
                  llama_model * model,
         llama_context_params   params) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+        return nullptr;
+    }
+
+    try {
+        llama_kvarn_resolve_effective_cache_policy(*model, params);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to resolve KVarN cache policy: %s\n", __func__, err.what());
         return nullptr;
     }
 

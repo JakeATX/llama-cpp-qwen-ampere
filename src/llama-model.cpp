@@ -2305,15 +2305,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             return create_memory(safe_params, cparams);
         }
 
-        llama_kvarn_validate_memory_support(*this, hparams, params, cparams);
-
-        const bool mtp_on_hybrid_qwen35 =
-            params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-            (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
-
-        if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-            if (arch == LLM_ARCH_GEMMA4 &&
-                    (!llama_kvarn_force_experimental_iswa() || llama_kvarn_force_normal_iswa_fallback())) {
+        if (arch == LLM_ARCH_GEMMA4 && hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+            const bool force_experimental = llama_kvarn_force_experimental_iswa();
+            const bool force_normal = force_experimental && llama_kvarn_force_normal_iswa_fallback();
+            if (llama_kvarn_gemma4_use_normal_iswa(force_experimental, force_normal)) {
                 LLAMA_LOG_WARN(
                         "%s: Gemma 4 KVarN+ISWA is below production parity; "
                         "using normal ISWA KV cache. Set LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 "
@@ -2322,7 +2317,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                 return llama_kvarn_create_normal_iswa_fallback(*this, params, cparams);
             }
+        }
 
+        llama_kvarn_validate_memory_support(*this, hparams, params, cparams);
+
+        const bool mtp_on_hybrid_qwen35 =
+            params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+
+        if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
             llama_memory_i::layer_reuse_cb reuse = nullptr;
             llama_kv_cache_kvarn::layer_filter_cb filter = nullptr;
 

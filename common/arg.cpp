@@ -510,9 +510,6 @@ static void common_kvarn_validate_runtime_params(common_params & params) {
     if (params.n_parallel < 0) {
         params.n_parallel = 1;
     }
-    if (params.n_parallel > 1) {
-        throw std::invalid_argument("KVarN currently supports only --parallel 1");
-    }
 }
 
 static bool parse_bool_value(const std::string & value) {

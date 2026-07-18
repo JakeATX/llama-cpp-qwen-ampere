@@ -178,6 +178,13 @@ static void test_qwen_hybrid_policy() {
             "Qwen hybrid KVarN defaults to the production-safe normal cache");
     require(llama_kvarn_choose_qwen_hybrid_policy(true) == policy::experimental_kvarn,
             "Qwen hybrid KVarN requires an explicit experimental opt-in");
+
+    require(llama_kvarn_gemma4_use_normal_iswa(false, false),
+            "Gemma 4 KVarN defaults to the production-safe normal ISWA cache");
+    require(!llama_kvarn_gemma4_use_normal_iswa(true, false),
+            "Gemma 4 KVarN requires an explicit experimental opt-in");
+    require(llama_kvarn_gemma4_use_normal_iswa(true, true),
+            "Gemma 4 legacy force-normal override takes precedence over experimental opt-in");
 }
 
 static void test_no_update_context_apply() {

@@ -20,6 +20,12 @@ constexpr llama_kvarn_iswa_full_normal_policy llama_kvarn_iswa_choose_full_norma
                               : llama_kvarn_iswa_full_normal_policy::none;
 }
 
+constexpr bool llama_kvarn_gemma4_use_normal_iswa(
+        bool force_experimental,
+        bool force_normal) {
+    return !force_experimental || force_normal;
+}
+
 // Composite cache for models that mix dense/full-attention layers with SWA
 // layers: KVarN owns non-SWA physical KV layers, while the existing SWA cache
 // owns sliding-window layers.

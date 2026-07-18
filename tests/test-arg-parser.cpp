@@ -155,11 +155,13 @@ int main(void) {
 
     params = {};
     argv = {"binary_name", "--parallel", "2", "--kv-cache-quant", "kvarn"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.n_parallel == 2);
 
     params = {};
     argv = {"binary_name", "--kv-cache-quant", "kvarn", "--parallel", "2"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.n_parallel == 2);
 
     params = {};
     argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "unknown"};
