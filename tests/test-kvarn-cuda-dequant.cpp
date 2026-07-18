@@ -710,6 +710,17 @@ static void turbo_test_fwht128(std::vector<float> & x) {
     }
 }
 
+static void turbo_test_inverse128(std::vector<float> & x) {
+    require(x.size() == 128, "Turbo inverse test block has 128 channels");
+    for (uint32_t j = 0; j < 128; ++j) {
+        x[j] *= TURBO_TEST_S2[j];
+    }
+    turbo_test_fwht128(x);
+    for (uint32_t j = 0; j < 128; ++j) {
+        x[j] *= TURBO_TEST_S1[j];
+    }
+}
+
 static void turbo_test_pack_ref(
         const std::vector<float> & v_tile,
         uint32_t head_dim,
@@ -754,11 +765,13 @@ static void turbo_test_pack_ref(
             }
             const float recon_norm = std::sqrt(float(rss));
             const float corrected_norm = recon_norm > 1.0e-10f ? norm/recon_norm : norm;
+            float dequant_norm = corrected_norm;
             if (canonical_layout) {
                 const size_t block_off = (size_t(g)*blocks_per_row + b)*turbo_test_block_bytes(bits);
                 const uint16_t norm_bits = f32_to_f16_bits(corrected_norm);
                 body[block_off + 0] = uint8_t(norm_bits & 0xffu);
                 body[block_off + 1] = uint8_t(norm_bits >> 8);
+                dequant_norm = f16_bits_to_f32(norm_bits);
                 if (bits == 4) {
                     body[block_off + 2] = 0;
                     body[block_off + 3] = 0;
@@ -781,7 +794,7 @@ static void turbo_test_pack_ref(
                         ((qi*4u) >> 3);
                     body[byte_pos] |= uint8_t((q[j] & 0x0fu) << ((j & 1u)*4u));
                 }
-                deq_rot[qi] = turbo_test_centroid(bits, q[j])*corrected_norm;
+                deq_rot[qi] = turbo_test_centroid(bits, q[j])*dequant_norm;
             }
         }
     }
@@ -5168,7 +5181,7 @@ static void test_experimental_turbo_v_codec(uint32_t head_dim, uint32_t bits, bo
     set_env_var("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", canonical_layout ? "1" : "0");
     ggml_cuda_kvarn_store_v_body_reference_minmax(
             v_tile_d, v_body_d, v_scales_d, scratch_d,
-            head_dim, group, bits, 0, 1.0f, canonical_layout ? 2u : 1u, false, nullptr);
+            head_dim, group, bits, 0, 1.0f, canonical_layout ? 2u : 1u, true, nullptr);
     require_cuda(cudaGetLastError(), "KVarN CUDA experimental Turbo V store launch");
     require_cuda(cudaDeviceSynchronize(), "KVarN CUDA experimental Turbo V store sync");
 
@@ -5254,6 +5267,161 @@ static void test_experimental_turbo_v_codec(uint32_t head_dim, uint32_t bits, bo
     cudaFree(v_out_d);
 }
 
+static void test_canonical_turbo_v_mixed_attention() {
+    const uint32_t head_dim = 256;
+    const uint32_t group = 128;
+    const uint32_t key_bits = 8;
+    const uint32_t value_bits = 2;
+    const uint32_t n_records = 2;
+    const uint32_t n_sink = 2;
+    const uint32_t n_pending = 3;
+    const uint32_t n_tail = 2;
+    const uint32_t tail_start = 1;
+    const uint32_t n_tokens = n_sink + n_records*group + n_pending + n_tail;
+    const size_t k_body_record_bytes = packed_nbytes(size_t(head_dim)*group, key_bits);
+    const size_t v_body_record_bytes = size_t(group)*(head_dim/128u)*turbo_test_block_bytes(value_bits);
+    const size_t k_scale_record_floats = size_t(2)*head_dim + group;
+    const size_t v_scale_record_floats = head_dim + size_t(2)*group;
+
+    std::vector<uint8_t> v_body(size_t(n_records)*v_body_record_bytes, 0);
+    std::vector<float> v_scales(size_t(n_records)*v_scale_record_floats, 0.0f);
+    std::vector<std::vector<float>> v_deq_rot(n_records);
+    for (uint32_t r = 0; r < n_records; ++r) {
+        std::vector<float> v_tile(size_t(head_dim)*group);
+        for (uint32_t g = 0; g < group; ++g) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                v_tile[size_t(g)*head_dim + d] =
+                    0.31f*std::sin(float(3*d + 11*g + 17*r)*0.017f) +
+                    0.09f*std::cos(float(7*d - 5*g + 13*r)*0.013f);
+            }
+        }
+        std::vector<uint8_t> body_record;
+        std::vector<float> scales_record;
+        turbo_test_pack_ref(
+                v_tile, head_dim, group, value_bits, true,
+                body_record, scales_record, v_deq_rot[r]);
+        require(body_record.size() == v_body_record_bytes, "canonical Turbo V2 record size matches layout");
+        std::copy(body_record.begin(), body_record.end(), v_body.begin() + size_t(r)*v_body_record_bytes);
+    }
+
+    std::vector<uint16_t> sink_tail_k(size_t(n_sink + n_tail)*head_dim, f32_to_f16_bits(0.0f));
+    std::vector<uint16_t> sink_tail_v(sink_tail_k.size());
+    for (uint32_t t = 0; t < n_sink + n_tail; ++t) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const float v = 0.12f*std::cos(float(5*d + 19*t)*0.021f) + 0.01f*float(t + 1);
+            sink_tail_v[size_t(t)*head_dim + d] = f32_to_f16_bits(v);
+        }
+    }
+
+    std::vector<float> pending_k(size_t(n_pending)*head_dim, 0.0f);
+    std::vector<float> pending_v(pending_k.size());
+    for (uint32_t t = 0; t < n_pending; ++t) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            pending_v[size_t(t)*head_dim + d] =
+                0.08f*std::sin(float(9*d + 23*t)*0.019f) - 0.015f*float(t + 1);
+        }
+    }
+
+    const float prob = 1.0f/float(n_tokens);
+    std::vector<float> ref(head_dim, 0.0f);
+    std::vector<float> body_rot(head_dim, 0.0f);
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        for (uint32_t t = 0; t < n_sink; ++t) {
+            ref[d] += prob*f16_bits_to_f32(sink_tail_v[size_t(t)*head_dim + d]);
+        }
+        for (uint32_t r = 0; r < n_records; ++r) {
+            for (uint32_t g = 0; g < group; ++g) {
+                body_rot[d] += prob*v_deq_rot[r][size_t(g)*head_dim + d];
+            }
+        }
+        for (uint32_t t = 0; t < n_pending; ++t) {
+            ref[d] += prob*pending_v[size_t(t)*head_dim + d];
+        }
+        for (uint32_t t = 0; t < n_tail; ++t) {
+            const uint32_t slot = (tail_start + t)%n_tail;
+            ref[d] += prob*f16_bits_to_f32(sink_tail_v[size_t(n_sink + slot)*head_dim + d]);
+        }
+    }
+    for (uint32_t b = 0; b < head_dim/128u; ++b) {
+        std::vector<float> block(128);
+        std::copy(body_rot.begin() + size_t(b)*128, body_rot.begin() + size_t(b + 1)*128, block.begin());
+        turbo_test_inverse128(block);
+        for (uint32_t j = 0; j < 128; ++j) {
+            ref[size_t(b)*128 + j] += block[j];
+        }
+    }
+
+    std::vector<float> q(head_dim, 0.0f);
+    std::vector<uint8_t> k_body(size_t(n_records)*k_body_record_bytes, 0);
+    std::vector<float> k_scales(size_t(n_records)*k_scale_record_floats, 0.0f);
+    float * q_d = cuda_upload(q);
+    uint16_t * sink_tail_k_d = cuda_upload(sink_tail_k);
+    uint16_t * sink_tail_v_d = cuda_upload(sink_tail_v);
+    uint8_t * k_body_d = cuda_upload(k_body);
+    uint8_t * v_body_d = cuda_upload(v_body);
+    float * k_scales_d = cuda_upload(k_scales);
+    float * v_scales_d = cuda_upload(v_scales);
+    float * pending_k_d = cuda_upload(pending_k);
+    float * pending_v_d = cuda_upload(pending_v);
+    float * out_d = nullptr;
+    float * scores_d = nullptr;
+    require_cuda(cudaMalloc(&out_d, head_dim*sizeof(float)), "cudaMalloc canonical Turbo mixed output");
+    require_cuda(cudaMalloc(&scores_d, n_tokens*sizeof(float)), "cudaMalloc canonical Turbo mixed scores");
+
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            q_d, sink_tail_k_d, sink_tail_v_d,
+            k_body_d, v_body_d, k_scales_d, v_scales_d,
+            pending_k_d, pending_v_d, nullptr,
+            out_d, scores_d,
+            1, 1, 1,
+            n_sink, n_records, n_pending, n_tail, tail_start,
+            head_dim, group, key_bits, value_bits,
+            head_dim, head_dim,
+            head_dim, head_dim,
+            size_t(n_sink + n_tail)*head_dim, head_dim,
+            size_t(n_pending)*head_dim, head_dim,
+            k_body_record_bytes, v_body_record_bytes,
+            size_t(n_records)*k_body_record_bytes, size_t(n_records)*v_body_record_bytes,
+            k_scale_record_floats, v_scale_record_floats,
+            size_t(n_records)*k_scale_record_floats, size_t(n_records)*v_scale_record_floats,
+            0, 0, 0, 1.0f,
+            nullptr, nullptr, 0, 0, nullptr, 0, 0.0f, 2u);
+    require_cuda(cudaGetLastError(), "KVarN CUDA canonical Turbo mixed-attention launch");
+    require_cuda(cudaDeviceSynchronize(), "KVarN CUDA canonical Turbo mixed-attention sync");
+
+    std::vector<float> got(head_dim);
+    require_cuda(cudaMemcpy(got.data(), out_d, got.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy canonical Turbo mixed output");
+    float max_err = 0.0f;
+    size_t worst = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const float err = std::fabs(got[i] - ref[i]);
+        if (err > max_err) {
+            max_err = err;
+            worst = i;
+        }
+    }
+    if (max_err >= 5.0e-5f) {
+        std::fprintf(stderr,
+                "canonical Turbo mixed-attention mismatch: err=%g d=%zu ref=%g cuda=%g\n",
+                double(max_err), worst, double(ref[worst]), double(got[worst]));
+    }
+    require(max_err < 5.0e-5f,
+            "CUDA canonical Turbo V2 mixed attention matches E + S1*H*S2(body) oracle");
+
+    cudaFree(q_d);
+    cudaFree(sink_tail_k_d);
+    cudaFree(sink_tail_v_d);
+    cudaFree(k_body_d);
+    cudaFree(v_body_d);
+    cudaFree(k_scales_d);
+    cudaFree(v_scales_d);
+    cudaFree(pending_k_d);
+    cudaFree(pending_v_d);
+    cudaFree(out_d);
+    cudaFree(scores_d);
+}
+
 int main() {
     const char * materialize_only = std::getenv("LLAMA_KVARN_TEST_MATERIALIZE_ONLY");
     if (materialize_only != nullptr && std::strcmp(materialize_only, "0") != 0) {
@@ -5289,6 +5457,7 @@ int main() {
         test_experimental_turbo_v_codec(512, 4, true);
         test_experimental_turbo_v_codec(128, 2, true);
         test_experimental_turbo_v_codec(512, 2, true);
+        test_canonical_turbo_v_mixed_attention();
     }
 
     for (float rtn_quantile : { 0.95f, 1.0f }) {

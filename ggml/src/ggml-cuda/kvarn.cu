@@ -910,6 +910,9 @@ static __device__ __forceinline__ float kvarn_turbo_v_dequant_rotated(
             const uint8_t * qs = v_body + block_off + 4u;
             q = (uint32_t(qs[j >> 1]) >> ((j & 1u)*4u)) & 0x0fu;
         }
+    } else {
+        q = kvarn_unpack_one(v_body, value_bits, size_t(g)*head_dim + d);
+        norm = v_scales[size_t(g)*(head_dim/128u) + block128];
     }
     return kvarn_turbo_centroid(value_bits, q)*norm;
 }
@@ -5690,6 +5693,84 @@ static __global__ void kvarn_attn_mixed_f16_av_kernel(
     out[d] = sum;
 }
 
+// Canonical Turbo V stores each 128-channel body block in the
+// S2*H_normalized*S1 basis.  Sink, pending, and tail values remain in the
+// ordinary KVarN frame, so only the weighted body contribution may be
+// transformed back before the components are added.
+static __global__ void kvarn_attn_mixed_f16_turbo2_av_kernel(
+        const float * __restrict__ probs,
+        const uint16_t * __restrict__ sink_tail_v,
+        const uint8_t * __restrict__ v_body,
+        const float * __restrict__ v_scales,
+        const float * __restrict__ pending_v,
+        float * __restrict__ out,
+        uint32_t n_sink,
+        uint32_t n_records,
+        uint32_t n_pending,
+        uint32_t n_tail,
+        uint32_t tail_start,
+        uint32_t head_dim,
+        uint32_t group_size,
+        uint32_t value_bits,
+        size_t sink_tail_stride_token_f16,
+        size_t pending_stride_token_floats,
+        size_t v_body_stride_bytes,
+        size_t v_scale_stride_floats) {
+    const uint32_t j = threadIdx.x;
+    const uint32_t d = blockIdx.x*128u + j;
+    if (j >= 128u || d >= head_dim) {
+        return;
+    }
+
+    const uint32_t n_body_tokens = n_records*group_size;
+    float exact_sum = 0.0f;
+    float body_sum = 0.0f;
+
+    for (uint32_t t = 0; t < n_sink; ++t) {
+        const uint16_t * v = sink_tail_v + size_t(t)*sink_tail_stride_token_f16;
+        exact_sum += probs[t]*__half2float(reinterpret_cast<const __half *>(v)[d]);
+    }
+
+    for (uint32_t r = 0; r < n_records; ++r) {
+        const uint8_t * v_record = v_body + size_t(r)*v_body_stride_bytes;
+        const float * v_record_scales = v_scales + size_t(r)*v_scale_stride_floats;
+        for (uint32_t g = 0; g < group_size; ++g) {
+            const float v = kvarn_turbo_v_dequant_rotated(
+                    v_record, v_record_scales, head_dim, group_size, value_bits, g, d, 2u);
+            body_sum += probs[size_t(n_sink) + size_t(r)*group_size + g]*v;
+        }
+    }
+
+    for (uint32_t t = 0; t < n_pending; ++t) {
+        const float * v = pending_v + size_t(t)*pending_stride_token_floats;
+        exact_sum += probs[size_t(n_sink) + n_body_tokens + t]*v[d];
+    }
+
+    for (uint32_t t = 0; t < n_tail; ++t) {
+        const uint32_t tail_slot = (tail_start + t)%n_tail;
+        const uint16_t * v = sink_tail_v + size_t(n_sink + tail_slot)*sink_tail_stride_token_f16;
+        exact_sum += probs[size_t(n_sink) + n_body_tokens + n_pending + t]*
+                __half2float(reinterpret_cast<const __half *>(v)[d]);
+    }
+
+    __shared__ float body_block[128];
+    body_block[j] = body_sum*KVARN_TURBO_WHT_SIGNS2_128[j];
+    __syncthreads();
+
+    for (uint32_t step = 1; step < 128; step <<= 1) {
+        if ((j & step) == 0) {
+            const uint32_t j1 = j + step;
+            const float a = body_block[j];
+            const float b = body_block[j1];
+            body_block[j]  = a + b;
+            body_block[j1] = a - b;
+        }
+        __syncthreads();
+    }
+
+    out[d] = exact_sum + body_block[j]*0.08838834764831845f*KVARN_TURBO_WHT_SIGNS1_128[j];
+}
+
 static __global__ void kvarn_attn_mixed_f16_fused_kernel(
         const float * __restrict__ q,
         const float * __restrict__ q_body,
@@ -7372,8 +7453,10 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const bool use_raw_body_k = kvarn_debug_raw_body_k_enabled();
     const bool use_raw_body_v = kvarn_debug_raw_body_v_enabled();
     const bool use_raw_body_scalar_qt = kvarn_debug_raw_body_scalar_qt_enabled() && (use_raw_body_k || use_raw_body_v);
+    const bool use_turbo2_body_inverse = turbo_v_mode == 2u && n_records != 0 && !use_raw_body_v;
     const bool use_split_kernels =
         mixed_frame ||
+        use_turbo2_body_inverse ||
         ((use_raw_body_k || use_raw_body_v) && !use_raw_body_scalar_qt) ||
         kvarn_env_flag("LLAMA_KVARN_ATTN_SPLIT_KERNELS");
     const bool use_serial_fused = force_serial_fused && !use_split_kernels;
@@ -8345,12 +8428,21 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             n_sink, n_records, n_pending, n_tail, head_dim, n_tokens,
                             1, block, reduce_shmem);
                 }
-                kvarn_attn_mixed_f16_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
-                        scores, v_st_ptr, v_body_ptr, v_scales_ptr, raw_body_v_ptr,
-                        pending_v_ptr, out_ptr,
-                        n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, value_bits,
-                        sink_tail_stride_token_f16, pending_stride_token_floats,
-                        v_body_stride_record_bytes, v_scale_stride_record_floats, turbo_v_mode);
+                if (use_turbo2_body_inverse) {
+                    kvarn_attn_mixed_f16_turbo2_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
+                            scores, v_st_ptr, v_body_ptr, v_scales_ptr,
+                            pending_v_ptr, out_ptr,
+                            n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, value_bits,
+                            sink_tail_stride_token_f16, pending_stride_token_floats,
+                            v_body_stride_record_bytes, v_scale_stride_record_floats);
+                } else {
+                    kvarn_attn_mixed_f16_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
+                            scores, v_st_ptr, v_body_ptr, v_scales_ptr, raw_body_v_ptr,
+                            pending_v_ptr, out_ptr,
+                            n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, value_bits,
+                            sink_tail_stride_token_f16, pending_stride_token_floats,
+                            v_body_stride_record_bytes, v_scale_stride_record_floats, turbo_v_mode);
+                }
                 kvarn_cuda_trace_launch_error(
                         "split-av", n_queries, n_head, n_head_kv,
                         n_sink, n_records, n_pending, n_tail, head_dim, n_tokens,
@@ -8384,12 +8476,21 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             "serial-softmax-global", n_queries, n_head, n_head_kv,
                             n_sink, n_records, n_pending, n_tail, head_dim, n_tokens,
                             1, block, reduce_shmem);
-                    kvarn_attn_mixed_f16_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
-                            scores, v_st_ptr, v_body_ptr, v_scales_ptr, nullptr,
-                            pending_v_ptr, out_ptr,
-                            n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, value_bits,
-                            sink_tail_stride_token_f16, pending_stride_token_floats,
-                            v_body_stride_record_bytes, v_scale_stride_record_floats, turbo_v_mode);
+                    if (use_turbo2_body_inverse) {
+                        kvarn_attn_mixed_f16_turbo2_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
+                                scores, v_st_ptr, v_body_ptr, v_scales_ptr,
+                                pending_v_ptr, out_ptr,
+                                n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, value_bits,
+                                sink_tail_stride_token_f16, pending_stride_token_floats,
+                                v_body_stride_record_bytes, v_scale_stride_record_floats);
+                    } else {
+                        kvarn_attn_mixed_f16_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
+                                scores, v_st_ptr, v_body_ptr, v_scales_ptr, nullptr,
+                                pending_v_ptr, out_ptr,
+                                n_sink, n_records, n_pending, n_tail, tail_start, head_dim, group_size, value_bits,
+                                sink_tail_stride_token_f16, pending_stride_token_floats,
+                                v_body_stride_record_bytes, v_scale_stride_record_floats, turbo_v_mode);
+                    }
                     kvarn_cuda_trace_launch_error(
                             "serial-av-global", n_queries, n_head, n_head_kv,
                             n_sink, n_records, n_pending, n_tail, head_dim, n_tokens,
