@@ -355,8 +355,6 @@ static llama_kvarn_params kvarn_apply_high_gqa_policy(
 
     const bool promote_k = params.key_bits < 8 &&
         !kvarn_env_flag_01_enabled("LLAMA_KVARN_DISABLE_HIGH_GQA_K8");
-    const bool promote_v = kvarn_experimental_turbo_v_layout_enabled() && params.value_bits == 2 &&
-        !kvarn_env_flag_01_enabled("LLAMA_KVARN_DISABLE_HIGH_GQA_V4");
 
     if (promote_k) {
         const uint32_t old_k = params.key_bits;
@@ -366,16 +364,6 @@ static llama_kvarn_params kvarn_apply_high_gqa_policy(
                     "llama_kv_cache_kvarn: layer %u high-GQA ratio %u:%u promotes KVarN key bits k%u -> k8 "
                     "(set LLAMA_KVARN_DISABLE_HIGH_GQA_K8=1 only for ablations)\n",
                     il, n_head, n_head_kv, old_k);
-        }
-    }
-    if (promote_v) {
-        const uint32_t old_v = params.value_bits;
-        params.value_bits = 4;
-        if (log_changes) {
-            std::fprintf(stderr,
-                    "llama_kv_cache_kvarn: layer %u high-GQA ratio %u:%u promotes canonical KVarN value bits v%u -> v4 "
-                    "(set LLAMA_KVARN_DISABLE_HIGH_GQA_V4=1 only for ablations)\n",
-                    il, n_head, n_head_kv, old_v);
         }
     }
     return params;

@@ -1525,7 +1525,6 @@ static void test_runtime_metadata() {
     auto clear_high_gqa_policy_env = []() {
         set_test_env("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", nullptr);
         set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", nullptr);
-        set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_V4", nullptr);
         set_test_env("LLAMA_KVARN_LAYER_KEY_BITS", nullptr);
         set_test_env("LLAMA_KVARN_LAYER_VALUE_BITS", nullptr);
     };
@@ -1534,12 +1533,10 @@ static void test_runtime_metadata() {
             const llama_hparams & case_hparams,
             const char * canonical_layout,
             const char * disable_k8,
-            const char * disable_v4,
             const char * layer_value_bits) {
         clear_high_gqa_policy_env();
         set_test_env("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", canonical_layout);
         set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_K8", disable_k8);
-        set_test_env("LLAMA_KVARN_DISABLE_HIGH_GQA_V4", disable_v4);
         set_test_env("LLAMA_KVARN_LAYER_VALUE_BITS", layer_value_bits);
         try {
             llama_kv_cache_kvarn case_cache(nullptr, case_hparams, case_params, false, 512, 4, 1, nullptr);
@@ -1557,40 +1554,29 @@ static void test_runtime_metadata() {
     k8_v2_params.key_bits = 8;
     k8_v2_params.value_bits = 2;
     const high_gqa_policy_result canonical_k8_v2 = run_high_gqa_policy_case(
-            k8_v2_params, hparams_high_gqa, "1", nullptr, nullptr, nullptr);
-    require(canonical_k8_v2.k.key_bits == 8 && canonical_k8_v2.v.value_bits == 4,
-            "canonical high-GQA K8V2 independently promotes V to K8V4");
+            k8_v2_params, hparams_high_gqa, "1", nullptr, nullptr);
+    require(canonical_k8_v2.k.key_bits == 8 && canonical_k8_v2.v.value_bits == 2,
+            "canonical high-GQA K8V2 preserves explicitly requested V2");
     require(canonical_k8_v2.v.v_layout == LLAMA_KVARN_V_LAYOUT_TURBO_CANONICAL,
-            "canonical high-GQA V4 uses canonical V layout");
-    require(canonical_k8_v2.v.v_body_bytes == 8704,
-            "canonical high-GQA V4 has exact 128-d body bytes");
+            "canonical high-GQA V2 uses the requested canonical V layout");
+    require(canonical_k8_v2.v.v_body_bytes == 4352,
+            "canonical high-GQA V2 has exact 128-d body bytes");
 
     const high_gqa_policy_result canonical_low_k_v2 = run_high_gqa_policy_case(
-            params, hparams_high_gqa, "1", nullptr, nullptr, nullptr);
-    require(canonical_low_k_v2.k.key_bits == 8 && canonical_low_k_v2.v.value_bits == 4,
-            "canonical high-GQA low-K/V2 independently promotes to K8V4");
+            params, hparams_high_gqa, "1", nullptr, nullptr);
+    require(canonical_low_k_v2.k.key_bits == 8 && canonical_low_k_v2.v.value_bits == 2,
+            "canonical high-GQA promotes K8 without changing requested V2");
 
     const high_gqa_policy_result canonical_k_optout = run_high_gqa_policy_case(
-            params, hparams_high_gqa, "1", "1", nullptr, nullptr);
-    require(canonical_k_optout.k.key_bits == params.key_bits && canonical_k_optout.v.value_bits == 4,
-            "high-GQA K8 opt-out does not bypass canonical V4 promotion");
-
-    const high_gqa_policy_result canonical_v_optout = run_high_gqa_policy_case(
-            params, hparams_high_gqa, "1", nullptr, "1", nullptr);
-    require(canonical_v_optout.k.key_bits == 8 && canonical_v_optout.v.value_bits == params.value_bits,
-            "high-GQA V4 opt-out does not bypass K8 promotion");
-
-    const high_gqa_policy_result canonical_both_optout = run_high_gqa_policy_case(
-            params, hparams_high_gqa, "1", "1", "1", nullptr);
-    require(canonical_both_optout.k.key_bits == params.key_bits &&
-            canonical_both_optout.v.value_bits == params.value_bits,
-            "both high-GQA opt-outs preserve requested K and V bits");
+            params, hparams_high_gqa, "1", "1", nullptr);
+    require(canonical_k_optout.k.key_bits == params.key_bits && canonical_k_optout.v.value_bits == 2,
+            "high-GQA K8 opt-out preserves requested K and V2 bits");
 
     llama_hparams hparams_exact_5x = hparams_high_gqa;
     hparams_exact_5x.n_head_arr[0] = 5;
     hparams_exact_5x.n_head_kv_arr[0] = 1;
     const high_gqa_policy_result canonical_exact_5x = run_high_gqa_policy_case(
-            params, hparams_exact_5x, "1", nullptr, nullptr, nullptr);
+            params, hparams_exact_5x, "1", nullptr, nullptr);
     require(canonical_exact_5x.k.key_bits == params.key_bits &&
             canonical_exact_5x.v.value_bits == params.value_bits,
             "canonical exact 5x GQA preserves requested K and V bits");
@@ -1599,12 +1585,12 @@ static void test_runtime_metadata() {
     hparams_exact_6x.n_head_arr[0] = 6;
     hparams_exact_6x.n_head_kv_arr[0] = 1;
     const high_gqa_policy_result canonical_exact_6x = run_high_gqa_policy_case(
-            params, hparams_exact_6x, "1", nullptr, nullptr, nullptr);
-    require(canonical_exact_6x.k.key_bits == 8 && canonical_exact_6x.v.value_bits == 4,
-            "canonical exact 6x GQA promotes to K8V4");
+            params, hparams_exact_6x, "1", nullptr, nullptr);
+    require(canonical_exact_6x.k.key_bits == 8 && canonical_exact_6x.v.value_bits == 2,
+            "canonical exact 6x GQA promotes K8 and preserves V2");
 
     const high_gqa_policy_result noncanonical_high_gqa = run_high_gqa_policy_case(
-            params, hparams_high_gqa, "0", nullptr, nullptr, nullptr);
+            params, hparams_high_gqa, "0", nullptr, nullptr);
     require(noncanonical_high_gqa.k.key_bits == 8 && noncanonical_high_gqa.v.value_bits == params.value_bits,
             "noncanonical high-GQA promotes K8 without changing V2");
 
@@ -1612,36 +1598,21 @@ static void test_runtime_metadata() {
     explicit_v4_params.key_bits = 8;
     explicit_v4_params.value_bits = 4;
     const high_gqa_policy_result canonical_explicit_v4 = run_high_gqa_policy_case(
-            explicit_v4_params, hparams_high_gqa, "1", nullptr, nullptr, nullptr);
+            explicit_v4_params, hparams_high_gqa, "1", nullptr, nullptr);
     require(canonical_explicit_v4.k.key_bits == 8 && canonical_explicit_v4.v.value_bits == 4,
             "canonical high-GQA preserves explicit K8V4");
 
-    const high_gqa_policy_result canonical_zero_optouts = run_high_gqa_policy_case(
-            params, hparams_high_gqa, "1", "0", "0", nullptr);
-    require(canonical_zero_optouts.k.key_bits == 8 && canonical_zero_optouts.v.value_bits == 4,
-            "high-GQA K8 and V4 opt-out flags treat 0 as disabled");
-
-    bool rejected_bad_high_gqa_v4_env = false;
-    try {
-        (void) run_high_gqa_policy_case(params, hparams_high_gqa, "1", nullptr, "false", nullptr);
-    } catch (const std::invalid_argument & e) {
-        rejected_bad_high_gqa_v4_env =
-            std::strstr(e.what(), "LLAMA_KVARN_DISABLE_HIGH_GQA_V4=false") != nullptr;
-    }
-    clear_high_gqa_policy_env();
-    require(rejected_bad_high_gqa_v4_env, "high-GQA V4 opt-out rejects non-0/1 env values");
+    const high_gqa_policy_result canonical_zero_optout = run_high_gqa_policy_case(
+            params, hparams_high_gqa, "1", "0", nullptr);
+    require(canonical_zero_optout.k.key_bits == 8 && canonical_zero_optout.v.value_bits == 2,
+            "high-GQA K8 opt-out flag 0 preserves K8 promotion and requested V2");
 
     llama_kvarn_params base_v4_params = params;
     base_v4_params.value_bits = 4;
     const high_gqa_policy_result canonical_layer_v2 = run_high_gqa_policy_case(
-            base_v4_params, hparams_high_gqa, "1", nullptr, nullptr, "0=2");
-    require(canonical_layer_v2.k.key_bits == 8 && canonical_layer_v2.v.value_bits == 4,
-            "canonical high-GQA promotes an effective per-layer V2 override to V4");
-
-    const high_gqa_policy_result canonical_layer_v2_optout = run_high_gqa_policy_case(
-            base_v4_params, hparams_high_gqa, "1", nullptr, "1", "0=2");
-    require(canonical_layer_v2_optout.k.key_bits == 8 && canonical_layer_v2_optout.v.value_bits == 2,
-            "high-GQA V4 opt-out preserves an effective per-layer V2 override");
+            base_v4_params, hparams_high_gqa, "1", nullptr, "0=2");
+    require(canonical_layer_v2.k.key_bits == 8 && canonical_layer_v2.v.value_bits == 2,
+            "canonical high-GQA preserves an effective per-layer V2 override");
     clear_high_gqa_policy_env();
 
 }

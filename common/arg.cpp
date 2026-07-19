@@ -2178,7 +2178,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_CACHE_QUANT"));
     add_opt(common_arg(
         {"--kvarn-preset"}, "PRESET",
-        "KVarN preset to use with --kv-cache-quant kvarn, kvarn_k<K>v<V>_g128 with K,V in [2,8] (e.g. kvarn_k4v4_g128, kvarn_k8v8_g128; V2 presets are measurement-only on high-GQA routes)",
+        "KVarN preset to use with --kv-cache-quant kvarn, kvarn_k<K>v<V>_g128 with K,V in [2,8] (e.g. kvarn_k8v2_g128, kvarn_k8v8_g128)",
         [](common_params & params, const std::string & value) {
             common_kvarn_apply_preset(params, value);
             common_kvarn_validate(params.kvarn);
