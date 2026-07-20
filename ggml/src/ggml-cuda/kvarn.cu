@@ -7583,7 +7583,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             constexpr int q1_block = 256;
 
             if (head_dim == 256 && n_gqa >= 8) {
-                constexpr int ht = 8;
+                constexpr int ht = 2;
                 const size_t q1_shmem =
                     (size_t(ht)*head_dim + size_t(ht)*n_tokens +
                      size_t(q1_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
@@ -7627,7 +7627,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             }
 
             if (n_gqa >= 4) {
-                constexpr int ht = 4;
+                constexpr int ht = 2;
                 const size_t q1_shmem =
                     (size_t(ht)*head_dim + size_t(ht)*n_tokens +
                      size_t(q1_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
