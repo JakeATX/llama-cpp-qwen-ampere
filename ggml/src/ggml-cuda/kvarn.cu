@@ -8207,6 +8207,60 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 }
                 return;
             }
+
+            constexpr int scalar_gqa_q1_ht = 2;
+            const bool scalar_gqa_q1_shape =
+                qt_override == 0 &&
+                key_bits == 8 && value_bits == 2 && group_size == 128 && turbo_v_mode == 0 &&
+                q_body == nullptr && frame_flags == 0 &&
+                n_head_kv != 0 && n_head % n_head_kv == 0 && n_gqa >= 2 && n_gqa % 2 == 0 &&
+                !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT") &&
+                !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_Q1_GQA_SCALAR") &&
+                scalar_body_k_f32 == nullptr && scalar_body_v_f32 == nullptr;
+            if (scalar_gqa_q1_shape) {
+                const size_t scalar_gqa_q1_shmem =
+                    (size_t(scalar_gqa_q1_ht)*head_dim + size_t(scalar_gqa_q1_ht)*n_tokens +
+                     size_t(scalar_qt_block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
+                if (kvarn_cuda_dynamic_shmem_fits(scalar_gqa_q1_shmem) &&
+                        kvarn_cuda_prepare_dynamic_shmem(
+                            kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<1, scalar_gqa_q1_ht>,
+                            scalar_gqa_q1_shmem)) {
+                    const int scalar_gqa_q1_grid = int(
+                            n_queries*n_head_kv*(n_gqa/uint32_t(scalar_gqa_q1_ht)));
+                    if (kvarn_attn_trace_claim()) {
+                        std::fprintf(stderr,
+                                "KVarN CUDA mixed-attn inner trace: mode=scalar-qt-gqa head_dim=%u n_queries=%u n_head=%u"
+                                " n_head_kv=%u n_gqa=%u sink=%u records=%u pending=%u tail=%u tail_start=%u"
+                                " tokens=%u qt=1 ht=%d block=%d grid=%d shmem=%zu scores_nelems=%" PRId64
+                                " body_records_cap=%" PRId64 " body_mirror_allowed=0 body_mirror_used=0"
+                                " kq_mask_type=%u kq_mask_stride_query_bytes=%zu kq_mask_stride_token_bytes=%zu\n",
+                                head_dim, n_queries, n_head, n_head_kv, n_gqa,
+                                n_sink, n_records, n_pending, n_tail, tail_start, n_tokens,
+                                scalar_gqa_q1_ht, scalar_qt_block, scalar_gqa_q1_grid, scalar_gqa_q1_shmem,
+                                scores_nelems, k_body_records_cap,
+                                kq_mask_type, kq_mask_stride_query_bytes, kq_mask_stride_token_bytes);
+                    }
+                    kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel<1, scalar_gqa_q1_ht>
+                        <<<scalar_gqa_q1_grid, scalar_qt_block, scalar_gqa_q1_shmem, cuda_stream>>>(
+                            q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales,
+                            pending_k, pending_v, kq_mask,
+                            nullptr, nullptr,
+                            out, scores, n_queries, n_head, n_head_kv,
+                            n_sink, n_records, n_pending, n_tail, tail_start,
+                            head_dim, group_size, key_bits, value_bits,
+                            q_stride_head_floats, q_stride_query_floats,
+                            out_stride_head_floats, out_stride_query_floats,
+                            sink_tail_stride_head_f16, sink_tail_stride_token_f16,
+                            pending_stride_head_floats, pending_stride_token_floats,
+                            k_body_stride_record_bytes, v_body_stride_record_bytes,
+                            k_body_stride_head_bytes, v_body_stride_head_bytes,
+                            k_scale_stride_record_floats, v_scale_stride_record_floats,
+                            k_scale_stride_head_floats, v_scale_stride_head_floats,
+                            kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
+                            kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
+                    return;
+                }
+            }
         }
 
         if (use_raw_body_scalar_qt) {
