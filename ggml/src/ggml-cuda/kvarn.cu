@@ -7358,66 +7358,64 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel(
             }
         }
         bool used_packed_k8v2_av = false;
-        if constexpr (QT == 1 && HT == 2) {
-            if (key_bits == 8 && value_bits == 2 && group_size == 128 &&
-                    turbo_v_mode == 0 && v_body_f32_head == nullptr) {
-                for (uint32_t t = 0; t < n_sink; ++t) {
-                    const uint16_t * v = v_st + size_t(t)*sink_tail_stride_token_f16;
-                    const float vv = __half2float(reinterpret_cast<const __half *>(v)[d]);
+        if (key_bits == 8 && value_bits == 2 && group_size == 128 &&
+                turbo_v_mode == 0 && v_body_f32_head == nullptr) {
+            for (uint32_t t = 0; t < n_sink; ++t) {
+                const uint16_t * v = v_st + size_t(t)*sink_tail_stride_token_f16;
+                const float vv = __half2float(reinterpret_cast<const __half *>(v)[d]);
 #pragma unroll
-                    for (int h = 0; h < HT; ++h) {
+                for (int h = 0; h < HT; ++h) {
 #pragma unroll
-                        for (int j = 0; j < QT; ++j) {
-                            acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
-                        }
+                    for (int j = 0; j < QT; ++j) {
+                        acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
                     }
                 }
-
-                for (uint32_t r = 0; r < n_records; ++r) {
-                    const uint8_t * v_record = v_body_head + size_t(r)*v_body_stride_record_bytes;
-                    const float * v_record_scales = v_scales_head + size_t(r)*v_scale_stride_record_floats;
-                    for (uint32_t g = 0; g < group_size; ++g) {
-                        const float vv = kvarn_turbo_v_dequant_rotated(
-                                v_record, v_record_scales, head_dim, group_size,
-                                value_bits, g, d, turbo_v_mode);
-                        const uint32_t t = n_sink + r*group_size + g;
-#pragma unroll
-                        for (int h = 0; h < HT; ++h) {
-#pragma unroll
-                            for (int j = 0; j < QT; ++j) {
-                                acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
-                            }
-                        }
-                    }
-                }
-
-                for (uint32_t p = 0; p < n_pending; ++p) {
-                    const float vv = pending_v_head[size_t(p)*pending_stride_token_floats + d];
-                    const uint32_t t = n_sink + n_body_tokens + p;
-#pragma unroll
-                    for (int h = 0; h < HT; ++h) {
-#pragma unroll
-                        for (int j = 0; j < QT; ++j) {
-                            acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
-                        }
-                    }
-                }
-
-                for (uint32_t tail_t = 0; tail_t < n_tail; ++tail_t) {
-                    const uint32_t tail_slot = (tail_start + tail_t)%n_tail;
-                    const uint16_t * v = v_st + size_t(n_sink + tail_slot)*sink_tail_stride_token_f16;
-                    const float vv = __half2float(reinterpret_cast<const __half *>(v)[d]);
-                    const uint32_t t = n_sink + n_body_tokens + n_pending + tail_t;
-#pragma unroll
-                    for (int h = 0; h < HT; ++h) {
-#pragma unroll
-                        for (int j = 0; j < QT; ++j) {
-                            acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
-                        }
-                    }
-                }
-                used_packed_k8v2_av = true;
             }
+
+            for (uint32_t r = 0; r < n_records; ++r) {
+                const uint8_t * v_record = v_body_head + size_t(r)*v_body_stride_record_bytes;
+                const float * v_record_scales = v_scales_head + size_t(r)*v_scale_stride_record_floats;
+                for (uint32_t g = 0; g < group_size; ++g) {
+                    const float vv = kvarn_turbo_v_dequant_rotated(
+                            v_record, v_record_scales, head_dim, group_size,
+                            value_bits, g, d, turbo_v_mode);
+                    const uint32_t t = n_sink + r*group_size + g;
+#pragma unroll
+                    for (int h = 0; h < HT; ++h) {
+#pragma unroll
+                        for (int j = 0; j < QT; ++j) {
+                            acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
+                        }
+                    }
+                }
+            }
+
+            for (uint32_t p = 0; p < n_pending; ++p) {
+                const float vv = pending_v_head[size_t(p)*pending_stride_token_floats + d];
+                const uint32_t t = n_sink + n_body_tokens + p;
+#pragma unroll
+                for (int h = 0; h < HT; ++h) {
+#pragma unroll
+                    for (int j = 0; j < QT; ++j) {
+                        acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
+                    }
+                }
+            }
+
+            for (uint32_t tail_t = 0; tail_t < n_tail; ++tail_t) {
+                const uint32_t tail_slot = (tail_start + tail_t)%n_tail;
+                const uint16_t * v = v_st + size_t(n_sink + tail_slot)*sink_tail_stride_token_f16;
+                const float vv = __half2float(reinterpret_cast<const __half *>(v)[d]);
+                const uint32_t t = n_sink + n_body_tokens + n_pending + tail_t;
+#pragma unroll
+                for (int h = 0; h < HT; ++h) {
+#pragma unroll
+                    for (int j = 0; j < QT; ++j) {
+                        acc[h][j] += probs[(size_t(h)*QT + j)*n_tokens + t]*vv;
+                    }
+                }
+            }
+            used_packed_k8v2_av = true;
         }
 
         if (!used_packed_k8v2_av) {
