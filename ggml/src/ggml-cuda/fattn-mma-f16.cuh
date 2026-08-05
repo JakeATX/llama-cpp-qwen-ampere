@@ -527,18 +527,30 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
             continue;
         }
         const char * row_ptr = KV_raw + (int64_t)row * stride_bytes;
-        // Which block(s) this column window spans. QK_TURBO4/2 == 64 half2 columns per block.
         // For D=128 there is exactly one block per row and col_offset==0.
-        for (int c = 0; c < D2; ++c) {
-            const int col = col_offset + c;                 // absolute half2 column in the row
-            const int blk_idx = col / (QK_TURBO4 / 2);      // 64 half2 cols per turbo4 block
-            const int in_blk  = col % (QK_TURBO4 / 2);      // half2 index within the block
+        // norm is constant within a block; precompute the 16 possible
+        // centroid*norm values once instead of recomputing per element.
+        int c = 0;
+        while (c < D2) {
+            const int col         = col_offset + c;                // absolute half2 column
+            const int blk_idx     = col / (QK_TURBO4 / 2);         // 64 half2 cols per turbo4 block
+            const int blk_col_end = (blk_idx + 1) * (QK_TURBO4 / 2) - col_offset;
+            const int c_end       = min(D2, blk_col_end);
+
             const block_turbo4_0 * blk = (const block_turbo4_0 *)(row_ptr) + blk_idx;
             const float norm = __half2float(blk->norm);
-            const uint8_t byte = blk->qs[in_blk];
-            const half lo = __float2half(TURBO_CENTROIDS_4BIT_FATTN[byte & 0xF] * norm);
-            const half hi = __float2half(TURBO_CENTROIDS_4BIT_FATTN[byte >>  4] * norm);
-            tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
+
+            half scaled[16];
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                scaled[i] = __float2half(TURBO_CENTROIDS_4BIT_FATTN[i] * norm);
+            }
+
+            for (; c < c_end; ++c) {
+                const int in_blk = (col_offset + c) % (QK_TURBO4 / 2);
+                const uint8_t byte = blk->qs[in_blk];
+                tile_KV[row*stride_tile + c] = __halves2half2(scaled[byte & 0xF], scaled[byte >> 4]);
+            }
         }
     }
 }
