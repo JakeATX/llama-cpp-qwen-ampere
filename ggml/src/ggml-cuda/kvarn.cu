@@ -5,11 +5,13 @@
 
 #include <cinttypes>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
+#include <limits>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -784,6 +786,238 @@ static __host__ __device__ size_t kvarn_packed_nbytes(size_t n_values, uint32_t 
     return (n_values*bits + 7)/8;
 }
 
+static void kvarn_validate_v_mode(uint32_t head_dim, uint32_t group_size, uint32_t value_bits, uint32_t mode);
+
+[[noreturn]] static void kvarn_invalid(const char * api, const std::string & reason) {
+    throw std::invalid_argument(std::string(api) + ": " + reason);
+}
+
+[[noreturn]] static void kvarn_fail(const char * api, const std::string & reason) {
+    throw std::runtime_error(std::string(api) + ": " + reason);
+}
+
+static size_t kvarn_checked_add(size_t a, size_t b, const char * api, const char * what) {
+    if (a > std::numeric_limits<size_t>::max() - b) {
+        kvarn_invalid(api, std::string(what) + " overflows size_t");
+    }
+    return a + b;
+}
+
+static size_t kvarn_checked_mul(size_t a, size_t b, const char * api, const char * what) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max()/a) {
+        kvarn_invalid(api, std::string(what) + " overflows size_t");
+    }
+    return a*b;
+}
+
+static uint32_t kvarn_checked_u32(size_t value, const char * api, const char * what) {
+    if (value > std::numeric_limits<uint32_t>::max()) {
+        kvarn_invalid(api, std::string(what) + " exceeds UINT32_MAX");
+    }
+    return uint32_t(value);
+}
+
+static int kvarn_checked_grid(size_t value, const char * api, const char * what, bool allow_zero = false) {
+    if ((!allow_zero && value == 0) || value > size_t(std::numeric_limits<int>::max())) {
+        kvarn_invalid(api, std::string(what) + " is not a valid CUDA grid extent");
+    }
+    return int(value);
+}
+
+static uint32_t kvarn_checked_grid_y(size_t value, const char * api, const char * what) {
+    constexpr size_t cuda_grid_y_max = 65535;
+    if (value == 0 || value > cuda_grid_y_max) {
+        kvarn_invalid(api, std::string(what) + " is not a valid CUDA Y-grid extent");
+    }
+    return uint32_t(value);
+}
+
+static int kvarn_reduction_block(size_t extent, const char * api, const char * what) {
+    if (extent == 0) {
+        kvarn_invalid(api, std::string(what) + " is zero");
+    }
+    int block = 1;
+    while (block < 256 && size_t(block) < extent) {
+        block <<= 1;
+    }
+    return block;
+}
+
+static size_t kvarn_checked_ceil_div(size_t value, size_t divisor, const char * api, const char * what) {
+    if (divisor == 0) {
+        kvarn_invalid(api, std::string(what) + " has zero divisor");
+    }
+    return value/divisor + (value%divisor != 0);
+}
+
+static void kvarn_require(bool condition, const char * api, const char * reason) {
+    if (!condition) {
+        kvarn_invalid(api, reason);
+    }
+}
+
+static void kvarn_require_ptr(const void * pointer, bool active, const char * api, const char * name) {
+    if (active && pointer == nullptr) {
+        kvarn_invalid(api, std::string(name) + " is null while its region is active");
+    }
+}
+
+static void kvarn_require_aligned(const void * pointer, size_t alignment, bool active, const char * api, const char * name) {
+    if (active && pointer != nullptr && reinterpret_cast<uintptr_t>(pointer)%alignment != 0) {
+        kvarn_invalid(api, std::string(name) + " is misaligned");
+    }
+}
+
+static void kvarn_validate_bits(uint32_t bits, const char * api, const char * name) {
+    if (bits != 2u && bits != 4u && bits != 8u) {
+        kvarn_invalid(api, std::string(name) + " must be 2, 4, or 8");
+    }
+}
+
+struct kvarn_record_contract {
+    size_t values;
+    size_t k_body_bytes;
+    size_t v_body_bytes;
+    size_t k_scale_floats;
+    size_t v_scale_floats;
+};
+
+static kvarn_record_contract kvarn_validate_record_contract(
+        uint32_t head_dim, uint32_t group_size, uint32_t key_bits,
+        uint32_t value_bits, uint32_t v_mode, const char * api) {
+    kvarn_require(head_dim != 0, api, "head_dim is zero");
+    kvarn_require(group_size != 0, api, "group_size is zero");
+    kvarn_validate_bits(key_bits, api, "key_bits");
+    kvarn_validate_bits(value_bits, api, "value_bits");
+    kvarn_validate_v_mode(head_dim, group_size, value_bits, v_mode);
+
+    kvarn_record_contract c = {};
+    c.values = kvarn_checked_mul(size_t(head_dim), size_t(group_size), api, "head_dim*group_size");
+    c.k_body_bytes = kvarn_checked_ceil_div(kvarn_checked_mul(c.values, key_bits, api, "K packed bits"), 8, api, "K packed bytes");
+    c.v_body_bytes = kvarn_checked_ceil_div(kvarn_checked_mul(c.values, value_bits, api, "V packed bits"), 8, api, "V packed bytes");
+    c.k_scale_floats = kvarn_checked_add(kvarn_checked_mul(2, head_dim, api, "2*head_dim"), group_size, api, "K scale floats");
+    c.v_scale_floats = kvarn_checked_add(head_dim, kvarn_checked_mul(2, group_size, api, "2*group_size"), api, "V scale floats");
+    // Every record path launches at least one kernel over each axis and one
+    // kernel over the flattened tile.  Reject dimensions that cannot be
+    // represented by the CUDA launch ABI before any asynchronous work starts.
+    (void) kvarn_checked_grid(head_dim, api, "head_dim grid");
+    (void) kvarn_checked_grid(group_size, api, "group_size grid");
+    (void) kvarn_checked_grid(
+            kvarn_checked_ceil_div(c.values, 128, api, "record element grid"),
+            api, "record element grid");
+    if (v_mode >= 3u && v_mode <= 5u) {
+        const size_t factor = kvarn_checked_mul(2, kvarn_checked_add(head_dim, group_size, api, "residual factor elements"), api, "residual factor bytes");
+        c.v_body_bytes = kvarn_checked_add(c.v_body_bytes, kvarn_checked_mul(v_mode - 2u, factor, api, "residual components"), api, "residual V record bytes");
+    } else if (v_mode == 1u || v_mode == 2u) {
+        (void) kvarn_checked_grid_y(head_dim/128u, api, "Turbo V block-row grid");
+        c.v_body_bytes = kvarn_checked_mul(
+                kvarn_checked_mul(group_size, head_dim/128u, api, "Turbo V blocks"),
+                kvarn_turbo_v_block_bytes(value_bits), api, "Turbo V record bytes");
+    } else if (v_mode == 6u) {
+        c.v_body_bytes = 21504;
+    }
+    // These are production ABI constants, not merely derived expectations.
+    if (v_mode == 5u && head_dim == 256u) {
+        kvarn_require(c.v_body_bytes == 10496u && c.v_scale_floats == 512u, api, "D256 legacy-R3 record contract mismatch");
+    }
+    if (v_mode == 6u) {
+        kvarn_require(c.v_body_bytes == 21504u && c.v_scale_floats == 768u, api, "D512 sparse-R3 record contract mismatch");
+    }
+    return c;
+}
+
+static void kvarn_require_stride(size_t stride, size_t minimum, bool repeated, const char * api, const char * name) {
+    if (repeated && stride < minimum) {
+        kvarn_invalid(api, std::string(name) + " is smaller than one logical element");
+    }
+}
+
+static size_t kvarn_checked_span(size_t count, size_t stride, size_t width, const char * api, const char * what) {
+    if (count == 0) {
+        return 0;
+    }
+    return kvarn_checked_add(kvarn_checked_mul(count - 1, stride, api, what), width, api, what);
+}
+
+static size_t kvarn_checked_tokens(
+        uint32_t n_sink, uint32_t n_records, uint32_t group_size,
+        uint32_t n_pending, uint32_t n_tail, const char * api, bool require_nonzero) {
+    size_t total = kvarn_checked_mul(n_records, group_size, api, "n_records*group_size");
+    total = kvarn_checked_add(total, n_sink, api, "token count");
+    total = kvarn_checked_add(total, n_pending, api, "token count");
+    total = kvarn_checked_add(total, n_tail, api, "token count");
+    if (require_nonzero && total == 0) {
+        kvarn_invalid(api, "logical token count is zero");
+    }
+    (void) kvarn_checked_u32(total, api, "logical token count");
+    return total;
+}
+
+static void kvarn_validate_tail(uint32_t n_tail, uint32_t tail_start, const char * api) {
+    if ((n_tail == 0 && tail_start != 0) || (n_tail != 0 && tail_start >= n_tail)) {
+        kvarn_invalid(api, "tail_start is inconsistent with n_tail");
+    }
+}
+
+static void kvarn_validate_heads(uint32_t n_queries, uint32_t n_head, uint32_t n_head_kv, const char * api) {
+    kvarn_require(n_queries != 0, api, "n_queries is zero");
+    kvarn_require(n_head != 0, api, "n_head is zero");
+    kvarn_require(n_head_kv != 0, api, "n_head_kv is zero");
+    kvarn_require(n_head%n_head_kv == 0, api, "n_head is not divisible by n_head_kv");
+}
+
+static void kvarn_validate_finite(float value, const char * api, const char * name) {
+    if (!std::isfinite(value)) {
+        kvarn_invalid(api, std::string(name) + " is not finite");
+    }
+}
+
+static void kvarn_validate_hadamard_channels(uint32_t head_dim, bool transform_active, const char * api) {
+    if (transform_active && (head_dim & (head_dim - 1u)) != 0u) {
+        kvarn_invalid(api, "Hadamard channel count must be a power of two");
+    }
+}
+
+static void kvarn_validate_mask(
+        const void * mask, uint32_t type, size_t stride_query,
+        size_t stride_token, uint32_t n_queries, uint32_t n_tokens, const char * api) {
+    kvarn_require(type <= KVARN_KQ_MASK_TYPE_CAUSAL, api, "kq_mask_type is unsupported");
+    const bool stored = type == 1u || type == 2u;
+    kvarn_require_ptr(mask, stored, api, "kq_mask");
+    if (!stored) {
+        return;
+    }
+    const size_t element = type == 1u ? sizeof(float) : sizeof(uint16_t);
+    kvarn_require_aligned(mask, element, true, api, "kq_mask");
+    if (stride_token != 0) {
+        kvarn_require(stride_token >= element, api, "kq_mask_stride_token_bytes is smaller than one mask element");
+    }
+    const size_t row_span = stride_token == 0 ? element : kvarn_checked_add(
+            kvarn_checked_mul(n_tokens - 1u, stride_token, api, "mask row prefix"), element, api, "mask row span");
+    if (n_queries > 1 && stride_query != 0) {
+        kvarn_require(stride_query >= row_span, api, "kq_mask_stride_query_bytes is smaller than one mask row");
+    }
+}
+
+static size_t kvarn_validate_mixed_shape(
+        uint32_t n_queries, uint32_t n_head, uint32_t n_head_kv,
+        uint32_t n_sink, uint32_t n_records, uint32_t n_pending,
+        uint32_t n_tail, uint32_t tail_start, uint32_t head_dim,
+        uint32_t group_size, const char * api) {
+    kvarn_validate_heads(n_queries, n_head, n_head_kv, api);
+    kvarn_require(head_dim != 0 && group_size != 0, api, "head_dim/group_size is zero");
+    kvarn_validate_tail(n_tail, tail_start, api);
+    (void) kvarn_checked_grid(kvarn_checked_mul(n_queries, n_head, api, "n_queries*n_head grid"), api, "n_queries*n_head grid");
+    return kvarn_checked_tokens(n_sink, n_records, group_size, n_pending, n_tail, api, true);
+}
+
+static void kvarn_launch_check(const char * api) {
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string(api) + ": CUDA launch failed: " + cudaGetErrorString(error));
+    }
+}
+
 static __device__ uint32_t kvarn_unpack_one(const uint8_t * src, uint32_t bits, size_t i) {
     const uint32_t mask = (1u << bits) - 1u;
     const size_t bit_pos = i*bits;
@@ -1246,10 +1480,10 @@ static __global__ void kvarn_hadamard_cols_parallel_kernel(
 
 static int kvarn_pow2_block(uint32_t n) {
     int block = 1;
-    while (block < int(n)) {
+    while (block < 1024 && uint32_t(block) < n) {
         block <<= 1;
     }
-    return block;
+    return uint32_t(block) < n ? 2048 : block;
 }
 
 static __global__ void kvarn_sinkhorn_rows_kernel(
@@ -1360,10 +1594,11 @@ static void kvarn_validate_v_mode(uint32_t head_dim, uint32_t group_size, uint32
             (head_dim == 256u || head_dim == 512u) && value_bits == 2u) ||
         (mode == 6u && head_dim == 512u && group_size == 128u && value_bits == 2u);
     if (!valid) {
-        std::fprintf(stderr,
-                "KVarN CUDA rejected V layout mode=%u head_dim=%u group_size=%u value_bits=%u\n",
-                mode, head_dim, group_size, value_bits);
-        std::abort();
+        std::ostringstream message;
+        message << "KVarN CUDA rejected V layout mode=" << mode
+                << " head_dim=" << head_dim << " group_size=" << group_size
+                << " value_bits=" << value_bits;
+        throw std::invalid_argument(message.str());
     }
 }
 
@@ -2913,7 +3148,7 @@ static void kvarn_sinkhorn_variance_normalize_batched(
 
     if (best_scratch == nullptr) {
         std::fprintf(stderr, "KVarN batched Sinkhorn requires scale-state scratch\n");
-        std::abort();
+        kvarn_fail("kvarn_sinkhorn_variance_normalize_batched", "scale-state scratch is null");
     }
     kvarn_sinkhorn_init_batched_kernel<<<int(n_tiles), block, 0, stream>>>(
             row_scale_base, col_scale_base, best_scratch,
@@ -3528,7 +3763,12 @@ static bool ggml_cuda_kvarn_store_body_direct_records_batched_fullrange(
     float * k_best = v_data + data_floats + (use_residual ? data_floats : 0);
     float * v_best = k_best + best_floats;
     const int hadamard_block = kvarn_pow2_block(head_dim);
-    if (hadamard_block <= 0 || hadamard_block > 1024) {
+    const int k_quant_block = kvarn_pow2_block(group_size);
+    const int v_quant_block = kvarn_pow2_block(head_dim);
+    if (hadamard_block <= 0 || hadamard_block > 1024 ||
+            k_quant_block <= 0 || k_quant_block > 1024 ||
+            v_quant_block <= 0 || v_quant_block > 1024 ||
+            !kvarn_paper_frame_enabled()) {
         return false;
     }
 
@@ -3536,10 +3776,6 @@ static bool ggml_cuda_kvarn_store_body_direct_records_batched_fullrange(
     cudaStream_t aux_stream = aux.stream;
     cudaEventRecord(aux.main_ready, stream);
     cudaStreamWaitEvent(aux_stream, aux.main_ready, 0);
-
-    if (!kvarn_paper_frame_enabled()) {
-        return false;
-    }
 
     kvarn_direct_records_hadamard_k_batched_kernel<<<int(total_tiles*group_size), hadamard_block,
             size_t(hadamard_block)*sizeof(float), stream>>>(
@@ -3572,11 +3808,6 @@ static bool ggml_cuda_kvarn_store_body_direct_records_batched_fullrange(
             v_scale_record_stride_floats, v_scale_head_stride_floats, v_best, aux_stream,
             turbo_v_mode != 5u && turbo_v_mode != 6u);
 
-    const int k_quant_block = kvarn_pow2_block(group_size);
-    const int v_quant_block = kvarn_pow2_block(head_dim);
-    if (k_quant_block <= 0 || k_quant_block > 1024 || v_quant_block <= 0 || v_quant_block > 1024) {
-        return false;
-    }
     kvarn_quantize_k_fullrange_batched_kernel<<<int(total_tiles*head_dim), k_quant_block,
             kvarn_quantize_fullrange_parallel_shmem_bytes(k_quant_block), stream>>>(
             k_data, k_body, k_scales, n_heads, head_dim, group_size, key_bits,
@@ -3638,7 +3869,19 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
         float rtn_quantile,
         bool input_already_rotated,
         void * stream) {
-    const size_t n = size_t(head_dim)*group_size;
+    constexpr const char * api = "ggml_cuda_kvarn_store_k_body_reference_minmax";
+    const kvarn_record_contract contract = kvarn_validate_record_contract(head_dim, group_size, key_bits, 2u, 0u, api);
+    kvarn_validate_hadamard_channels(head_dim, !input_already_rotated && kvarn_paper_frame_enabled(), api);
+    kvarn_require_ptr(k_tile, true, api, "k_tile");
+    kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales");
+    kvarn_require_ptr(scratch, true, api, "scratch");
+    kvarn_require_aligned(k_tile, alignof(float), true, api, "k_tile");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(scratch, alignof(float), true, api, "scratch");
+    kvarn_validate_finite(rtn_quantile, api, "rtn_quantile");
+    kvarn_require(rtn_quantile > 0.0f && rtn_quantile <= 1.0f, api, "rtn_quantile must be in (0, 1]");
+    const size_t n = contract.values;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
@@ -3681,6 +3924,7 @@ void ggml_cuda_kvarn_store_k_body_reference_minmax(
     const int block = 128;
     kvarn_store_k_finalize_scales_kernel<<<int((head_dim + block - 1)/block), block, 0, cuda_stream>>>(
             k_scales, rtn_scale, rtn_zp, head_dim);
+    kvarn_launch_check(api);
 }
 
 void ggml_cuda_kvarn_store_v_body_reference_minmax(
@@ -3696,8 +3940,19 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
         uint32_t turbo_v_mode,
         bool input_already_rotated,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const size_t n = size_t(head_dim)*group_size;
+    constexpr const char * api = "ggml_cuda_kvarn_store_v_body_reference_minmax";
+    const kvarn_record_contract contract = kvarn_validate_record_contract(head_dim, group_size, 8u, value_bits, turbo_v_mode, api);
+    kvarn_validate_hadamard_channels(head_dim, !input_already_rotated && kvarn_paper_frame_enabled(), api);
+    kvarn_require_ptr(v_tile, true, api, "v_tile");
+    kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(scratch, true, api, "scratch");
+    kvarn_require_aligned(v_tile, alignof(float), true, api, "v_tile");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(scratch, alignof(float), true, api, "scratch");
+    kvarn_validate_finite(rtn_quantile, api, "rtn_quantile");
+    kvarn_require(rtn_quantile > 0.0f && rtn_quantile <= 1.0f, api, "rtn_quantile must be in (0, 1]");
+    const size_t n = contract.values;
     const uint32_t tmp_rows = head_dim > group_size ? head_dim : group_size;
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
@@ -3730,6 +3985,7 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
         const uint32_t canonical_layout = turbo_v_mode == 2u ? 1u : 0u;
         kvarn_turbo_quantize_v_rows_kernel<<<grid, 128, 0, cuda_stream>>>(
                 data, v_body, v_scales, head_dim, group_size, value_bits, canonical_layout);
+        kvarn_launch_check(api);
         return;
     }
 
@@ -3778,6 +4034,7 @@ void ggml_cuda_kvarn_store_v_body_reference_minmax(
                     size_t(head_dim + 2*group_size), 0, 2u);
         }
     }
+    kvarn_launch_check(api);
 }
 
 static size_t kvarn_store_scratch_floats_one(uint32_t head_dim, uint32_t group_size) {
@@ -4090,14 +4347,43 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
         uint32_t turbo_v_mode,
         bool src_in_frame,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    if (n_record_batch != 1) {
-        throw std::invalid_argument(
-                "KVarN pending record batch store requires exactly one body record; "
-                "the pending buffer has no per-record source dimension");
+    constexpr const char * api = "ggml_cuda_kvarn_store_body_pending_records_minmax";
+    if (n_record_batch == 0) {
+        return;
     }
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_validate_hadamard_channels(
+            head_dim, kvarn_paper_frame_enabled() && (!src_in_frame || kvarn_paper_mixed_frame_enabled()), api);
+    if (n_record_batch != 1) {
+        kvarn_invalid(api, "pending source represents exactly one record");
+    }
+    kvarn_require_ptr(pending_k, true, api, "pending_k");
+    kvarn_require_ptr(pending_v, true, api, "pending_v");
+    kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales");
+    kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(scratch, true, api, "scratch");
+    kvarn_require_aligned(pending_k, alignof(float), true, api, "pending_k");
+    kvarn_require_aligned(pending_v, alignof(float), true, api, "pending_v");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(scratch, alignof(float), true, api, "scratch");
+    kvarn_require_ptr(records, true, api, "records");
+    kvarn_require_aligned(records, alignof(int32_t), true, api, "records");
+    kvarn_require(records[0] >= 0, api, "record index is negative");
+    kvarn_validate_finite(rtn_quantile, api, "rtn_quantile");
+    kvarn_require(rtn_quantile > 0.0f && rtn_quantile <= 1.0f, api, "rtn_quantile must be in (0, 1]");
+    kvarn_require_stride(k_body_record_stride_bytes, c.k_body_bytes, true, api, "k_body_record_stride_bytes");
+    kvarn_require_stride(v_body_record_stride_bytes, c.v_body_bytes, true, api, "v_body_record_stride_bytes");
+    kvarn_require_stride(k_scale_record_stride_floats, c.k_scale_floats, true, api, "k_scale_record_stride_floats");
+    kvarn_require_stride(v_scale_record_stride_floats, c.v_scale_floats, true, api, "v_scale_record_stride_floats");
+    kvarn_require(pending_k_head_stride_floats >= head_dim, api, "pending K token stride is too small");
+    kvarn_require(pending_v_head_stride_floats >= head_dim, api, "pending V token stride is too small");
+    (void) kvarn_checked_u32(pending_k_head_stride_floats, api, "pending_k_head_stride_floats");
+    (void) kvarn_checked_u32(pending_v_head_stride_floats, api, "pending_v_head_stride_floats");
 
-    const size_t tile_floats = size_t(head_dim)*group_size;
+    const size_t tile_floats = c.values;
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
     float * pipeline = scratch + 2*tile_floats;
@@ -4144,6 +4430,7 @@ void ggml_cuda_kvarn_store_body_pending_records_minmax(
                     pending_already_rotated, stream);
         }
     }
+    kvarn_launch_check(api);
 }
 
 void ggml_cuda_kvarn_store_body_pending_heads_minmax(
@@ -4170,8 +4457,36 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
         uint32_t turbo_v_mode,
         bool src_in_frame,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const size_t tile_floats = size_t(head_dim)*group_size;
+    constexpr const char * api = "ggml_cuda_kvarn_store_body_pending_heads_minmax";
+    if (n_heads == 0) {
+        return;
+    }
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_validate_hadamard_channels(
+            head_dim, kvarn_paper_frame_enabled() && (!src_in_frame || kvarn_paper_mixed_frame_enabled()), api);
+    kvarn_require_ptr(pending_k, true, api, "pending_k");
+    kvarn_require_ptr(pending_v, true, api, "pending_v");
+    kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales");
+    kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(scratch, true, api, "scratch");
+    kvarn_require_aligned(pending_k, alignof(float), true, api, "pending_k");
+    kvarn_require_aligned(pending_v, alignof(float), true, api, "pending_v");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(scratch, alignof(float), true, api, "scratch");
+    kvarn_validate_finite(rtn_quantile, api, "rtn_quantile");
+    kvarn_require(rtn_quantile > 0.0f && rtn_quantile <= 1.0f, api, "rtn_quantile must be in (0, 1]");
+    kvarn_require_stride(k_body_stride_bytes, c.k_body_bytes, n_heads > 1, api, "k_body_stride_bytes");
+    kvarn_require_stride(v_body_stride_bytes, c.v_body_bytes, n_heads > 1, api, "v_body_stride_bytes");
+    kvarn_require_stride(k_scale_stride_floats, c.k_scale_floats, n_heads > 1, api, "k_scale_stride_floats");
+    kvarn_require_stride(v_scale_stride_floats, c.v_scale_floats, n_heads > 1, api, "v_scale_stride_floats");
+    kvarn_require(pending_k_head_stride_floats >= head_dim, api, "pending K token stride is too small");
+    kvarn_require(pending_v_head_stride_floats >= head_dim, api, "pending V token stride is too small");
+    (void) kvarn_checked_u32(pending_k_head_stride_floats, api, "pending_k_head_stride_floats");
+    (void) kvarn_checked_u32(pending_v_head_stride_floats, api, "pending_v_head_stride_floats");
+    const size_t tile_floats = c.values;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
@@ -4218,6 +4533,7 @@ void ggml_cuda_kvarn_store_body_pending_heads_minmax(
                     pending_already_rotated, stream);
         }
     }
+    kvarn_launch_check(api);
 }
 
 void ggml_cuda_kvarn_store_body_direct_records_minmax(
@@ -4253,9 +4569,75 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
         size_t scratch_floats,
         uint32_t turbo_v_mode,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const size_t tile_floats = size_t(head_dim)*group_size;
+    constexpr const char * api = "ggml_cuda_kvarn_store_body_direct_records_minmax";
+    if (n_heads == 0 || n_records == 0) {
+        return;
+    }
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_validate_hadamard_channels(head_dim, kvarn_paper_frame_enabled(), api);
+    kvarn_require_ptr(k_tiles, true, api, "k_tiles");
+    kvarn_require_ptr(v_tiles, true, api, "v_tiles");
+    kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales");
+    kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(scratch, true, api, "scratch");
+    kvarn_require_aligned(k_tiles, alignof(float), true, api, "k_tiles");
+    kvarn_require_aligned(v_tiles, alignof(float), true, api, "v_tiles");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(scratch, alignof(float), true, api, "scratch");
+    kvarn_validate_finite(rtn_quantile, api, "rtn_quantile");
+    kvarn_require(rtn_quantile > 0.0f && rtn_quantile <= 1.0f, api, "rtn_quantile must be in (0, 1]");
+    const size_t tiles = kvarn_checked_mul(n_heads, n_records, api, "n_heads*n_records");
+    (void) kvarn_checked_u32(tiles, api, "n_heads*n_records");
+    (void) kvarn_checked_grid(kvarn_checked_mul(tiles, std::max(head_dim, group_size), api, "batched store grid"), api, "batched store grid");
+    const size_t tile_floats = c.values;
     const size_t per_pipeline = kvarn_store_scratch_floats_one(head_dim, group_size);
+    const bool residual = turbo_v_mode >= 3u;
+    size_t fallback_required = kvarn_checked_add(
+            kvarn_checked_mul(2, tile_floats, api, "two gather tiles"),
+            kvarn_checked_mul(head_dim >= 256u ? 2u : 1u, per_pipeline, api, "store pipelines"), api, "direct-record scratch");
+    if (residual) {
+        fallback_required = kvarn_checked_add(fallback_required, tile_floats, api, "residual direct-record scratch");
+    }
+    const size_t data_floats = kvarn_checked_mul(tiles, tile_floats, api, "batched tile storage");
+    (void) kvarn_checked_grid(
+            kvarn_checked_ceil_div(data_floats, 128, api, "batched element grid"),
+            api, "batched element grid");
+    const size_t best_floats = kvarn_checked_mul(tiles, kvarn_sinkhorn_best_tile_floats(head_dim, group_size), api, "batched best storage");
+    const size_t batched_required = kvarn_checked_add(
+            kvarn_checked_mul(residual ? 3u : 2u, data_floats, api, "batched data storage"),
+            kvarn_checked_mul(2, best_floats, api, "batched best storage"), api, "batched direct-record scratch");
+    kvarn_require(scratch_floats >= fallback_required,
+            api, "scratch_floats is smaller than the checked fallback requirement");
+    kvarn_require_stride(k_body_record_stride_bytes, c.k_body_bytes, n_records > 1, api, "k_body_record_stride_bytes");
+    kvarn_require_stride(v_body_record_stride_bytes, c.v_body_bytes, n_records > 1, api, "v_body_record_stride_bytes");
+    kvarn_require_stride(k_scale_record_stride_floats, c.k_scale_floats, n_records > 1, api, "k_scale_record_stride_floats");
+    kvarn_require_stride(v_scale_record_stride_floats, c.v_scale_floats, n_records > 1, api, "v_scale_record_stride_floats");
+    (void) kvarn_checked_u32(k_tile_group_stride_floats, api, "k_tile_group_stride_floats");
+    (void) kvarn_checked_u32(v_tile_group_stride_floats, api, "v_tile_group_stride_floats");
+    const size_t k_body_record_span = kvarn_checked_span(n_records, k_body_record_stride_bytes, c.k_body_bytes, api, "K body record span");
+    const size_t v_body_record_span = kvarn_checked_span(n_records, v_body_record_stride_bytes, c.v_body_bytes, api, "V body record span");
+    const size_t k_scale_record_span = kvarn_checked_span(n_records, k_scale_record_stride_floats, c.k_scale_floats, api, "K scale record span");
+    const size_t v_scale_record_span = kvarn_checked_span(n_records, v_scale_record_stride_floats, c.v_scale_floats, api, "V scale record span");
+    kvarn_require_stride(k_body_head_stride_bytes, k_body_record_span, n_heads > 1, api, "k_body_head_stride_bytes");
+    kvarn_require_stride(v_body_head_stride_bytes, v_body_record_span, n_heads > 1, api, "v_body_head_stride_bytes");
+    kvarn_require_stride(k_scale_head_stride_floats, k_scale_record_span, n_heads > 1, api, "k_scale_head_stride_floats");
+    kvarn_require_stride(v_scale_head_stride_floats, v_scale_record_span, n_heads > 1, api, "v_scale_head_stride_floats");
+    // Direct source tiles follow [record][group][head][channel].  Validate the
+    // nested spans in that order; treating heads as the outer dimension rejects
+    // the token-major GGML layout used by the production call site.
+    kvarn_require_stride(k_tile_head_stride_floats, head_dim, n_heads > 1, api, "k_tile_head_stride_floats");
+    kvarn_require_stride(v_tile_head_stride_floats, head_dim, n_heads > 1, api, "v_tile_head_stride_floats");
+    const size_t k_head_span = kvarn_checked_span(n_heads, k_tile_head_stride_floats, head_dim, api, "K tile group span");
+    const size_t v_head_span = kvarn_checked_span(n_heads, v_tile_head_stride_floats, head_dim, api, "V tile group span");
+    kvarn_require_stride(k_tile_group_stride_floats, k_head_span, group_size > 1, api, "k_tile_group_stride_floats");
+    kvarn_require_stride(v_tile_group_stride_floats, v_head_span, group_size > 1, api, "v_tile_group_stride_floats");
+    const size_t k_group_span = kvarn_checked_span(group_size, k_tile_group_stride_floats, k_head_span, api, "K tile record span");
+    const size_t v_group_span = kvarn_checked_span(group_size, v_tile_group_stride_floats, v_head_span, api, "V tile record span");
+    kvarn_require_stride(k_tile_record_stride_floats, k_group_span, n_records > 1, api, "k_tile_record_stride_floats");
+    kvarn_require_stride(v_tile_record_stride_floats, v_group_span, n_records > 1, api, "v_tile_record_stride_floats");
     float * k_tile = scratch;
     float * v_tile = scratch + tile_floats;
     float * pipeline = scratch + 2*tile_floats;
@@ -4264,6 +4646,7 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
     const int grid = int((tile_floats + block - 1)/block);
 
     const bool use_batched_phases =
+        scratch_floats >= batched_required &&
         kvarn_paper_frame_enabled() &&
         !kvarn_env_flag("LLAMA_KVARN_DEBUG_BODY_RECORD_DUMP") &&
         !kvarn_debug_raw_body_capture_enabled() &&
@@ -4287,6 +4670,7 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
                     "KVarN CUDA store-body batched-phases trace: used=1 head_dim=%u group_size=%u n_records=%u n_heads=%u scratch_floats=%zu\n",
                     head_dim, group_size, n_records, n_heads, scratch_floats);
         }
+        kvarn_launch_check(api);
         return;
     }
     if (use_batched_phases && kvarn_store_phase_trace_claim()) {
@@ -4299,7 +4683,7 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
                 "KVarN CUDA store-body batched-phases required but unavailable: head_dim=%u group_size=%u "
                 "key_bits=%u value_bits=%u n_records=%u n_heads=%u rtn_quantile=%g scratch_floats=%zu\n",
                 head_dim, group_size, key_bits, value_bits, n_records, n_heads, double(rtn_quantile), scratch_floats);
-        std::abort();
+        kvarn_fail(api, "required batched direct-record route is unavailable");
     }
 
     for (uint32_t record = 0; record < n_records; ++record) {
@@ -4339,6 +4723,7 @@ void ggml_cuda_kvarn_store_body_direct_records_minmax(
             }
         }
     }
+    kvarn_launch_check(api);
 }
 
 void ggml_cuda_kvarn_store_body_reference_minmax(
@@ -4360,12 +4745,29 @@ void ggml_cuda_kvarn_store_body_reference_minmax(
         void * stream,
         uint32_t debug_record,
         uint32_t debug_head) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
+    constexpr const char * api = "ggml_cuda_kvarn_store_body_reference_minmax";
+    (void) kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_validate_hadamard_channels(head_dim, !input_already_rotated && kvarn_paper_frame_enabled(), api);
+    kvarn_require_ptr(k_tile, true, api, "k_tile");
+    kvarn_require_ptr(v_tile, true, api, "v_tile");
+    kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales");
+    kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(scratch, true, api, "scratch");
+    kvarn_require_aligned(k_tile, alignof(float), true, api, "k_tile");
+    kvarn_require_aligned(v_tile, alignof(float), true, api, "v_tile");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(scratch, alignof(float), true, api, "scratch");
+    kvarn_validate_finite(rtn_quantile, api, "rtn_quantile");
+    kvarn_require(rtn_quantile > 0.0f && rtn_quantile <= 1.0f, api, "rtn_quantile must be in (0, 1]");
     if (head_dim >= 256) {
         ggml_cuda_kvarn_store_kv_body_pipelined(
                 k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
                 head_dim, group_size, key_bits, value_bits, sinkhorn_iters, rtn_quantile,
                 input_already_rotated, debug_record, debug_head, turbo_v_mode, stream);
+        kvarn_launch_check(api);
         return;
     }
 
@@ -4437,14 +4839,26 @@ void ggml_cuda_kvarn_dequant_body(
         uint32_t value_bits,
         uint32_t turbo_v_mode,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const size_t n = size_t(head_dim)*group_size;
+    constexpr const char * api = "ggml_cuda_kvarn_dequant_body";
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales");
+    kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(k_out, true, api, "k_out");
+    kvarn_require_ptr(v_out, true, api, "v_out");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(k_out, alignof(float), true, api, "k_out");
+    kvarn_require_aligned(v_out, alignof(float), true, api, "v_out");
+    const size_t n = c.values;
     const int block = 256;
-    const int grid = int((n + block - 1)/block);
+    const int grid = kvarn_checked_grid(kvarn_checked_ceil_div(n, block, api, "dequant grid"), api, "dequant grid");
 
     kvarn_dequant_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
             k_body, v_body, k_scales, v_scales, k_out, v_out,
             head_dim, group_size, key_bits, value_bits, n, turbo_v_mode);
+    kvarn_launch_check(api);
 }
 
 template<typename T>
@@ -4554,17 +4968,33 @@ void ggml_cuda_kvarn_dequant_body_n(
         size_t v_out_stride_floats,
         uint32_t turbo_v_mode,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const size_t n_per_record = size_t(head_dim)*group_size;
-    const size_t n_total = size_t(n_records)*n_per_record;
+    constexpr const char * api = "ggml_cuda_kvarn_dequant_body_n";
+    if (n_records == 0) {
+        return;
+    }
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_require_ptr(k_body, true, api, "k_body"); kvarn_require_ptr(v_body, v_out != nullptr, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales"); kvarn_require_ptr(v_scales, v_out != nullptr, api, "v_scales");
+    kvarn_require_ptr(k_out, true, api, "k_out");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales"); kvarn_require_aligned(v_scales, alignof(float), v_out != nullptr, api, "v_scales");
+    kvarn_require_aligned(k_out, alignof(float), true, api, "k_out"); kvarn_require_aligned(v_out, alignof(float), v_out != nullptr, api, "v_out");
+    kvarn_require_stride(k_body_stride_bytes, c.k_body_bytes, n_records > 1, api, "k_body_stride_bytes");
+    kvarn_require_stride(k_scale_stride_floats, c.k_scale_floats, n_records > 1, api, "k_scale_stride_floats");
+    kvarn_require_stride(k_out_stride_floats, c.values, n_records > 1, api, "k_out_stride_floats");
+    kvarn_require_stride(v_body_stride_bytes, c.v_body_bytes, n_records > 1 && v_out != nullptr, api, "v_body_stride_bytes");
+    kvarn_require_stride(v_scale_stride_floats, c.v_scale_floats, n_records > 1 && v_out != nullptr, api, "v_scale_stride_floats");
+    kvarn_require_stride(v_out_stride_floats, c.values, n_records > 1 && v_out != nullptr, api, "v_out_stride_floats");
+    const size_t n_per_record = c.values;
+    const size_t n_total = kvarn_checked_mul(n_records, n_per_record, api, "dequant element count");
     const int block = 256;
-    const int grid = int((n_total + block - 1)/block);
+    const int grid = kvarn_checked_grid(kvarn_checked_ceil_div(n_total, block, api, "dequant grid"), api, "dequant grid");
     kvarn_dequant_n_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
             k_body, v_body, k_scales, v_scales, k_out, v_out,
             n_records, head_dim, group_size, key_bits, value_bits,
             k_body_stride_bytes, v_body_stride_bytes,
             k_scale_stride_floats, v_scale_stride_floats,
             k_out_stride_floats, v_out_stride_floats, n_per_record, 0u, turbo_v_mode);
+    kvarn_launch_check(api);
 }
 
 // Same as ggml_cuda_kvarn_dequant_body_n but writes the K f32 output in
@@ -4592,17 +5022,30 @@ void ggml_cuda_kvarn_dequant_body_n_k_token_major(
         size_t v_out_stride_floats,
         uint32_t turbo_v_mode,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const size_t n_per_record = size_t(head_dim)*group_size;
-    const size_t n_total = size_t(n_records)*n_per_record;
+    constexpr const char * api = "ggml_cuda_kvarn_dequant_body_n_k_token_major";
+    if (n_records == 0) { return; }
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_require_ptr(k_body, true, api, "k_body"); kvarn_require_ptr(k_scales, true, api, "k_scales"); kvarn_require_ptr(k_out, true, api, "k_out");
+    kvarn_require_ptr(v_body, v_out != nullptr, api, "v_body"); kvarn_require_ptr(v_scales, v_out != nullptr, api, "v_scales");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales"); kvarn_require_aligned(v_scales, alignof(float), v_out != nullptr, api, "v_scales");
+    kvarn_require_aligned(k_out, alignof(float), true, api, "k_out"); kvarn_require_aligned(v_out, alignof(float), v_out != nullptr, api, "v_out");
+    kvarn_require_stride(k_body_stride_bytes, c.k_body_bytes, n_records > 1, api, "k_body_stride_bytes");
+    kvarn_require_stride(k_scale_stride_floats, c.k_scale_floats, n_records > 1, api, "k_scale_stride_floats");
+    kvarn_require_stride(k_out_stride_floats, c.values, n_records > 1, api, "k_out_stride_floats");
+    kvarn_require_stride(v_body_stride_bytes, c.v_body_bytes, n_records > 1 && v_out != nullptr, api, "v_body_stride_bytes");
+    kvarn_require_stride(v_scale_stride_floats, c.v_scale_floats, n_records > 1 && v_out != nullptr, api, "v_scale_stride_floats");
+    kvarn_require_stride(v_out_stride_floats, c.values, n_records > 1 && v_out != nullptr, api, "v_out_stride_floats");
+    const size_t n_per_record = c.values;
+    const size_t n_total = kvarn_checked_mul(n_records, n_per_record, api, "dequant element count");
     const int block = 256;
-    const int grid = int((n_total + block - 1)/block);
+    const int grid = kvarn_checked_grid(kvarn_checked_ceil_div(n_total, block, api, "dequant grid"), api, "dequant grid");
     kvarn_dequant_n_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
             k_body, v_body, k_scales, v_scales, k_out, v_out,
             n_records, head_dim, group_size, key_bits, value_bits,
             k_body_stride_bytes, v_body_stride_bytes,
             k_scale_stride_floats, v_scale_stride_floats,
             k_out_stride_floats, v_out_stride_floats, n_per_record, 1u, turbo_v_mode);
+    kvarn_launch_check(api);
 }
 
 // f16 variant of the token-major dequant: same indexing, __half outputs.
@@ -4629,11 +5072,23 @@ void ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
         size_t v_out_stride_elems,
         uint32_t turbo_v_mode,
         void * stream) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const size_t n_per_record = size_t(head_dim)*group_size;
-    const size_t n_total = size_t(n_records)*n_per_record;
+    constexpr const char * api = "ggml_cuda_kvarn_dequant_body_n_k_token_major_f16";
+    if (n_records == 0) { return; }
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    kvarn_require_ptr(k_body, true, api, "k_body"); kvarn_require_ptr(k_scales, true, api, "k_scales"); kvarn_require_ptr(k_out, true, api, "k_out");
+    kvarn_require_ptr(v_body, v_out != nullptr, api, "v_body"); kvarn_require_ptr(v_scales, v_out != nullptr, api, "v_scales");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales"); kvarn_require_aligned(v_scales, alignof(float), v_out != nullptr, api, "v_scales");
+    kvarn_require_aligned(k_out, alignof(uint16_t), true, api, "k_out"); kvarn_require_aligned(v_out, alignof(uint16_t), v_out != nullptr, api, "v_out");
+    kvarn_require_stride(k_body_stride_bytes, c.k_body_bytes, n_records > 1, api, "k_body_stride_bytes");
+    kvarn_require_stride(k_scale_stride_floats, c.k_scale_floats, n_records > 1, api, "k_scale_stride_floats");
+    kvarn_require_stride(k_out_stride_elems, c.values, n_records > 1, api, "k_out_stride_elems");
+    kvarn_require_stride(v_body_stride_bytes, c.v_body_bytes, n_records > 1 && v_out != nullptr, api, "v_body_stride_bytes");
+    kvarn_require_stride(v_scale_stride_floats, c.v_scale_floats, n_records > 1 && v_out != nullptr, api, "v_scale_stride_floats");
+    kvarn_require_stride(v_out_stride_elems, c.values, n_records > 1 && v_out != nullptr, api, "v_out_stride_elems");
+    const size_t n_per_record = c.values;
+    const size_t n_total = kvarn_checked_mul(n_records, n_per_record, api, "dequant element count");
     const int block = 256;
-    const int grid = int((n_total + block - 1)/block);
+    const int grid = kvarn_checked_grid(kvarn_checked_ceil_div(n_total, block, api, "dequant grid"), api, "dequant grid");
     kvarn_dequant_n_kernel<__half><<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
             k_body, v_body, k_scales, v_scales,
             static_cast<__half *>(k_out), static_cast<__half *>(v_out),
@@ -4641,6 +5096,7 @@ void ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
             k_body_stride_bytes, v_body_stride_bytes,
             k_scale_stride_floats, v_scale_stride_floats,
             k_out_stride_elems, v_out_stride_elems, n_per_record, 1u, turbo_v_mode);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_materialize_kv_f16_kernel(
@@ -4763,17 +5219,53 @@ void ggml_cuda_kvarn_materialize_kv_f16(
         size_t out_stride_head_f16,
         size_t out_stride_token_f16,
         void * stream) {
+    constexpr const char * api = "ggml_cuda_kvarn_materialize_kv_f16";
+    kvarn_require(is_v <= 1u, api, "is_v must be 0 or 1");
+    const kvarn_record_contract c = kvarn_validate_record_contract(
+            head_dim, group_size, is_v ? 8u : bits, is_v ? bits : 2u, is_v ? turbo_v_mode : 0u, api);
     if (is_v != 0u) {
-        kvarn_validate_v_mode(head_dim, group_size, bits, turbo_v_mode);
+        // Contract validation above covers the selected V layout.
     } else if (turbo_v_mode != 0u) {
-        std::fprintf(stderr, "KVarN CUDA rejected a V layout mode for K materialization\n");
-        std::abort();
+        kvarn_invalid(api, "V layout mode supplied for K materialization");
     }
-    const uint64_t n_kv = uint64_t(n_sink) + uint64_t(n_records)*group_size + n_pending + n_tail;
-    const uint64_t total = n_kv*n_head_kv*head_dim;
+    kvarn_validate_tail(n_tail, tail_start, api);
+    kvarn_require(n_head_kv != 0, api, "n_head_kv is zero");
+    const size_t n_kv = kvarn_checked_tokens(n_sink, n_records, group_size, n_pending, n_tail, api, false);
+    const size_t total = kvarn_checked_mul(kvarn_checked_mul(n_kv, n_head_kv, api, "tokens*n_head_kv"), head_dim, api, "materialize elements");
     if (total == 0) {
         return;
     }
+    const bool sink_active = n_sink != 0 || n_tail != 0;
+    const bool body_active = n_records != 0;
+    const bool pending_active = n_pending != 0;
+    kvarn_require_ptr(sink_tail, sink_active, api, "sink_tail");
+    kvarn_require_ptr(body, body_active, api, "body");
+    kvarn_require_ptr(scales, body_active, api, "scales");
+    kvarn_require_ptr(pending, pending_active, api, "pending");
+    kvarn_require_ptr(out, true, api, "out");
+    kvarn_require_aligned(sink_tail, alignof(uint16_t), sink_active, api, "sink_tail");
+    kvarn_require_aligned(scales, alignof(float), body_active, api, "scales");
+    kvarn_require_aligned(pending, alignof(float), pending_active, api, "pending");
+    kvarn_require_aligned(out, alignof(uint16_t), true, api, "out");
+    const size_t sink_head_span = kvarn_checked_span(n_head_kv, sink_tail_stride_head_f16, head_dim, api, "sink/tail token span");
+    kvarn_require_stride(sink_tail_stride_head_f16, head_dim, n_head_kv > 1 && sink_active, api, "sink_tail_stride_head_f16");
+    kvarn_require_stride(sink_tail_stride_token_f16, sink_head_span, sink_active, api, "sink_tail_stride_token_f16");
+    kvarn_require_stride(body_stride_record_bytes, is_v ? c.v_body_bytes : c.k_body_bytes, n_records > 1, api, "body_stride_record_bytes");
+    const size_t body_head_span = kvarn_checked_span(
+            n_records, body_stride_record_bytes, is_v ? c.v_body_bytes : c.k_body_bytes,
+            api, "body head span");
+    kvarn_require_stride(body_stride_head_bytes, body_head_span, n_head_kv > 1 && body_active, api, "body_stride_head_bytes");
+    kvarn_require_stride(scale_stride_record_floats, is_v ? c.v_scale_floats : c.k_scale_floats, n_records > 1, api, "scale_stride_record_floats");
+    const size_t scale_head_span = kvarn_checked_span(
+            n_records, scale_stride_record_floats, is_v ? c.v_scale_floats : c.k_scale_floats,
+            api, "scale head span");
+    kvarn_require_stride(scale_stride_head_floats, scale_head_span, n_head_kv > 1 && body_active, api, "scale_stride_head_floats");
+    const size_t pending_head_span = kvarn_checked_span(n_head_kv, pending_stride_head_floats, head_dim, api, "pending token span");
+    kvarn_require_stride(pending_stride_head_floats, head_dim, n_head_kv > 1 && pending_active, api, "pending_stride_head_floats");
+    kvarn_require_stride(pending_stride_token_floats, pending_head_span, pending_active, api, "pending_stride_token_floats");
+    const size_t out_head_span = kvarn_checked_span(n_head_kv, out_stride_head_f16, head_dim, api, "output token span");
+    kvarn_require_stride(out_stride_head_f16, head_dim, n_head_kv > 1, api, "out_stride_head_f16");
+    kvarn_require_stride(out_stride_token_f16, out_head_span, n_kv > 1, api, "out_stride_token_f16");
     const bool use_raw_body = debug_raw_body && n_records > 0;
     const float * body_f32 = nullptr;
     size_t body_f32_stride_head_floats = 0;
@@ -4788,10 +5280,12 @@ void ggml_cuda_kvarn_materialize_kv_f16(
                     " (raw_key=%p body=%p mirror_count=%zu records=%u n_head_kv=%u head_dim=%u group_size=%u is_v=%u)\n",
                     raw_mirror_key, (const void *) body, kvarn_raw_body_mirror_count(),
                     n_records, n_head_kv, head_dim, group_size, is_v);
-            std::abort();
+            kvarn_fail(api, "raw-body materialization requested without an exact captured mirror");
         }
         body_f32 = is_v ? raw_body.v : raw_body.k;
-        body_f32_stride_head_floats = size_t(raw_body.n_records_cap)*group_size*head_dim;
+        body_f32_stride_head_floats = kvarn_checked_mul(
+                kvarn_checked_mul(raw_body.n_records_cap, group_size, api, "raw materialize records*group_size"),
+                head_dim, api, "raw materialize head stride");
     }
     const int block = 256;
     const int grid = int(std::min<uint64_t>((total + block - 1)/block, 65535));
@@ -4807,6 +5301,7 @@ void ggml_cuda_kvarn_materialize_kv_f16(
             body_f32_stride_head_floats,
             out_stride_head_f16, out_stride_token_f16,
             total);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_qk_body_kernel(
@@ -4862,14 +5357,19 @@ void ggml_cuda_kvarn_qk_body(
         uint32_t key_bits,
         float scale,
         void * stream) {
-    int block = 1;
-    while (block < int(head_dim)) {
-        block <<= 1;
-    }
-    block = block > 256 ? 256 : block;
+    constexpr const char * api = "ggml_cuda_kvarn_qk_body";
+    (void) kvarn_validate_record_contract(head_dim, group_size, key_bits, 2u, 0u, api);
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales"); kvarn_require_ptr(scores, true, api, "scores");
+    kvarn_require_aligned(q, alignof(float), true, api, "q"); kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    kvarn_validate_finite(scale, api, "scale");
+    const int block = kvarn_reduction_block(head_dim, api, "QK reduction extent");
+    const int grid = kvarn_checked_grid(group_size, api, "QK group grid");
 
-    kvarn_qk_body_kernel<<<group_size, block, block*sizeof(float), static_cast<cudaStream_t>(stream)>>>(
+    kvarn_qk_body_kernel<<<grid, block, block*sizeof(float), static_cast<cudaStream_t>(stream)>>>(
             q, k_body, k_scales, scores, head_dim, group_size, key_bits, scale);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_av_body_kernel(
@@ -4909,11 +5409,19 @@ void ggml_cuda_kvarn_av_body(
         uint32_t group_size,
         uint32_t value_bits,
         void * stream) {
+    constexpr const char * api = "ggml_cuda_kvarn_av_body";
+    (void) kvarn_validate_record_contract(head_dim, group_size, 8u, value_bits, 0u, api);
+    kvarn_require_ptr(probs, true, api, "probs"); kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(v_scales, true, api, "v_scales"); kvarn_require_ptr(out, true, api, "out");
+    kvarn_require_aligned(probs, alignof(float), true, api, "probs"); kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(out, alignof(float), true, api, "out");
     const int block = 128;
-    const int grid = int((head_dim + block - 1)/block);
+    const int grid = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, block, api, "AV grid"), api, "AV grid");
 
     kvarn_av_body_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
             probs, v_body, v_scales, out, head_dim, group_size, value_bits);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_attn_scores_softmax_kernel(
@@ -4997,11 +5505,18 @@ void ggml_cuda_kvarn_attn_body(
         uint32_t value_bits,
         float scale,
         void * stream) {
-    int block = 1;
-    while (block < int(group_size)) {
-        block <<= 1;
-    }
-    block = block > 256 ? 256 : block;
+    constexpr const char * api = "ggml_cuda_kvarn_attn_body";
+    (void) kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, 0u, api);
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(k_body, true, api, "k_body");
+    kvarn_require_ptr(v_body, true, api, "v_body"); kvarn_require_ptr(k_scales, true, api, "k_scales");
+    kvarn_require_ptr(v_scales, true, api, "v_scales"); kvarn_require_ptr(out, true, api, "out");
+    kvarn_require_ptr(scores, true, api, "scores"); kvarn_validate_finite(scale, api, "scale");
+    kvarn_require_aligned(q, alignof(float), true, api, "q");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(out, alignof(float), true, api, "out");
+    kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    const int block = kvarn_reduction_block(group_size, api, "attention reduction extent");
 
     const size_t shmem = (size_t(group_size) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
@@ -5009,9 +5524,11 @@ void ggml_cuda_kvarn_attn_body(
             q, k_body, k_scales, scores, head_dim, group_size, key_bits, scale);
 
     const int av_block = 128;
-    const int av_grid = int((head_dim + av_block - 1)/av_block);
+    const int av_grid = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, av_block, api, "attention AV grid"), api, "attention AV grid");
     kvarn_av_body_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
             scores, v_body, v_scales, out, head_dim, group_size, value_bits);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_attn_scores_softmax_n_kernel(
@@ -5145,13 +5662,24 @@ void ggml_cuda_kvarn_attn_body_n(
         size_t v_scale_stride_floats,
         float scale,
         void * stream) {
-    const uint32_t n_tokens = n_records*group_size;
+    constexpr const char * api = "ggml_cuda_kvarn_attn_body_n";
+    kvarn_require(n_records != 0, api, "n_records is zero");
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, 0u, api);
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(k_body, true, api, "k_body"); kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales"); kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(out, true, api, "out"); kvarn_require_ptr(scores, true, api, "scores"); kvarn_validate_finite(scale, api, "scale");
+    kvarn_require_aligned(q, alignof(float), true, api, "q");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(out, alignof(float), true, api, "out");
+    kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    kvarn_require_stride(k_body_stride_bytes, c.k_body_bytes, n_records > 1, api, "k_body_stride_bytes");
+    kvarn_require_stride(v_body_stride_bytes, c.v_body_bytes, n_records > 1, api, "v_body_stride_bytes");
+    kvarn_require_stride(k_scale_stride_floats, c.k_scale_floats, n_records > 1, api, "k_scale_stride_floats");
+    kvarn_require_stride(v_scale_stride_floats, c.v_scale_floats, n_records > 1, api, "v_scale_stride_floats");
+    const uint32_t n_tokens = kvarn_checked_u32(kvarn_checked_mul(n_records, group_size, api, "body token count"), api, "body token count");
 
-    int block = 1;
-    while (block < int(n_tokens)) {
-        block <<= 1;
-    }
-    block = block > 256 ? 256 : block;
+    const int block = kvarn_reduction_block(n_tokens, api, "body-N reduction extent");
 
     const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
@@ -5160,10 +5688,12 @@ void ggml_cuda_kvarn_attn_body_n(
             k_body_stride_bytes, k_scale_stride_floats, scale);
 
     const int av_block = 128;
-    const int av_grid = int((head_dim + av_block - 1)/av_block);
+    const int av_grid = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, av_block, api, "body-N AV grid"), api, "body-N AV grid");
     kvarn_av_body_n_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
             scores, v_body, v_scales, out, n_records, head_dim, group_size, value_bits,
             v_body_stride_bytes, v_scale_stride_floats);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_attn_scores_softmax_n_batch_kernel(
@@ -5312,25 +5842,44 @@ void ggml_cuda_kvarn_attn_body_n_batch(
         size_t v_scale_stride_floats,
         float scale,
         void * stream) {
-    const uint32_t n_tokens = n_records*group_size;
+    constexpr const char * api = "ggml_cuda_kvarn_attn_body_n_batch";
+    kvarn_require(n_queries != 0, api, "n_queries is zero"); kvarn_require(n_records != 0, api, "n_records is zero");
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, 0u, api);
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(k_body, true, api, "k_body"); kvarn_require_ptr(v_body, true, api, "v_body");
+    kvarn_require_ptr(k_scales, true, api, "k_scales"); kvarn_require_ptr(v_scales, true, api, "v_scales");
+    kvarn_require_ptr(out, true, api, "out"); kvarn_require_ptr(scores, true, api, "scores"); kvarn_validate_finite(scale, api, "scale");
+    kvarn_require_aligned(q, alignof(float), true, api, "q");
+    kvarn_require_aligned(k_scales, alignof(float), true, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), true, api, "v_scales");
+    kvarn_require_aligned(out, alignof(float), true, api, "out");
+    kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    const uint32_t n_tokens = kvarn_checked_u32(kvarn_checked_mul(n_records, group_size, api, "body token count"), api, "body token count");
+    kvarn_require_stride(q_stride_floats, head_dim, n_queries > 1, api, "q_stride_floats");
+    kvarn_require_stride(out_stride_floats, head_dim, n_queries > 1, api, "out_stride_floats");
+    kvarn_require_stride(score_stride_floats, n_tokens, n_queries > 1, api, "score_stride_floats");
+    kvarn_require_stride(k_body_stride_bytes, c.k_body_bytes, n_records > 1, api, "k_body_stride_bytes");
+    kvarn_require_stride(v_body_stride_bytes, c.v_body_bytes, n_records > 1, api, "v_body_stride_bytes");
+    kvarn_require_stride(k_scale_stride_floats, c.k_scale_floats, n_records > 1, api, "k_scale_stride_floats");
+    kvarn_require_stride(v_scale_stride_floats, c.v_scale_floats, n_records > 1, api, "v_scale_stride_floats");
 
-    int block = 1;
-    while (block < int(n_tokens)) {
-        block <<= 1;
-    }
-    block = block > 256 ? 256 : block;
+    const int block = kvarn_reduction_block(n_tokens, api, "batched body reduction extent");
 
     const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
-    kvarn_attn_scores_softmax_n_batch_kernel<<<n_queries, block, shmem, cuda_stream>>>(
+    const int query_grid = kvarn_checked_grid(n_queries, api, "batched body query grid");
+    const uint32_t av_grid_y = kvarn_checked_grid_y(n_queries, api, "batched body AV query grid");
+    kvarn_attn_scores_softmax_n_batch_kernel<<<query_grid, block, shmem, cuda_stream>>>(
             q, k_body, k_scales, scores, n_records, head_dim, group_size, key_bits,
             q_stride_floats, score_stride_floats, k_body_stride_bytes, k_scale_stride_floats, scale);
 
     const int av_block = 128;
-    const dim3 av_grid(int((head_dim + av_block - 1)/av_block), n_queries, 1);
+    const int av_grid_x = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, av_block, api, "batched body AV grid"), api, "batched body AV grid");
+    const dim3 av_grid(av_grid_x, av_grid_y, 1);
     kvarn_av_body_n_batch_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
             scores, v_body, v_scales, out, n_records, head_dim, group_size, value_bits,
             out_stride_floats, score_stride_floats, v_body_stride_bytes, v_scale_stride_floats);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_attn_mixed_scores_softmax_kernel(
@@ -5504,13 +6053,30 @@ void ggml_cuda_kvarn_attn_mixed(
         size_t v_scale_stride_floats,
         float scale,
         void * stream) {
-    const uint32_t n_tokens = n_sink + n_records*group_size + n_tail;
+    constexpr const char * api = "ggml_cuda_kvarn_attn_mixed";
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, 0u, api);
+    const uint32_t n_tokens = kvarn_checked_u32(kvarn_checked_tokens(n_sink, n_records, group_size, 0, n_tail, api, true), api, "logical token count");
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(out, true, api, "out"); kvarn_require_ptr(scores, true, api, "scores");
+    kvarn_require_ptr(sink_k, n_sink != 0, api, "sink_k"); kvarn_require_ptr(sink_v, n_sink != 0, api, "sink_v");
+    kvarn_require_ptr(k_body, n_records != 0, api, "k_body"); kvarn_require_ptr(v_body, n_records != 0, api, "v_body");
+    kvarn_require_ptr(k_scales, n_records != 0, api, "k_scales"); kvarn_require_ptr(v_scales, n_records != 0, api, "v_scales");
+    kvarn_require_ptr(tail_k, n_tail != 0, api, "tail_k"); kvarn_require_ptr(tail_v, n_tail != 0, api, "tail_v");
+    kvarn_require_aligned(q, alignof(float), true, api, "q");
+    kvarn_require_aligned(out, alignof(float), true, api, "out");
+    kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    kvarn_require_aligned(sink_k, alignof(float), n_sink != 0, api, "sink_k");
+    kvarn_require_aligned(sink_v, alignof(float), n_sink != 0, api, "sink_v");
+    kvarn_require_aligned(k_scales, alignof(float), n_records != 0, api, "k_scales");
+    kvarn_require_aligned(v_scales, alignof(float), n_records != 0, api, "v_scales");
+    kvarn_require_aligned(tail_k, alignof(float), n_tail != 0, api, "tail_k");
+    kvarn_require_aligned(tail_v, alignof(float), n_tail != 0, api, "tail_v");
+    kvarn_require_stride(k_body_stride_bytes, c.k_body_bytes, n_records > 1, api, "k_body_stride_bytes");
+    kvarn_require_stride(v_body_stride_bytes, c.v_body_bytes, n_records > 1, api, "v_body_stride_bytes");
+    kvarn_require_stride(k_scale_stride_floats, c.k_scale_floats, n_records > 1, api, "k_scale_stride_floats");
+    kvarn_require_stride(v_scale_stride_floats, c.v_scale_floats, n_records > 1, api, "v_scale_stride_floats");
+    kvarn_validate_finite(scale, api, "scale");
 
-    int block = 1;
-    while (block < int(n_tokens)) {
-        block <<= 1;
-    }
-    block = block > 256 ? 256 : block;
+    const int block = kvarn_reduction_block(n_tokens, api, "mixed-attention reduction extent");
 
     const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
@@ -5520,11 +6086,13 @@ void ggml_cuda_kvarn_attn_mixed(
             k_body_stride_bytes, k_scale_stride_floats, scale);
 
     const int av_block = 128;
-    const int av_grid = int((head_dim + av_block - 1)/av_block);
+    const int av_grid = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, av_block, api, "mixed-attention AV grid"), api, "mixed-attention AV grid");
     kvarn_attn_mixed_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
             scores, sink_v, v_body, v_scales, tail_v, out,
             n_sink, n_records, n_tail, head_dim, group_size, value_bits,
             v_body_stride_bytes, v_scale_stride_floats);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_attn_mixed_scratch_scores_softmax_kernel(
@@ -5669,13 +6237,28 @@ void ggml_cuda_kvarn_attn_mixed_f32_scratch(
         size_t v_body_stride_floats,
         float scale,
         void * stream) {
-    const uint32_t n_tokens = n_sink + n_records*group_size + n_tail;
+    constexpr const char * api = "ggml_cuda_kvarn_attn_mixed_f32_scratch";
+    kvarn_require(head_dim != 0 && group_size != 0, api, "head_dim/group_size is zero");
+    const size_t record_floats = kvarn_checked_mul(head_dim, group_size, api, "record floats");
+    const uint32_t n_tokens = kvarn_checked_u32(kvarn_checked_tokens(n_sink, n_records, group_size, 0, n_tail, api, true), api, "logical token count");
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(out, true, api, "out"); kvarn_require_ptr(scores, true, api, "scores");
+    kvarn_require_ptr(sink_k, n_sink != 0, api, "sink_k"); kvarn_require_ptr(sink_v, n_sink != 0, api, "sink_v");
+    kvarn_require_ptr(body_k, n_records != 0, api, "body_k"); kvarn_require_ptr(body_v, n_records != 0, api, "body_v");
+    kvarn_require_ptr(tail_k, n_tail != 0, api, "tail_k"); kvarn_require_ptr(tail_v, n_tail != 0, api, "tail_v");
+    kvarn_require_aligned(q, alignof(float), true, api, "q");
+    kvarn_require_aligned(out, alignof(float), true, api, "out");
+    kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    kvarn_require_aligned(sink_k, alignof(float), n_sink != 0, api, "sink_k");
+    kvarn_require_aligned(sink_v, alignof(float), n_sink != 0, api, "sink_v");
+    kvarn_require_aligned(body_k, alignof(float), n_records != 0, api, "body_k");
+    kvarn_require_aligned(body_v, alignof(float), n_records != 0, api, "body_v");
+    kvarn_require_aligned(tail_k, alignof(float), n_tail != 0, api, "tail_k");
+    kvarn_require_aligned(tail_v, alignof(float), n_tail != 0, api, "tail_v");
+    kvarn_require_stride(k_body_stride_floats, record_floats, n_records != 0, api, "k_body_stride_floats");
+    kvarn_require_stride(v_body_stride_floats, record_floats, n_records != 0, api, "v_body_stride_floats");
+    kvarn_validate_finite(scale, api, "scale");
 
-    int block = 1;
-    while (block < int(n_tokens)) {
-        block <<= 1;
-    }
-    block = block > 256 ? 256 : block;
+    const int block = kvarn_reduction_block(n_tokens, api, "F32-scratch reduction extent");
 
     const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     auto cuda_stream = static_cast<cudaStream_t>(stream);
@@ -5684,10 +6267,12 @@ void ggml_cuda_kvarn_attn_mixed_f32_scratch(
             n_sink, n_records, n_tail, head_dim, group_size, k_body_stride_floats, scale);
 
     const int av_block = 128;
-    const int av_grid = int((head_dim + av_block - 1)/av_block);
+    const int av_grid = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, av_block, api, "F32-scratch AV grid"), api, "F32-scratch AV grid");
     kvarn_attn_mixed_scratch_av_kernel<<<av_grid, av_block, 0, cuda_stream>>>(
             scores, sink_v, body_v, tail_v, out,
             n_sink, n_records, n_tail, head_dim, group_size, v_body_stride_floats);
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_attn_mixed_f16_scratch_scores_softmax_kernel(
@@ -5887,18 +6472,56 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
         float scale,
         void * stream,
         float logit_softcap) {
-    const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
+    constexpr const char * api = "ggml_cuda_kvarn_attn_mixed_f16_batch_scratch";
+    const uint32_t n_tokens = kvarn_checked_u32(kvarn_validate_mixed_shape(
+            n_queries, n_head, n_head_kv, n_sink, n_records, n_pending, n_tail,
+            tail_start, head_dim, group_size, api), api, "logical token count");
     const uint32_t n_gqa = n_head/n_head_kv;
-
-    int block = 1;
-    while (block < int(n_tokens)) {
-        block <<= 1;
+    const size_t record_floats = kvarn_checked_mul(head_dim, group_size, api, "record floats");
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(out, true, api, "out"); kvarn_require_ptr(scores, true, api, "scores");
+    const bool sink_tail_active = n_sink != 0 || n_tail != 0;
+    kvarn_require_ptr(sink_tail_k, sink_tail_active, api, "sink_tail_k"); kvarn_require_ptr(sink_tail_v, sink_tail_active, api, "sink_tail_v");
+    kvarn_require_ptr(body_k, n_records != 0, api, "body_k"); kvarn_require_ptr(body_v, n_records != 0, api, "body_v");
+    kvarn_require_ptr(pending_k, n_pending != 0, api, "pending_k"); kvarn_require_ptr(pending_v, n_pending != 0, api, "pending_v");
+    kvarn_require_aligned(q, alignof(float), true, api, "q");
+    kvarn_require_aligned(q_body, alignof(float), q_body != nullptr, api, "q_body");
+    kvarn_require_aligned(out, alignof(float), true, api, "out");
+    kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    kvarn_require_aligned(sink_tail_k, alignof(uint16_t), sink_tail_active, api, "sink_tail_k");
+    kvarn_require_aligned(sink_tail_v, alignof(uint16_t), sink_tail_active, api, "sink_tail_v");
+    kvarn_require_aligned(body_k, alignof(float), n_records != 0, api, "body_k");
+    kvarn_require_aligned(body_v, alignof(float), n_records != 0, api, "body_v");
+    kvarn_require_aligned(pending_k, alignof(float), n_pending != 0, api, "pending_k");
+    kvarn_require_aligned(pending_v, alignof(float), n_pending != 0, api, "pending_v");
+    kvarn_validate_finite(scale, api, "scale"); kvarn_validate_finite(logit_softcap, api, "logit_softcap");
+    kvarn_require(logit_softcap >= 0.0f, api, "logit_softcap is negative");
+    kvarn_require_stride(q_stride_head_floats, head_dim, n_head > 1, api, "q_stride_head_floats");
+    kvarn_require_stride(q_stride_query_floats, kvarn_checked_span(n_head, q_stride_head_floats, head_dim, api, "Q query span"), n_queries > 1, api, "q_stride_query_floats");
+    if (q_body != nullptr) {
+        kvarn_require_stride(q_body_stride_head_floats, head_dim, n_head > 1, api, "q_body_stride_head_floats");
+        kvarn_require_stride(q_body_stride_query_floats, kvarn_checked_span(n_head, q_body_stride_head_floats, head_dim, api, "Q-body query span"), n_queries > 1, api, "q_body_stride_query_floats");
     }
-    block = block > 256 ? 256 : block;
+    kvarn_require_stride(out_stride_head_floats, head_dim, n_head > 1, api, "out_stride_head_floats");
+    kvarn_require_stride(out_stride_query_floats, kvarn_checked_span(n_head, out_stride_head_floats, head_dim, api, "output query span"), n_queries > 1, api, "out_stride_query_floats");
+    const size_t scratch_sink_slots = kvarn_checked_add(n_sink, n_tail, api, "sink/tail slots");
+    kvarn_require_stride(sink_tail_stride_head_f16, head_dim, n_head_kv > 1 && sink_tail_active, api, "sink_tail_stride_head_f16");
+    const size_t scratch_sink_head_span = kvarn_checked_span(n_head_kv, sink_tail_stride_head_f16, head_dim, api, "sink/tail token span");
+    kvarn_require_stride(sink_tail_stride_token_f16, scratch_sink_head_span, scratch_sink_slots > 1, api, "sink_tail_stride_token_f16");
+    kvarn_require_stride(pending_stride_head_floats, head_dim, n_head_kv > 1 && n_pending != 0, api, "pending_stride_head_floats");
+    const size_t scratch_pending_head_span = kvarn_checked_span(n_head_kv, pending_stride_head_floats, head_dim, api, "pending token span");
+    kvarn_require_stride(pending_stride_token_floats, scratch_pending_head_span, n_pending > 1, api, "pending_stride_token_floats");
+    kvarn_require_stride(k_body_stride_record_floats, record_floats, n_records != 0, api, "k_body_stride_record_floats");
+    kvarn_require_stride(v_body_stride_record_floats, record_floats, n_records != 0, api, "v_body_stride_record_floats");
+    kvarn_require_stride(k_body_stride_head_floats, kvarn_checked_span(n_records, k_body_stride_record_floats, record_floats, api, "K body head span"), n_head_kv > 1 && n_records != 0, api, "k_body_stride_head_floats");
+    kvarn_require_stride(v_body_stride_head_floats, kvarn_checked_span(n_records, v_body_stride_record_floats, record_floats, api, "V body head span"), n_head_kv > 1 && n_records != 0, api, "v_body_stride_head_floats");
+    kvarn_validate_mask(kq_mask, kq_mask_type, kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, n_queries, n_tokens, api);
+
+    const int block = kvarn_reduction_block(n_tokens, api, "F16-scratch reduction extent");
 
     const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     const int av_block = 128;
-    const int av_grid = int((head_dim + av_block - 1)/av_block);
+    const int av_grid = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, av_block, api, "F16-scratch AV grid"), api, "F16-scratch AV grid");
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
     for (uint32_t iq = 0; iq < n_queries; ++iq) {
@@ -5908,12 +6531,12 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
             const float * q_body_ptr = q_body == nullptr ? nullptr :
                 q_body + size_t(iq)*q_body_stride_query_floats + size_t(ih)*q_body_stride_head_floats;
             float * out_ptr = out + size_t(iq)*out_stride_query_floats + size_t(ih)*out_stride_head_floats;
-            const uint16_t * k_st_ptr = sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16;
-            const uint16_t * v_st_ptr = sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16;
-            const float * k_body_ptr = body_k + size_t(ikh)*k_body_stride_head_floats;
-            const float * v_body_ptr = body_v + size_t(ikh)*v_body_stride_head_floats;
-            const float * pending_k_ptr = pending_k + size_t(ikh)*pending_stride_head_floats;
-            const float * pending_v_ptr = pending_v + size_t(ikh)*pending_stride_head_floats;
+            const uint16_t * k_st_ptr = sink_tail_active ? sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16 : nullptr;
+            const uint16_t * v_st_ptr = sink_tail_active ? sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16 : nullptr;
+            const float * k_body_ptr = n_records != 0 ? body_k + size_t(ikh)*k_body_stride_head_floats : nullptr;
+            const float * v_body_ptr = n_records != 0 ? body_v + size_t(ikh)*v_body_stride_head_floats : nullptr;
+            const float * pending_k_ptr = n_pending != 0 ? pending_k + size_t(ikh)*pending_stride_head_floats : nullptr;
+            const float * pending_v_ptr = n_pending != 0 ? pending_v + size_t(ikh)*pending_stride_head_floats : nullptr;
             const void * kq_mask_ptr = kq_mask == nullptr ? nullptr :
                 (const char *) kq_mask + size_t(iq)*kq_mask_stride_query_bytes;
 
@@ -5930,6 +6553,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
                     v_body_stride_record_floats);
         }
     }
+    kvarn_launch_check(api);
 }
 
 static __global__ void kvarn_attn_mixed_f16_scores_softmax_kernel(
@@ -8399,9 +9023,56 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         uint32_t frame_flags,
         float logit_softcap,
         uint32_t turbo_v_mode) {
-    kvarn_validate_v_mode(head_dim, group_size, value_bits, turbo_v_mode);
-    const uint32_t n_tokens = n_sink + n_records*group_size + n_pending + n_tail;
+    constexpr const char * api = "ggml_cuda_kvarn_attn_mixed_f16_batch";
+    const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
+    const uint32_t n_tokens = kvarn_checked_u32(kvarn_validate_mixed_shape(
+            n_queries, n_head, n_head_kv, n_sink, n_records, n_pending, n_tail,
+            tail_start, head_dim, group_size, api), api, "logical token count");
     const uint32_t n_gqa = n_head/n_head_kv;
+    const bool sink_tail_active = n_sink != 0 || n_tail != 0;
+    const bool body_active = n_records != 0;
+    const bool pending_active = n_pending != 0;
+    kvarn_require_ptr(q, true, api, "q"); kvarn_require_ptr(out, true, api, "out"); kvarn_require_ptr(scores, true, api, "scores");
+    kvarn_require_ptr(sink_tail_k, sink_tail_active, api, "sink_tail_k"); kvarn_require_ptr(sink_tail_v, sink_tail_active, api, "sink_tail_v");
+    kvarn_require_ptr(k_body, body_active, api, "k_body"); kvarn_require_ptr(v_body, body_active, api, "v_body");
+    kvarn_require_ptr(k_scales, body_active, api, "k_scales"); kvarn_require_ptr(v_scales, body_active, api, "v_scales");
+    kvarn_require_ptr(pending_k, pending_active, api, "pending_k"); kvarn_require_ptr(pending_v, pending_active, api, "pending_v");
+    kvarn_require_aligned(q, alignof(float), true, api, "q"); kvarn_require_aligned(q_body, alignof(float), q_body != nullptr, api, "q_body");
+    kvarn_require_aligned(out, alignof(float), true, api, "out"); kvarn_require_aligned(scores, alignof(float), true, api, "scores");
+    kvarn_require_aligned(sink_tail_k, alignof(uint16_t), sink_tail_active, api, "sink_tail_k"); kvarn_require_aligned(sink_tail_v, alignof(uint16_t), sink_tail_active, api, "sink_tail_v");
+    kvarn_require_aligned(k_scales, alignof(float), body_active, api, "k_scales"); kvarn_require_aligned(v_scales, alignof(float), body_active, api, "v_scales");
+    kvarn_require_aligned(pending_k, alignof(float), pending_active, api, "pending_k"); kvarn_require_aligned(pending_v, alignof(float), pending_active, api, "pending_v");
+    kvarn_require_aligned(window_dev, alignof(int32_t), window_dev != nullptr, api, "window_dev");
+    kvarn_validate_finite(scale, api, "scale"); kvarn_validate_finite(logit_softcap, api, "logit_softcap");
+    kvarn_require(logit_softcap >= 0.0f, api, "logit_softcap is negative");
+    kvarn_require(scores_nelems >= 0, api, "scores_nelems is negative");
+    kvarn_require(k_body_records_cap >= 0, api, "k_body_records_cap is negative");
+    if (scores_nelems > 0) kvarn_require(size_t(scores_nelems) >= n_tokens, api, "scores_nelems is smaller than active score storage");
+    if (k_body_records_cap > 0) kvarn_require(uint64_t(k_body_records_cap) >= n_records, api, "k_body_records_cap is smaller than n_records");
+    kvarn_require_stride(q_stride_head_floats, head_dim, n_head > 1, api, "q_stride_head_floats");
+    kvarn_require_stride(q_stride_query_floats, kvarn_checked_span(n_head, q_stride_head_floats, head_dim, api, "Q query span"), n_queries > 1, api, "q_stride_query_floats");
+    if (q_body != nullptr) {
+        kvarn_require_stride(q_body_stride_head_floats, head_dim, n_head > 1, api, "q_body_stride_head_floats");
+        kvarn_require_stride(q_body_stride_query_floats, kvarn_checked_span(n_head, q_body_stride_head_floats, head_dim, api, "Q-body query span"), n_queries > 1, api, "q_body_stride_query_floats");
+    }
+    kvarn_require_stride(out_stride_head_floats, head_dim, n_head > 1, api, "out_stride_head_floats");
+    kvarn_require_stride(out_stride_query_floats, kvarn_checked_span(n_head, out_stride_head_floats, head_dim, api, "output query span"), n_queries > 1, api, "out_stride_query_floats");
+    const size_t sink_slots = kvarn_checked_add(n_sink, n_tail, api, "sink/tail slot count");
+    kvarn_require_stride(sink_tail_stride_head_f16, head_dim, n_head_kv > 1 && sink_tail_active, api, "sink_tail_stride_head_f16");
+    const size_t sink_head_span = kvarn_checked_span(n_head_kv, sink_tail_stride_head_f16, head_dim, api, "sink/tail token span");
+    kvarn_require_stride(sink_tail_stride_token_f16, sink_head_span, sink_slots > 1, api, "sink_tail_stride_token_f16");
+    kvarn_require_stride(pending_stride_head_floats, head_dim, n_head_kv > 1 && pending_active, api, "pending_stride_head_floats");
+    const size_t pending_head_span = kvarn_checked_span(n_head_kv, pending_stride_head_floats, head_dim, api, "pending token span");
+    kvarn_require_stride(pending_stride_token_floats, pending_head_span, n_pending > 1, api, "pending_stride_token_floats");
+    kvarn_require_stride(k_body_stride_record_bytes, c.k_body_bytes, body_active, api, "k_body_stride_record_bytes");
+    kvarn_require_stride(v_body_stride_record_bytes, c.v_body_bytes, body_active, api, "v_body_stride_record_bytes");
+    kvarn_require_stride(k_scale_stride_record_floats, c.k_scale_floats, body_active, api, "k_scale_stride_record_floats");
+    kvarn_require_stride(v_scale_stride_record_floats, c.v_scale_floats, body_active, api, "v_scale_stride_record_floats");
+    kvarn_require_stride(k_body_stride_head_bytes, kvarn_checked_span(n_records, k_body_stride_record_bytes, c.k_body_bytes, api, "K body head span"), n_head_kv > 1 && body_active, api, "k_body_stride_head_bytes");
+    kvarn_require_stride(v_body_stride_head_bytes, kvarn_checked_span(n_records, v_body_stride_record_bytes, c.v_body_bytes, api, "V body head span"), n_head_kv > 1 && body_active, api, "v_body_stride_head_bytes");
+    kvarn_require_stride(k_scale_stride_head_floats, kvarn_checked_span(n_records, k_scale_stride_record_floats, c.k_scale_floats, api, "K scale head span"), n_head_kv > 1 && body_active, api, "k_scale_stride_head_floats");
+    kvarn_require_stride(v_scale_stride_head_floats, kvarn_checked_span(n_records, v_scale_stride_record_floats, c.v_scale_floats, api, "V scale head span"), n_head_kv > 1 && body_active, api, "v_scale_stride_head_floats");
+    kvarn_validate_mask(kq_mask, kq_mask_type, kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, n_queries, n_tokens, api);
     (void) kvarn_env_flag("LLAMA_KVARN_ATTN_FUSED_BATCH");
     (void) kvarn_dequant_cache_trace_enabled();
     (void) kvarn_dequant_cache_trace_limit();
@@ -8419,27 +9090,21 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const bool use_serial_fused = force_serial_fused && !use_split_kernels;
     const bool fused_paper_frame = (frame_flags & KVARN_ATTN_FRAME_FUSED_PAPER_FULL) != 0;
     if ((frame_flags & ~KVARN_ATTN_FRAME_FUSED_PAPER_FULL) != 0) {
-        std::fprintf(stderr, "KVarN mixed attention received unsupported frame flags\n");
-        std::abort();
+        kvarn_invalid(api, "unsupported frame flags");
     }
     if (turbo_v_mode == 6u) {
         if (mixed_frame || use_raw_body_k || use_raw_body_v) {
-            std::fprintf(stderr,
-                    "KVarN sparse-D512 attention does not support mixed-frame or raw-body diagnostics\n");
-            std::abort();
+            kvarn_invalid(api, "sparse-D512 does not support mixed-frame or raw-body diagnostics");
         }
     }
 
-    int block = 1;
-    while (block < int(n_tokens)) {
-        block <<= 1;
-    }
-    block = block > 256 ? 256 : block;
+    const int block = kvarn_reduction_block(n_tokens, api, "packed mixed-attention reduction extent");
 
     const size_t shmem = (size_t(n_tokens) + size_t(block) + KVARN_ATTN_SHMEM_PAD_FLOATS)*sizeof(float);
     const size_t reduce_shmem = size_t(block)*sizeof(float);
     const int av_block = 128;
-    const int av_grid = int((head_dim + av_block - 1)/av_block);
+    const int av_grid = kvarn_checked_grid(
+            kvarn_checked_ceil_div(head_dim, av_block, api, "attention AV grid"), api, "attention AV grid");
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
     // Per-head serial launches add n_head kernel launch overheads and regressed
@@ -8447,8 +9112,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
     const bool use_decode_per_head = kvarn_env_flag("LLAMA_KVARN_ATTN_DECODE_PER_HEAD");
 
     if (fused_paper_frame && (use_split_kernels || use_serial_fused || n_records != 0 || n_pending != 0)) {
-        std::fprintf(stderr, "KVarN fused paper-frame FWHT is only implemented for pure sink/tail attention\n");
-        std::abort();
+        kvarn_invalid(api, "fused paper-frame FWHT requires pure sink/tail attention");
     }
 
     if (!use_split_kernels && !use_serial_fused) {
@@ -8458,14 +9122,14 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 const uint32_t ikh = ih/n_gqa;
                 const float * q_ptr = q + size_t(ih)*q_stride_head_floats;
                 float * out_ptr = out + size_t(ih)*out_stride_head_floats;
-                const uint16_t * k_st_ptr = sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16;
-                const uint16_t * v_st_ptr = sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16;
-                const uint8_t * k_body_ptr = k_body + size_t(ikh)*k_body_stride_head_bytes;
-                const uint8_t * v_body_ptr = v_body + size_t(ikh)*v_body_stride_head_bytes;
-                const float * k_scales_ptr = k_scales + size_t(ikh)*k_scale_stride_head_floats;
-                const float * v_scales_ptr = v_scales + size_t(ikh)*v_scale_stride_head_floats;
-                const float * pending_k_ptr = pending_k + size_t(ikh)*pending_stride_head_floats;
-                const float * pending_v_ptr = pending_v + size_t(ikh)*pending_stride_head_floats;
+                const uint16_t * k_st_ptr = sink_tail_active ? sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16 : nullptr;
+                const uint16_t * v_st_ptr = sink_tail_active ? sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16 : nullptr;
+                const uint8_t * k_body_ptr = body_active ? k_body + size_t(ikh)*k_body_stride_head_bytes : nullptr;
+                const uint8_t * v_body_ptr = body_active ? v_body + size_t(ikh)*v_body_stride_head_bytes : nullptr;
+                const float * k_scales_ptr = body_active ? k_scales + size_t(ikh)*k_scale_stride_head_floats : nullptr;
+                const float * v_scales_ptr = body_active ? v_scales + size_t(ikh)*v_scale_stride_head_floats : nullptr;
+                const float * pending_k_ptr = pending_active ? pending_k + size_t(ikh)*pending_stride_head_floats : nullptr;
+                const float * pending_v_ptr = pending_active ? pending_v + size_t(ikh)*pending_stride_head_floats : nullptr;
                 const void * kq_mask_ptr = kq_mask;
 
                 kvarn_attn_mixed_f16_fused_kernel<<<1, block, shmem, cuda_stream>>>(
@@ -8478,6 +9142,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         kq_mask_stride_token_bytes, kq_mask_type,
                         int32_t(n_tokens) - 1, scale, logit_softcap, turbo_v_mode);
             }
+            kvarn_launch_check(api);
             return;
         }
 
@@ -8503,6 +9168,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             kq_mask_stride_token_bytes, kq_mask_type, scale,
                             fused_paper_frame,
                             window_dev, logit_softcap);
+                    kvarn_launch_check(api);
                     return;
                 }
             }
@@ -8522,13 +9188,13 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             sink_tail_stride_head_f16, sink_tail_stride_token_f16,
                             kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
                             kq_mask_type, scale, logit_softcap, fused_paper_frame);
+                    kvarn_launch_check(api);
                     return;
                 }
             }
 
             if (fused_paper_frame) {
-                std::fprintf(stderr, "KVarN fused paper-frame FWHT sink/tail shared-memory requirement was not met\n");
-                std::abort();
+                kvarn_invalid(api, "fused paper-frame FWHT shared-memory requirement was not met");
             }
         }
 
@@ -8542,9 +9208,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                     !kvarn_cuda_prepare_dynamic_shmem(
                         kvarn_attn_mixed_f16_fused_batch_sparse_d512_scalar_qt_gqa_kernel<1, sparse_q1_ht>,
                         sparse_q1_shmem)) {
-                std::fprintf(stderr,
-                        "KVarN sparse-D512 scalar-q1-GQA shared-memory requirement was not met\n");
-                std::abort();
+                kvarn_invalid(api, "sparse-D512 scalar-q1-GQA shared-memory requirement was not met");
             }
             const int sparse_q1_grid = int(
                     n_head_kv*((n_gqa + uint32_t(sparse_q1_ht - 1))/uint32_t(sparse_q1_ht)));
@@ -8575,6 +9239,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                     k_scale_stride_head_floats, v_scale_stride_head_floats,
                     kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
                     kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
+            kvarn_launch_check(api);
             return;
         }
 
@@ -8632,6 +9297,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             k_scale_stride_head_floats, v_scale_stride_head_floats,
                             kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
                             kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
+                    kvarn_launch_check(api);
                     return;
                 }
             }
@@ -8676,6 +9342,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             k_scale_stride_head_floats, v_scale_stride_head_floats,
                             kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
                             kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
+                    kvarn_launch_check(api);
                     return;
                 }
             }
@@ -8720,6 +9387,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             k_scale_stride_head_floats, v_scale_stride_head_floats,
                             kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
                             kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
+                    kvarn_launch_check(api);
                     return;
                 }
             }
@@ -8731,7 +9399,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                     "sink=%u records=%u pending=%u tail=%u tokens=%u disabled=%d\n",
                     head_dim, n_queries, n_head, n_head_kv, n_gqa,
                     n_sink, n_records, n_pending, n_tail, n_tokens, q1_gqa_disabled ? 1 : 0);
-            std::abort();
+            kvarn_invalid(api, "required q1-GQA scalar route is unavailable");
         }
 
         const int sparse_mode6_qt_override = turbo_v_mode == 6u ? kvarn_env_qt_override() : 0;
@@ -8801,7 +9469,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         "KVarN sparse-D512 scalar-QT-GQA shared-memory requirement was not met"
                         " (override=%d tokens=%u)\n",
                         sparse_qt_override, n_tokens);
-                std::abort();
+                kvarn_invalid(api, "sparse-D512 scalar-QT-GQA shared-memory requirement was not met");
             }
             const int sparse_grid = int(
                     ((n_queries + uint32_t(sparse_qt - 1))/uint32_t(sparse_qt))*n_head_kv*
@@ -8843,6 +9511,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 KVARN_LAUNCH_SPARSE_D512_GQA(4, 1);
             }
 #undef KVARN_LAUNCH_SPARSE_D512_GQA
+            kvarn_launch_check(api);
             return;
         }
 
@@ -8871,9 +9540,11 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             raw_key, (const void *) k_body, kvarn_raw_body_mirror_count(),
                             n_records, n_head_kv, head_dim, group_size,
                             use_raw_body_k ? 1 : 0, use_raw_body_v ? 1 : 0);
-                    std::abort();
+                    kvarn_fail(api, "raw-body scalar-QT requested without a compatible captured mirror");
                 }
-                scalar_body_f32_stride_head_elems = size_t(raw_body.n_records_cap)*group_size*head_dim;
+                scalar_body_f32_stride_head_elems = kvarn_checked_mul(
+                        kvarn_checked_mul(raw_body.n_records_cap, group_size, api, "raw mirror records*group_size"),
+                        head_dim, api, "raw mirror head stride");
                 scalar_body_k_f32 = use_raw_body_k ? raw_body.k : nullptr;
                 scalar_body_v_f32 = use_raw_body_v ? raw_body.v : nullptr;
                 scalar_used_f32_body_mirror = true;
@@ -8886,19 +9557,20 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                  kvarn_env_flag("LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE") ||
                  kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR"));
             if (scalar_allow_f32_body_mirror) {
-                const size_t n_per_record = size_t(group_size)*head_dim;
-                const size_t n_per_head = size_t(n_records)*n_per_record;
+                const size_t n_per_record = kvarn_checked_mul(group_size, head_dim, api, "F32 mirror record elements");
+                const size_t n_per_head = kvarn_checked_mul(n_records, n_per_record, api, "F32 mirror active head elements");
                 const size_t cap_records = size_t(k_body_records_cap > 0 ? k_body_records_cap : n_records);
-                const size_t cap_elems_per_head = cap_records*n_per_record;
-                const size_t cap_floats = 2*size_t(n_head_kv)*cap_elems_per_head;
-                const size_t active_floats = 2*size_t(n_head_kv)*n_per_head;
+                const size_t cap_elems_per_head = kvarn_checked_mul(cap_records, n_per_record, api, "F32 mirror capacity head elements");
+                const size_t two_heads = kvarn_checked_mul(2, n_head_kv, api, "F32 mirror K/V heads");
+                const size_t cap_floats = kvarn_checked_mul(two_heads, cap_elems_per_head, api, "F32 mirror capacity");
+                const size_t active_floats = kvarn_checked_mul(two_heads, n_per_head, api, "F32 mirror active size");
                 const bool enable_f32_dequant_cache =
                     kvarn_env_flag("LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE");
                 const bool anchored = enable_f32_dequant_cache && scores_nelems > 0 &&
-                        size_t(scores_nelems) >= size_t(n_tokens) + cap_floats &&
+                        size_t(scores_nelems) >= kvarn_checked_add(n_tokens, cap_floats, api, "F32 mirror workspace") &&
                         cap_records >= size_t(n_records);
                 const bool active_mirror_fits = scores_nelems > 0 &&
-                        size_t(scores_nelems) >= size_t(n_tokens) + active_floats;
+                        size_t(scores_nelems) >= kvarn_checked_add(n_tokens, active_floats, api, "F32 active mirror workspace");
                 if (anchored || active_mirror_fits) {
                     float * k_dequant = anchored ? scores + (size_t(scores_nelems) - cap_floats) : scores + size_t(n_tokens);
                     float * v_dequant = k_dequant + size_t(n_head_kv)*(anchored ? cap_elems_per_head : n_per_head);
@@ -8932,7 +9604,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             }
             if (use_raw_body_scalar_qt && (scalar_body_k_f32 == nullptr && scalar_body_v_f32 == nullptr)) {
                 std::fprintf(stderr, "KVarN raw body scalar-QT ablation requested but no raw K or V body was selected\n");
-                std::abort();
+                kvarn_fail(api, "raw-body scalar-QT requested without a selected raw K or V body");
             }
             if (n_gqa >= 2 && qt_override != 16 && !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT")) {
                 if (head_dim == 256 && n_gqa >= 8 && !kvarn_env_flag("LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT_HT8")) {
@@ -9003,6 +9675,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                                     kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
                                     scalar_body_f32_stride_head_elems, logit_softcap, turbo_v_mode);
                         }
+                        kvarn_launch_check(api);
                         return;
                     }
                 }
@@ -9074,6 +9747,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                                     kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
                                     scalar_body_f32_stride_head_elems, logit_softcap, turbo_v_mode);
                         }
+                        kvarn_launch_check(api);
                         return;
                     }
                 }
@@ -9118,6 +9792,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                                 k_scale_stride_head_floats, v_scale_stride_head_floats,
                                 kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
                                 scalar_body_f32_stride_head_elems, logit_softcap, turbo_v_mode);
+                        kvarn_launch_check(api);
                         return;
                     }
                 }
@@ -9188,6 +9863,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                                 kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
                                 scalar_body_f32_stride_head_elems, logit_softcap, turbo_v_mode);
                     }
+                    kvarn_launch_check(api);
                     return;
                 }
             }
@@ -9264,6 +9940,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             k_scale_stride_head_floats, v_scale_stride_head_floats,
                              kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
                 }
+                kvarn_launch_check(api);
                 return;
             }
 
@@ -9318,6 +9995,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             k_scale_stride_head_floats, v_scale_stride_head_floats,
                             kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
                             kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
+                    kvarn_launch_check(api);
                     return;
                 }
             }
@@ -9372,8 +10050,8 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                 bool used_f16_body_mirror = false;
 
                 if (n_records > 0 && scores != nullptr && allow_f16_body_mirror) {
-                    const size_t n_per_record = size_t(group_size)*head_dim;
-                    const size_t n_per_head = size_t(n_records)*n_per_record;
+                    const size_t n_per_record = kvarn_checked_mul(group_size, head_dim, api, "F16 mirror record elements");
+                    const size_t n_per_head = kvarn_checked_mul(n_records, n_per_record, api, "F16 mirror active head elements");
                     // K/V f16 mirrors are END-ANCHORED in the persistent attn scratch
                     // (capacity-sized region whose base does not move as the window
                     // grows). A host-side cache keyed by (scratch ptr -> k_body ptr,
@@ -9381,14 +10059,17 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                     // Packed V in-kernel is cheaper in theory but measured slower on
                     // 512d Gemma warpqk AV; keep the f16 V mirror.
                     const size_t cap_records = size_t(k_body_records_cap > 0 ? k_body_records_cap : n_records);
-                    const size_t cap_elems_per_head = cap_records*n_per_record;
-                    const size_t cap_halves_kv = 2*size_t(n_head_kv)*cap_elems_per_head;
-                    const size_t cap_floats = (cap_halves_kv + 1)/2;
+                    const size_t cap_elems_per_head = kvarn_checked_mul(cap_records, n_per_record, api, "F16 mirror capacity head elements");
+                    const size_t two_heads = kvarn_checked_mul(2, n_head_kv, api, "F16 mirror K/V heads");
+                    const size_t cap_halves_kv = kvarn_checked_mul(two_heads, cap_elems_per_head, api, "F16 mirror capacity");
+                    const size_t cap_floats = kvarn_checked_add(cap_halves_kv, 1, api, "F16 mirror float rounding")/2;
+                    const size_t active_halves_kv = kvarn_checked_mul(two_heads, n_per_head, api, "F16 mirror active size");
+                    const size_t active_floats = kvarn_checked_add(active_halves_kv, 1, api, "F16 active mirror float rounding")/2;
                     const bool anchored = scores_nelems > 0 &&
-                            size_t(scores_nelems) >= size_t(n_tokens) + cap_floats &&
+                            size_t(scores_nelems) >= kvarn_checked_add(n_tokens, cap_floats, api, "F16 mirror workspace") &&
                             cap_records >= size_t(n_records);
                     const bool active_mirror_fits = scores_nelems > 0 &&
-                            size_t(scores_nelems) >= size_t(n_tokens) + (2*size_t(n_head_kv)*n_per_head + 1)/2;
+                            size_t(scores_nelems) >= kvarn_checked_add(n_tokens, active_floats, api, "F16 active mirror workspace");
                     if (anchored || active_mirror_fits) {
                         __half * k_dequant = anchored ?
                             reinterpret_cast<__half *>(scores + (size_t(scores_nelems) - cap_floats)) :
@@ -9432,12 +10113,15 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         kvarn_env_flag("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR") &&
                         scores_nelems > 0 &&
                         !used_f16_body_mirror) {
+                    const size_t required_body_f16_elems = kvarn_checked_mul(
+                            kvarn_checked_mul(2, n_head_kv, api, "required body mirror K/V heads"),
+                            kvarn_checked_mul(n_records, kvarn_checked_mul(group_size, head_dim, api, "required body mirror record"), api, "required body mirror head"),
+                            api, "required body mirror elements");
                     std::fprintf(stderr,
                             "KVarN CUDA mixed-attn diagnostic error: LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR=1"
                             " but body_mirror_used=0 (scores_nelems=%" PRId64 ", required_body_f16_elems=%zu)\n",
-                            scores_nelems,
-                            2*size_t(n_head_kv)*size_t(n_records)*size_t(group_size)*size_t(head_dim));
-                    std::abort();
+                            scores_nelems, required_body_f16_elems);
+                    kvarn_fail(api, "required 256D body mirror does not fit the supplied score workspace");
                 }
 
                 const int warpqk_grid = warpqk_q8 ? int(((n_queries + 7)/8)*n_head) :
@@ -9505,6 +10189,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                         kq_mask_stride_query_bytes, kq_mask_stride_token_bytes, kq_mask_type, scale,
                         body_k_f16, body_v_f16, body_f16_stride_head_elems, logit_softcap, turbo_v_mode);
                 }
+                kvarn_launch_check(api);
                 return;
             }
         }
@@ -9529,6 +10214,7 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                     "fused-batch-generic", n_queries, n_head, n_head_kv,
                     n_sink, n_records, n_pending, n_tail, head_dim, n_tokens,
                     int(n_queries*n_head), block, shmem);
+            kvarn_launch_check(api);
             return;
         }
     }
@@ -9546,13 +10232,14 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                     raw_key, (const void *) k_body, kvarn_raw_body_mirror_count(),
                     n_records, n_head_kv, head_dim, group_size,
                     use_raw_body_k ? 1 : 0, use_raw_body_v ? 1 : 0);
-            std::abort();
+            kvarn_fail(api, "raw-body ablation requested without a compatible captured mirror");
         }
     }
     const float * raw_body_k_base = (use_raw_body_k && have_raw_body) ? raw_body.k : nullptr;
     const float * raw_body_v_base = (use_raw_body_v && have_raw_body) ? raw_body.v : nullptr;
-    const size_t raw_body_stride_head_floats = have_raw_body ?
-        size_t(raw_body.n_records_cap)*group_size*head_dim : 0;
+    const size_t raw_body_stride_head_floats = have_raw_body ? kvarn_checked_mul(
+            kvarn_checked_mul(raw_body.n_records_cap, group_size, api, "raw attention records*group_size"),
+            head_dim, api, "raw attention head stride") : 0;
 
     for (uint32_t iq = 0; iq < n_queries; ++iq) {
         for (uint32_t ih = 0; ih < n_head; ++ih) {
@@ -9561,14 +10248,14 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             const float * q_body_ptr = q_body == nullptr ? nullptr :
                 q_body + size_t(iq)*q_body_stride_query_floats + size_t(ih)*q_body_stride_head_floats;
             float * out_ptr = out + size_t(iq)*out_stride_query_floats + size_t(ih)*out_stride_head_floats;
-            const uint16_t * k_st_ptr = sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16;
-            const uint16_t * v_st_ptr = sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16;
-            const uint8_t * k_body_ptr = k_body + size_t(ikh)*k_body_stride_head_bytes;
-            const uint8_t * v_body_ptr = v_body + size_t(ikh)*v_body_stride_head_bytes;
-            const float * k_scales_ptr = k_scales + size_t(ikh)*k_scale_stride_head_floats;
-            const float * v_scales_ptr = v_scales + size_t(ikh)*v_scale_stride_head_floats;
-            const float * pending_k_ptr = pending_k + size_t(ikh)*pending_stride_head_floats;
-            const float * pending_v_ptr = pending_v + size_t(ikh)*pending_stride_head_floats;
+            const uint16_t * k_st_ptr = sink_tail_active ? sink_tail_k + size_t(ikh)*sink_tail_stride_head_f16 : nullptr;
+            const uint16_t * v_st_ptr = sink_tail_active ? sink_tail_v + size_t(ikh)*sink_tail_stride_head_f16 : nullptr;
+            const uint8_t * k_body_ptr = body_active ? k_body + size_t(ikh)*k_body_stride_head_bytes : nullptr;
+            const uint8_t * v_body_ptr = body_active ? v_body + size_t(ikh)*v_body_stride_head_bytes : nullptr;
+            const float * k_scales_ptr = body_active ? k_scales + size_t(ikh)*k_scale_stride_head_floats : nullptr;
+            const float * v_scales_ptr = body_active ? v_scales + size_t(ikh)*v_scale_stride_head_floats : nullptr;
+            const float * pending_k_ptr = pending_active ? pending_k + size_t(ikh)*pending_stride_head_floats : nullptr;
+            const float * pending_v_ptr = pending_active ? pending_v + size_t(ikh)*pending_stride_head_floats : nullptr;
             const float * raw_body_k_ptr = raw_body_k_base == nullptr ? nullptr :
                 raw_body_k_base + size_t(ikh)*raw_body_stride_head_floats;
             const float * raw_body_v_ptr = raw_body_v_base == nullptr ? nullptr :
@@ -9676,4 +10363,5 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
             }
         }
     }
+    kvarn_launch_check(api);
 }

@@ -118,12 +118,6 @@ int main() {
     float * out_d = nullptr;
     float * scores_d = nullptr;
 
-    require_cuda(cudaMalloc(&k_body_d, 1), "cudaMalloc dummy K body");
-    require_cuda(cudaMalloc(&v_body_d, 1), "cudaMalloc dummy V body");
-    require_cuda(cudaMalloc(&k_scales_d, sizeof(float)), "cudaMalloc dummy K scales");
-    require_cuda(cudaMalloc(&v_scales_d, sizeof(float)), "cudaMalloc dummy V scales");
-    require_cuda(cudaMalloc(&pending_k_d, sizeof(float)), "cudaMalloc dummy pending K");
-    require_cuda(cudaMalloc(&pending_v_d, sizeof(float)), "cudaMalloc dummy pending V");
     require_cuda(cudaMalloc(&out_d, head_dim*sizeof(float)), "cudaMalloc output");
     require_cuda(cudaMalloc(&scores_d, n_tokens*sizeof(float)), "cudaMalloc scores");
 
@@ -206,12 +200,6 @@ int main() {
     cudaFree(q_d);
     cudaFree(sink_tail_k_d);
     cudaFree(sink_tail_v_d);
-    cudaFree(k_body_d);
-    cudaFree(v_body_d);
-    cudaFree(k_scales_d);
-    cudaFree(v_scales_d);
-    cudaFree(pending_k_d);
-    cudaFree(pending_v_d);
     cudaFree(out_d);
     cudaFree(scores_d);
 

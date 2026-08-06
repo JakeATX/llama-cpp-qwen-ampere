@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -26,6 +27,11 @@ static void set_env_var(const char * name, const char * value) {
     }
 #endif
 }
+
+struct clear_env_on_exit {
+    const char * name;
+    ~clear_env_on_exit() { set_env_var(name, ""); }
+};
 
 static void set_paper_frame_env(bool enabled) {
     set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", enabled ? "1" : "");
@@ -95,6 +101,28 @@ static float f16_bits_to_f32(uint16_t v) {
     return __half2float(h);
 }
 
+static void require_invalid_argument(const char * name, const std::function<void()> & invoke) {
+    try {
+        invoke();
+    } catch (const std::invalid_argument &) {
+        return;
+    } catch (const std::exception & err) {
+        std::fprintf(stderr, "FAIL: %s threw the wrong exception: %s\n", name, err.what());
+        std::exit(1);
+    }
+    std::fprintf(stderr, "FAIL: %s accepted an invalid public-boundary invocation\n", name);
+    std::exit(1);
+}
+
+static void require_valid_invocation(const char * name, const std::function<void()> & invoke) {
+    try {
+        invoke();
+    } catch (const std::exception & err) {
+        std::fprintf(stderr, "FAIL: %s rejected a valid public-boundary invocation: %s\n", name, err.what());
+        std::exit(1);
+    }
+}
+
 static void test_nonfinite_softmax_contract() {
     constexpr uint32_t n_tokens = 3;
     constexpr uint32_t head_dim = 4;
@@ -126,12 +154,6 @@ static void test_nonfinite_softmax_contract() {
     float * pending_v_d = nullptr;
     float * out_d = nullptr;
     float * scores_d = nullptr;
-    require_cuda(cudaMalloc(&k_body_d, 1), "cudaMalloc nonfinite dummy K body");
-    require_cuda(cudaMalloc(&v_body_d, 1), "cudaMalloc nonfinite dummy V body");
-    require_cuda(cudaMalloc(&k_scales_d, sizeof(float)), "cudaMalloc nonfinite dummy K scales");
-    require_cuda(cudaMalloc(&v_scales_d, sizeof(float)), "cudaMalloc nonfinite dummy V scales");
-    require_cuda(cudaMalloc(&pending_k_d, sizeof(float)), "cudaMalloc nonfinite dummy pending K");
-    require_cuda(cudaMalloc(&pending_v_d, sizeof(float)), "cudaMalloc nonfinite dummy pending V");
     require_cuda(cudaMalloc(&out_d, head_dim*sizeof(float)), "cudaMalloc nonfinite output");
     require_cuda(cudaMalloc(&scores_d, n_tokens*sizeof(float)), "cudaMalloc nonfinite scores");
 
@@ -140,7 +162,8 @@ static void test_nonfinite_softmax_contract() {
         const std::vector<float> poison(head_dim, std::numeric_limits<float>::quiet_NaN());
         require_cuda(cudaMemcpy(out_d, poison.data(), head_dim*sizeof(float), cudaMemcpyHostToDevice),
                 "poison nonfinite output");
-        ggml_cuda_kvarn_attn_mixed_f16_batch(
+        require_valid_invocation("nonfinite softmax valid launch", [&] {
+            ggml_cuda_kvarn_attn_mixed_f16_batch(
                 q_d, k_d, v_d,
                 k_body_d, v_body_d, k_scales_d, v_scales_d, pending_k_d, pending_v_d,
                 mask_d, out_d, scores_d,
@@ -149,6 +172,7 @@ static void test_nonfinite_softmax_contract() {
                 head_dim, head_dim, head_dim, head_dim,
                 1, 1, 1, 1, 1, 1, 1, 1,
                 n_tokens*sizeof(float), sizeof(float), 1, 1.0f, nullptr);
+        });
         require_cuda(cudaGetLastError(), "KVarN nonfinite softmax launch");
         require_cuda(cudaDeviceSynchronize(), "KVarN nonfinite softmax sync");
         std::vector<float> out(head_dim);
@@ -189,14 +213,290 @@ static void test_nonfinite_softmax_contract() {
     cudaFree(q_d);
     cudaFree(k_d);
     cudaFree(v_d);
-    cudaFree(k_body_d);
-    cudaFree(v_body_d);
-    cudaFree(k_scales_d);
-    cudaFree(v_scales_d);
-    cudaFree(pending_k_d);
-    cudaFree(pending_v_d);
     cudaFree(out_d);
     cudaFree(scores_d);
+}
+
+static void test_public_cuda_boundary_validation() {
+    // These deliberately invalid calls must be rejected by the host wrappers before
+    // CUDA launches work. Keep the matrix compact: one causal mutation per wrapper,
+    // distributed across the public boundary contract.
+    float * f = nullptr;
+    uint8_t * u8 = nullptr;
+    uint16_t * u16 = nullptr;
+    int32_t * i32_mut = nullptr;
+    // Real device allocations make a missed validator deterministic and memory-safe;
+    // no test relies on fabricated CUDA addresses.  The float slab is large enough
+    // for a valid D512 tile/scratch use and the byte slab for two packed records.
+    require_cuda(cudaMalloc(&f, size_t(1 << 20)*sizeof(float)), "cudaMalloc boundary float slab");
+    require_cuda(cudaMalloc(&u8, size_t(1 << 18)), "cudaMalloc boundary packed slab");
+    require_cuda(cudaMalloc(&u16, size_t(1 << 17)*sizeof(uint16_t)), "cudaMalloc boundary half slab");
+    require_cuda(cudaMalloc(&i32_mut, 2*sizeof(int32_t)), "cudaMalloc boundary record indices");
+    const float * cf = f;
+    const uint8_t * cu8 = u8;
+    const uint16_t * cu16 = u16;
+    const int32_t * i32 = i32_mut;
+    constexpr uint32_t d = 256;
+    constexpr uint32_t g = 128;
+    constexpr size_t tile = size_t(d)*g;
+    constexpr size_t kb = tile;
+    constexpr size_t vb = tile/4;
+    constexpr size_t ks = size_t(2)*d + g;
+    constexpr size_t vs = d + size_t(2)*g;
+
+    require_invalid_argument("store body rejects non-finite RTN quantile", [&] {
+        ggml_cuda_kvarn_store_body_reference_minmax(
+                cf, cf, u8, u8, f, f, f, d, g, 8, 2, 4,
+                std::numeric_limits<float>::quiet_NaN(), 0, false, nullptr);
+    });
+    require_invalid_argument("store body rejects a non-power-of-two active Hadamard dimension", [&] {
+        ggml_cuda_kvarn_store_body_reference_minmax(
+                cf, cf, u8, u8, f, f, f, d - 1, g, 8, 2, 4,
+                1.0f, 0, false, nullptr);
+    });
+    require_invalid_argument("pending-record store rejects a source-less record batch", [&] {
+        ggml_cuda_kvarn_store_body_pending_records_minmax(
+                cf, cf, u8, u8, f, f, f, i32, 2, d, g, 8, 2, 4, 1.0f,
+                kb, vb, kb, vb, ks, vs, ks, vs, d, d, 0, false, nullptr);
+    });
+    require_invalid_argument("pending-head store rejects an active null K source", [&] {
+        ggml_cuda_kvarn_store_body_pending_heads_minmax(
+                nullptr, cf, u8, u8, f, f, f, 1, d, g, 8, 2, 4, 1.0f,
+                kb, vb, ks, vs, d, d, 0, false, nullptr);
+    });
+    require_invalid_argument("direct-record store rejects undersized workspace", [&] {
+        ggml_cuda_kvarn_store_body_direct_records_minmax(
+                cf, cf, u8, u8, f, f, f, 1, 1, d, g, 8, 2, 4, 1.0f,
+                kb, vb, kb, vb, ks, vs, ks, vs,
+                d, d, size_t(d), size_t(d), tile, tile, 1, 0, nullptr);
+    });
+    require_invalid_argument("K store rejects an unsupported bit width", [&] {
+        ggml_cuda_kvarn_store_k_body_reference_minmax(cf, u8, f, f, d, g, 3, 4, 1.0f, false, nullptr);
+    });
+    require_invalid_argument("V store rejects a layout-mode/head-dimension mismatch", [&] {
+        ggml_cuda_kvarn_store_v_body_reference_minmax(cf, u8, f, f, d, g, 2, 4, 1.0f, 6, false, nullptr);
+    });
+
+    require_invalid_argument("dequant rejects zero group size", [&] {
+        ggml_cuda_kvarn_dequant_body(cu8, cu8, cf, cf, f, f, d, 0, 8, 2, 0, nullptr);
+    });
+    require_invalid_argument("dequant-N rejects a short packed-K record stride", [&] {
+        ggml_cuda_kvarn_dequant_body_n(
+                cu8, cu8, cf, cf, f, f, 2, d, g, 8, 2,
+                kb - 1, vb, ks, vs, tile, tile, 0, nullptr);
+    });
+    require_invalid_argument("D256 mode5 rejects a V record one byte below 10496", [&] {
+        ggml_cuda_kvarn_dequant_body_n(
+                cu8, cu8, cf, cf, f, f, 2, d, g, 8, 2,
+                kb, 10496 - 1, ks, vs, tile, tile, 5, nullptr);
+    });
+    require_invalid_argument("D512 mode6 rejects a V record one byte below 21504", [&] {
+        constexpr uint32_t d512 = 512;
+        constexpr size_t tile512 = size_t(d512)*128;
+        ggml_cuda_kvarn_dequant_body_n(
+                cu8, cu8, cf, cf, f, f, 2, d512, g, 8, 2,
+                tile512, 21504 - 1, size_t(2)*d512 + g, d512 + size_t(2)*g,
+                tile512, tile512, 6, nullptr);
+    });
+    require_invalid_argument("token-major dequant rejects a short K metadata stride", [&] {
+        ggml_cuda_kvarn_dequant_body_n_k_token_major(
+                cu8, cu8, cf, cf, f, f, 2, d, g, 8, 2,
+                kb, vb, ks - 1, vs, tile, tile, 0, nullptr);
+    });
+    require_invalid_argument("F16 token-major dequant rejects an active null output", [&] {
+        ggml_cuda_kvarn_dequant_body_n_k_token_major_f16(
+                cu8, cu8, cf, cf, nullptr, u16, 1, d, g, 8, 2,
+                kb, vb, ks, vs, tile, tile, 0, nullptr);
+    });
+    require_invalid_argument("materialize rejects an out-of-range tail cursor", [&] {
+        ggml_cuda_kvarn_materialize_kv_f16(
+                cu16, cu8, cf, cf, u16, 0, 1, 0, 0, 1, 1,
+                1, d, g, 8, 0, 0, nullptr,
+                d, d, kb, kb, ks, ks, d, d, d, d, nullptr);
+    });
+
+    require_invalid_argument("QK body rejects a non-finite scale", [&] {
+        ggml_cuda_kvarn_qk_body(cf, cu8, cf, f, d, g, 8,
+                std::numeric_limits<float>::infinity(), nullptr);
+    });
+    require_invalid_argument("QK body rejects a misaligned active float pointer", [&] {
+        const auto * misaligned_q = reinterpret_cast<const float *>(
+                reinterpret_cast<const uint8_t *>(cf) + 1);
+        ggml_cuda_kvarn_qk_body(misaligned_q, cu8, cf, f, d, g, 8, 1.0f, nullptr);
+    });
+    require_invalid_argument("AV body rejects an active null packed V", [&] {
+        ggml_cuda_kvarn_av_body(cf, nullptr, cf, f, d, g, 2, nullptr);
+    });
+    require_invalid_argument("body attention rejects an active null score output", [&] {
+        ggml_cuda_kvarn_attn_body(cf, cu8, cu8, cf, cf, f, nullptr, d, g, 8, 2, 1.0f, nullptr);
+    });
+    require_invalid_argument("body-N attention rejects an empty body", [&] {
+        ggml_cuda_kvarn_attn_body_n(
+                cf, cu8, cu8, cf, cf, f, f, 0, d, g, 8, 2,
+                kb, vb, ks, vs, 1.0f, nullptr);
+    });
+    require_invalid_argument("batched body attention rejects zero queries", [&] {
+        ggml_cuda_kvarn_attn_body_n_batch(
+                cf, cu8, cu8, cf, cf, f, f, 0, 1, d, g, 8, 2,
+                d, d, g, kb, vb, ks, vs, 1.0f, nullptr);
+    });
+    require_invalid_argument("batched body attention rejects an oversized CUDA Y grid before launch", [&] {
+        ggml_cuda_kvarn_attn_body_n_batch(
+                cf, cu8, cu8, cf, cf, f, f, 65536, 1, d, g, 8, 2,
+                d, d, g, kb, vb, ks, vs, 1.0f, nullptr);
+    });
+    require_invalid_argument("mixed attention rejects an empty logical token set", [&] {
+        ggml_cuda_kvarn_attn_mixed(
+                cf, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                f, f, 0, 0, 0, d, g, 8, 2, kb, vb, ks, vs, 1.0f, nullptr);
+    });
+    require_invalid_argument("F32-scratch mixed attention rejects a short body stride", [&] {
+        ggml_cuda_kvarn_attn_mixed_f32_scratch(
+                cf, nullptr, nullptr, cf, cf, nullptr, nullptr, f, f,
+                0, 1, 0, d, g, tile - 1, tile, 1.0f, nullptr);
+    });
+    require_invalid_argument("F16-scratch mixed attention rejects an unsupported mask type", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
+                cf, nullptr, cu16, cu16, nullptr, nullptr, nullptr, nullptr, cf, f, f,
+                1, 1, 1, 1, 0, 0, 0, 0, d, g,
+                d, d, 0, 0, d, d, d, d, 0, 0,
+                0, 0, 0, 0, sizeof(float), sizeof(float), 99, 1.0f, nullptr);
+    });
+    require_invalid_argument("F16-scratch mixed attention rejects mask type without a pointer", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
+                cf, nullptr, cu16, cu16, nullptr, nullptr, nullptr, nullptr, nullptr, f, f,
+                1, 1, 1, 1, 0, 0, 0, 0, d, g,
+                d, d, 0, 0, d, d, d, d, 0, 0,
+                0, 0, 0, 0, sizeof(float), sizeof(float), 1, 1.0f, nullptr);
+    });
+    require_invalid_argument("F16-scratch mixed attention rejects a short mask element stride", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
+                cf, nullptr, cu16, cu16, nullptr, nullptr, nullptr, nullptr, cf, f, f,
+                1, 1, 1, 1, 0, 0, 0, 0, d, g,
+                d, d, 0, 0, d, d, d, d, 0, 0,
+                0, 0, 0, 0, sizeof(float), sizeof(float) - 1, 1, 1.0f, nullptr);
+    });
+    require_invalid_argument("F16-scratch mixed attention rejects a short per-query mask stride", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch_scratch(
+                cf, nullptr, cu16, cu16, nullptr, nullptr, nullptr, nullptr, cf, f, f,
+                2, 1, 1, 2, 0, 0, 0, 0, d, g,
+                d, d, 0, 0, d, d, d, d, 0, 0,
+                0, 0, 0, 0, sizeof(float), sizeof(float), 1, 1.0f, nullptr);
+    });
+    require_invalid_argument("packed F16 mixed attention rejects insufficient score capacity", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                cf, nullptr, cu16, cu16, cu8, cu8, cf, cf, nullptr, nullptr, nullptr, f, f,
+                1, 1, 1, 0, 1, 0, 0, 0, d, g, 8, 2,
+                d, d, 0, 0, d, d, 0, 0, 0, 0,
+                kb, vb, kb, vb, ks, vs, ks, vs,
+                0, 0, 0, 1.0f, nullptr, nullptr, int64_t(g) - 1, 1);
+    });
+    require_invalid_argument("packed F16 mixed attention rejects insufficient body-record capacity", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                cf, nullptr, cu16, cu16, cu8, cu8, cf, cf, nullptr, nullptr, nullptr, f, f,
+                1, 1, 1, 0, 2, 0, 0, 0, d, g, 8, 2,
+                d, d, 0, 0, d, d, 0, 0, 0, 0,
+                kb, vb, kb, vb, ks, vs, ks, vs,
+                0, 0, 0, 1.0f, nullptr, nullptr, int64_t(2*g), 1);
+    });
+    require_invalid_argument("packed F16 mixed attention rejects overflowing token counts", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                cf, nullptr, nullptr, nullptr, cu8, cu8, cf, cf, nullptr, nullptr, nullptr, f, f,
+                1, 1, 1, 0, UINT32_MAX, 0, 0, 0, d, g, 8, 2,
+                d, d, 0, 0, d, d, 0, 0, 0, 0,
+                kb, vb, kb, vb, ks, vs, ks, vs,
+                0, 0, 0, 1.0f, nullptr, nullptr, INT64_MAX, INT64_MAX);
+    });
+
+    // Positive boundary controls: exact and larger record strides must remain
+    // legal.  With one active record the oversized stride cannot change which
+    // bytes are read, so this is a compact boundary check rather than a codec test.
+    ggml_cuda_kvarn_dequant_body_n(
+            cu8, cu8, cf, cf, f + 200000, f + 300000, 1, d, g, 8, 2,
+            kb, 10496, ks, vs, tile, tile, 5, nullptr);
+    ggml_cuda_kvarn_dequant_body_n(
+            cu8, cu8, cf, cf, f + 200000, f + 300000, 1, d, g, 8, 2,
+            kb + 17, 10496 + 17, ks + 3, vs + 3, tile + 11, tile + 11, 5, nullptr);
+    constexpr uint32_t d512 = 512;
+    constexpr size_t tile512 = size_t(d512)*g;
+    constexpr size_t ks512 = size_t(2)*d512 + g;
+    constexpr size_t vs512 = d512 + size_t(2)*g;
+    ggml_cuda_kvarn_dequant_body_n(
+            cu8, cu8, cf, cf, f + 200000, f + 300000, 1, d512, g, 8, 2,
+            tile512, 21504, ks512, vs512, tile512, tile512, 6, nullptr);
+    ggml_cuda_kvarn_dequant_body_n(
+            cu8, cu8, cf, cf, f + 200000, f + 300000, 1, d512, g, 8, 2,
+            tile512 + 17, 21504 + 17, ks512 + 3, vs512 + 3, tile512 + 11, tile512 + 11, 6, nullptr);
+    require_cuda(cudaGetLastError(), "exact/oversized record-stride launches");
+    require_cuda(cudaDeviceSynchronize(), "exact/oversized record-stride sync");
+
+    const auto test_direct_workspace_boundary = [&](uint32_t dim, uint32_t mode, size_t v_record_bytes) {
+        const size_t values = size_t(dim)*g;
+        const size_t k_scale_floats = size_t(2)*dim + g;
+        const size_t v_scale_floats = dim + size_t(2)*g;
+        const size_t per_pipeline = values + 2*std::max<size_t>(dim, g) + dim + g + 2;
+        const size_t fallback_scratch = 3*values + 2*per_pipeline;
+        const char * label = mode == 5 ? "D256 mode5 direct fallback workspace" : "D512 mode6 direct fallback workspace";
+        set_env_var("LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES", "1");
+        const clear_env_on_exit restore_direct_fallback_env = { "LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES" };
+        ggml_cuda_kvarn_store_body_direct_records_minmax(
+                cf, cf, u8, u8 + 131072, f + 400000, f + 410000, f + 500000,
+                1, 1, dim, g, 8, 2, 4, 1.0f,
+                values, v_record_bytes, values, v_record_bytes,
+                k_scale_floats, v_scale_floats, k_scale_floats, v_scale_floats,
+                dim, dim, dim, dim, values, values, fallback_scratch, mode, nullptr);
+        require_invalid_argument(label, [&] {
+            ggml_cuda_kvarn_store_body_direct_records_minmax(
+                    cf, cf, u8, u8 + 131072, f + 400000, f + 410000, f + 500000,
+                    1, 1, dim, g, 8, 2, 4, 1.0f,
+                    values, v_record_bytes, values, v_record_bytes,
+                    k_scale_floats, v_scale_floats, k_scale_floats, v_scale_floats,
+                    dim, dim, dim, dim, values, values, fallback_scratch - 1, mode, nullptr);
+        });
+        ggml_cuda_kvarn_store_body_direct_records_minmax(
+                cf, cf, u8, u8 + 131072, f + 400000, f + 410000, f + 500000,
+                1, 1, dim, g, 8, 2, 4, 1.0f,
+                values, v_record_bytes, values, v_record_bytes,
+                k_scale_floats, v_scale_floats, k_scale_floats, v_scale_floats,
+                dim, dim, dim, dim, values, values, fallback_scratch + 17, mode, nullptr);
+        require_cuda(cudaGetLastError(), label);
+        require_cuda(cudaDeviceSynchronize(), label);
+    };
+    test_direct_workspace_boundary(256, 5, 10496);
+    test_direct_workspace_boundary(512, 6, 21504);
+
+    // Capacity is inclusive: exact packed score/body capacity passes, one less
+    // rejects above, and a two-record persistent capacity with matching larger
+    // workspace also passes while only one record is logically active.
+    const size_t exact_scores = kvarn_test_attn_scores_floats(g, 1, 1, d, g);
+    const size_t larger_scores = g + 2*size_t(2)*d*g + 17;
+    require_valid_invocation("packed exact-capacity control", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+            cf, nullptr, nullptr, nullptr, cu8, cu8, cf, cf, nullptr, nullptr, nullptr,
+            f + 900000, f + 400000,
+            1, 1, 1, 0, 1, 0, 0, 0, d, g, 8, 2,
+            d, d, 0, 0, d, d, 0, 0, 0, 0,
+            kb, 10496, kb, 10496, ks, vs, ks, vs,
+            0, 0, 0, 1.0f, nullptr, nullptr, int64_t(exact_scores), 1,
+            nullptr, 0, 0.0f, 5);
+        require_cuda(cudaDeviceSynchronize(), "packed exact-capacity sync");
+    });
+    require_valid_invocation("packed oversized-capacity control", [&] {
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+            cf, nullptr, nullptr, nullptr, cu8, cu8, cf, cf, nullptr, nullptr, nullptr,
+            f + 900000, f + 400000,
+            1, 1, 1, 0, 1, 0, 0, 0, d, g, 8, 2,
+            d, d, 0, 0, d, d, 0, 0, 0, 0,
+            kb, 10496, 2*kb, 2*size_t(10496), ks, vs, 2*ks, 2*vs,
+            0, 0, 0, 1.0f, nullptr, nullptr, int64_t(larger_scores), 2,
+            nullptr, 0, 0.0f, 5);
+        require_cuda(cudaDeviceSynchronize(), "packed oversized-capacity sync");
+    });
+
+    cudaFree(f);
+    cudaFree(u8);
+    cudaFree(u16);
+    cudaFree(i32_mut);
 }
 
 struct llama_kvarn_params {
@@ -1884,7 +2184,8 @@ static void test_direct_record_batched_phases(
     const size_t batched_scratch_floats = 2*data_floats + 2*best_floats;
     const size_t tmp_rows = std::max<uint32_t>(head_dim, group);
     const size_t per_pipeline_floats = n + 2*tmp_rows + head_dim + group + 2;
-    const size_t fallback_scratch_floats = 2*n + per_pipeline_floats;
+    const size_t fallback_scratch_floats = 2*n +
+        (head_dim >= 256 ? 2 : 1)*per_pipeline_floats;
     const size_t scratch_floats = std::max(batched_scratch_floats, fallback_scratch_floats);
 
     auto run_store = [&](const char * label, bool rollback,
@@ -7143,7 +7444,8 @@ static void test_sparse_d512_direct_and_pending_record() {
     cudaFree(kb_pending); cudaFree(vb_pending); cudaFree(ks_pending); cudaFree(vs_pending);
 }
 
-int main() {
+static int run_all_tests() {
+    test_public_cuda_boundary_validation();
     test_nonfinite_softmax_contract();
     const char * sparse_families_only = std::getenv("LLAMA_KVARN_TEST_SPARSE_D512_FAMILIES_ONLY");
     if (sparse_families_only != nullptr && std::strcmp(sparse_families_only, "0") != 0) {
@@ -7240,4 +7542,13 @@ int main() {
     test_pending_heads_store(256);
     test_pending_heads_store(512);
     return 0;
+}
+
+int main() {
+    try {
+        return run_all_tests();
+    } catch (const std::exception & err) {
+        std::fprintf(stderr, "FAIL: uncaught exception: %s\n", err.what());
+        return 1;
+    }
 }
