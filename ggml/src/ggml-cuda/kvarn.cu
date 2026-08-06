@@ -51,6 +51,19 @@ struct kvarn_debug_store_context {
 };
 
 static thread_local kvarn_debug_store_context g_kvarn_debug_store_context;
+static thread_local ggml_cuda_kvarn_attn_dispatch_info g_kvarn_attn_dispatch = {};
+
+void ggml_cuda_kvarn_debug_reset_attn_dispatch() {
+    g_kvarn_attn_dispatch = {};
+}
+
+bool ggml_cuda_kvarn_debug_get_attn_dispatch(ggml_cuda_kvarn_attn_dispatch_info * info) {
+    if (info == nullptr) {
+        return false;
+    }
+    *info = g_kvarn_attn_dispatch;
+    return info->path != GGML_CUDA_KVARN_ATTN_DISPATCH_NONE;
+}
 
 void ggml_cuda_kvarn_debug_set_store_context(
         int32_t layer,
@@ -9024,6 +9037,9 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
         float logit_softcap,
         uint32_t turbo_v_mode) {
     constexpr const char * api = "ggml_cuda_kvarn_attn_mixed_f16_batch";
+    // Clear before validation so a rejected call cannot leave a prior
+    // successful dispatch visible to diagnostics running on this host thread.
+    ggml_cuda_kvarn_debug_reset_attn_dispatch();
     const kvarn_record_contract c = kvarn_validate_record_contract(head_dim, group_size, key_bits, value_bits, turbo_v_mode, api);
     const uint32_t n_tokens = kvarn_checked_u32(kvarn_validate_mixed_shape(
             n_queries, n_head, n_head_kv, n_sink, n_records, n_pending, n_tail,
@@ -9996,6 +10012,27 @@ void ggml_cuda_kvarn_attn_mixed_f16_batch(
                             kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
                             kq_mask_type, scale, 0, logit_softcap, turbo_v_mode);
                     kvarn_launch_check(api);
+                    if (turbo_v_mode == 0) {
+                        g_kvarn_attn_dispatch = {
+                            GGML_CUDA_KVARN_ATTN_DISPATCH_PACKED_K8V2_SCALAR_Q1_GQA,
+                            1,
+                            scalar_gqa_q1_ht,
+                            key_bits,
+                            value_bits,
+                            group_size,
+                            head_dim,
+                            n_queries,
+                            n_head,
+                            n_head_kv,
+                            n_records,
+                            body_active ? 1u : 0u,
+                            turbo_v_mode,
+                            0,
+                            0,
+                            0,
+                            0,
+                        };
+                    }
                     return;
                 }
             }

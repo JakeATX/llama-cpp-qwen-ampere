@@ -33,6 +33,31 @@ struct clear_env_on_exit {
     ~clear_env_on_exit() { set_env_var(name, ""); }
 };
 
+struct scoped_env_clear {
+    struct saved_value {
+        std::string name;
+        std::string value;
+        bool existed;
+    };
+
+    std::vector<saved_value> saved;
+
+    explicit scoped_env_clear(const std::vector<const char *> & names) {
+        saved.reserve(names.size());
+        for (const char * name : names) {
+            const char * value = std::getenv(name);
+            saved.push_back({ name, value == nullptr ? "" : value, value != nullptr });
+            set_env_var(name, "");
+        }
+    }
+
+    ~scoped_env_clear() {
+        for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+            set_env_var(it->name.c_str(), it->existed ? it->value.c_str() : "");
+        }
+    }
+};
+
 static void set_paper_frame_env(bool enabled) {
     set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", enabled ? "1" : "");
     set_env_var("LLAMA_KVARN_DISABLE_PAPER_FRAME", enabled ? "" : "1");
@@ -5555,6 +5580,457 @@ static void run_case(uint32_t head_dim, float rtn_quantile) {
     cudaFree(store_scratch_d);
 }
 
+static void test_deep_standard_packed_k8v2_numerical_dispatch_case(
+        uint32_t head_dim,
+        uint32_t n_head,
+        uint32_t n_head_kv) {
+    constexpr uint32_t n_queries = 3;
+    constexpr uint32_t group = 128;
+    constexpr uint32_t key_bits = 8;
+    constexpr uint32_t value_bits = 2;
+    constexpr uint32_t n_sink = 2;
+    constexpr uint32_t n_pending = 17;
+    constexpr uint32_t n_tail = 7;
+    constexpr uint32_t tail_start = 3;
+    constexpr uint32_t block = 256;
+    constexpr uint32_t shmem_pad_floats = 8;
+    constexpr size_t byte_guard = 64;
+    constexpr size_t float_guard = 16;
+    constexpr uint8_t byte_canary = 0xd3;
+    constexpr float float_canary = 9876.25f;
+
+    require((head_dim == 256 && n_head == 16 && n_head_kv == 2) ||
+            (head_dim == 512 && n_head == 4 && n_head_kv == 2),
+            "deep standard K8/V2 test shape is canonical");
+    require(n_head % n_head_kv == 0 && (n_head/n_head_kv) % 2 == 0,
+            "deep standard K8/V2 GQA is even for HT2");
+
+    int device = -1;
+    cudaDeviceProp prop = {};
+    require_cuda(cudaGetDevice(&device), "query deep standard K8/V2 CUDA device");
+    require_cuda(cudaGetDeviceProperties(&prop, device), "query deep standard K8/V2 CUDA properties");
+    const size_t default_shmem = size_t(prop.sharedMemPerBlock);
+    const size_t optin_shmem = prop.sharedMemPerBlockOptin > 0 ?
+        size_t(prop.sharedMemPerBlockOptin) : default_shmem;
+
+    uint32_t n_records = 0;
+    size_t q4_gqa_shmem = 0;
+    size_t q4_scalar_shmem = 0;
+    size_t q1_gqa_shmem = 0;
+    for (uint32_t candidate = 1; candidate <= 4096; ++candidate) {
+        const size_t n_tokens = size_t(n_sink) + size_t(candidate)*group + n_pending + n_tail;
+        const size_t q4_gqa =
+            (size_t(2)*4*head_dim + size_t(2)*4*n_tokens + block + shmem_pad_floats)*sizeof(float);
+        const size_t q4_scalar =
+            (size_t(4)*head_dim + size_t(4)*n_tokens + block + shmem_pad_floats)*sizeof(float);
+        const size_t q1_gqa =
+            (size_t(2)*head_dim + size_t(2)*n_tokens + block + shmem_pad_floats)*sizeof(float);
+        if (q4_gqa > optin_shmem && q4_scalar > default_shmem && q1_gqa <= default_shmem) {
+            n_records = candidate;
+            q4_gqa_shmem = q4_gqa;
+            q4_scalar_shmem = q4_scalar;
+            q1_gqa_shmem = q1_gqa;
+            break;
+        }
+    }
+    if (n_records == 0) {
+        std::fprintf(stderr,
+                "deep standard K8/V2 has no natural QT1-only window: head_dim=%u default_shmem=%zu optin_shmem=%zu\n",
+                head_dim, default_shmem, optin_shmem);
+    }
+    require(n_records != 0,
+            "device must provide a deep window where QT4 routes exceed shared-memory limits and QT1/HT2 fits");
+    const uint32_t n_tokens = n_sink + n_records*group + n_pending + n_tail;
+    require(q4_gqa_shmem > optin_shmem && q4_scalar_shmem > default_shmem && q1_gqa_shmem <= default_shmem,
+            "deep standard K8/V2 shared-memory route inequalities hold");
+
+    const scoped_env_clear natural_dispatch({
+        "LLAMA_KVARN_ATTN_WARPQK_FORCE_QT",
+        "LLAMA_KVARN_ATTN_DISABLE_256D_SCALAR_QT",
+        "LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT",
+        "LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT_HT4",
+        "LLAMA_KVARN_ATTN_DISABLE_GQA_SCALAR_QT_HT8",
+        "LLAMA_KVARN_ATTN_DISABLE_Q1_GQA_SCALAR",
+        "LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR",
+        "LLAMA_KVARN_ATTN_DISABLE_BODY_F32_MIRROR",
+        "LLAMA_KVARN_ATTN_DISABLE_BODY_MIRROR",
+        "LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR",
+        "LLAMA_KVARN_ATTN_ENABLE_512D_GQA_SCALAR_QT_HT4",
+        "LLAMA_KVARN_ATTN_REF_SCRATCH",
+        "LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR",
+        "LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_K",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_V",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_SCALAR_QT",
+        "LLAMA_KVARN_ATTN_SPLIT_KERNELS",
+        "LLAMA_KVARN_ATTN_SERIAL_FUSED",
+        "LLAMA_KVARN_ATTN_DECODE_PER_HEAD",
+        "LLAMA_KVARN_ATTN_FUSED_BATCH",
+        "LLAMA_KVARN_ATTN_DISABLE_WARPQK",
+        "LLAMA_KVARN_ATTN_ENABLE_256D_WARPQK",
+        "LLAMA_KVARN_ATTN_ENABLE_512D_WARPQK",
+    });
+
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.group_size = group;
+    params.key_bits = key_bits;
+    params.value_bits = value_bits;
+    params.sinkhorn_iters = 4;
+    params.rtn_quantile = 1.0f;
+
+    struct cpu_record {
+        llama_kvarn_body_record packed;
+        std::vector<float> k_deq;
+        std::vector<float> v_deq;
+    };
+    std::vector<cpu_record> records;
+    records.reserve(size_t(n_head_kv)*n_records);
+    std::vector<uint8_t> packed_k;
+    std::vector<uint8_t> packed_v;
+    std::vector<float> packed_k_scales;
+    std::vector<float> packed_v_scales;
+
+    const size_t values_per_record = size_t(head_dim)*group;
+    for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+        for (uint32_t r = 0; r < n_records; ++r) {
+            std::vector<float> k(values_per_record);
+            std::vector<float> v(values_per_record);
+            for (uint32_t g = 0; g < group; ++g) {
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    const float record_phase = 0.071f*float(r + 1) + 0.19f*float(ikh + 1);
+                    k[size_t(d)*group + g] =
+                        0.31f*std::sin(0.017f*float(d + 1) + 0.043f*float(g + 1) + record_phase) +
+                        0.12f*std::cos(0.031f*float(d + 3) - 0.029f*float(g + 2) + 0.37f*record_phase);
+                    v[size_t(g)*head_dim + d] =
+                        0.055f*std::sin(0.013f*float(d + 1)) +
+                        0.037f*std::cos(0.021f*float(d + 2)) +
+                        0.029f*std::sin(0.023f*float(d + 1) + 0.051f*float(g + 1) + 0.83f*record_phase) -
+                        0.018f*std::cos(0.009f*float(d + 5) - 0.033f*float(g + 1) + record_phase);
+                }
+            }
+
+            cpu_record rec;
+            rec.packed = llama_kvarn_store_reference_frame(
+                    params, head_dim, k, v, false, false, false);
+            llama_kvarn_dequant_reference(rec.packed, rec.k_deq, rec.v_deq);
+            append_vec(packed_k, rec.packed.k_body);
+            append_vec(packed_v, rec.packed.v_body);
+            append_vec(packed_k_scales, rec.packed.k_scales);
+            append_vec(packed_v_scales, rec.packed.v_scales);
+            records.push_back(std::move(rec));
+        }
+    }
+    require(records.size() == size_t(n_head_kv)*n_records,
+            "deep standard K8/V2 CPU encoder produced every head/record");
+    const llama_kvarn_layout & layout = records[0].packed.layout;
+
+    std::vector<float> q(size_t(n_queries)*n_head*head_dim);
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                q[(size_t(iq)*n_head + ih)*head_dim + d] =
+                    0.47f*std::sin(0.017f*float(d + 1) + 0.13f*float(ih + 1) + 0.23f*float(iq + 1)) -
+                    0.21f*std::cos(0.029f*float(d + 3) - 0.07f*float(ih + 2) + 0.17f*float(iq + 1));
+            }
+        }
+    }
+
+    const uint32_t n_sink_tail_slots = n_sink + n_tail;
+    std::vector<uint16_t> sink_tail_k(size_t(n_sink_tail_slots)*n_head_kv*head_dim);
+    std::vector<uint16_t> sink_tail_v(sink_tail_k.size());
+    std::vector<float> sink_tail_k_ref(sink_tail_k.size());
+    std::vector<float> sink_tail_v_ref(sink_tail_v.size());
+    for (uint32_t slot = 0; slot < n_sink_tail_slots; ++slot) {
+        for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t i = (size_t(slot)*n_head_kv + ikh)*head_dim + d;
+                const float k =
+                    0.28f*std::sin(0.019f*float(d + 1) + 0.31f*float(slot + 1) + 0.11f*float(ikh + 1)) +
+                    0.09f*std::cos(0.027f*float(d + 2) - 0.17f*float(slot + 1));
+                const float v =
+                    0.055f*std::sin(0.013f*float(d + 1)) +
+                    0.037f*std::cos(0.021f*float(d + 2)) +
+                    0.031f*std::cos(0.025f*float(d + 3) + 0.29f*float(slot + 1) + 0.09f*float(ikh + 1));
+                sink_tail_k[i] = f32_to_f16_bits(k);
+                sink_tail_v[i] = f32_to_f16_bits(v);
+                sink_tail_k_ref[i] = f16_bits_to_f32(sink_tail_k[i]);
+                sink_tail_v_ref[i] = f16_bits_to_f32(sink_tail_v[i]);
+            }
+        }
+    }
+
+    std::vector<float> pending_k(size_t(n_pending)*n_head_kv*head_dim);
+    std::vector<float> pending_v(pending_k.size());
+    for (uint32_t t = 0; t < n_pending; ++t) {
+        for (uint32_t ikh = 0; ikh < n_head_kv; ++ikh) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t i = (size_t(t)*n_head_kv + ikh)*head_dim + d;
+                pending_k[i] =
+                    0.26f*std::sin(0.018f*float(d + 1) + 0.087f*float(t + 1) + 0.14f*float(ikh + 1)) -
+                    0.08f*std::cos(0.033f*float(d + 2) - 0.041f*float(t + 1));
+                pending_v[i] =
+                    0.055f*std::sin(0.013f*float(d + 1)) +
+                    0.037f*std::cos(0.021f*float(d + 2)) +
+                    0.027f*std::sin(0.016f*float(d + 4) + 0.093f*float(t + 1) + 0.12f*float(ikh + 1));
+            }
+        }
+    }
+
+    std::vector<uint16_t> mask(size_t(n_queries)*n_tokens);
+    std::vector<float> mask_ref(mask.size());
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            const int wave = int((t + 7*iq) % 11) - 5;
+            float bias = 0.0625f*float(wave);
+            if ((t + 13*iq) % 97 == 0) {
+                bias -= 1.75f;
+            }
+            const size_t i = size_t(iq)*n_tokens + t;
+            mask[i] = f32_to_f16_bits(bias);
+            mask_ref[i] = f16_bits_to_f32(mask[i]);
+        }
+    }
+
+    const float scale = 1.0f/std::sqrt(float(head_dim));
+    std::vector<float> oracle(size_t(n_queries)*n_head*head_dim, 0.0f);
+    double min_logit = std::numeric_limits<double>::infinity();
+    double max_logit = -std::numeric_limits<double>::infinity();
+    double max_probability = 0.0;
+    const uint32_t n_gqa = n_head/n_head_kv;
+    for (uint32_t iq = 0; iq < n_queries; ++iq) {
+        for (uint32_t ih = 0; ih < n_head; ++ih) {
+            const uint32_t ikh = ih/n_gqa;
+            const float * q_row = q.data() + (size_t(iq)*n_head + ih)*head_dim;
+            std::vector<double> logits(n_tokens, 0.0);
+            uint32_t token = 0;
+            const auto score_token = [&](const float * k_row, uint32_t logical_token) {
+                double dot = 0.0;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    dot += double(q_row[d])*double(k_row[d]);
+                }
+                logits[logical_token] = dot*double(scale) + double(mask_ref[size_t(iq)*n_tokens + logical_token]);
+            };
+            for (uint32_t t = 0; t < n_sink; ++t, ++token) {
+                score_token(sink_tail_k_ref.data() + (size_t(t)*n_head_kv + ikh)*head_dim, token);
+            }
+            for (uint32_t r = 0; r < n_records; ++r) {
+                const cpu_record & rec = records[size_t(ikh)*n_records + r];
+                for (uint32_t g = 0; g < group; ++g, ++token) {
+                    double dot = 0.0;
+                    for (uint32_t d = 0; d < head_dim; ++d) {
+                        dot += double(q_row[d])*double(rec.k_deq[size_t(d)*group + g]);
+                    }
+                    logits[token] = dot*double(scale) + double(mask_ref[size_t(iq)*n_tokens + token]);
+                }
+            }
+            for (uint32_t t = 0; t < n_pending; ++t, ++token) {
+                score_token(pending_k.data() + (size_t(t)*n_head_kv + ikh)*head_dim, token);
+            }
+            for (uint32_t t = 0; t < n_tail; ++t, ++token) {
+                const uint32_t slot = n_sink + (tail_start + t)%n_tail;
+                score_token(sink_tail_k_ref.data() + (size_t(slot)*n_head_kv + ikh)*head_dim, token);
+            }
+            require(token == n_tokens, "deep standard K8/V2 oracle scored every logical token");
+
+            const double row_max = *std::max_element(logits.begin(), logits.end());
+            std::vector<double> probabilities(n_tokens);
+            double denom = 0.0;
+            for (uint32_t t = 0; t < n_tokens; ++t) {
+                min_logit = std::min(min_logit, logits[t]);
+                max_logit = std::max(max_logit, logits[t]);
+                probabilities[t] = std::exp(logits[t] - row_max);
+                denom += probabilities[t];
+            }
+            for (double & p : probabilities) {
+                p /= denom;
+                max_probability = std::max(max_probability, p);
+            }
+
+            std::vector<double> accum(head_dim, 0.0);
+            token = 0;
+            const auto add_value = [&](const float * v_row, uint32_t logical_token) {
+                const double p = probabilities[logical_token];
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    accum[d] += p*double(v_row[d]);
+                }
+            };
+            for (uint32_t t = 0; t < n_sink; ++t, ++token) {
+                add_value(sink_tail_v_ref.data() + (size_t(t)*n_head_kv + ikh)*head_dim, token);
+            }
+            for (uint32_t r = 0; r < n_records; ++r) {
+                const cpu_record & rec = records[size_t(ikh)*n_records + r];
+                for (uint32_t g = 0; g < group; ++g, ++token) {
+                    add_value(rec.v_deq.data() + size_t(g)*head_dim, token);
+                }
+            }
+            for (uint32_t t = 0; t < n_pending; ++t, ++token) {
+                add_value(pending_v.data() + (size_t(t)*n_head_kv + ikh)*head_dim, token);
+            }
+            for (uint32_t t = 0; t < n_tail; ++t, ++token) {
+                const uint32_t slot = n_sink + (tail_start + t)%n_tail;
+                add_value(sink_tail_v_ref.data() + (size_t(slot)*n_head_kv + ikh)*head_dim, token);
+            }
+            require(token == n_tokens, "deep standard K8/V2 oracle accumulated every logical token");
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                oracle[(size_t(iq)*n_head + ih)*head_dim + d] = float(accum[d]);
+            }
+        }
+    }
+    float oracle_max_abs = 0.0f;
+    double oracle_ss = 0.0;
+    for (float value : oracle) {
+        require(std::isfinite(value), "deep standard K8/V2 oracle output is finite");
+        oracle_max_abs = std::max(oracle_max_abs, std::fabs(value));
+        oracle_ss += double(value)*double(value);
+    }
+    require(max_logit - min_logit > 1.0 && max_probability > 1.25/double(n_tokens),
+            "deep standard K8/V2 oracle has discriminating logits and nonuniform softmax");
+    require(oracle_max_abs > 1.0e-2f && oracle_ss > 1.0e-3,
+            "deep standard K8/V2 oracle output is nontrivial");
+
+    std::vector<uint8_t> k_slab(byte_guard + packed_k.size() + byte_guard, byte_canary);
+    std::vector<uint8_t> v_slab(byte_guard + packed_v.size() + byte_guard, byte_canary);
+    std::copy(packed_k.begin(), packed_k.end(), k_slab.begin() + byte_guard);
+    std::copy(packed_v.begin(), packed_v.end(), v_slab.begin() + byte_guard);
+    std::vector<float> out_slab(float_guard + oracle.size() + float_guard, float_canary);
+    std::fill(out_slab.begin() + float_guard, out_slab.end() - float_guard,
+            std::numeric_limits<float>::quiet_NaN());
+    std::vector<float> scores_slab(float_guard + n_tokens + float_guard, float_canary);
+
+    float * q_d = cuda_upload(q);
+    uint16_t * sink_tail_k_d = cuda_upload(sink_tail_k);
+    uint16_t * sink_tail_v_d = cuda_upload(sink_tail_v);
+    uint8_t * k_slab_d = cuda_upload(k_slab);
+    uint8_t * v_slab_d = cuda_upload(v_slab);
+    float * k_scales_d = cuda_upload(packed_k_scales);
+    float * v_scales_d = cuda_upload(packed_v_scales);
+    float * pending_k_d = cuda_upload(pending_k);
+    float * pending_v_d = cuda_upload(pending_v);
+    uint16_t * mask_d = cuda_upload(mask);
+    float * out_slab_d = cuda_upload(out_slab);
+    float * scores_slab_d = cuda_upload(scores_slab);
+
+    ggml_cuda_kvarn_debug_reset_attn_dispatch();
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            q_d,
+            sink_tail_k_d, sink_tail_v_d,
+            k_slab_d + byte_guard, v_slab_d + byte_guard,
+            k_scales_d, v_scales_d,
+            pending_k_d, pending_v_d,
+            mask_d,
+            out_slab_d + float_guard, scores_slab_d + float_guard,
+            n_queries, n_head, n_head_kv,
+            n_sink, n_records, n_pending, n_tail, tail_start,
+            head_dim, group, key_bits, value_bits,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            head_dim, size_t(n_head_kv)*head_dim,
+            layout.k_body_bytes, layout.v_body_bytes,
+            size_t(n_records)*layout.k_body_bytes, size_t(n_records)*layout.v_body_bytes,
+            layout.k_scale_floats, layout.v_scale_floats,
+            size_t(n_records)*layout.k_scale_floats, size_t(n_records)*layout.v_scale_floats,
+            size_t(n_tokens)*sizeof(uint16_t), sizeof(uint16_t), 2,
+            scale, nullptr,
+            nullptr, int64_t(n_tokens), int64_t(n_records), nullptr, 0, 0.0f, 0u);
+    require_cuda(cudaGetLastError(), "deep standard packed K8/V2 launch");
+    require_cuda(cudaDeviceSynchronize(), "deep standard packed K8/V2 sync");
+
+    ggml_cuda_kvarn_attn_dispatch_info dispatch = {};
+    require(ggml_cuda_kvarn_debug_get_attn_dispatch(&dispatch),
+            "deep standard packed K8/V2 dispatch is observable");
+    require(dispatch.path == GGML_CUDA_KVARN_ATTN_DISPATCH_PACKED_K8V2_SCALAR_Q1_GQA &&
+            dispatch.query_tile == 1 && dispatch.head_tile == 2,
+            "deep standard packed K8/V2 selected exact QT1/HT2 dispatch");
+    require(dispatch.key_bits == key_bits && dispatch.value_bits == value_bits &&
+            dispatch.group_size == group && dispatch.head_dim == head_dim &&
+            dispatch.n_queries == n_queries && dispatch.n_head == n_head &&
+            dispatch.n_head_kv == n_head_kv && dispatch.n_records == n_records &&
+            dispatch.body_active == 1 && dispatch.turbo_v_mode == 0,
+            "deep standard packed K8/V2 dispatch metadata matches the launch");
+    require(dispatch.used_f32_body_mirror == 0 && dispatch.used_raw_body == 0 &&
+            dispatch.used_materialized_body == 0 && dispatch.used_normal_kv_fallback == 0,
+            "deep standard packed K8/V2 dispatch used no substitutions or fallback");
+
+    require_cuda(cudaMemcpy(out_slab.data(), out_slab_d, out_slab.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy deep standard packed K8/V2 guarded output");
+    require_cuda(cudaMemcpy(scores_slab.data(), scores_slab_d, scores_slab.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy deep standard packed K8/V2 guarded scores");
+    require_cuda(cudaMemcpy(k_slab.data(), k_slab_d, k_slab.size(), cudaMemcpyDeviceToHost),
+            "copy deep standard packed K8/V2 guarded K body");
+    require_cuda(cudaMemcpy(v_slab.data(), v_slab_d, v_slab.size(), cudaMemcpyDeviceToHost),
+            "copy deep standard packed K8/V2 guarded V body");
+
+    const auto require_float_canaries = [&](const std::vector<float> & slab, size_t active,
+                                             const char * message) {
+        for (size_t i = 0; i < float_guard; ++i) {
+            require(slab[i] == float_canary && slab[float_guard + active + i] == float_canary, message);
+        }
+    };
+    const auto require_byte_canaries = [&](const std::vector<uint8_t> & slab, size_t active,
+                                            const char * message) {
+        for (size_t i = 0; i < byte_guard; ++i) {
+            require(slab[i] == byte_canary && slab[byte_guard + active + i] == byte_canary, message);
+        }
+    };
+    require_float_canaries(out_slab, oracle.size(), "deep standard K8/V2 output canaries are intact");
+    require_float_canaries(scores_slab, n_tokens, "deep standard K8/V2 score canaries are intact");
+    require_byte_canaries(k_slab, packed_k.size(), "deep standard K8/V2 K-body canaries are intact");
+    require_byte_canaries(v_slab, packed_v.size(), "deep standard K8/V2 V-body canaries are intact");
+
+    double error_ss = 0.0;
+    double got_ss = 0.0;
+    float max_error = 0.0f;
+    float got_max_abs = 0.0f;
+    size_t worst = 0;
+    for (size_t i = 0; i < oracle.size(); ++i) {
+        const float got = out_slab[float_guard + i];
+        require(std::isfinite(got), "deep standard packed K8/V2 output overwrote poison with finite values");
+        const double error = double(got) - double(oracle[i]);
+        error_ss += error*error;
+        got_ss += double(got)*double(got);
+        got_max_abs = std::max(got_max_abs, std::fabs(got));
+        if (std::fabs(error) > max_error) {
+            max_error = float(std::fabs(error));
+            worst = i;
+        }
+    }
+    const double error_nmse = error_ss/std::max(oracle_ss, 1.0e-30);
+    if (max_error >= 5.0e-4f || error_nmse >= 1.0e-6) {
+        std::fprintf(stderr,
+                "deep standard K8/V2 mismatch: D=%u records=%u tokens=%u max_err=%g nmse=%g worst=%zu got=%g ref=%g\n",
+                head_dim, n_records, n_tokens, double(max_error), error_nmse, worst,
+                double(out_slab[float_guard + worst]), double(oracle[worst]));
+    }
+    require(got_max_abs > 1.0e-2f && got_ss > 1.0e-3,
+            "deep standard packed K8/V2 GPU output is nontrivial");
+    require(max_error < 5.0e-4f && error_nmse < 1.0e-6,
+            "deep standard packed K8/V2 output matches double CPU logits/softmax/AV oracle");
+
+    std::fprintf(stderr,
+            "PASS deep standard K8/V2 D=%u heads=%u/%u records=%u tokens=%u shmem(q4-gqa/scalar,q1)=%zu/%zu/%zu max_err=%g nmse=%g\n",
+            head_dim, n_head, n_head_kv, n_records, n_tokens,
+            q4_gqa_shmem, q4_scalar_shmem, q1_gqa_shmem, double(max_error), error_nmse);
+
+    cudaFree(q_d);
+    cudaFree(sink_tail_k_d);
+    cudaFree(sink_tail_v_d);
+    cudaFree(k_slab_d);
+    cudaFree(v_slab_d);
+    cudaFree(k_scales_d);
+    cudaFree(v_scales_d);
+    cudaFree(pending_k_d);
+    cudaFree(pending_v_d);
+    cudaFree(mask_d);
+    cudaFree(out_slab_d);
+    cudaFree(scores_slab_d);
+}
+
+static void test_deep_standard_packed_k8v2_numerical_dispatch() {
+    test_deep_standard_packed_k8v2_numerical_dispatch_case(256, 16, 2);
+    test_deep_standard_packed_k8v2_numerical_dispatch_case(512, 4, 2);
+}
+
 static void test_experimental_turbo_v_codec(uint32_t head_dim, uint32_t bits, bool canonical_layout) {
     const uint32_t group = 128;
     const size_t n = size_t(head_dim)*group;
@@ -7500,6 +7976,7 @@ static int run_all_tests() {
     test_fused_paper_frame_sinktail_decode();
     test_fused_paper_frame_sinktail_batch();
     test_gemma512_sinktail_production_shape_sampled();
+    test_deep_standard_packed_k8v2_numerical_dispatch();
     test_materialize_kv_window(8, 8);
     test_materialize_kv_window(8, 2);
     test_raw_mirror_exact_key_lifecycle();

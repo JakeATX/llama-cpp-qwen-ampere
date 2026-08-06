@@ -3,6 +3,34 @@
 #include <cstddef>
 #include <cstdint>
 
+enum ggml_cuda_kvarn_attn_dispatch_path : uint32_t {
+    GGML_CUDA_KVARN_ATTN_DISPATCH_NONE = 0,
+    GGML_CUDA_KVARN_ATTN_DISPATCH_PACKED_K8V2_SCALAR_Q1_GQA = 1,
+};
+
+struct ggml_cuda_kvarn_attn_dispatch_info {
+    uint32_t path;
+    uint32_t query_tile;
+    uint32_t head_tile;
+    uint32_t key_bits;
+    uint32_t value_bits;
+    uint32_t group_size;
+    uint32_t head_dim;
+    uint32_t n_queries;
+    uint32_t n_head;
+    uint32_t n_head_kv;
+    uint32_t n_records;
+    uint32_t body_active;
+    uint32_t turbo_v_mode;
+    uint32_t used_f32_body_mirror;
+    uint32_t used_raw_body;
+    uint32_t used_materialized_body;
+    uint32_t used_normal_kv_fallback;
+};
+
+void ggml_cuda_kvarn_debug_reset_attn_dispatch();
+bool ggml_cuda_kvarn_debug_get_attn_dispatch(ggml_cuda_kvarn_attn_dispatch_info * info);
+
 void ggml_cuda_kvarn_mark_body_store(const void * k_body);
 void ggml_cuda_kvarn_mark_body_store_records(const void * k_body, uint32_t first_record, uint32_t n_records);
 void ggml_cuda_kvarn_invalidate_restored_body(const void * k_body);
