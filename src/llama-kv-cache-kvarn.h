@@ -50,6 +50,32 @@ struct llama_kvarn_body_record {
     std::vector<float>   v_scales;
 };
 
+// Production attestation mode for the two approved packed K8/V2 routes:
+// ordinary K8/V2 and the K8/V2+r3s residual candidate. The validator is a
+// no-op unless LLAMA_KVARN_STRICT_PACKED_K8V2=1.
+bool llama_kvarn_strict_packed_k8v2_enabled();
+void llama_kvarn_validate_strict_packed_k8v2(const llama_kvarn_params & params);
+
+enum class llama_kvarn_requested_route {
+    packed,
+    explicit_normal,
+    reject,
+};
+
+constexpr llama_kvarn_requested_route llama_kvarn_resolve_requested_route(
+        bool selects_normal,
+        bool normal_route_explicitly_allowed) {
+    return !selects_normal ? llama_kvarn_requested_route::packed
+         : normal_route_explicitly_allowed ? llama_kvarn_requested_route::explicit_normal
+                                           : llama_kvarn_requested_route::reject;
+}
+
+constexpr bool llama_kvarn_prefill_direct_attn_enabled(
+        bool unsafe_opt_in,
+        bool explicitly_disabled) {
+    return unsafe_opt_in && !explicitly_disabled;
+}
+
 llama_kvarn_layout llama_kvarn_make_layout(const llama_kvarn_params & params, uint32_t head_dim);
 
 void llama_kvarn_hadamard_channels(

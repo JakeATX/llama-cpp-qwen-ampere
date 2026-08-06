@@ -3752,14 +3752,27 @@ static void llama_kvarn_resolve_effective_cache_policy(
         return;
     }
 
+    llama_kvarn_validate_strict_packed_k8v2(params.kvarn);
+    const bool allow_normal_fallback =
+            llama_kvarn_parse_env_flag("LLAMA_KVARN_ALLOW_NORMAL_KV_FALLBACK");
+
     if (llama_kvarn_is_qwen35_family(model.arch)) {
-        if (llama_kvarn_choose_qwen_hybrid_policy(
-                    llama_kvarn_parse_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA")) ==
-                llama_kvarn_qwen_hybrid_policy::normal_hybrid) {
+        const bool selects_normal = llama_kvarn_choose_qwen_hybrid_policy(
+                llama_kvarn_parse_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA")) ==
+                llama_kvarn_qwen_hybrid_policy::normal_hybrid;
+        const llama_kvarn_requested_route route =
+                llama_kvarn_resolve_requested_route(selects_normal, allow_normal_fallback);
+        if (route != llama_kvarn_requested_route::packed) {
+            if (route == llama_kvarn_requested_route::reject) {
+                throw std::runtime_error(
+                        "KVarN was requested for Qwen 3.5/3.6 but true hybrid KVarN was not enabled. "
+                        "Set LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 to run packed KVarN, or set "
+                        "LLAMA_KVARN_ALLOW_NORMAL_KV_FALLBACK=1 to explicitly accept F16 KV.");
+            }
             LLAMA_LOG_WARN(
                     "%s: Qwen 3.5/3.6 hybrid KVarN is below production parity; "
-                    "using the normal F16 KV memory path. Set the legacy experimental-hybrid opt-in "
-                    "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 only for benchmarking/development.\n",
+                    "using the normal F16 KV memory path because explicit fallback was enabled. "
+                    "This run is NOT KVarN.\n",
                     __func__);
             params.kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_NONE;
             params.type_k = GGML_TYPE_F16;
@@ -3773,11 +3786,20 @@ static void llama_kvarn_resolve_effective_cache_policy(
                 llama_kvarn_parse_env_flag("LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA");
         const bool force_normal = force_experimental &&
                 llama_kvarn_parse_env_flag("LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK");
-        if (llama_kvarn_gemma4_use_normal_iswa(force_experimental, force_normal)) {
+        const llama_kvarn_requested_route route = llama_kvarn_resolve_requested_route(
+                llama_kvarn_gemma4_use_normal_iswa(force_experimental, force_normal),
+                allow_normal_fallback || force_normal);
+        if (route != llama_kvarn_requested_route::packed) {
+            if (route == llama_kvarn_requested_route::reject) {
+                throw std::runtime_error(
+                        "KVarN was requested for Gemma 4 but true KVarN+ISWA was not enabled. Set "
+                        "LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 to run packed KVarN+ISWA, or set "
+                        "LLAMA_KVARN_ALLOW_NORMAL_KV_FALLBACK=1 to explicitly accept normal ISWA KV.");
+            }
             LLAMA_LOG_WARN(
                     "%s: Gemma 4 KVarN+ISWA is below production parity; "
-                    "using normal ISWA KV cache. Set LLAMA_KVARN_FORCE_EXPERIMENTAL_ISWA=1 "
-                    "to opt into true KVarN+ISWA for benchmarking/development.\n",
+                    "using normal ISWA KV cache because explicit fallback was enabled. "
+                    "This run is NOT KVarN.\n",
                     __func__);
             params.kv_cache_quant_type = LLAMA_KV_CACHE_QUANT_TYPE_NONE;
         }

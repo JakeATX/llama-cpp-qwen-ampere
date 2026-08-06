@@ -208,6 +208,90 @@ static bool kvarn_experimental_turbo_v_layout_enabled() {
     return kvarn_env_flag_01_enabled("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT");
 }
 
+bool llama_kvarn_strict_packed_k8v2_enabled() {
+    return kvarn_env_flag_01_enabled("LLAMA_KVARN_STRICT_PACKED_K8V2");
+}
+
+void llama_kvarn_validate_strict_packed_k8v2(const llama_kvarn_params & params) {
+    if (!llama_kvarn_strict_packed_k8v2_enabled()) {
+        return;
+    }
+
+    const bool plain = params.value_residual_rank == 0 && params.value_sparse_residual == 0;
+    const bool r3s = params.value_residual_rank == 3 && params.value_sparse_residual == 1;
+    if (params.key_bits != 8 || params.value_bits != 2 || params.group_size != 128 ||
+            params.sinkhorn_iters != 8 || kvarn_float_bits(params.rtn_quantile) != 0x3f800000u ||
+            (!plain && !r3s)) {
+        throw std::runtime_error(
+                "LLAMA_KVARN_STRICT_PACKED_K8V2 requires exactly kvarn_k8v2_g128 or "
+                "kvarn_k8v2_r3s_g128 with 8 VarN iterations and rtn_quantile=1.0");
+    }
+
+    // These switches replace packed attention, change the paper frame/VarN
+    // contract, select another codec, or permit a normal-KV route. Strict mode
+    // rejects the permission itself so a run cannot be silently re-routed later.
+    static constexpr const char * forbidden_flags[] = {
+        "LLAMA_KVARN_EXPERIMENTAL_TURBO_V",
+        "LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT",
+        "LLAMA_KVARN_ALLOW_NORMAL_KV_FALLBACK",
+        "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK",
+        "LLAMA_KVARN_ATTN_REF_SCRATCH",
+        "LLAMA_KVARN_ATTN_FUSED_BATCH",
+        "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH",
+        "LLAMA_KVARN_ATTN_SPLIT_KERNELS",
+        "LLAMA_KVARN_ATTN_SERIAL_FUSED",
+        "LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE",
+        "LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR",
+        "LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR",
+        "LLAMA_KVARN_DEBUG_CAPTURE_RAW_BODY_MIRROR",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_K",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_V",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_SCALAR_QT",
+        "LLAMA_KVARN_UNSAFE_ENABLE_PREFILL_DIRECT_ATTN",
+        "LLAMA_KVARN_UNSAFE_ENABLE_ISWA_PREFILL_DIRECT_ATTN",
+        "LLAMA_KVARN_ISWA_DEBUG_MATERIALIZE_MHA",
+        "LLAMA_KVARN_ISWA_DEBUG_DUAL_MHA_COMPARE",
+        "LLAMA_KVARN_ISWA_DEBUG_RAW_MHA_COMPARE",
+        "LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN",
+        "LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME",
+        "LLAMA_KVARN_DISABLE_ISWA_SINKTAIL_MHA",
+        "LLAMA_KVARN_ATTN_DISABLE_MASK",
+        "LLAMA_KVARN_DISABLE_INTERNAL_CAUSAL_MASK",
+        "LLAMA_KVARN_DISABLE_PAPER_FRAME",
+        "LLAMA_KVARN_PAPER_MIXED_FRAME",
+        "LLAMA_KVARN_UNSAFE_ALLOW_PAPER_MIXED_FRAME",
+        "LLAMA_KVARN_DISABLE_FUSED_FWHT",
+        "LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN",
+        "LLAMA_KVARN_DISABLE_GLOBAL_NORM",
+        "LLAMA_KVARN_DISABLE_RTN_CLIP",
+        "LLAMA_KVARN_GEMMA4_ROUTE_CONSERVATIVE",
+    };
+    for (const char * name : forbidden_flags) {
+        if (kvarn_env_flag_01_enabled(name)) {
+            throw std::runtime_error(std::string("LLAMA_KVARN_STRICT_PACKED_K8V2 forbids ") + name + "=1");
+        }
+    }
+
+    const char * enable_log_std = std::getenv("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN");
+    if (enable_log_std != nullptr && !kvarn_env_flag_01_enabled("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN")) {
+        throw std::runtime_error(
+                "LLAMA_KVARN_STRICT_PACKED_K8V2 forbids LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN=0");
+    }
+
+    static constexpr const char * forbidden_nonempty[] = {
+        "LLAMA_KVARN_LAYER_KEY_BITS",
+        "LLAMA_KVARN_LAYER_VALUE_BITS",
+        "LLAMA_KVARN_LAYER_FILTER",
+        "LLAMA_KVARN_GEMMA4_PROTECT_DONORS",
+    };
+    for (const char * name : forbidden_nonempty) {
+        const char * value = std::getenv(name);
+        if (value != nullptr && value[0] != '\0') {
+            throw std::runtime_error(std::string("LLAMA_KVARN_STRICT_PACKED_K8V2 forbids ") + name);
+        }
+    }
+}
+
 static size_t kvarn_turbo_v_block_bytes(uint32_t value_bits) {
     if (value_bits == 2) {
         return 2 + 128/4;
@@ -1910,6 +1994,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     if (kv_size == 0 || n_seq_max == 0) {
         throw std::invalid_argument("KVarN cache requires non-zero kv_size and n_seq_max");
     }
+    llama_kvarn_validate_strict_packed_k8v2(params);
 #ifdef LLAMA_BUILD
     if (params.value_residual_rank > 0 && model != nullptr) {
         if (!offload) {
@@ -1995,6 +2080,19 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const llama_kvarn_params layer_params = kvarn_params_for_layer(params, hparams, il, true);
         const llama_kvarn_layout layout_k = llama_kvarn_make_layout(layer_params, head_k);
         const llama_kvarn_layout layout_v = llama_kvarn_make_layout(layer_params, head_v);
+        if (llama_kvarn_strict_packed_k8v2_enabled()) {
+            const bool strict_plain = params.value_residual_rank == 0 && params.value_sparse_residual == 0;
+            const uint32_t expected_v_layout = strict_plain ? LLAMA_KVARN_V_LAYOUT_LEGACY :
+                (head_v == KVAR_N_SPARSE_HEAD_DIM ? LLAMA_KVARN_V_LAYOUT_SPARSE_R3 :
+                 LLAMA_KVARN_V_LAYOUT_LEGACY_R3);
+            if (layer_params.key_bits != 8 || layer_params.value_bits != 2 ||
+                    layer_params.group_size != 128 || layout_k.key_bits != 8 ||
+                    layout_v.value_bits != 2 || layout_v.v_layout != expected_v_layout) {
+                throw std::runtime_error(
+                        std::string("LLAMA_KVARN_STRICT_PACKED_K8V2 effective layout violation on layer ") +
+                        std::to_string(il));
+            }
+        }
         layer_heads.push_back(n_head_kv);
 
         layer_storage st = {};
@@ -2058,11 +2156,13 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             double(size_t(head_v)*layer_params.group_size);
         std::fprintf(stderr,
                 "%s: KVarN layer %3u storage dev = %s, heads = %u, body records = %u, "
-                "requested k%u/v%u%s effective k%u/v%u%s, V %.4f bpv, record %zu bytes\n",
+                "requested k%u/v%u%s effective k%u/v%u%s, group %u, strict_k8v2=%d, "
+                "V %.4f bpv, record %zu bytes\n",
                 __func__, il, dev_name, n_head_kv, n_records,
                 params.key_bits, params.value_bits, kvarn_requested_residual_suffix(params),
                 layout_k.key_bits, layout_v.value_bits,
                 kvarn_effective_residual_suffix(layout_v.v_layout),
+                layer_params.group_size, llama_kvarn_strict_packed_k8v2_enabled() ? 1 : 0,
                 realized_v_bpv, record_bytes);
     }
 

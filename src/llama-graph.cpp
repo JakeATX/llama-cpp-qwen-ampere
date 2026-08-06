@@ -85,6 +85,10 @@ static bool kvarn_graph_prefill_direct_attn_disabled() {
     return kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_PREFILL_DIRECT_ATTN");
 }
 
+static bool kvarn_graph_prefill_direct_attn_opted_in() {
+    return kvarn_graph_parse_env_flag("LLAMA_KVARN_UNSAFE_ENABLE_PREFILL_DIRECT_ATTN");
+}
+
 static bool kvarn_graph_iswa_sinktail_mha_disabled() {
     return kvarn_graph_parse_env_flag("LLAMA_KVARN_DISABLE_ISWA_SINKTAIL_MHA");
 }
@@ -3717,7 +3721,9 @@ ggml_tensor * llm_graph_context::build_attn(
         const ggml_tensor * kq_mask = inp->get_kq_mask();
         const bool prefill_direct_attn =
             stores_kv &&
-            !kvarn_graph_prefill_direct_attn_disabled() &&
+            llama_kvarn_prefill_direct_attn_enabled(
+                    kvarn_graph_prefill_direct_attn_opted_in(),
+                    kvarn_graph_prefill_direct_attn_disabled()) &&
             q_cur != nullptr && k_cur != nullptr && v_cur != nullptr && kq_mask != nullptr &&
             q_cur->ne[2] > 1 &&
             k_cur->ne[2] == q_cur->ne[2] &&

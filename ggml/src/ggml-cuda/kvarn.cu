@@ -1028,6 +1028,22 @@ static __device__ __forceinline__ float kvarn_softcap_attn_score(
     return score;
 }
 
+// Non-finite packed-attention logits have an explicit contract. NaN and -Inf
+// entries are excluded. A +Inf maximum invalidates the complete row, so every
+// probability and the resulting AV row become exactly zero. A finite maximum
+// contributes exp(0) == 1, which also makes a one-token row normalize exactly.
+static __device__ __forceinline__ float kvarn_softmax_exp(float score, float max_score) {
+    return isfinite(score) && isfinite(max_score) ? expf(score - max_score) : 0.0f;
+}
+
+static __device__ __forceinline__ float kvarn_softmax_inv_denom(float denom) {
+    return isfinite(denom) && denom > 0.0f ? 1.0f/denom : 0.0f;
+}
+
+static __device__ __forceinline__ float kvarn_softmax_normalize(float value, float inv_denom) {
+    return isfinite(value) && inv_denom > 0.0f ? value*inv_denom : 0.0f;
+}
+
 static __device__ __forceinline__ float kvarn_warp_reduce_sum(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
@@ -4947,7 +4963,7 @@ static __global__ void kvarn_attn_scores_softmax_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t g = threadIdx.x; g < group_size; g += blockDim.x) {
-        const float p = expf(scores[g] - max_score);
+        const float p = kvarn_softmax_exp(scores[g], max_score);
         probs[g] = p;
         local_sum += p;
     }
@@ -4960,10 +4976,10 @@ static __global__ void kvarn_attn_scores_softmax_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t g = threadIdx.x; g < group_size; g += blockDim.x) {
-        probs[g] *= inv_denom;
+        probs[g] = kvarn_softmax_normalize(probs[g], inv_denom);
     }
 }
 
@@ -5055,7 +5071,7 @@ static __global__ void kvarn_attn_scores_softmax_n_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -5068,10 +5084,10 @@ static __global__ void kvarn_attn_scores_softmax_n_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs[t] *= inv_denom;
+        probs[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
 }
 
@@ -5213,7 +5229,7 @@ static __global__ void kvarn_attn_scores_softmax_n_batch_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         probs_cur[t] = p;
         local_sum += p;
     }
@@ -5226,10 +5242,10 @@ static __global__ void kvarn_attn_scores_softmax_n_batch_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs_cur[t] *= inv_denom;
+        probs_cur[t] = kvarn_softmax_normalize(probs_cur[t], inv_denom);
     }
 }
 
@@ -5394,7 +5410,7 @@ static __global__ void kvarn_attn_mixed_scores_softmax_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -5407,10 +5423,10 @@ static __global__ void kvarn_attn_mixed_scores_softmax_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs[t] *= inv_denom;
+        probs[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
 }
 
@@ -5576,7 +5592,7 @@ static __global__ void kvarn_attn_mixed_scratch_scores_softmax_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -5589,10 +5605,10 @@ static __global__ void kvarn_attn_mixed_scratch_scores_softmax_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs[t] *= inv_denom;
+        probs[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
 }
 
@@ -5759,7 +5775,7 @@ static __global__ void kvarn_attn_mixed_f16_scratch_scores_softmax_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -5772,10 +5788,10 @@ static __global__ void kvarn_attn_mixed_f16_scratch_scores_softmax_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        scores[t] = probs[t]*inv_denom;
+        scores[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
 }
 
@@ -6018,7 +6034,7 @@ static __global__ void kvarn_attn_mixed_f16_scores_softmax_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -6031,10 +6047,10 @@ static __global__ void kvarn_attn_mixed_f16_scores_softmax_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        scores[t] = probs[t]*inv_denom;
+        scores[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
 }
 
@@ -6135,7 +6151,7 @@ static __global__ void kvarn_attn_mixed_f16_scores_softmax_global_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         scores[t] = p;
         local_sum += p;
     }
@@ -6148,10 +6164,10 @@ static __global__ void kvarn_attn_mixed_f16_scores_softmax_global_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        scores[t] *= inv_denom;
+        scores[t] = kvarn_softmax_normalize(scores[t], inv_denom);
     }
 }
 
@@ -6403,7 +6419,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(scores[t] - max_score);
+        const float p = kvarn_softmax_exp(scores[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -6416,10 +6432,10 @@ static __global__ void kvarn_attn_mixed_f16_fused_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs[t] *= inv_denom;
+        probs[t] = kvarn_softmax_normalize(probs[t], inv_denom);
         scores[t] = probs[t];
     }
     __syncthreads();
@@ -6660,7 +6676,7 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_batch_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(probs[t] - max_score);
+        const float p = kvarn_softmax_exp(probs[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -6673,10 +6689,10 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_batch_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs[t] *= inv_denom;
+        probs[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
     __syncthreads();
 
@@ -6848,7 +6864,7 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(probs[t] - max_score);
+        const float p = kvarn_softmax_exp(probs[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -6861,11 +6877,11 @@ static __global__ void kvarn_attn_mixed_f16_sinktail_decode_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
     __syncthreads();
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs[t] *= inv_denom;
+        probs[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
     __syncthreads();
 
@@ -7088,7 +7104,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
 
         float local_sum = 0.0f;
         for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-            const float p = expf(row[t] - max_score);
+            const float p = kvarn_softmax_exp(row[t], max_score);
             row[t] = p;
             local_sum += p;
         }
@@ -7101,10 +7117,10 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_warpqk_kernel(
             }
             __syncthreads();
         }
-        const float inv_denom = 1.0f/reduce[0];
+        const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
         for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-            row[t] *= inv_denom;
+            row[t] = kvarn_softmax_normalize(row[t], inv_denom);
         }
         __syncthreads();
     }
@@ -7282,7 +7298,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_kernel(
 
     float local_sum = 0.0f;
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        const float p = expf(probs[t] - max_score);
+        const float p = kvarn_softmax_exp(probs[t], max_score);
         probs[t] = p;
         local_sum += p;
     }
@@ -7295,10 +7311,10 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_kernel(
         }
         __syncthreads();
     }
-    const float inv_denom = 1.0f/reduce[0];
+    const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
     for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-        probs[t] *= inv_denom;
+        probs[t] = kvarn_softmax_normalize(probs[t], inv_denom);
     }
     __syncthreads();
 
@@ -7538,7 +7554,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_scalar_qt_kernel(
 
         float local_sum = 0.0f;
         for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-            const float p = expf(row[t] - max_score);
+            const float p = kvarn_softmax_exp(row[t], max_score);
             row[t] = p;
             local_sum += p;
         }
@@ -7551,10 +7567,10 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_scalar_qt_kernel(
             }
             __syncthreads();
         }
-        const float inv_denom = 1.0f/reduce[0];
+        const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
 
         for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-            row[t] *= inv_denom;
+            row[t] = kvarn_softmax_normalize(row[t], inv_denom);
         }
         __syncthreads();
     }
@@ -7860,7 +7876,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel(
 
             float local_sum = 0.0f;
             for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-                const float p = expf(row[t] - max_score);
+                const float p = kvarn_softmax_exp(row[t], max_score);
                 row[t] = p;
                 local_sum += p;
             }
@@ -7873,9 +7889,9 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_scalar_qt_gqa_kernel(
                 }
                 __syncthreads();
             }
-            const float inv_denom = 1.0f/reduce[0];
+            const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
             for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-                row[t] *= inv_denom;
+                row[t] = kvarn_softmax_normalize(row[t], inv_denom);
             }
             __syncthreads();
         }
@@ -8219,7 +8235,7 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_sparse_d512_scalar_qt_gq
 
             float local_sum = 0.0f;
             for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-                const float p = expf(row[t] - max_score);
+                const float p = kvarn_softmax_exp(row[t], max_score);
                 row[t] = p;
                 local_sum += p;
             }
@@ -8232,9 +8248,9 @@ static __global__ void kvarn_attn_mixed_f16_fused_batch_sparse_d512_scalar_qt_gq
                 }
                 __syncthreads();
             }
-            const float inv_denom = 1.0f/reduce[0];
+            const float inv_denom = kvarn_softmax_inv_denom(reduce[0]);
             for (uint32_t t = threadIdx.x; t < n_tokens; t += blockDim.x) {
-                row[t] *= inv_denom;
+                row[t] = kvarn_softmax_normalize(row[t], inv_denom);
             }
             __syncthreads();
         }

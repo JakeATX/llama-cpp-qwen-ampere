@@ -252,16 +252,31 @@ static void test_qwen_hybrid_policy() {
     require(!llama_kvarn_is_qwen35_family(LLM_ARCH_GEMMA4), "Gemma 4 is outside the Qwen fail-closed family");
 
     require(llama_kvarn_choose_qwen_hybrid_policy(false) == policy::normal_hybrid,
-            "Qwen hybrid KVarN defaults to the production-safe normal cache");
+            "Qwen hybrid policy selects its legacy normal route without the packed opt-in");
     require(llama_kvarn_choose_qwen_hybrid_policy(true) == policy::experimental_kvarn,
             "Qwen hybrid KVarN requires an explicit experimental opt-in");
 
+    using requested_route = llama_kvarn_requested_route;
+    require(llama_kvarn_resolve_requested_route(true, false) == requested_route::reject,
+            "requested KVarN fails closed when Qwen or Gemma selects normal KV by default");
+    require(llama_kvarn_resolve_requested_route(true, true) == requested_route::explicit_normal,
+            "requested KVarN permits normal KV only through an explicit non-strict fallback");
+    require(llama_kvarn_resolve_requested_route(false, false) == requested_route::packed,
+            "requested KVarN retains the packed route when the architecture enables it");
+
     require(llama_kvarn_gemma4_use_normal_iswa(false, false),
-            "Gemma 4 KVarN defaults to the production-safe normal ISWA cache");
+            "Gemma 4 policy selects its legacy normal ISWA route without the packed opt-in");
     require(!llama_kvarn_gemma4_use_normal_iswa(true, false),
             "Gemma 4 KVarN requires an explicit experimental opt-in");
     require(llama_kvarn_gemma4_use_normal_iswa(true, true),
             "Gemma 4 legacy force-normal override takes precedence over experimental opt-in");
+
+    require(!llama_kvarn_prefill_direct_attn_enabled(false, false),
+            "non-ISWA prefill direct attention is disabled by default");
+    require(llama_kvarn_prefill_direct_attn_enabled(true, false),
+            "non-ISWA prefill direct attention requires its explicit unsafe opt-in");
+    require(!llama_kvarn_prefill_direct_attn_enabled(true, true),
+            "the explicit prefill-direct disable overrides the unsafe opt-in");
 }
 
 static void test_no_update_context_apply() {
@@ -2870,6 +2885,127 @@ static void test_runtime_body_record_graph_api() {
             "KVarN pending fused KV body store rejects unsafe multi-record batches");
 }
 
+static void test_strict_packed_k8v2_contract() {
+    llama_kvarn_params plain = llama_kvarn_default_params();
+    plain.key_bits = 8;
+    plain.value_bits = 2;
+    plain.group_size = 128;
+    plain.value_residual_rank = 0;
+    plain.value_sparse_residual = 0;
+
+    llama_kvarn_params r3s = plain;
+    r3s.value_residual_rank = 3;
+    r3s.value_sparse_residual = 1;
+
+    const char * forbidden_flags[] = {
+        "LLAMA_KVARN_EXPERIMENTAL_TURBO_V",
+        "LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT",
+        "LLAMA_KVARN_ALLOW_NORMAL_KV_FALLBACK",
+        "LLAMA_KVARN_FORCE_NORMAL_ISWA_FALLBACK",
+        "LLAMA_KVARN_ATTN_REF_SCRATCH",
+        "LLAMA_KVARN_ATTN_FUSED_BATCH",
+        "LLAMA_KVARN_UNSAFE_ALLOW_FUSED_BATCH",
+        "LLAMA_KVARN_ATTN_SPLIT_KERNELS",
+        "LLAMA_KVARN_ATTN_SERIAL_FUSED",
+        "LLAMA_KVARN_ENABLE_F32_DEQUANT_CACHE",
+        "LLAMA_KVARN_ATTN_ENABLE_BODY_F32_MIRROR",
+        "LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR",
+        "LLAMA_KVARN_DEBUG_CAPTURE_RAW_BODY_MIRROR",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_K",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_V",
+        "LLAMA_KVARN_DEBUG_RAW_BODY_SCALAR_QT",
+        "LLAMA_KVARN_UNSAFE_ENABLE_PREFILL_DIRECT_ATTN",
+        "LLAMA_KVARN_UNSAFE_ENABLE_ISWA_PREFILL_DIRECT_ATTN",
+        "LLAMA_KVARN_ISWA_DEBUG_MATERIALIZE_MHA",
+        "LLAMA_KVARN_ISWA_DEBUG_DUAL_MHA_COMPARE",
+        "LLAMA_KVARN_ISWA_DEBUG_RAW_MHA_COMPARE",
+        "LLAMA_KVARN_ISWA_DEBUG_FULL_NORMAL_ATTN",
+        "LLAMA_KVARN_ISWA_DEBUG_TURBO_V_FRAME",
+        "LLAMA_KVARN_DISABLE_ISWA_SINKTAIL_MHA",
+        "LLAMA_KVARN_ATTN_DISABLE_MASK",
+        "LLAMA_KVARN_DISABLE_INTERNAL_CAUSAL_MASK",
+        "LLAMA_KVARN_DISABLE_PAPER_FRAME",
+        "LLAMA_KVARN_PAPER_MIXED_FRAME",
+        "LLAMA_KVARN_UNSAFE_ALLOW_PAPER_MIXED_FRAME",
+        "LLAMA_KVARN_DISABLE_FUSED_FWHT",
+        "LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN",
+        "LLAMA_KVARN_DISABLE_GLOBAL_NORM",
+        "LLAMA_KVARN_DISABLE_RTN_CLIP",
+        "LLAMA_KVARN_GEMMA4_ROUTE_CONSERVATIVE",
+    };
+    const char * forbidden_nonempty[] = {
+        "LLAMA_KVARN_LAYER_KEY_BITS",
+        "LLAMA_KVARN_LAYER_VALUE_BITS",
+        "LLAMA_KVARN_LAYER_FILTER",
+        "LLAMA_KVARN_GEMMA4_PROTECT_DONORS",
+    };
+    const auto clear_env = [&]() {
+        set_test_env("LLAMA_KVARN_STRICT_PACKED_K8V2", nullptr);
+        for (const char * name : forbidden_flags) {
+            set_test_env(name, nullptr);
+        }
+        for (const char * name : forbidden_nonempty) {
+            set_test_env(name, nullptr);
+        }
+        set_test_env("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", nullptr);
+    };
+
+    clear_env();
+    set_test_env("LLAMA_KVARN_STRICT_PACKED_K8V2", "1");
+    llama_kvarn_validate_strict_packed_k8v2(plain);
+    llama_kvarn_validate_strict_packed_k8v2(r3s);
+
+    llama_hparams hparams256 = make_test_hparams(256);
+    llama_hparams hparams512 = make_test_hparams(512);
+    llama_kv_cache_kvarn r3s256(nullptr, hparams256, r3s, false, 512, 1, 1, nullptr);
+    llama_kv_cache_kvarn r3s512(nullptr, hparams512, r3s, false, 512, 1, 1, nullptr);
+    require(r3s256.get_layer_view(0).layout_v.v_layout == LLAMA_KVARN_V_LAYOUT_LEGACY_R3,
+            "strict r3s accepts the D256 rank-3 packed layout");
+    require(r3s512.get_layer_view(0).layout_v.v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3,
+            "strict r3s accepts the D512 sparse packed layout");
+
+    auto require_rejected = [&](const llama_kvarn_params & candidate, const char * message) {
+        bool rejected = false;
+        try {
+            llama_kvarn_validate_strict_packed_k8v2(candidate);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        require(rejected, message);
+    };
+
+    llama_kvarn_params wrong_bits = plain;
+    wrong_bits.value_bits = 4;
+    require_rejected(wrong_bits, "strict packed mode rejects effective V4");
+    llama_kvarn_params wrong_residual = plain;
+    wrong_residual.value_residual_rank = 3;
+    require_rejected(wrong_residual, "strict packed mode rejects non-r3s residual substitutions");
+    llama_kvarn_params wrong_iters = plain;
+    wrong_iters.sinkhorn_iters = 7;
+    require_rejected(wrong_iters, "strict packed mode rejects a non-production VarN iteration count");
+    llama_kvarn_params wrong_quantile = plain;
+    wrong_quantile.rtn_quantile = std::nextafter(1.0f, 0.0f);
+    require_rejected(wrong_quantile, "strict packed mode rejects a non-production RTN quantile");
+
+    for (const char * name : forbidden_flags) {
+        set_test_env(name, "1");
+        require_rejected(plain, "strict packed mode rejects a route or algorithm substitution flag");
+        set_test_env(name, nullptr);
+    }
+    set_test_env("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", "0");
+    require_rejected(plain, "strict packed mode rejects disabling the default log-std VarN path");
+    set_test_env("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", "1");
+    llama_kvarn_validate_strict_packed_k8v2(plain);
+    set_test_env("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", nullptr);
+    for (const char * name : forbidden_nonempty) {
+        set_test_env(name, "0=4");
+        require_rejected(plain, "strict packed mode rejects a per-layer route or layout override");
+        set_test_env(name, nullptr);
+    }
+
+    clear_env();
+}
+
 static void test_residual_body_store_scratch_graph_api() {
     const auto run_case = [](uint32_t head_dim, uint32_t n_head_kv, bool sparse) {
         llama_kvarn_params params = llama_kvarn_default_params();
@@ -3319,6 +3455,7 @@ int main() {
     run_phase("test_reference_cache_sealing", test_reference_cache_sealing);
     run_phase("test_shared_kv_reuse_layer_matching_attention_type", test_shared_kv_reuse_layer_matching_attention_type);
     run_phase("test_memory_estimate", test_memory_estimate);
+    run_phase("test_strict_packed_k8v2_contract", test_strict_packed_k8v2_contract);
     run_phase("test_runtime_metadata", test_runtime_metadata);
     run_phase("test_runtime_storage_sealing", test_runtime_storage_sealing);
     run_phase("test_runtime_sink_tail_graph_api", test_runtime_sink_tail_graph_api);

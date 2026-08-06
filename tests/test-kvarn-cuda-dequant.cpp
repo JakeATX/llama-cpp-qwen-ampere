@@ -95,6 +95,110 @@ static float f16_bits_to_f32(uint16_t v) {
     return __half2float(h);
 }
 
+static void test_nonfinite_softmax_contract() {
+    constexpr uint32_t n_tokens = 3;
+    constexpr uint32_t head_dim = 4;
+    constexpr uint32_t group_size = 128;
+
+    const std::vector<float> q(head_dim, 0.0f);
+    const std::vector<float> k(size_t(n_tokens)*head_dim, 0.0f);
+    std::vector<float> v = {
+         1.0f,  2.0f,  3.0f,  4.0f,
+        -1.0f,  0.5f,  2.0f, -3.0f,
+         4.0f, -2.0f,  0.25f, 1.0f,
+    };
+    std::vector<uint16_t> k_f16(k.size());
+    std::vector<uint16_t> v_f16(v.size());
+    for (size_t i = 0; i < k.size(); ++i) {
+        k_f16[i] = f32_to_f16_bits(k[i]);
+        v_f16[i] = f32_to_f16_bits(v[i]);
+        v[i] = f16_bits_to_f32(v_f16[i]);
+    }
+
+    float * q_d = cuda_upload(q);
+    uint16_t * k_d = cuda_upload(k_f16);
+    uint16_t * v_d = cuda_upload(v_f16);
+    uint8_t * k_body_d = nullptr;
+    uint8_t * v_body_d = nullptr;
+    float * k_scales_d = nullptr;
+    float * v_scales_d = nullptr;
+    float * pending_k_d = nullptr;
+    float * pending_v_d = nullptr;
+    float * out_d = nullptr;
+    float * scores_d = nullptr;
+    require_cuda(cudaMalloc(&k_body_d, 1), "cudaMalloc nonfinite dummy K body");
+    require_cuda(cudaMalloc(&v_body_d, 1), "cudaMalloc nonfinite dummy V body");
+    require_cuda(cudaMalloc(&k_scales_d, sizeof(float)), "cudaMalloc nonfinite dummy K scales");
+    require_cuda(cudaMalloc(&v_scales_d, sizeof(float)), "cudaMalloc nonfinite dummy V scales");
+    require_cuda(cudaMalloc(&pending_k_d, sizeof(float)), "cudaMalloc nonfinite dummy pending K");
+    require_cuda(cudaMalloc(&pending_v_d, sizeof(float)), "cudaMalloc nonfinite dummy pending V");
+    require_cuda(cudaMalloc(&out_d, head_dim*sizeof(float)), "cudaMalloc nonfinite output");
+    require_cuda(cudaMalloc(&scores_d, n_tokens*sizeof(float)), "cudaMalloc nonfinite scores");
+
+    const auto run = [&](const std::vector<float> & mask) {
+        float * mask_d = cuda_upload(mask);
+        const std::vector<float> poison(head_dim, std::numeric_limits<float>::quiet_NaN());
+        require_cuda(cudaMemcpy(out_d, poison.data(), head_dim*sizeof(float), cudaMemcpyHostToDevice),
+                "poison nonfinite output");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                q_d, k_d, v_d,
+                k_body_d, v_body_d, k_scales_d, v_scales_d, pending_k_d, pending_v_d,
+                mask_d, out_d, scores_d,
+                1, 1, 1, n_tokens, 0, 0, 0, 0, head_dim, group_size, 8, 2,
+                head_dim, head_dim, head_dim, head_dim,
+                head_dim, head_dim, head_dim, head_dim,
+                1, 1, 1, 1, 1, 1, 1, 1,
+                n_tokens*sizeof(float), sizeof(float), 1, 1.0f, nullptr);
+        require_cuda(cudaGetLastError(), "KVarN nonfinite softmax launch");
+        require_cuda(cudaDeviceSynchronize(), "KVarN nonfinite softmax sync");
+        std::vector<float> out(head_dim);
+        require_cuda(cudaMemcpy(out.data(), out_d, head_dim*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy nonfinite softmax output");
+        cudaFree(mask_d);
+        return out;
+    };
+    const auto require_close = [](const std::vector<float> & got, const std::vector<float> & expected,
+                                  float tolerance, const char * message) {
+        float max_err = 0.0f;
+        for (size_t i = 0; i < got.size(); ++i) {
+            require(std::isfinite(got[i]), message);
+            max_err = std::max(max_err, std::fabs(got[i] - expected[i]));
+        }
+        require(max_err <= tolerance, message);
+    };
+
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    require_close(run({ -inf, 0.0f, -inf }), { v[4], v[5], v[6], v[7] }, 0.0f,
+            "one finite logit produces exact selected V");
+    std::vector<float> nan_expected(head_dim);
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        nan_expected[d] = (v[head_dim + d] + 2.0f*v[2*head_dim + d])/3.0f;
+    }
+    require_close(run({ nan, 0.0f, std::log(2.0f) }), nan_expected, 2.0e-6f,
+            "NaN logit is excluded while finite logits normalize");
+    require_close(run({ inf, 0.0f, -inf }), std::vector<float>(head_dim, 0.0f), 0.0f,
+            "+Inf invalidates the complete softmax row");
+    require_close(run({ inf, inf, 0.0f }), std::vector<float>(head_dim, 0.0f), 0.0f,
+            "multiple +Inf logits invalidate the complete softmax row");
+    require_close(run({ nan, -inf, 0.0f }), { v[8], v[9], v[10], v[11] }, 0.0f,
+            "a combined NaN, -Inf, and finite row selects its sole finite token");
+    require_close(run({ -inf, -inf, -inf }), std::vector<float>(head_dim, 0.0f), 0.0f,
+            "fully masked softmax row produces exact zero output");
+
+    cudaFree(q_d);
+    cudaFree(k_d);
+    cudaFree(v_d);
+    cudaFree(k_body_d);
+    cudaFree(v_body_d);
+    cudaFree(k_scales_d);
+    cudaFree(v_scales_d);
+    cudaFree(pending_k_d);
+    cudaFree(pending_v_d);
+    cudaFree(out_d);
+    cudaFree(scores_d);
+}
+
 struct llama_kvarn_params {
     uint32_t group_size = 128;
     uint32_t key_bits = 4;
@@ -7040,6 +7144,7 @@ static void test_sparse_d512_direct_and_pending_record() {
 }
 
 int main() {
+    test_nonfinite_softmax_contract();
     const char * sparse_families_only = std::getenv("LLAMA_KVARN_TEST_SPARSE_D512_FAMILIES_ONLY");
     if (sparse_families_only != nullptr && std::strcmp(sparse_families_only, "0") != 0) {
         test_sparse_d512_direct_and_pending_record();
