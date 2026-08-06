@@ -133,12 +133,29 @@ static bool ggml_cuda_kvarn_env_flag(const char * name) {
 enum {
     GGML_CUDA_KVARN_V_LAYOUT_LEGACY          = 0,
     GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL = 1,
+    GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R1       = 2,
+    GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R2       = 3,
+    GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R3       = 4,
+    GGML_CUDA_KVARN_V_LAYOUT_SPARSE_D512     = 5,
 };
 
 static int64_t ggml_cuda_kvarn_v_body_bytes(int32_t head_dim, int32_t group_size, int32_t value_bits, int32_t v_layout) {
     const int64_t n = int64_t(head_dim)*group_size;
     if (v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY) {
         return (n*value_bits + 7)/8;
+    }
+    if (v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R1 ||
+            v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R2 ||
+            v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R3) {
+        if (group_size != 128 || (head_dim != 256 && head_dim != 512) || value_bits != 2) {
+            return -1;
+        }
+        const int64_t rank = v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R3 ? 3 :
+            (v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R2 ? 2 : 1);
+        return (n*value_bits + 7)/8 + rank*int64_t(sizeof(uint16_t))*(group_size + head_dim);
+    }
+    if (v_layout == GGML_CUDA_KVARN_V_LAYOUT_SPARSE_D512) {
+        return head_dim == 512 && group_size == 128 && value_bits == 2 ? 21504 : -1;
     }
     if (v_layout != GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL) {
         return -1;
@@ -154,8 +171,23 @@ static bool ggml_cuda_kvarn_v_body_shape_ok(int64_t actual_bytes, int64_t expect
     if (expected_bytes < 0) {
         return false;
     }
-    return v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ?
-        actual_bytes == expected_bytes : actual_bytes >= expected_bytes;
+    return v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY ?
+        actual_bytes >= expected_bytes : actual_bytes == expected_bytes;
+}
+
+static uint32_t ggml_cuda_kvarn_v_mode(int32_t v_layout) {
+    return v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2u :
+        (v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R1 ? 3u :
+         (v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R2 ? 4u :
+          (v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R3 ? 5u :
+           (v_layout == GGML_CUDA_KVARN_V_LAYOUT_SPARSE_D512 ? 6u : 0u))));
+}
+
+static bool ggml_cuda_kvarn_v_layout_is_residual(int32_t v_layout) {
+    return v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R1 ||
+        v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R2 ||
+        v_layout == GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R3 ||
+        v_layout == GGML_CUDA_KVARN_V_LAYOUT_SPARSE_D512;
 }
 
 static int ggml_cuda_kvarn_env_int(const char * name, int default_value) {
@@ -3488,7 +3520,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             (float *) scales->data,
                             (float *) scratch->data,
                             params.head_dim, params.group_size, params.bits, params.sinkhorn_iters, params.rtn_quantile,
-                            params.v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2u : 0u,
+                            ggml_cuda_kvarn_v_mode(params.v_layout),
                             params.src_layout == 2,
                             ctx.stream());
                 } else {
@@ -3548,8 +3580,16 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 if (v_body_bytes < 0) {
                     return false;
                 }
-                const uint32_t turbo_v_mode =
-                    params.v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2u : 0u;
+                if (ggml_cuda_kvarn_v_layout_is_residual(params.v_layout) &&
+                        (v_body->ne[0] != v_body_bytes ||
+                         v_body->nb[0] != 1 ||
+                         v_body->nb[1] < size_t(v_body_bytes) ||
+                         v_body->nb[2] < v_body->nb[1]*size_t(v_body->ne[1]) ||
+                         params.group_size != 128 || params.key_bits != 8 || params.value_bits != 2 ||
+                         (params.head_dim != 256 && params.head_dim != 512))) {
+                    return false;
+                }
+                const uint32_t turbo_v_mode = ggml_cuda_kvarn_v_mode(params.v_layout);
 
                 if (ggml_cuda_kvarn_store_trace_enabled() && ggml_cuda_kvarn_store_trace_claim()) {
                     if (params.n_record_batch > 0) {
@@ -3766,7 +3806,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                         uint32_t(params.head_dim),
                         uint32_t(params.group_size),
                         uint32_t(params.bits),
-                        uint32_t(params.v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2 : 0),
+                        ggml_cuda_kvarn_v_mode(params.v_layout),
                         uint32_t(params.debug_raw_body != 0),
                         raw_mirror_key,
                         size_t(sink_tail->nb[1]/sizeof(uint16_t)),
@@ -3799,8 +3839,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     int32_t v_layout;
                 } params;
                 memcpy(&params, dst->op_params, sizeof(params));
-                const uint32_t turbo_v_mode =
-                    params.v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2u : 0u;
+                const uint32_t turbo_v_mode = ggml_cuda_kvarn_v_mode(params.v_layout);
 
                 const ggml_tensor * q           = dst->src[0];
                 const ggml_tensor * sink_tail_k = dst->src[1];
@@ -3965,7 +4004,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                 scales_v->nb[1]/sizeof(float),
                                 n_per_record,
                                 n_per_record,
-                                params.v_layout == GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL ? 2u : 0u,
+                                ggml_cuda_kvarn_v_mode(params.v_layout),
                                 ctx.stream());
                     }
 
@@ -6587,8 +6626,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 const int64_t scale_floats = params.is_v ? params.head_dim + 2*params.group_size : 2*params.head_dim + params.group_size;
-                const int64_t scratch_floats =
+                const int64_t scratch_base =
                     n + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
+                const int64_t scratch_floats = scratch_base +
+                    ((params.is_v && ggml_cuda_kvarn_v_layout_is_residual(params.v_layout)) ? n : 0);
                 return ggml_nelements(op->src[0]) == n &&
                        ggml_cuda_kvarn_v_body_shape_ok(op->ne[0], body_bytes, params.is_v ? params.v_layout : GGML_CUDA_KVARN_V_LAYOUT_LEGACY) &&
                        op->src[1]->ne[0] >= scale_floats &&
@@ -6648,7 +6689,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     const int64_t per_pipeline =
                         tile_floats + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
                     const int64_t pipeline_scratch_floats = params.head_dim >= 256 ? 2*per_pipeline : per_pipeline;
-                    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
+                    int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
+                    if (ggml_cuda_kvarn_v_layout_is_residual(params.v_layout)) {
+                        const int64_t tiles = int64_t(params.n_heads)*params.n_record_batch;
+                        scratch_floats = tiles*(3*tile_floats + 2*(params.head_dim + params.group_size + 2));
+                    }
                     const int64_t v_body_bytes_direct = ggml_cuda_kvarn_v_body_bytes(params.head_dim, params.group_size, params.value_bits, params.v_layout);
                     if (v_body_bytes_direct < 0) {
                         return false;
@@ -6682,7 +6727,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int64_t per_pipeline =
                     n + 2*std::max(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
                 const int64_t pipeline_scratch_floats = params.head_dim >= 256 ? 2*per_pipeline : per_pipeline;
-                const int64_t batch_scratch_floats = 2*n + pipeline_scratch_floats;
+                const int64_t batch_scratch_floats = 2*n + pipeline_scratch_floats +
+                    (ggml_cuda_kvarn_v_layout_is_residual(params.v_layout) ? n : 0);
 
                 if (params.n_record_batch > 0) {
                     return params.n_record_batch == 1 &&
@@ -6715,7 +6761,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                            ggml_nelements(op->src[4]) >= batch_scratch_floats;
                 }
 
-                const int64_t scratch_floats = params.head_dim >= 256 ? 2*per_pipeline : per_pipeline;
+                const int64_t scratch_floats = (params.head_dim >= 256 ? 2*per_pipeline : per_pipeline) +
+                    (ggml_cuda_kvarn_v_layout_is_residual(params.v_layout) ? n : 0);
                 return ggml_nelements(op->src[0]) == n &&
                        ggml_nelements(op->src[1]) == n &&
                        op->src[5]->ne[0] >= k_body_bytes &&
@@ -6829,12 +6876,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         params.key_bits <= 0 || params.key_bits > 8 ||
                         params.value_bits <= 0 || params.value_bits > 8 ||
                         (params.v_layout != GGML_CUDA_KVARN_V_LAYOUT_LEGACY &&
-                         params.v_layout != GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL) ||
+                         params.v_layout != GGML_CUDA_KVARN_V_LAYOUT_TURBO_CANONICAL &&
+                         params.v_layout != GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R1 &&
+                         params.v_layout != GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R2 &&
+                         params.v_layout != GGML_CUDA_KVARN_V_LAYOUT_LEGACY_R3 &&
+                         params.v_layout != GGML_CUDA_KVARN_V_LAYOUT_SPARSE_D512) ||
                         (params.frame_flags & ~GGML_KVARN_ATTN_FRAME_FUSED_PAPER_FULL) != 0) {
                     return false;
                 }
                 if (op->ne[0] != params.head_dim || op->src[0]->ne[0] != params.head_dim ||
-                        op->ne[1] != op->src[0]->ne[1] || op->ne[2] != op->src[0]->ne[2]) {
+                        op->ne[1] != op->src[0]->ne[1] || op->ne[2] != op->src[0]->ne[2] ||
+                        op->ne[3] != 1) {
                     return false;
                 }
                 if (op->src[1]->ne[0] != params.head_dim || op->src[2]->ne[0] != params.head_dim ||
@@ -6868,6 +6920,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 const int64_t k_scale_floats = 2*params.head_dim + params.group_size;
                 const int64_t v_scale_floats = params.head_dim + 2*params.group_size;
                 if (v_body_bytes < 0) {
+                    return false;
+                }
+                if (ggml_cuda_kvarn_v_layout_is_residual(params.v_layout) &&
+                        (op->src[4]->ne[0] != v_body_bytes ||
+                         op->src[4]->nb[0] != 1 ||
+                         op->src[4]->nb[1] < size_t(v_body_bytes) ||
+                         op->src[4]->nb[2] < op->src[4]->nb[1]*size_t(op->src[4]->ne[1]) ||
+                         params.group_size != 128 || params.key_bits != 8 || params.value_bits != 2 ||
+                         (params.head_dim != 256 && params.head_dim != 512))) {
                     return false;
                 }
                 return op->src[1]->ne[2] >= params.n_sink + params.n_tail &&

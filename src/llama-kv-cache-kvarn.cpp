@@ -38,6 +38,21 @@ namespace {
 constexpr std::array<uint8_t, 8> KVAR_N_STATE_MAGIC = { 'K', 'V', 'A', 'R', 'N', 'K', 'V', 0 };
 constexpr uint32_t KVAR_N_STATE_VERSION = 1;
 constexpr uint32_t KVAR_N_STATE_TENSORS_PER_LAYER = 8;
+constexpr uint32_t KVAR_N_SPARSE_HEAD_DIM = 512;
+constexpr uint32_t KVAR_N_SPARSE_GROUP_SIZE = 128;
+constexpr uint32_t KVAR_N_SPARSE_PER_ROW = 10;
+constexpr uint32_t KVAR_N_SPARSE_EXTRA_CANDIDATES_PER_ROW = 1;
+constexpr uint32_t KVAR_N_SPARSE_EXTRA = 85;
+constexpr uint32_t KVAR_N_SPARSE_NNZ = KVAR_N_SPARSE_GROUP_SIZE*KVAR_N_SPARSE_PER_ROW + KVAR_N_SPARSE_EXTRA;
+constexpr size_t KVAR_N_SPARSE_COL_START_BYTES = KVAR_N_SPARSE_HEAD_DIM*sizeof(uint16_t);
+constexpr size_t KVAR_N_SPARSE_ROW_BYTES = KVAR_N_SPARSE_NNZ*sizeof(uint8_t);
+constexpr size_t KVAR_N_SPARSE_PAD_BYTES = 1;
+constexpr size_t KVAR_N_SPARSE_VALUE_BYTES = KVAR_N_SPARSE_NNZ*sizeof(ggml_fp16_t);
+constexpr size_t KVAR_N_SPARSE_SUFFIX_BYTES = KVAR_N_SPARSE_COL_START_BYTES +
+    KVAR_N_SPARSE_ROW_BYTES + KVAR_N_SPARSE_PAD_BYTES + KVAR_N_SPARSE_VALUE_BYTES;
+
+static_assert(KVAR_N_SPARSE_NNZ == 1365);
+static_assert(KVAR_N_SPARSE_SUFFIX_BYTES == 5120);
 
 template<typename T>
 void kvarn_state_write_uint(llama_io_write_i & io, T value) {
@@ -203,7 +218,16 @@ static size_t kvarn_turbo_v_block_bytes(uint32_t value_bits) {
     throw std::invalid_argument("Turbo V layout currently supports only value_bits 2 or 4");
 }
 
-static size_t kvarn_v_body_bytes(uint32_t head_dim, uint32_t group_size, uint32_t value_bits) {
+static size_t kvarn_v_body_bytes(const llama_kvarn_params & params, uint32_t head_dim) {
+    const uint32_t group_size = params.group_size;
+    const uint32_t value_bits = params.value_bits;
+    if (params.value_sparse_residual != 0 && head_dim == KVAR_N_SPARSE_HEAD_DIM) {
+        return packed_nbytes(size_t(head_dim)*group_size, value_bits) + KVAR_N_SPARSE_SUFFIX_BYTES;
+    }
+    if (params.value_residual_rank > 0) {
+        return packed_nbytes(size_t(head_dim)*group_size, value_bits) +
+            size_t(params.value_residual_rank)*(size_t(group_size) + head_dim)*sizeof(ggml_fp16_t);
+    }
     if (!kvarn_experimental_turbo_v_layout_enabled()) {
         return packed_nbytes(size_t(head_dim)*group_size, value_bits);
     }
@@ -213,9 +237,41 @@ static size_t kvarn_v_body_bytes(uint32_t head_dim, uint32_t group_size, uint32_
     return size_t(group_size)*(head_dim/128u)*kvarn_turbo_v_block_bytes(value_bits);
 }
 
-static uint32_t kvarn_v_layout_id() {
+static uint32_t kvarn_v_layout_id(const llama_kvarn_params & params, uint32_t head_dim) {
+    if (params.value_sparse_residual != 0 && head_dim == KVAR_N_SPARSE_HEAD_DIM) {
+        return LLAMA_KVARN_V_LAYOUT_SPARSE_R3;
+    }
+    if (params.value_residual_rank == 1) {
+        return LLAMA_KVARN_V_LAYOUT_LEGACY_R1;
+    }
+    if (params.value_residual_rank == 2) {
+        return LLAMA_KVARN_V_LAYOUT_LEGACY_R2;
+    }
+    if (params.value_residual_rank == 3) {
+        return LLAMA_KVARN_V_LAYOUT_LEGACY_R3;
+    }
     return kvarn_experimental_turbo_v_layout_enabled() ?
         LLAMA_KVARN_V_LAYOUT_TURBO_CANONICAL : LLAMA_KVARN_V_LAYOUT_LEGACY;
+}
+
+static uint32_t kvarn_v_layout_residual_rank(uint32_t v_layout) {
+    if (v_layout >= LLAMA_KVARN_V_LAYOUT_LEGACY_R1 && v_layout <= LLAMA_KVARN_V_LAYOUT_LEGACY_R3) {
+        return v_layout - LLAMA_KVARN_V_LAYOUT_LEGACY_R1 + 1;
+    }
+    return 0;
+}
+
+static const char * kvarn_residual_suffix(uint32_t rank) {
+    return rank == 1 ? "+r1" : (rank == 2 ? "+r2" : (rank == 3 ? "+r3" : ""));
+}
+
+static const char * kvarn_requested_residual_suffix(const llama_kvarn_params & params) {
+    return params.value_sparse_residual != 0 ? "+r3s" : kvarn_residual_suffix(params.value_residual_rank);
+}
+
+static const char * kvarn_effective_residual_suffix(uint32_t v_layout) {
+    return v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3 ? "+sparse" :
+        kvarn_residual_suffix(kvarn_v_layout_residual_rank(v_layout));
 }
 
 static std::string kvarn_trim(std::string s) {
@@ -503,7 +559,8 @@ static void sinkhorn_variance_normalize(
         std::vector<float> & col_scale,
         uint32_t rows,
         uint32_t cols,
-        uint32_t iters) {
+        uint32_t iters,
+        bool allow_global_norm = true) {
     row_scale.assign(rows, 1.0f);
     col_scale.assign(cols, 1.0f);
 
@@ -511,7 +568,7 @@ static void sinkhorn_variance_normalize(
 
     if (log_std_sinkhorn_enabled()) {
         float global_scale = 1.0f;
-        if (iters > 0 && kvarn_global_norm_enabled()) {
+        if (iters > 0 && allow_global_norm && kvarn_global_norm_enabled()) {
             double ss_all = 0.0;
             for (const float v : data) {
                 ss_all += double(v)*double(v);
@@ -748,15 +805,31 @@ llama_kvarn_layout llama_kvarn_make_layout(const llama_kvarn_params & params, ui
     if (params.key_bits == 0 || params.key_bits > 8 || params.value_bits == 0 || params.value_bits > 8) {
         throw std::invalid_argument("KVarN layout requires bit widths in [1, 8]");
     }
+    if (params.value_residual_rank > 3) {
+        throw std::invalid_argument("KVarN value residual rank must be in [0, 3]");
+    }
+    if (params.value_sparse_residual > 1 ||
+            (params.value_sparse_residual != 0 && params.value_residual_rank != 3)) {
+        throw std::invalid_argument("KVarN sparse value residual requires residual rank 3");
+    }
+    if (params.value_residual_rank > 0) {
+        if (params.key_bits != 8 || params.value_bits != 2 || params.group_size != 128 ||
+                (head_dim != 256 && head_dim != 512)) {
+            throw std::invalid_argument("KVarN value residual requires K8/V2, group_size=128, and head_dim 256 or 512");
+        }
+        if (kvarn_experimental_turbo_v_layout_enabled()) {
+            throw std::invalid_argument("KVarN value residual and experimental Turbo V layout are mutually exclusive");
+        }
+    }
 
     llama_kvarn_layout layout = {
         /*.head_dim          =*/ head_dim,
         /*.group_size        =*/ params.group_size,
         /*.key_bits          =*/ params.key_bits,
         /*.value_bits        =*/ params.value_bits,
-        /*.v_layout          =*/ kvarn_v_layout_id(),
+        /*.v_layout          =*/ kvarn_v_layout_id(params, head_dim),
         /*.k_body_bytes      =*/ packed_nbytes(size_t(head_dim)*params.group_size, params.key_bits),
-        /*.v_body_bytes      =*/ kvarn_v_body_bytes(head_dim, params.group_size, params.value_bits),
+        /*.v_body_bytes      =*/ kvarn_v_body_bytes(params, head_dim),
         /*.k_scale_floats    =*/ size_t(2)*head_dim + params.group_size,
         /*.v_scale_floats    =*/ head_dim + size_t(2)*params.group_size,
         /*.total_record_bytes=*/ 0,
@@ -898,6 +971,262 @@ void llama_kvarn_unpack_bits(const std::vector<uint8_t> & src, uint32_t bits, si
     }
 }
 
+static void kvarn_append_fp16_bytes(std::vector<uint8_t> & dst, const std::vector<float> & src) {
+    const size_t old_size = dst.size();
+    std::vector<ggml_fp16_t> fp16(src.size());
+    ggml_fp32_to_fp16_row(src.data(), fp16.data(), src.size());
+    dst.resize(old_size + fp16.size()*sizeof(ggml_fp16_t));
+    std::memcpy(dst.data() + old_size, fp16.data(), fp16.size()*sizeof(ggml_fp16_t));
+}
+
+static void kvarn_load_fp16_bytes(
+        const std::vector<uint8_t> & src, size_t offset, size_t count, std::vector<float> & dst) {
+    if (offset > src.size() || count*sizeof(ggml_fp16_t) > src.size() - offset) {
+        throw std::invalid_argument("KVarN low-rank residual body is truncated");
+    }
+    std::vector<ggml_fp16_t> fp16(count);
+    std::memcpy(fp16.data(), src.data() + offset, count*sizeof(ggml_fp16_t));
+    dst.resize(count);
+    ggml_fp16_to_fp32_row(fp16.data(), dst.data(), count);
+}
+
+struct kvarn_sparse_entry {
+    uint32_t row;
+    uint32_t col;
+    float value;
+};
+
+static float kvarn_sparse_magnitude(float value) {
+    const float magnitude = std::fabs(value);
+    return std::isnan(magnitude) ? std::numeric_limits<float>::infinity() : magnitude;
+}
+
+static bool kvarn_sparse_stronger(const kvarn_sparse_entry & a, const kvarn_sparse_entry & b) {
+    const float a_magnitude = kvarn_sparse_magnitude(a.value);
+    const float b_magnitude = kvarn_sparse_magnitude(b.value);
+    if (a_magnitude != b_magnitude) {
+        return a_magnitude > b_magnitude;
+    }
+    return size_t(a.row)*KVAR_N_SPARSE_HEAD_DIM + a.col <
+        size_t(b.row)*KVAR_N_SPARSE_HEAD_DIM + b.col;
+}
+
+static void kvarn_append_sparse_r3_bytes(
+        std::vector<uint8_t> & dst,
+        const std::vector<float> & residual) {
+    const size_t expected_size = size_t(KVAR_N_SPARSE_GROUP_SIZE)*KVAR_N_SPARSE_HEAD_DIM;
+    if (residual.size() != expected_size) {
+        throw std::invalid_argument("KVarN sparse residual tile size mismatch");
+    }
+
+    std::vector<kvarn_sparse_entry> selected;
+    std::vector<kvarn_sparse_entry> extra_candidates;
+    selected.reserve(KVAR_N_SPARSE_NNZ);
+    extra_candidates.reserve(
+        size_t(KVAR_N_SPARSE_GROUP_SIZE)*KVAR_N_SPARSE_EXTRA_CANDIDATES_PER_ROW);
+
+    for (uint32_t g = 0; g < KVAR_N_SPARSE_GROUP_SIZE; ++g) {
+        std::vector<kvarn_sparse_entry> row;
+        row.reserve(KVAR_N_SPARSE_HEAD_DIM);
+        for (uint32_t d = 0; d < KVAR_N_SPARSE_HEAD_DIM; ++d) {
+            const size_t i = size_t(g)*KVAR_N_SPARSE_HEAD_DIM + d;
+            row.push_back({ g, d, residual[i] });
+        }
+        std::sort(row.begin(), row.end(), kvarn_sparse_stronger);
+        selected.insert(selected.end(), row.begin(), row.begin() + KVAR_N_SPARSE_PER_ROW);
+        extra_candidates.push_back(row[KVAR_N_SPARSE_PER_ROW]);
+    }
+
+    std::sort(extra_candidates.begin(), extra_candidates.end(), kvarn_sparse_stronger);
+    for (uint32_t i = 0; i < KVAR_N_SPARSE_EXTRA; ++i) {
+        selected.push_back(extra_candidates[i]);
+    }
+    if (selected.size() != KVAR_N_SPARSE_NNZ) {
+        throw std::runtime_error("KVarN sparse residual selection count mismatch");
+    }
+
+    std::sort(selected.begin(), selected.end(), [](const kvarn_sparse_entry & a, const kvarn_sparse_entry & b) {
+        return a.col != b.col ? a.col < b.col : a.row < b.row;
+    });
+
+    const size_t suffix_offset = dst.size();
+    dst.resize(suffix_offset + KVAR_N_SPARSE_SUFFIX_BYTES, 0);
+    size_t entry = 0;
+    for (uint32_t d = 0; d < KVAR_N_SPARSE_HEAD_DIM; ++d) {
+        const uint16_t start = uint16_t(entry);
+        dst[suffix_offset + 2*d + 0] = uint8_t(start);
+        dst[suffix_offset + 2*d + 1] = uint8_t(start >> 8);
+        while (entry < selected.size() && selected[entry].col == d) {
+            ++entry;
+        }
+    }
+    if (entry != selected.size()) {
+        throw std::runtime_error("KVarN sparse residual CSR serialization mismatch");
+    }
+
+    const size_t row_offset = suffix_offset + KVAR_N_SPARSE_COL_START_BYTES;
+    const size_t value_offset = row_offset + KVAR_N_SPARSE_ROW_BYTES + KVAR_N_SPARSE_PAD_BYTES;
+    std::vector<ggml_fp16_t> values(selected.size());
+    for (size_t i = 0; i < selected.size(); ++i) {
+        dst[row_offset + i] = uint8_t(selected[i].row);
+        values[i] = ggml_fp32_to_fp16(selected[i].value);
+    }
+    std::memcpy(dst.data() + value_offset, values.data(), KVAR_N_SPARSE_VALUE_BYTES);
+}
+
+static void kvarn_add_sparse_r3_bytes(
+        const std::vector<uint8_t> & src,
+        size_t suffix_offset,
+        std::vector<float> & dst) {
+    if (suffix_offset > src.size() || KVAR_N_SPARSE_SUFFIX_BYTES != src.size() - suffix_offset ||
+            dst.size() != size_t(KVAR_N_SPARSE_GROUP_SIZE)*KVAR_N_SPARSE_HEAD_DIM) {
+        throw std::invalid_argument("KVarN sparse residual body size mismatch");
+    }
+
+    std::array<uint16_t, KVAR_N_SPARSE_HEAD_DIM> col_start = {};
+    for (uint32_t d = 0; d < KVAR_N_SPARSE_HEAD_DIM; ++d) {
+        col_start[d] = uint16_t(src[suffix_offset + 2*d + 0]) |
+            uint16_t(uint16_t(src[suffix_offset + 2*d + 1]) << 8);
+    }
+    if (col_start[0] != 0) {
+        throw std::invalid_argument("KVarN sparse residual first column must start at zero");
+    }
+    for (uint32_t d = 0; d < KVAR_N_SPARSE_HEAD_DIM; ++d) {
+        const uint32_t end = d + 1 < KVAR_N_SPARSE_HEAD_DIM ? col_start[d + 1] : KVAR_N_SPARSE_NNZ;
+        if (col_start[d] > end || end > KVAR_N_SPARSE_NNZ) {
+            throw std::invalid_argument("KVarN sparse residual column offsets are malformed");
+        }
+    }
+
+    const size_t row_offset = suffix_offset + KVAR_N_SPARSE_COL_START_BYTES;
+    const size_t pad_offset = row_offset + KVAR_N_SPARSE_ROW_BYTES;
+    const size_t value_offset = pad_offset + KVAR_N_SPARSE_PAD_BYTES;
+    if (src[pad_offset] != 0) {
+        throw std::invalid_argument("KVarN sparse residual alignment pad must be zero");
+    }
+
+    std::vector<ggml_fp16_t> values(KVAR_N_SPARSE_NNZ);
+    std::memcpy(values.data(), src.data() + value_offset, KVAR_N_SPARSE_VALUE_BYTES);
+    for (uint32_t d = 0; d < KVAR_N_SPARSE_HEAD_DIM; ++d) {
+        const uint32_t begin = col_start[d];
+        const uint32_t end = d + 1 < KVAR_N_SPARSE_HEAD_DIM ? col_start[d + 1] : KVAR_N_SPARSE_NNZ;
+        int32_t previous_row = -1;
+        for (uint32_t i = begin; i < end; ++i) {
+            const uint32_t row = src[row_offset + i];
+            if (row >= KVAR_N_SPARSE_GROUP_SIZE || int32_t(row) <= previous_row) {
+                throw std::invalid_argument("KVarN sparse residual rows must be unique and ascending per column");
+            }
+            previous_row = int32_t(row);
+            dst[size_t(row)*KVAR_N_SPARSE_HEAD_DIM + d] += ggml_fp16_to_fp32(values[i]);
+        }
+    }
+}
+
+// Frozen rank-1 residual rule: deterministic NIPALS initialized from the
+// lowest-index maximum-energy column, four ALS iterations, and a final W step.
+static void kvarn_rank1_nipals(
+        const std::vector<float> & residual, uint32_t rows, uint32_t cols,
+        std::vector<float> & u, std::vector<float> & w) {
+    constexpr double zero_energy = 1.0e-20;
+    u.assign(rows, 0.0f);
+    w.assign(cols, 0.0f);
+
+    uint32_t seed_col = 0;
+    double seed_energy = -1.0;
+    for (uint32_t d = 0; d < cols; ++d) {
+        double energy = 0.0;
+        for (uint32_t g = 0; g < rows; ++g) {
+            const double x = residual[size_t(g)*cols + d];
+            energy += x*x;
+        }
+        if (energy > seed_energy) {
+            seed_energy = energy;
+            seed_col = d;
+        }
+    }
+    if (seed_energy <= zero_energy) {
+        return;
+    }
+    for (uint32_t g = 0; g < rows; ++g) {
+        u[g] = residual[size_t(g)*cols + seed_col];
+    }
+
+    const auto update_w = [&]() -> bool {
+        double denom = 0.0;
+        for (float x : u) {
+            denom += double(x)*x;
+        }
+        if (denom <= zero_energy) {
+            return false;
+        }
+        for (uint32_t d = 0; d < cols; ++d) {
+            double dot = 0.0;
+            for (uint32_t g = 0; g < rows; ++g) {
+                dot += double(residual[size_t(g)*cols + d])*u[g];
+            }
+            w[d] = float(dot/denom);
+        }
+        return true;
+    };
+    const auto update_u = [&]() -> bool {
+        double denom = 0.0;
+        for (float x : w) {
+            denom += double(x)*x;
+        }
+        if (denom <= zero_energy) {
+            return false;
+        }
+        for (uint32_t g = 0; g < rows; ++g) {
+            double dot = 0.0;
+            for (uint32_t d = 0; d < cols; ++d) {
+                dot += double(residual[size_t(g)*cols + d])*w[d];
+            }
+            u[g] = float(dot/denom);
+        }
+        return true;
+    };
+
+    for (int iter = 0; iter < 4; ++iter) {
+        if (!update_w() || !update_u()) {
+            u.assign(rows, 0.0f);
+            w.assign(cols, 0.0f);
+            return;
+        }
+    }
+    if (!update_w()) {
+        u.assign(rows, 0.0f);
+        w.assign(cols, 0.0f);
+        return;
+    }
+
+    double u_norm2 = 0.0;
+    double w_norm2 = 0.0;
+    for (float x : u) u_norm2 += double(x)*x;
+    for (float x : w) w_norm2 += double(x)*x;
+    if (u_norm2 <= zero_energy || w_norm2 <= zero_energy) {
+        u.assign(rows, 0.0f);
+        w.assign(cols, 0.0f);
+        return;
+    }
+    const double balance = std::sqrt(std::sqrt(w_norm2/u_norm2));
+    for (float & x : u) x = float(double(x)*balance);
+    for (float & x : w) x = float(double(x)/balance);
+
+    uint32_t sign_index = 0;
+    float sign_magnitude = -1.0f;
+    for (uint32_t d = 0; d < cols; ++d) {
+        const float magnitude = std::fabs(w[d]);
+        if (magnitude > sign_magnitude) {
+            sign_magnitude = magnitude;
+            sign_index = d;
+        }
+    }
+    if (w[sign_index] < 0.0f) {
+        for (float & x : u) x = -x;
+        for (float & x : w) x = -x;
+    }
+}
+
 llama_kvarn_body_record llama_kvarn_store_reference(
         const llama_kvarn_params & params,
         uint32_t head_dim,
@@ -916,10 +1245,16 @@ llama_kvarn_body_record llama_kvarn_store_reference(
     std::vector<float> v_rot;
     llama_kvarn_hadamard_channels(k_tile, k_rot, head_dim, params.group_size, true);
     llama_kvarn_hadamard_channels(v_tile, v_rot, params.group_size, head_dim, false);
+    const std::vector<float> v_raw_rot = params.value_residual_rank > 0 ? v_rot : std::vector<float>{};
 
     std::vector<float> k_row_scale, k_col_scale, v_row_scale, v_col_scale;
-    sinkhorn_variance_normalize(k_rot, k_row_scale, k_col_scale, head_dim, params.group_size, params.sinkhorn_iters);
-    sinkhorn_variance_normalize(v_rot, v_row_scale, v_col_scale, params.group_size, head_dim, params.sinkhorn_iters);
+    // R3 is the explicit official-VarN candidate: unlike the established
+    // standard/R1/R2 codecs it does not apply branch global-RMS pre-scaling.
+    const bool allow_global_norm = params.value_residual_rank != 3;
+    sinkhorn_variance_normalize(
+            k_rot, k_row_scale, k_col_scale, head_dim, params.group_size, params.sinkhorn_iters, allow_global_norm);
+    sinkhorn_variance_normalize(
+            v_rot, v_row_scale, v_col_scale, params.group_size, head_dim, params.sinkhorn_iters, allow_global_norm);
 
     std::vector<uint8_t> k_q, v_q;
     std::vector<float> k_rtn_scale, k_rtn_zp, v_rtn_scale, v_rtn_zp;
@@ -953,6 +1288,54 @@ llama_kvarn_body_record llama_kvarn_store_reference(
         record.v_scales.push_back(v_row_scale[g]*v_rtn_zp[g]);
     }
 
+    if (kvarn_v_layout_residual_rank(layout.v_layout) > 0 ||
+            layout.v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3) {
+        // Form the residual only after the standard packed V2 reconstruction
+        // and its stored metadata are finalized.
+        std::vector<float> residual(n);
+        for (uint32_t g = 0; g < params.group_size; ++g) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t i = size_t(g)*head_dim + d;
+                const float base =
+                    (float(v_q[i])*record.v_scales[head_dim + g] +
+                     record.v_scales[head_dim + params.group_size + g])*record.v_scales[d];
+                residual[i] = v_raw_rot[i] - base;
+            }
+        }
+        if (layout.v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3) {
+            kvarn_append_sparse_r3_bytes(record.v_body, residual);
+        } else {
+            for (uint32_t component = 0; component < params.value_residual_rank; ++component) {
+                std::vector<float> u;
+                std::vector<float> w;
+                kvarn_rank1_nipals(residual, params.group_size, head_dim, u, w);
+                kvarn_append_fp16_bytes(record.v_body, u);
+                kvarn_append_fp16_bytes(record.v_body, w);
+
+                // Each later component is fitted to the residual left by the
+                // representation actually stored, including fp16 rounding.
+                if (component + 1 < params.value_residual_rank) {
+                    std::vector<float> u_fp16;
+                    std::vector<float> w_fp16;
+                    const size_t component_bytes = (size_t(params.group_size) + head_dim)*sizeof(ggml_fp16_t);
+                    const size_t component_offset = record.v_body.size() - component_bytes;
+                    kvarn_load_fp16_bytes(record.v_body, component_offset, params.group_size, u_fp16);
+                    kvarn_load_fp16_bytes(record.v_body,
+                            component_offset + size_t(params.group_size)*sizeof(ggml_fp16_t), head_dim, w_fp16);
+                    for (uint32_t g = 0; g < params.group_size; ++g) {
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            residual[size_t(g)*head_dim + d] -= u_fp16[g]*w_fp16[d];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (record.v_body.size() != layout.v_body_bytes) {
+        throw std::runtime_error("KVarN stored V body size does not match its layout");
+    }
+
     return record;
 }
 
@@ -965,6 +1348,37 @@ void llama_kvarn_dequant_reference(
         throw std::runtime_error("KVarN CPU reference dequant does not implement canonical Turbo V layout");
     }
     const size_t n = size_t(layout.head_dim)*layout.group_size;
+    if (layout.head_dim == 0 || layout.group_size == 0 || layout.key_bits == 0 || layout.key_bits > 8 ||
+            layout.value_bits == 0 || layout.value_bits > 8) {
+        throw std::invalid_argument("KVarN record layout is invalid");
+    }
+    const size_t packed_k_bytes = packed_nbytes(n, layout.key_bits);
+    const size_t packed_v_bytes = packed_nbytes(n, layout.value_bits);
+    size_t expected_v_body_bytes = packed_v_bytes;
+    if (layout.v_layout >= LLAMA_KVARN_V_LAYOUT_LEGACY_R1 &&
+            layout.v_layout <= LLAMA_KVARN_V_LAYOUT_LEGACY_R3) {
+        expected_v_body_bytes += size_t(kvarn_v_layout_residual_rank(layout.v_layout))*
+            (size_t(layout.group_size) + layout.head_dim)*sizeof(ggml_fp16_t);
+    } else if (layout.v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3) {
+        if (layout.head_dim != KVAR_N_SPARSE_HEAD_DIM || layout.group_size != KVAR_N_SPARSE_GROUP_SIZE ||
+                layout.key_bits != 8 || layout.value_bits != 2) {
+            throw std::invalid_argument("KVarN sparse residual record geometry is invalid");
+        }
+        expected_v_body_bytes += KVAR_N_SPARSE_SUFFIX_BYTES;
+    } else if (layout.v_layout != LLAMA_KVARN_V_LAYOUT_LEGACY) {
+        throw std::invalid_argument("KVarN record V layout is unsupported");
+    }
+    const size_t expected_k_scale_floats = size_t(2)*layout.head_dim + layout.group_size;
+    const size_t expected_v_scale_floats = size_t(layout.head_dim) + 2*layout.group_size;
+    const size_t expected_record_bytes = packed_k_bytes + expected_v_body_bytes +
+        (expected_k_scale_floats + expected_v_scale_floats)*sizeof(float);
+    if (layout.k_body_bytes != packed_k_bytes || layout.v_body_bytes != expected_v_body_bytes ||
+            layout.k_scale_floats != expected_k_scale_floats || layout.v_scale_floats != expected_v_scale_floats ||
+            layout.total_record_bytes != expected_record_bytes ||
+            record.k_body.size() != packed_k_bytes || record.v_body.size() != expected_v_body_bytes ||
+            record.k_scales.size() != expected_k_scale_floats || record.v_scales.size() != expected_v_scale_floats) {
+        throw std::invalid_argument("KVarN record storage size does not match its layout");
+    }
 
     std::vector<uint8_t> k_q, v_q;
     llama_kvarn_unpack_bits(record.k_body, layout.key_bits, n, k_q);
@@ -992,6 +1406,27 @@ void llama_kvarn_dequant_reference(
         for (uint32_t d = 0; d < layout.head_dim; ++d) {
             v_tile[g*layout.head_dim + d] =
                 (float(v_q[g*layout.head_dim + d])*v_s_row[g] + v_zp[g])*v_s_col[d];
+        }
+    }
+
+    if (layout.v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3) {
+        kvarn_add_sparse_r3_bytes(record.v_body, packed_v_bytes, v_tile);
+    } else if (kvarn_v_layout_residual_rank(layout.v_layout) > 0) {
+        const size_t prefix_bytes = packed_nbytes(n, layout.value_bits);
+        const uint32_t rank = kvarn_v_layout_residual_rank(layout.v_layout);
+        const size_t component_bytes = (size_t(layout.group_size) + layout.head_dim)*sizeof(ggml_fp16_t);
+        for (uint32_t component = 0; component < rank; ++component) {
+            std::vector<float> u;
+            std::vector<float> w;
+            const size_t component_offset = prefix_bytes + size_t(component)*component_bytes;
+            kvarn_load_fp16_bytes(record.v_body, component_offset, layout.group_size, u);
+            kvarn_load_fp16_bytes(record.v_body,
+                    component_offset + size_t(layout.group_size)*sizeof(ggml_fp16_t), layout.head_dim, w);
+            for (uint32_t g = 0; g < layout.group_size; ++g) {
+                for (uint32_t d = 0; d < layout.head_dim; ++d) {
+                    v_tile[size_t(g)*layout.head_dim + d] += u[g]*w[d];
+                }
+            }
         }
     }
 }
@@ -1475,6 +1910,22 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     if (kv_size == 0 || n_seq_max == 0) {
         throw std::invalid_argument("KVarN cache requires non-zero kv_size and n_seq_max");
     }
+#ifdef LLAMA_BUILD
+    if (params.value_residual_rank > 0 && model != nullptr) {
+        if (!offload) {
+            throw std::invalid_argument("KVarN K8/V2 residual layouts require GPU-offloaded cache storage");
+        }
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (!kvarn_hparams_has_kv(hparams, il) || (filter && !filter(il))) {
+                continue;
+            }
+            ggml_backend_dev_t dev = model->dev_layer(il);
+            if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                throw std::invalid_argument("KVarN K8/V2 residual layouts require every compressed KV layer on a GPU backend");
+            }
+        }
+    }
+#endif
     if (uint64_t(params.sink_tokens) + uint64_t(params.tail_tokens) > kv_size) {
         if (params.sink_tokens >= kv_size) {
             throw std::invalid_argument("KVarN sink tokens must be smaller than the KV cache size");
@@ -1601,12 +2052,18 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
         runtime_cache.push_back(std::move(caches));
 
+        const size_t record_bytes = layout_k.k_body_bytes + layout_v.v_body_bytes +
+            (layout_k.k_scale_floats + layout_v.v_scale_floats)*sizeof(float);
+        const double realized_v_bpv = 8.0*double(layout_v.v_body_bytes + layout_v.v_scale_floats*sizeof(float))/
+            double(size_t(head_v)*layer_params.group_size);
         std::fprintf(stderr,
                 "%s: KVarN layer %3u storage dev = %s, heads = %u, body records = %u, "
-                "requested k%u/v%u effective k%u/v%u\n",
+                "requested k%u/v%u%s effective k%u/v%u%s, V %.4f bpv, record %zu bytes\n",
                 __func__, il, dev_name, n_head_kv, n_records,
-                params.key_bits, params.value_bits,
-                layout_k.key_bits, layout_v.value_bits);
+                params.key_bits, params.value_bits, kvarn_requested_residual_suffix(params),
+                layout_k.key_bits, layout_v.value_bits,
+                kvarn_effective_residual_suffix(layout_v.v_layout),
+                realized_v_bpv, record_bytes);
     }
 
     if (reuse) {
@@ -2430,15 +2887,22 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
     }
 
     const size_t tile_floats = size_t(view.head_dim_k)*params.group_size;
-    // Best-so-far scratch per tile: row scales + col scales + imbalance + global RMS.
+    // Best-state scratch carries row/column scales, imbalance, and global RMS;
+    // the existing RTN temporaries are reused for log-scale state.
     const size_t per_pipeline =
         tile_floats + 2*std::max<uint32_t>(view.head_dim_k, params.group_size) +
         view.head_dim_k + params.group_size + 2;
-    const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
+    size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
     // Multi-head stores gather one K and one V tile per head before the fused store kernel.
     // Reserve those transpose tiles for every multi-head layer, including 128-dim Qwen paths.
     const bool needs_pending_head_tiles = view.n_head_kv > 1 || view.head_dim_k >= 512;
     size_t result = needs_pending_head_tiles ? 2*tile_floats + pipeline_scratch : pipeline_scratch;
+    const bool has_value_residual =
+        view.layout_v.v_layout >= LLAMA_KVARN_V_LAYOUT_LEGACY_R1 &&
+        view.layout_v.v_layout <= LLAMA_KVARN_V_LAYOUT_SPARSE_R3;
+    if (has_value_residual) {
+        result += tile_floats;
+    }
 
     // Direct prefill batches at most eight contiguous records per graph op.
     // Production K2/K4/K8 with V2/V4/V8 batches record x head phases by default,
@@ -2448,9 +2912,8 @@ size_t llama_kv_cache_kvarn::body_store_scratch_floats(int32_t il) const {
         constexpr uint32_t direct_record_batch_max = 8;
         const size_t n_tiles = size_t(view.n_head_kv)*direct_record_batch_max;
         const size_t data_floats = n_tiles*tile_floats;
-        const size_t best_floats =
-            n_tiles*(size_t(view.head_dim_k) + params.group_size + 2);
-        const size_t batched_phase_scratch = 2*data_floats + 2*best_floats;
+        const size_t best_floats = n_tiles*(size_t(view.head_dim_k) + params.group_size + 2);
+        const size_t batched_phase_scratch = (has_value_residual ? 3 : 2)*data_floats + 2*best_floats;
         result = std::max(result, batched_phase_scratch);
     }
     return result;

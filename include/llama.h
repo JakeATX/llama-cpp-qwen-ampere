@@ -204,6 +204,8 @@ extern "C" {
         uint32_t sink_tokens;
         uint32_t tail_tokens;
         uint32_t sinkhorn_iters;
+        uint32_t value_residual_rank; // 0: standard V codec, 1..3: K8/V2 low-rank residual
+        uint32_t value_sparse_residual; // explicit R3/sparse policy, dimension selects the effective layout
         float    rtn_quantile;
     };
 

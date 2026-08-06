@@ -22,6 +22,10 @@ class llama_io_write_i;
 enum llama_kvarn_v_layout : uint32_t {
     LLAMA_KVARN_V_LAYOUT_LEGACY          = 0,
     LLAMA_KVARN_V_LAYOUT_TURBO_CANONICAL = 1,
+    LLAMA_KVARN_V_LAYOUT_LEGACY_R1       = 2,
+    LLAMA_KVARN_V_LAYOUT_LEGACY_R2       = 3,
+    LLAMA_KVARN_V_LAYOUT_LEGACY_R3       = 4,
+    LLAMA_KVARN_V_LAYOUT_SPARSE_R3       = 5,
 };
 
 struct llama_kvarn_layout {

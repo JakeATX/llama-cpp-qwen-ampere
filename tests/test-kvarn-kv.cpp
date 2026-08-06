@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -97,6 +98,82 @@ static void test_layout() {
     require(layout512.k_scale_floats == 1152, "512-dim K scale float count");
     require(layout512.v_scale_floats == 768, "512-dim V scale float count");
     require(layout512.total_record_bytes == 56832, "512-dim total record bytes");
+
+    llama_kvarn_params r1 = params;
+    r1.key_bits = 8;
+    r1.value_residual_rank = 1;
+    const llama_kvarn_layout r1_256 = llama_kvarn_make_layout(r1, 256);
+    require(r1_256.v_layout == LLAMA_KVARN_V_LAYOUT_LEGACY_R1, "R1 V layout id");
+    require(r1_256.v_body_bytes == 8960, "256-dim R1 V body bytes");
+    require(r1_256.total_record_bytes == 46336, "256-dim R1 total record bytes");
+    const llama_kvarn_layout r1_512 = llama_kvarn_make_layout(r1, 512);
+    require(r1_512.v_body_bytes == 17664, "512-dim R1 V body bytes");
+    require(r1_512.total_record_bytes == 90880, "512-dim R1 total record bytes");
+
+    llama_kvarn_params r2 = r1;
+    r2.value_residual_rank = 2;
+    const llama_kvarn_layout r2_256 = llama_kvarn_make_layout(r2, 256);
+    require(r2_256.v_layout == LLAMA_KVARN_V_LAYOUT_LEGACY_R2, "R2 V layout id");
+    require(r2_256.v_body_bytes == 9728, "256-dim R2 V body bytes");
+    require(r2_256.total_record_bytes == 47104, "256-dim R2 total record bytes");
+    const llama_kvarn_layout r2_512 = llama_kvarn_make_layout(r2, 512);
+    require(r2_512.v_body_bytes == 18944, "512-dim R2 V body bytes");
+    require(r2_512.total_record_bytes == 92160, "512-dim R2 total record bytes");
+
+    llama_kvarn_params r3 = r2;
+    r3.value_residual_rank = 3;
+    const llama_kvarn_layout r3_256 = llama_kvarn_make_layout(r3, 256);
+    require(r3_256.v_layout == LLAMA_KVARN_V_LAYOUT_LEGACY_R3, "R3 V layout id");
+    require(r3_256.v_body_bytes == 10496, "256-dim R3 V body bytes");
+    require(r3_256.total_record_bytes == 47872, "256-dim R3 total record bytes");
+    require(8.0*double(r3_256.v_body_bytes + r3_256.v_scale_floats*sizeof(float))/(256.0*128.0) == 3.0625,
+            "256-dim R3 exact V rate");
+    const llama_kvarn_layout r3_512 = llama_kvarn_make_layout(r3, 512);
+    require(r3_512.v_body_bytes == 20224, "512-dim R3 V body bytes");
+    require(r3_512.total_record_bytes == 93440, "512-dim R3 total record bytes");
+    require(8.0*double(r3_512.v_body_bytes + r3_512.v_scale_floats*sizeof(float))/(512.0*128.0) == 2.84375,
+            "512-dim R3 exact V rate");
+
+    llama_kvarn_params r3s = r3;
+    r3s.value_sparse_residual = 1;
+    const llama_kvarn_layout r3s_256 = llama_kvarn_make_layout(r3s, 256);
+    require(r3s_256.v_layout == LLAMA_KVARN_V_LAYOUT_LEGACY_R3, "R3s 256-dim resolves to legacy R3 layout");
+    require(r3s_256.v_body_bytes == r3_256.v_body_bytes &&
+            r3s_256.total_record_bytes == r3_256.total_record_bytes,
+            "R3s 256-dim layout is byte-identical to R3");
+    const llama_kvarn_layout r3s_512 = llama_kvarn_make_layout(r3s, 512);
+    require(r3s_512.v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3, "R3s 512-dim sparse V layout id");
+    require(r3s_512.v_body_bytes == 21504, "R3s 512-dim V body bytes");
+    require(r3s_512.v_scale_floats*sizeof(float) == 3072, "R3s 512-dim V scale bytes");
+    require(r3s_512.total_record_bytes == 94720, "R3s 512-dim total record bytes");
+    require(8.0*double(r3s_512.v_body_bytes + r3s_512.v_scale_floats*sizeof(float))/(512.0*128.0) == 3.0,
+            "R3s 512-dim exact V rate");
+
+    const auto rejects_layout = [](const llama_kvarn_params & p, uint32_t head_dim) {
+        try {
+            (void) llama_kvarn_make_layout(p, head_dim);
+            return false;
+        } catch (const std::invalid_argument &) {
+            return true;
+        }
+    };
+    require(rejects_layout(r1, 128), "R1 rejects unsupported head dimension");
+    require(rejects_layout(r3s, 128), "R3s rejects unsupported head dimension");
+    require(rejects_layout(r3s, 1024), "R3s rejects unsupported large head dimension");
+    llama_kvarn_params bad = r1;
+    bad.key_bits = 4;
+    require(rejects_layout(bad, 256), "R1 rejects non-K8 configuration");
+    bad = r1;
+    bad.value_residual_rank = 4;
+    require(rejects_layout(bad, 256), "KVarN rejects unsupported residual rank");
+
+    set_test_env("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", "1");
+    require(rejects_layout(r1, 256), "R1 rejects mutually exclusive Turbo layout");
+    require(rejects_layout(r2, 256), "R2 rejects mutually exclusive Turbo layout");
+    require(rejects_layout(r3, 256), "R3 rejects mutually exclusive Turbo layout");
+    require(rejects_layout(r3s, 256), "R3s 256 rejects mutually exclusive Turbo layout");
+    require(rejects_layout(r3s, 512), "R3s 512 rejects mutually exclusive Turbo layout");
+    set_test_env("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT", nullptr);
 }
 
 class kvarn_test_writer final : public llama_io_write_i {
@@ -272,6 +349,517 @@ static void test_reference_store_dequant() {
     require(k_abs > 0.0f, "nonzero K dequant");
     require(v_abs > 0.0f, "nonzero V dequant");
     }
+}
+
+static void test_rank1_reference_oracle() {
+    constexpr uint32_t rows = 128;
+    llama_kvarn_params base_params = llama_kvarn_default_params();
+    base_params.key_bits = 8;
+    base_params.sinkhorn_iters = 8;
+    llama_kvarn_params r1_params = base_params;
+    r1_params.value_residual_rank = 1;
+    llama_kvarn_params r2_params = base_params;
+    r2_params.value_residual_rank = 2;
+    llama_kvarn_params r3_params = base_params;
+    r3_params.value_residual_rank = 3;
+
+    for (const uint32_t cols : { 256u, 512u }) {
+    std::vector<float> k(size_t(rows)*cols);
+    std::vector<float> v(size_t(rows)*cols);
+    for (uint32_t g = 0; g < rows; ++g) {
+        for (uint32_t d = 0; d < cols; ++d) {
+            const size_t i = size_t(g)*cols + d;
+            k[i] = 0.03f*std::sin(float(i)*0.013f) + 0.01f*std::cos(float(i)*0.031f);
+            v[i] = 0.04f*std::cos(float(i)*0.009f) - 0.02f*std::sin(float(i)*0.021f) +
+                0.015f*std::sin(float(g)*0.17f)*std::cos(float(d)*0.07f);
+        }
+    }
+
+    const llama_kvarn_body_record base = llama_kvarn_store_reference(base_params, cols, k, v);
+    const llama_kvarn_body_record r1 = llama_kvarn_store_reference(r1_params, cols, k, v);
+    const llama_kvarn_body_record r2 = llama_kvarn_store_reference(r2_params, cols, k, v);
+    const llama_kvarn_body_record r3 = llama_kvarn_store_reference(r3_params, cols, k, v);
+    const llama_kvarn_body_record repeat = llama_kvarn_store_reference(r1_params, cols, k, v);
+    const llama_kvarn_body_record r2_repeat = llama_kvarn_store_reference(r2_params, cols, k, v);
+    const llama_kvarn_body_record r3_repeat = llama_kvarn_store_reference(r3_params, cols, k, v);
+    set_test_env("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    const llama_kvarn_body_record base_global_off = llama_kvarn_store_reference(base_params, cols, k, v);
+    const llama_kvarn_body_record r1_global_off = llama_kvarn_store_reference(r1_params, cols, k, v);
+    const llama_kvarn_body_record r2_global_off = llama_kvarn_store_reference(r2_params, cols, k, v);
+    const llama_kvarn_body_record r3_global_off = llama_kvarn_store_reference(r3_params, cols, k, v);
+    set_test_env("LLAMA_KVARN_DISABLE_GLOBAL_NORM", nullptr);
+    const size_t prefix = base.layout.v_body_bytes;
+    const size_t component_bytes = (rows + cols)*sizeof(ggml_fp16_t);
+    require(r1.v_body.size() == (cols == 256 ? 8960u : 17664u), "R1 oracle exact V body size");
+    require(std::equal(base.v_body.begin(), base.v_body.end(), r1.v_body.begin()),
+            "R1 preserves standard V2 prefix bytes");
+    require(base.k_body == r1.k_body && base.k_scales == r1.k_scales && base.v_scales == r1.v_scales,
+            "R1 preserves standard K8/V2 bodies and scales");
+    require(r1.v_body == repeat.v_body, "R1 factorization is byte deterministic");
+    require(r2.v_body.size() == (cols == 256 ? 9728u : 18944u), "R2 oracle exact V body size");
+    require(std::equal(r1.v_body.begin(), r1.v_body.end(), r2.v_body.begin()),
+            "R2 preserves the complete R1 representation byte-identically");
+    require(base.k_body == r2.k_body && base.k_scales == r2.k_scales && base.v_scales == r2.v_scales,
+            "R2 preserves standard K8/V2 bodies and scales");
+    require(r2.v_body == r2_repeat.v_body, "R2 factorization is byte deterministic");
+    require(r3.v_body.size() == (cols == 256 ? 10496u : 20224u), "R3 oracle exact V body size");
+    require(r3.v_body == r3_global_off.v_body && r3.k_body == r3_global_off.k_body &&
+                r3.k_scales == r3_global_off.k_scales && r3.v_scales == r3_global_off.v_scales,
+            "R3 defaults byte-exactly to the explicit global-norm-off policy");
+    require(std::equal(r2_global_off.v_body.begin(), r2_global_off.v_body.end(), r3.v_body.begin()),
+            "R3 V2 prefix and first two residual components preserve official-VarN R2 bytes");
+    require(r2_global_off.k_body == r3.k_body && r2_global_off.k_scales == r3.k_scales &&
+                r2_global_off.v_scales == r3.v_scales,
+            "R3 preserves global-off K8/V2 bodies and scales");
+    require(r3.v_body == r3_repeat.v_body, "R3 factorization is byte deterministic");
+    require(base.k_body != base_global_off.k_body || base.k_scales != base_global_off.k_scales ||
+                base.v_body != base_global_off.v_body || base.v_scales != base_global_off.v_scales,
+            "standard codec remains sensitive to the global-norm environment policy");
+    require(r1.v_body != r1_global_off.v_body || r1.k_body != r1_global_off.k_body ||
+                r1.k_scales != r1_global_off.k_scales || r1.v_scales != r1_global_off.v_scales,
+            "R1 default retains global normalization");
+    require(r2.v_body != r2_global_off.v_body || r2.k_body != r2_global_off.k_body ||
+                r2.k_scales != r2_global_off.k_scales || r2.v_scales != r2_global_off.v_scales,
+            "R2 default retains global normalization");
+
+    std::vector<float> base_k;
+    std::vector<float> base_v;
+    llama_kvarn_dequant_reference(base, base_k, base_v);
+    std::vector<float> v_rot;
+    llama_kvarn_hadamard_channels(v, v_rot, rows, cols, false);
+    std::vector<float> residual(v.size());
+    for (size_t i = 0; i < residual.size(); ++i) {
+        residual[i] = v_rot[i] - base_v[i];
+    }
+
+    // Independent test oracle: use double-precision vectors and explicit
+    // matrix-vector passes, then quantize only the final balanced factors.
+    uint32_t seed = 0;
+    double best_energy = -1.0;
+    for (uint32_t d = 0; d < cols; ++d) {
+        double energy = 0.0;
+        for (uint32_t g = 0; g < rows; ++g) {
+            const double x = residual[size_t(g)*cols + d];
+            energy += x*x;
+        }
+        if (energy > best_energy) {
+            best_energy = energy;
+            seed = d;
+        }
+    }
+    require(best_energy > 1.0e-20, "R1 oracle fixture has nonzero residual");
+    std::vector<float> oracle_u(rows);
+    std::vector<float> oracle_w(cols);
+    for (uint32_t g = 0; g < rows; ++g) oracle_u[g] = residual[size_t(g)*cols + seed];
+    const auto oracle_w_step = [&]() {
+        double denom = 0.0;
+        for (float x : oracle_u) denom += double(x)*x;
+        for (uint32_t d = 0; d < cols; ++d) {
+            double dot = 0.0;
+            for (uint32_t g = 0; g < rows; ++g) dot += double(residual[size_t(g)*cols + d])*oracle_u[g];
+            oracle_w[d] = float(dot/denom);
+        }
+    };
+    const auto oracle_u_step = [&]() {
+        double denom = 0.0;
+        for (float x : oracle_w) denom += double(x)*x;
+        for (uint32_t g = 0; g < rows; ++g) {
+            double dot = 0.0;
+            for (uint32_t d = 0; d < cols; ++d) dot += double(residual[size_t(g)*cols + d])*oracle_w[d];
+            oracle_u[g] = float(dot/denom);
+        }
+    };
+    for (int iter = 0; iter < 4; ++iter) {
+        oracle_w_step();
+        oracle_u_step();
+    }
+    oracle_w_step();
+    double un2 = 0.0, wn2 = 0.0;
+    for (float x : oracle_u) un2 += double(x)*x;
+    for (float x : oracle_w) wn2 += double(x)*x;
+    const double balance = std::sqrt(std::sqrt(wn2/un2));
+    for (float & x : oracle_u) x = float(double(x)*balance);
+    for (float & x : oracle_w) x = float(double(x)/balance);
+    uint32_t sign_index = 0;
+    for (uint32_t d = 1; d < cols; ++d) {
+        if (std::fabs(oracle_w[d]) > std::fabs(oracle_w[sign_index])) sign_index = d;
+    }
+    if (oracle_w[sign_index] < 0.0) {
+        for (float & x : oracle_u) x = -x;
+        for (float & x : oracle_w) x = -x;
+    }
+
+    std::vector<ggml_fp16_t> expected(rows + cols);
+    for (uint32_t g = 0; g < rows; ++g) expected[g] = ggml_fp32_to_fp16(oracle_u[g]);
+    for (uint32_t d = 0; d < cols; ++d) expected[rows + d] = ggml_fp32_to_fp16(oracle_w[d]);
+    require(std::memcmp(r1.v_body.data() + prefix, expected.data(), expected.size()*sizeof(ggml_fp16_t)) == 0,
+            "R1 stored factors match independent frozen-rule oracle");
+
+    // Independently deflate the fp16-decoded first component and repeat the
+    // frozen rule for the second component.
+    std::vector<float> stored_u(rows);
+    std::vector<float> stored_w(cols);
+    ggml_fp16_to_fp32_row(expected.data(), stored_u.data(), rows);
+    ggml_fp16_to_fp32_row(expected.data() + rows, stored_w.data(), cols);
+    for (uint32_t g = 0; g < rows; ++g) {
+        for (uint32_t d = 0; d < cols; ++d) {
+            residual[size_t(g)*cols + d] -= stored_u[g]*stored_w[d];
+        }
+    }
+    seed = 0;
+    best_energy = -1.0;
+    for (uint32_t d = 0; d < cols; ++d) {
+        double energy = 0.0;
+        for (uint32_t g = 0; g < rows; ++g) {
+            const double x = residual[size_t(g)*cols + d];
+            energy += x*x;
+        }
+        if (energy > best_energy) {
+            best_energy = energy;
+            seed = d;
+        }
+    }
+    require(best_energy > 1.0e-20, "R2 oracle fixture has nonzero second residual");
+    std::fill(oracle_u.begin(), oracle_u.end(), 0.0f);
+    std::fill(oracle_w.begin(), oracle_w.end(), 0.0f);
+    for (uint32_t g = 0; g < rows; ++g) oracle_u[g] = residual[size_t(g)*cols + seed];
+    for (int iter = 0; iter < 4; ++iter) {
+        oracle_w_step();
+        oracle_u_step();
+    }
+    oracle_w_step();
+    un2 = 0.0;
+    wn2 = 0.0;
+    for (float x : oracle_u) un2 += double(x)*x;
+    for (float x : oracle_w) wn2 += double(x)*x;
+    const double balance2 = std::sqrt(std::sqrt(wn2/un2));
+    for (float & x : oracle_u) x = float(double(x)*balance2);
+    for (float & x : oracle_w) x = float(double(x)/balance2);
+    sign_index = 0;
+    for (uint32_t d = 1; d < cols; ++d) {
+        if (std::fabs(oracle_w[d]) > std::fabs(oracle_w[sign_index])) sign_index = d;
+    }
+    if (oracle_w[sign_index] < 0.0f) {
+        for (float & x : oracle_u) x = -x;
+        for (float & x : oracle_w) x = -x;
+    }
+    std::vector<ggml_fp16_t> expected2(rows + cols);
+    for (uint32_t g = 0; g < rows; ++g) expected2[g] = ggml_fp32_to_fp16(oracle_u[g]);
+    for (uint32_t d = 0; d < cols; ++d) expected2[rows + d] = ggml_fp32_to_fp16(oracle_w[d]);
+    require(std::memcmp(r2.v_body.data() + prefix + component_bytes,
+                expected2.data(), expected2.size()*sizeof(ggml_fp16_t)) == 0,
+            "R2 second factors match independent fp16-deflated frozen-rule oracle");
+
+    // Independent official-VarN R3 oracle: begin with the decoded global-off
+    // R2 representation, which includes the actual fp16 sum of components 1/2.
+    std::vector<float> r2_global_off_k;
+    std::vector<float> r2_global_off_v;
+    llama_kvarn_dequant_reference(r2_global_off, r2_global_off_k, r2_global_off_v);
+    for (size_t i = 0; i < residual.size(); ++i) {
+        residual[i] = v_rot[i] - r2_global_off_v[i];
+    }
+    seed = 0;
+    best_energy = -1.0;
+    for (uint32_t d = 0; d < cols; ++d) {
+        double energy = 0.0;
+        for (uint32_t g = 0; g < rows; ++g) {
+            const double x = residual[size_t(g)*cols + d];
+            energy += x*x;
+        }
+        if (energy > best_energy) {
+            best_energy = energy;
+            seed = d;
+        }
+    }
+    require(best_energy > 1.0e-20, "R3 oracle fixture has nonzero third residual");
+    std::fill(oracle_u.begin(), oracle_u.end(), 0.0f);
+    std::fill(oracle_w.begin(), oracle_w.end(), 0.0f);
+    for (uint32_t g = 0; g < rows; ++g) oracle_u[g] = residual[size_t(g)*cols + seed];
+    for (int iter = 0; iter < 4; ++iter) {
+        oracle_w_step();
+        oracle_u_step();
+    }
+    oracle_w_step();
+    un2 = 0.0;
+    wn2 = 0.0;
+    for (float x : oracle_u) un2 += double(x)*x;
+    for (float x : oracle_w) wn2 += double(x)*x;
+    const double balance3 = std::sqrt(std::sqrt(wn2/un2));
+    for (float & x : oracle_u) x = float(double(x)*balance3);
+    for (float & x : oracle_w) x = float(double(x)/balance3);
+    sign_index = 0;
+    for (uint32_t d = 1; d < cols; ++d) {
+        if (std::fabs(oracle_w[d]) > std::fabs(oracle_w[sign_index])) sign_index = d;
+    }
+    if (oracle_w[sign_index] < 0.0f) {
+        for (float & x : oracle_u) x = -x;
+        for (float & x : oracle_w) x = -x;
+    }
+    std::vector<ggml_fp16_t> expected3(rows + cols);
+    for (uint32_t g = 0; g < rows; ++g) expected3[g] = ggml_fp32_to_fp16(oracle_u[g]);
+    for (uint32_t d = 0; d < cols; ++d) expected3[rows + d] = ggml_fp32_to_fp16(oracle_w[d]);
+    require(std::memcmp(r3.v_body.data() + prefix + 2*component_bytes,
+                expected3.data(), expected3.size()*sizeof(ggml_fp16_t)) == 0,
+            "R3 third factors match the independent frozen-rule oracle");
+
+    std::vector<float> r1_k;
+    std::vector<float> r1_v;
+    llama_kvarn_dequant_reference(r1, r1_k, r1_v);
+    std::vector<float> r2_k;
+    std::vector<float> r2_v;
+    llama_kvarn_dequant_reference(r2, r2_k, r2_v);
+    std::vector<float> r3_k;
+    std::vector<float> r3_v;
+    llama_kvarn_dequant_reference(r3, r3_k, r3_v);
+    double base_error = 0.0, r1_error = 0.0, r2_error = 0.0, r2_global_off_error = 0.0, r3_error = 0.0;
+    for (size_t i = 0; i < v_rot.size(); ++i) {
+        const double eb = double(base_v[i]) - v_rot[i];
+        const double er = double(r1_v[i]) - v_rot[i];
+        const double er2 = double(r2_v[i]) - v_rot[i];
+        const double er2_global_off = double(r2_global_off_v[i]) - v_rot[i];
+        const double er3 = double(r3_v[i]) - v_rot[i];
+        base_error += eb*eb;
+        r1_error += er*er;
+        r2_error += er2*er2;
+        r2_global_off_error += er2_global_off*er2_global_off;
+        r3_error += er3*er3;
+    }
+    require(r1_error < base_error, "R1 oracle improves V2 reconstruction");
+    require(r2_error < r1_error, "R2 oracle improves R1 reconstruction");
+    require(r3_error < r2_global_off_error, "R3 oracle improves official-VarN R2 reconstruction");
+
+    std::vector<float> zero(k.size(), 0.0f);
+    const llama_kvarn_body_record zero_record = llama_kvarn_store_reference(r1_params, cols, zero, zero);
+    require(std::all_of(zero_record.v_body.begin() + prefix, zero_record.v_body.end(),
+                [](uint8_t byte) { return byte == 0; }),
+            "R1 zero-energy residual stores zero fp16 factors");
+    const llama_kvarn_body_record zero_r2_record = llama_kvarn_store_reference(r2_params, cols, zero, zero);
+    require(std::all_of(zero_r2_record.v_body.begin() + prefix, zero_r2_record.v_body.end(),
+                [](uint8_t byte) { return byte == 0; }),
+            "R2 zero-energy residual stores zero fp16 factors");
+    const llama_kvarn_body_record zero_r3_record = llama_kvarn_store_reference(r3_params, cols, zero, zero);
+    require(std::all_of(zero_r3_record.v_body.begin() + prefix, zero_r3_record.v_body.end(),
+                [](uint8_t byte) { return byte == 0; }),
+            "R3 zero-energy residual stores zero fp16 factors");
+    }
+}
+
+static void test_sparse_r3_reference_oracle() {
+    constexpr uint32_t rows = 128;
+    constexpr uint32_t cols = 512;
+    constexpr size_t n = size_t(rows)*cols;
+    constexpr size_t prefix_bytes = n*2/8;
+    constexpr size_t col_start_bytes = cols*sizeof(uint16_t);
+    constexpr size_t nnz = 1365;
+    constexpr size_t row_bytes = nnz;
+    constexpr size_t pad_bytes = 1;
+    constexpr size_t suffix_bytes = col_start_bytes + row_bytes + pad_bytes + nnz*sizeof(ggml_fp16_t);
+
+    llama_kvarn_params r3 = llama_kvarn_default_params();
+    r3.key_bits = 8;
+    r3.value_bits = 2;
+    r3.value_residual_rank = 3;
+    llama_kvarn_params r3s = r3;
+    r3s.value_sparse_residual = 1;
+
+    std::vector<float> k256(size_t(rows)*256);
+    std::vector<float> v256(k256.size());
+    for (size_t i = 0; i < k256.size(); ++i) {
+        k256[i] = 0.25f*std::sin(float(i)*0.013f) + 0.01f*float(i%17);
+        v256[i] = 0.31f*std::cos(float(i)*0.009f) - 0.02f*float(i%11);
+    }
+    const llama_kvarn_body_record legacy_r3 = llama_kvarn_store_reference(r3, 256, k256, v256);
+    const llama_kvarn_body_record policy_256 = llama_kvarn_store_reference(r3s, 256, k256, v256);
+    const auto same_layout = [](const llama_kvarn_layout & a, const llama_kvarn_layout & b) {
+        return a.head_dim == b.head_dim && a.group_size == b.group_size &&
+            a.key_bits == b.key_bits && a.value_bits == b.value_bits && a.v_layout == b.v_layout &&
+            a.k_body_bytes == b.k_body_bytes && a.v_body_bytes == b.v_body_bytes &&
+            a.k_scale_floats == b.k_scale_floats && a.v_scale_floats == b.v_scale_floats &&
+            a.total_record_bytes == b.total_record_bytes;
+    };
+    require(same_layout(policy_256.layout, legacy_r3.layout),
+            "R3s D256 effective layout matches explicit R3");
+    require(policy_256.k_body == legacy_r3.k_body && policy_256.v_body == legacy_r3.v_body &&
+            policy_256.k_scales == legacy_r3.k_scales && policy_256.v_scales == legacy_r3.v_scales,
+            "R3s D256 record is byte-identical to explicit R3");
+
+    std::vector<float> k(n);
+    std::vector<float> v(n);
+    for (size_t i = 0; i < n; ++i) {
+        k[i] = 0.17f*std::sin(float(i)*0.0031f) + 0.07f*std::cos(float(i)*0.0017f);
+        v[i] = 0.29f*std::cos(float(i)*0.0023f) - 0.11f*std::sin(float(i)*0.0049f) +
+            0.001f*float(i%37);
+    }
+
+    const llama_kvarn_body_record sparse = llama_kvarn_store_reference(r3s, cols, k, v);
+    const llama_kvarn_body_record sparse_repeat = llama_kvarn_store_reference(r3s, cols, k, v);
+    require(sparse.layout.v_layout == LLAMA_KVARN_V_LAYOUT_SPARSE_R3, "R3s D512 uses sparse layout");
+    require(sparse.v_body.size() == prefix_bytes + suffix_bytes && suffix_bytes == 5120,
+            "R3s D512 exact prefix and suffix sizes");
+    require(sparse.layout.total_record_bytes == 94720, "R3s D512 exact record size");
+    require(sparse.v_body == sparse_repeat.v_body && sparse.v_scales == sparse_repeat.v_scales,
+            "R3s D512 encoding is deterministic");
+
+    llama_kvarn_params base_params = r3s;
+    base_params.value_residual_rank = 0;
+    base_params.value_sparse_residual = 0;
+    set_test_env("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    const llama_kvarn_body_record base = llama_kvarn_store_reference(base_params, cols, k, v);
+    set_test_env("LLAMA_KVARN_DISABLE_GLOBAL_NORM", nullptr);
+    require(std::equal(base.v_body.begin(), base.v_body.end(), sparse.v_body.begin()),
+            "R3s D512 packed prefix matches paper-faithful V2");
+    require(base.v_scales == sparse.v_scales, "R3s D512 scales match paper-faithful V2");
+    require(base.k_body == sparse.k_body && base.k_scales == sparse.k_scales,
+            "R3s D512 K record matches paper-faithful K8");
+
+    const auto read_u16 = [](const std::vector<uint8_t> & bytes, size_t offset) {
+        return uint16_t(bytes[offset]) | uint16_t(uint16_t(bytes[offset + 1]) << 8);
+    };
+    const size_t suffix_offset = prefix_bytes;
+    const size_t row_offset = suffix_offset + col_start_bytes;
+    const size_t pad_offset = row_offset + row_bytes;
+    const size_t value_offset = pad_offset + pad_bytes;
+    require(sparse.v_body[pad_offset] == 0, "R3s D512 sparse alignment pad is zero");
+    require(read_u16(sparse.v_body, suffix_offset) == 0, "R3s D512 CSR starts at zero");
+    for (uint32_t d = 0; d < cols; ++d) {
+        const uint32_t begin = read_u16(sparse.v_body, suffix_offset + 2*d);
+        const uint32_t end = d + 1 < cols ? read_u16(sparse.v_body, suffix_offset + 2*(d + 1)) : nnz;
+        require(begin <= end && end <= nnz, "R3s D512 CSR column offsets are monotone");
+        int32_t previous = -1;
+        for (uint32_t i = begin; i < end; ++i) {
+            const uint32_t row = sparse.v_body[row_offset + i];
+            require(row < rows && int32_t(row) > previous, "R3s D512 CSR rows are unique and ascending");
+            previous = int32_t(row);
+        }
+    }
+
+    std::vector<float> raw_rot;
+    llama_kvarn_hadamard_channels(v, raw_rot, rows, cols, false);
+    std::vector<float> base_k;
+    std::vector<float> base_v;
+    llama_kvarn_dequant_reference(base, base_k, base_v);
+    std::vector<float> residual(n);
+    for (size_t i = 0; i < n; ++i) {
+        residual[i] = raw_rot[i] - base_v[i];
+    }
+
+    struct oracle_entry {
+        uint32_t row;
+        uint32_t col;
+        float value;
+    };
+    const auto stronger = [=](const oracle_entry & a, const oracle_entry & b) {
+        const float am = std::isnan(a.value) ? std::numeric_limits<float>::infinity() : std::fabs(a.value);
+        const float bm = std::isnan(b.value) ? std::numeric_limits<float>::infinity() : std::fabs(b.value);
+        if (am != bm) {
+            return am > bm;
+        }
+        return size_t(a.row)*cols + a.col < size_t(b.row)*cols + b.col;
+    };
+    std::vector<oracle_entry> expected;
+    std::vector<oracle_entry> extra_candidates;
+    expected.reserve(nnz);
+    extra_candidates.reserve(rows);
+    for (uint32_t g = 0; g < rows; ++g) {
+        std::vector<oracle_entry> row;
+        row.reserve(cols);
+        for (uint32_t d = 0; d < cols; ++d) {
+            const size_t i = size_t(g)*cols + d;
+            row.push_back({ g, d, residual[i] });
+        }
+        std::sort(row.begin(), row.end(), stronger);
+        expected.insert(expected.end(), row.begin(), row.begin() + 10);
+        extra_candidates.push_back(row[10]);
+    }
+    std::sort(extra_candidates.begin(), extra_candidates.end(), stronger);
+    for (size_t i = 0; i < 85; ++i) {
+        expected.push_back(extra_candidates[i]);
+    }
+    std::sort(expected.begin(), expected.end(), [](const oracle_entry & a, const oracle_entry & b) {
+        return a.col != b.col ? a.col < b.col : a.row < b.row;
+    });
+    std::vector<ggml_fp16_t> stored_values(nnz);
+    std::memcpy(stored_values.data(), sparse.v_body.data() + value_offset, nnz*sizeof(ggml_fp16_t));
+    for (size_t i = 0; i < nnz; ++i) {
+        require(sparse.v_body[row_offset + i] == expected[i].row,
+                "R3s D512 selection matches independent oracle");
+        require(stored_values[i] == ggml_fp32_to_fp16(expected[i].value),
+                "R3s D512 values match independent fp16 oracle");
+    }
+
+    std::vector<float> sparse_k;
+    std::vector<float> sparse_v;
+    llama_kvarn_dequant_reference(sparse, sparse_k, sparse_v);
+    std::vector<float> independently_corrected = base_v;
+    for (size_t i = 0; i < nnz; ++i) {
+        independently_corrected[size_t(expected[i].row)*cols + expected[i].col] +=
+            ggml_fp16_to_fp32(stored_values[i]);
+    }
+    require(sparse_v == independently_corrected,
+            "R3s D512 dequant adds sparse correction in the rotated domain");
+
+    std::vector<float> base_unrot;
+    std::vector<float> sparse_unrot;
+    llama_kvarn_hadamard_channels(base_v, base_unrot, rows, cols, false);
+    llama_kvarn_hadamard_channels(sparse_v, sparse_unrot, rows, cols, false);
+    double base_error = 0.0;
+    double sparse_error = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double eb = double(base_unrot[i]) - v[i];
+        const double es = double(sparse_unrot[i]) - v[i];
+        base_error += eb*eb;
+        sparse_error += es*es;
+    }
+    require(sparse_error < base_error, "R3s D512 sparse correction improves reconstructed V");
+
+    std::vector<float> zero(n, 0.0f);
+    const llama_kvarn_body_record zero_sparse = llama_kvarn_store_reference(r3s, cols, zero, zero);
+    const llama_kvarn_body_record zero_repeat = llama_kvarn_store_reference(r3s, cols, zero, zero);
+    require(zero_sparse.v_body == zero_repeat.v_body, "R3s zero-tie selection is deterministic");
+    const size_t zero_row_offset = prefix_bytes + col_start_bytes;
+    for (uint32_t d = 0; d < cols; ++d) {
+        const uint32_t expected_start = d <= 10 ? 128*d : 1365;
+        require(read_u16(zero_sparse.v_body, prefix_bytes + 2*d) == expected_start,
+                "R3s ties prefer lower columns");
+    }
+    for (uint32_t i = 0; i < 1280; ++i) {
+        require(zero_sparse.v_body[zero_row_offset + i] == i%rows,
+                "R3s per-row tie selections serialize all rows ascending");
+    }
+    for (uint32_t i = 0; i < 85; ++i) {
+        require(zero_sparse.v_body[zero_row_offset + 1280 + i] == i,
+                "R3s absolute-residual ties prefer lower flat index");
+    }
+
+    const auto rejects_dequant = [](llama_kvarn_body_record malformed) {
+        try {
+            std::vector<float> k_out;
+            std::vector<float> v_out;
+            llama_kvarn_dequant_reference(malformed, k_out, v_out);
+            return false;
+        } catch (const std::invalid_argument &) {
+            return true;
+        }
+    };
+    llama_kvarn_body_record malformed = zero_sparse;
+    malformed.v_body.pop_back();
+    require(rejects_dequant(std::move(malformed)), "R3s dequant rejects truncated suffix");
+    malformed = zero_sparse;
+    malformed.v_body[prefix_bytes] = 1;
+    require(rejects_dequant(std::move(malformed)), "R3s dequant rejects nonzero first column offset");
+    malformed = zero_sparse;
+    malformed.v_body[prefix_bytes + 2] = 0xff;
+    malformed.v_body[prefix_bytes + 3] = 0xff;
+    require(rejects_dequant(std::move(malformed)), "R3s dequant rejects out-of-range column offset");
+    malformed = zero_sparse;
+    malformed.v_body[zero_row_offset] = 255;
+    require(rejects_dequant(std::move(malformed)), "R3s dequant rejects out-of-range row");
+    malformed = zero_sparse;
+    malformed.v_body[zero_row_offset + 1] = malformed.v_body[zero_row_offset];
+    require(rejects_dequant(std::move(malformed)), "R3s dequant rejects duplicate row");
+    malformed = zero_sparse;
+    malformed.v_body[prefix_bytes + col_start_bytes + row_bytes] = 1;
+    require(rejects_dequant(std::move(malformed)), "R3s dequant rejects nonzero alignment pad");
 }
 
 // The global-RMS Sinkhorn pre-normalization and the bit-aware RTN clip must
@@ -455,6 +1043,12 @@ static size_t expected_body_store_scratch_floats(
     const size_t pipeline_scratch = view.head_dim_k >= 256 ? 2*per_pipeline : per_pipeline;
     const bool needs_pending_head_tiles = view.n_head_kv > 1 || view.head_dim_k >= 512;
     size_t expected = needs_pending_head_tiles ? 2*tile + pipeline_scratch : pipeline_scratch;
+    const bool has_value_residual =
+        view.layout_v.v_layout >= LLAMA_KVARN_V_LAYOUT_LEGACY_R1 &&
+        view.layout_v.v_layout <= LLAMA_KVARN_V_LAYOUT_SPARSE_R3;
+    if (has_value_residual) {
+        expected += tile;
+    }
 
     if ((view.layout_k.key_bits == 2 || view.layout_k.key_bits == 4 || view.layout_k.key_bits == 8) &&
             (view.layout_v.value_bits == 2 || view.layout_v.value_bits == 4 || view.layout_v.value_bits == 8)) {
@@ -462,7 +1056,7 @@ static size_t expected_body_store_scratch_floats(
         const size_t n_tiles = size_t(view.n_head_kv)*direct_record_batch_max;
         const size_t data_floats = n_tiles*tile;
         const size_t best_floats = n_tiles*(size_t(view.head_dim_k) + params.group_size + 2);
-        expected = std::max(expected, 2*data_floats + 2*best_floats);
+        expected = std::max(expected, (has_value_residual ? 3 : 2)*data_floats + 2*best_floats);
     }
     return expected;
 }
@@ -1014,6 +1608,130 @@ static void test_runtime_state_roundtrip() {
     require(unsupported, "KVarN per-sequence state read rejected");
     require(restored.seq_pos_min(0) == 10 && restored.seq_pos_max(0) == 12,
             "unsupported KVarN per-sequence state read is non-mutating");
+}
+
+static void test_runtime_state_rejects_r1_cross_layout() {
+    llama_kvarn_params base_params = llama_kvarn_default_params();
+    base_params.key_bits = 8;
+    llama_kvarn_params r1_params = base_params;
+    r1_params.value_residual_rank = 1;
+    llama_hparams hparams = make_test_hparams(256);
+    llama_kv_cache_kvarn base(nullptr, hparams, base_params, false, 512, 1, 1, nullptr);
+    llama_kv_cache_kvarn r1(nullptr, hparams, r1_params, false, 512, 1, 1, nullptr);
+    const llama_kvarn_layer_view r1_view = r1.get_layer_view(0);
+    require(r1.body_store_scratch_floats(0) == expected_body_store_scratch_floats(r1_view, r1_params),
+            "R1 body-store scratch includes immutable rotated V tile");
+
+    kvarn_test_writer writer;
+    base.state_write(writer);
+    kvarn_test_reader reader(writer.data);
+    bool rejected = false;
+    try {
+        r1.state_read(reader);
+    } catch (const std::runtime_error & e) {
+        rejected = std::string(e.what()).find("layout mismatch") != std::string::npos;
+    }
+    require(rejected, "KVarN state v1 rejects rank-0 to rank-1 cross-layout restore");
+
+    kvarn_test_seed_state(r1, true, 512);
+    kvarn_test_writer r1_writer;
+    r1.state_write(r1_writer);
+    llama_kv_cache_kvarn base_destination(nullptr, hparams, base_params, false, 512, 1, 1, nullptr);
+    kvarn_test_reader reverse_reader(r1_writer.data);
+    rejected = false;
+    try {
+        base_destination.state_read(reverse_reader);
+    } catch (const std::runtime_error & e) {
+        rejected = std::string(e.what()).find("layout mismatch") != std::string::npos;
+    }
+    require(rejected, "KVarN state v1 rejects rank-1 to rank-0 cross-layout restore");
+
+    llama_kv_cache_kvarn r1_restored(nullptr, hparams, r1_params, false, 512, 1, 1, nullptr);
+    kvarn_test_reader r1_reader(r1_writer.data);
+    r1_restored.state_read(r1_reader);
+    kvarn_test_writer r1_rewritten;
+    r1_restored.state_write(r1_rewritten);
+    require(r1_rewritten.data == r1_writer.data, "KVarN R1 state v1 roundtrip is byte exact");
+    const auto source_v_body = kvarn_test_tensor_bytes(r1.get_layer_view(0).body_v);
+    const auto restored_v_body = kvarn_test_tensor_bytes(r1_restored.get_layer_view(0).body_v);
+    require(source_v_body == restored_v_body, "KVarN R1 state preserves packed prefix and fp16 residual suffix");
+
+    llama_kvarn_params r2_params = base_params;
+    r2_params.value_residual_rank = 2;
+    llama_kv_cache_kvarn r2(nullptr, hparams, r2_params, false, 512, 1, 1, nullptr);
+    const llama_kvarn_layer_view r2_view = r2.get_layer_view(0);
+    require(r2.body_store_scratch_floats(0) == expected_body_store_scratch_floats(r2_view, r2_params),
+            "R2 body-store scratch reuses the immutable rotated V tile");
+    kvarn_test_reader r1_to_r2_reader(r1_writer.data);
+    rejected = false;
+    try {
+        r2.state_read(r1_to_r2_reader);
+    } catch (const std::runtime_error & e) {
+        rejected = std::string(e.what()).find("layout mismatch") != std::string::npos;
+    }
+    require(rejected, "KVarN state v1 rejects rank-1 to rank-2 cross-layout restore");
+
+    kvarn_test_seed_state(r2, true, 512);
+    kvarn_test_writer r2_writer;
+    r2.state_write(r2_writer);
+    llama_kv_cache_kvarn r1_destination(nullptr, hparams, r1_params, false, 512, 1, 1, nullptr);
+    kvarn_test_reader r2_to_r1_reader(r2_writer.data);
+    rejected = false;
+    try {
+        r1_destination.state_read(r2_to_r1_reader);
+    } catch (const std::runtime_error & e) {
+        rejected = std::string(e.what()).find("layout mismatch") != std::string::npos;
+    }
+    require(rejected, "KVarN state v1 rejects rank-2 to rank-1 cross-layout restore");
+
+    llama_kv_cache_kvarn r2_restored(nullptr, hparams, r2_params, false, 512, 1, 1, nullptr);
+    kvarn_test_reader r2_reader(r2_writer.data);
+    r2_restored.state_read(r2_reader);
+    kvarn_test_writer r2_rewritten;
+    r2_restored.state_write(r2_rewritten);
+    require(r2_rewritten.data == r2_writer.data, "KVarN R2 state v1 roundtrip is byte exact");
+    require(kvarn_test_tensor_bytes(r2.get_layer_view(0).body_v) ==
+                kvarn_test_tensor_bytes(r2_restored.get_layer_view(0).body_v),
+            "KVarN R2 state preserves packed prefix and both fp16 residual suffixes");
+
+    llama_kvarn_params r3_params = base_params;
+    r3_params.value_residual_rank = 3;
+    llama_kv_cache_kvarn r3(nullptr, hparams, r3_params, false, 512, 1, 1, nullptr);
+    const llama_kvarn_layer_view r3_view = r3.get_layer_view(0);
+    require(r3.body_store_scratch_floats(0) == expected_body_store_scratch_floats(r3_view, r3_params),
+            "R3 body-store scratch reuses the immutable rotated V tile");
+    kvarn_test_reader r2_to_r3_reader(r2_writer.data);
+    rejected = false;
+    try {
+        r3.state_read(r2_to_r3_reader);
+    } catch (const std::runtime_error & e) {
+        rejected = std::string(e.what()).find("layout mismatch") != std::string::npos;
+    }
+    require(rejected, "KVarN state v1 rejects rank-2 to rank-3 cross-layout restore");
+
+    kvarn_test_seed_state(r3, true, 512);
+    kvarn_test_writer r3_writer;
+    r3.state_write(r3_writer);
+    llama_kv_cache_kvarn r2_destination(nullptr, hparams, r2_params, false, 512, 1, 1, nullptr);
+    kvarn_test_reader r3_to_r2_reader(r3_writer.data);
+    rejected = false;
+    try {
+        r2_destination.state_read(r3_to_r2_reader);
+    } catch (const std::runtime_error & e) {
+        rejected = std::string(e.what()).find("layout mismatch") != std::string::npos;
+    }
+    require(rejected, "KVarN state v1 rejects rank-3 to rank-2 cross-layout restore");
+
+    llama_kv_cache_kvarn r3_restored(nullptr, hparams, r3_params, false, 512, 1, 1, nullptr);
+    kvarn_test_reader r3_reader(r3_writer.data);
+    r3_restored.state_read(r3_reader);
+    kvarn_test_writer r3_rewritten;
+    r3_restored.state_write(r3_rewritten);
+    require(r3_rewritten.data == r3_writer.data, "KVarN R3 state v1 roundtrip is byte exact");
+    require(kvarn_test_tensor_bytes(r3.get_layer_view(0).body_v) ==
+                kvarn_test_tensor_bytes(r3_restored.get_layer_view(0).body_v),
+            "KVarN R3 state preserves packed prefix and all three fp16 residual suffixes");
+
 }
 
 static void test_runtime_single_sequence_state_roundtrip() {
@@ -2152,6 +2870,63 @@ static void test_runtime_body_record_graph_api() {
             "KVarN pending fused KV body store rejects unsafe multi-record batches");
 }
 
+static void test_residual_body_store_scratch_graph_api() {
+    const auto run_case = [](uint32_t head_dim, uint32_t n_head_kv, bool sparse) {
+        llama_kvarn_params params = llama_kvarn_default_params();
+        params.key_bits = 8;
+        params.value_bits = 2;
+        params.value_residual_rank = 3;
+        params.value_sparse_residual = sparse ? 1 : 0;
+
+        llama_hparams hparams = make_test_hparams(head_dim);
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            hparams.n_head_kv_arr[il] = n_head_kv;
+            hparams.n_head_arr[il] = n_head_kv;
+        }
+        llama_kv_cache_kvarn cache(nullptr, hparams, params, false, 512, 1, 1, nullptr);
+        const llama_kvarn_layer_view view = cache.get_layer_view(0);
+        require(cache.body_store_scratch_floats(0) == expected_body_store_scratch_floats(view, params),
+                "residual cache body-store scratch matches exact planner oracle");
+
+        ggml_init_params init_params = {
+            /*.mem_size   =*/ 4*1024*1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx { ggml_init(init_params) };
+        ggml_tensor * scratch = cache.build_body_store_scratch(ctx.get(), 0);
+        ggml_tensor * k_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, params.group_size, head_dim);
+        ggml_tensor * v_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, head_dim, params.group_size);
+        ggml_tensor * one = cache.store_kv_body_record(ctx.get(), k_tile, v_tile, scratch, 0, 0, 0);
+        require(one->op_params[13] == int32_t(view.layout_v.v_layout),
+                "residual single-record fused store accepts planned scratch");
+
+        ggml_tensor * k_heads = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_head_kv, params.group_size);
+        ggml_tensor * v_heads = ggml_new_tensor_3d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_head_kv, params.group_size);
+        ggml_tensor * heads = cache.store_kv_body_all_heads(ctx.get(), k_heads, v_heads, scratch, 0, 0);
+        require(heads->op_params[13] == int32_t(view.layout_v.v_layout),
+                "residual all-head fused store accepts planned scratch");
+
+        ggml_tensor * k_records = ggml_new_tensor_4d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_head_kv, params.group_size, 1);
+        ggml_tensor * v_records = ggml_new_tensor_4d(
+                ctx.get(), GGML_TYPE_F32, head_dim, n_head_kv, params.group_size, 1);
+        ggml_tensor * records = cache.store_kv_body_records_all_heads(
+                ctx.get(), k_records, v_records, scratch, 0, 0, 1);
+        require(records->op_params[13] == int32_t(view.layout_v.v_layout),
+                "residual direct-record fused store accepts planned scratch");
+
+        ggml_tensor * pending = cache.store_kv_body_records_from_pending(ctx.get(), scratch, 0, { 0 });
+        require(pending->op_params[13] == int32_t(view.layout_v.v_layout),
+                "residual pending-record fused store accepts planned scratch");
+    };
+
+    run_case(256, 1, false);
+    run_case(512, 2, true);
+}
+
 static void test_kvarn_store_body_ggml_ops() {
     llama_kvarn_params params = llama_kvarn_default_params();
     params.rtn_quantile = 0.75f;
@@ -2206,6 +2981,72 @@ static void test_kvarn_store_body_ggml_ops() {
                 std::fabs(v_quantile - params.rtn_quantile) < 1.0e-6f,
                 "KVarN body store quantile params");
     }
+}
+
+static void test_sparse_r3_ggml_layout_contract() {
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.key_bits = 8;
+    params.value_bits = 2;
+    params.value_residual_rank = 3;
+    params.value_sparse_residual = 1;
+    constexpr int32_t head_dim = 512;
+    constexpr int32_t group_size = 128;
+    const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+
+    ggml_init_params init_params = {
+        /*.mem_size   =*/ 8*1024*1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(init_params) };
+
+    ggml_tensor * k_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, group_size, head_dim);
+    ggml_tensor * v_tile = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, head_dim, group_size);
+    ggml_tensor * k_body = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I8, layout.k_body_bytes, 1, 1);
+    ggml_tensor * v_body = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_I8, layout.v_body_bytes, 1, 1);
+    ggml_tensor * k_scales = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, layout.k_scale_floats, 1, 1);
+    ggml_tensor * v_scales = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, layout.v_scale_floats, 1, 1);
+    const int64_t tile_floats = int64_t(head_dim)*group_size;
+    const int64_t exact_fused_scratch = fused_store_scratch_floats(head_dim, group_size) + tile_floats;
+    ggml_tensor * scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, exact_fused_scratch);
+
+    ggml_tensor * v_store = ggml_kvarn_store_v_body(
+            ctx.get(), v_tile, v_body, v_scales, scratch,
+            head_dim, group_size, params.value_bits, params.sinkhorn_iters, params.rtn_quantile);
+    ggml_kvarn_store_body_set_v_layout(v_store, GGML_KVARN_V_LAYOUT_SPARSE_R3);
+    require(v_store->op_params[6] == GGML_KVARN_V_LAYOUT_SPARSE_R3,
+            "R3s single-store ggml layout contract");
+
+    ggml_tensor * fused = ggml_kvarn_store_kv_body(
+            ctx.get(), k_tile, v_tile, k_body, v_body, k_scales, v_scales, scratch,
+            head_dim, group_size, params.key_bits, params.value_bits,
+            params.sinkhorn_iters, params.rtn_quantile);
+    ggml_kvarn_store_kv_body_set_v_layout(fused, GGML_KVARN_V_LAYOUT_SPARSE_R3);
+    require(fused->op_params[13] == GGML_KVARN_V_LAYOUT_SPARSE_R3,
+            "R3s fused-store ggml layout contract");
+    require(scratch->ne[0] == exact_fused_scratch,
+            "R3s fused-store accepts exact pipeline plus raw-V scratch");
+
+    ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, head_dim, 1, 1);
+    ggml_tensor * sink_tail_k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, head_dim, 1, 2);
+    ggml_tensor * sink_tail_v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, head_dim, 1, 2);
+    ggml_tensor * pending_k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, head_dim, 1, group_size);
+    ggml_tensor * pending_v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, head_dim, 1, group_size);
+    ggml_tensor * attn_scratch = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, group_size + 2);
+    ggml_tensor * attn = ggml_kvarn_attn_mixed(
+            ctx.get(), q, sink_tail_k, sink_tail_v, k_body, v_body, k_scales, v_scales,
+            pending_k, pending_v, attn_scratch, nullptr,
+            1, 0, 0, 1, 0, head_dim, group_size, params.key_bits, params.value_bits, 1.0f, 0.0f);
+    ggml_kvarn_attn_mixed_set_v_layout(attn, GGML_KVARN_V_LAYOUT_SPARSE_R3);
+    require(attn->op_params[12] == GGML_KVARN_V_LAYOUT_SPARSE_R3,
+            "R3s mixed-attention ggml layout contract");
+
+    ggml_tensor * materialized = ggml_kvarn_materialize_kv(
+            ctx.get(), sink_tail_v, v_body, v_scales, pending_v,
+            1, 1, 0, 0, 1, 0, head_dim, group_size, params.value_bits);
+    ggml_kvarn_materialize_kv_set_v_layout(materialized, GGML_KVARN_V_LAYOUT_SPARSE_R3);
+    require(materialized->op_params[9] == GGML_KVARN_V_LAYOUT_SPARSE_R3,
+            "R3s materialize ggml layout contract");
 }
 
 static void test_kvarn_store_body_scratch_contracts() {
@@ -2471,6 +3312,8 @@ int main() {
     run_phase("test_pack_roundtrip", test_pack_roundtrip);
     run_phase("test_hadamard_inverse", test_hadamard_inverse);
     run_phase("test_reference_store_dequant", test_reference_store_dequant);
+    run_phase("test_rank1_reference_oracle", test_rank1_reference_oracle);
+    run_phase("test_sparse_r3_reference_oracle", test_sparse_r3_reference_oracle);
     run_phase("test_reference_quantizer_fidelity", test_reference_quantizer_fidelity);
     run_phase("test_reference_store_scale_invariance", test_reference_store_scale_invariance);
     run_phase("test_reference_cache_sealing", test_reference_cache_sealing);
@@ -2485,13 +3328,16 @@ int main() {
     run_phase("test_runtime_stream_consistency", test_runtime_stream_consistency);
     run_phase("test_runtime_state_safety", test_runtime_state_safety);
     run_phase("test_runtime_state_roundtrip", test_runtime_state_roundtrip);
+    run_phase("test_runtime_state_rejects_r1_cross_layout", test_runtime_state_rejects_r1_cross_layout);
     run_phase("test_runtime_single_sequence_state_roundtrip", test_runtime_single_sequence_state_roundtrip);
     run_phase("test_runtime_single_sequence_state_excludes_inactive_storage",
             test_runtime_single_sequence_state_excludes_inactive_storage);
     run_phase("test_runtime_state_rejects_corruption", test_runtime_state_rejects_corruption);
     run_phase("test_runtime_kq_mask_graph_api", test_runtime_kq_mask_graph_api);
     run_phase("test_runtime_body_record_graph_api", test_runtime_body_record_graph_api);
+    run_phase("test_residual_body_store_scratch_graph_api", test_residual_body_store_scratch_graph_api);
     run_phase("test_kvarn_store_body_ggml_ops", test_kvarn_store_body_ggml_ops);
+    run_phase("test_sparse_r3_ggml_layout_contract", test_sparse_r3_ggml_layout_contract);
     run_phase("test_kvarn_store_body_scratch_contracts", test_kvarn_store_body_scratch_contracts);
     run_phase("test_kvarn_mixed_attention_ggml_op", test_kvarn_mixed_attention_ggml_op);
     run_phase("test_cpu_backend_rejects_kvarn_ops", test_cpu_backend_rejects_kvarn_ops);

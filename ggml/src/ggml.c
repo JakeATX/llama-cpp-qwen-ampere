@@ -3946,11 +3946,6 @@ void ggml_set_rows_add_dep(
     GGML_ABORT("SET_ROWS dependency slots exhausted");
 }
 
-enum {
-    GGML_KVARN_V_LAYOUT_LEGACY          = 0,
-    GGML_KVARN_V_LAYOUT_TURBO_CANONICAL = 1,
-};
-
 static bool ggml_kvarn_turbo_v_layout_enabled(void) {
     const char * env = getenv("LLAMA_KVARN_EXPERIMENTAL_TURBO_V_LAYOUT");
     return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
@@ -3973,6 +3968,16 @@ static int64_t ggml_kvarn_v_body_bytes_for_layout(
     if (v_layout == GGML_KVARN_V_LAYOUT_LEGACY) {
         return ggml_kvarn_packed_body_bytes(head_dim, group_size, value_bits);
     }
+    if (v_layout >= GGML_KVARN_V_LAYOUT_LEGACY_R1 && v_layout <= GGML_KVARN_V_LAYOUT_LEGACY_R3) {
+        GGML_ASSERT(group_size == 128 && (head_dim == 256 || head_dim == 512) && value_bits == 2);
+        return ggml_kvarn_packed_body_bytes(head_dim, group_size, value_bits) +
+            (int64_t) sizeof(ggml_fp16_t)*(group_size + head_dim)*
+                (v_layout - GGML_KVARN_V_LAYOUT_LEGACY_R1 + 1);
+    }
+    if (v_layout == GGML_KVARN_V_LAYOUT_SPARSE_R3) {
+        GGML_ASSERT(group_size == 128 && head_dim == 512 && value_bits == 2);
+        return ggml_kvarn_packed_body_bytes(head_dim, group_size, value_bits) + 5120;
+    }
     GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
     GGML_ASSERT(group_size == 128 && (head_dim % 128) == 0 && (value_bits == 2 || value_bits == 4));
     const int64_t block_bytes = value_bits == 2 ? 34 : 68;
@@ -3980,7 +3985,28 @@ static int64_t ggml_kvarn_v_body_bytes_for_layout(
 }
 
 static void ggml_kvarn_assert_v_body_shape(const struct ggml_tensor * body, int64_t body_bytes, int32_t v_layout) {
-    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL ? body->ne[0] == body_bytes : body->ne[0] >= body_bytes);
+    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY ? body->ne[0] >= body_bytes : body->ne[0] == body_bytes);
+}
+
+static bool ggml_kvarn_v_body_has_explicit_residual(
+        const struct ggml_tensor * body,
+        int32_t head_dim,
+        int32_t group_size,
+        int32_t value_bits,
+        int32_t v_layout) {
+    if (v_layout != GGML_KVARN_V_LAYOUT_LEGACY || group_size != 128 || value_bits != 2 ||
+            (head_dim != 256 && head_dim != 512)) {
+        return false;
+    }
+    for (int32_t layout = GGML_KVARN_V_LAYOUT_LEGACY_R1;
+            layout <= GGML_KVARN_V_LAYOUT_LEGACY_R3; ++layout) {
+        if (body->ne[0] == ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, layout)) {
+            return true;
+        }
+    }
+    return head_dim == 512 &&
+        body->ne[0] == ggml_kvarn_v_body_bytes_for_layout(
+            head_dim, group_size, value_bits, GGML_KVARN_V_LAYOUT_SPARSE_R3);
 }
 
 static struct ggml_tensor * ggml_kvarn_store_body_impl(
@@ -4114,12 +4140,15 @@ struct ggml_tensor * ggml_kvarn_store_kv_body(
     GGML_ASSERT(ggml_is_contiguous(scratch));
     GGML_ASSERT(ggml_nelements(k_tile) == (int64_t) head_dim*group_size);
     GGML_ASSERT(ggml_nelements(v_tile) == (int64_t) head_dim*group_size);
-    const int64_t per_pipeline = (int64_t) head_dim*group_size +
+    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
+    const int64_t tile_floats = (int64_t) head_dim*group_size;
+    const int64_t per_pipeline = tile_floats +
         2*MAX(head_dim, group_size) + head_dim + group_size + 2;
-    const int64_t scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
+    const int64_t residual_scratch_floats = ggml_kvarn_v_body_has_explicit_residual(
+        v_body, head_dim, group_size, value_bits, v_layout) ? tile_floats : 0;
+    const int64_t scratch_floats = (head_dim >= 256 ? 2*per_pipeline : per_pipeline) + residual_scratch_floats;
     GGML_ASSERT(ggml_nelements(scratch) >= scratch_floats);
 
-    const int32_t v_layout = ggml_kvarn_v_layout_for_is_v(1);
     const int64_t k_body_bytes = ggml_kvarn_packed_body_bytes(head_dim, group_size, key_bits);
     const int64_t v_body_bytes = ggml_kvarn_v_body_bytes_for_layout(head_dim, group_size, value_bits, v_layout);
     const int64_t k_scale_floats = 2*head_dim + group_size;
@@ -4223,7 +4252,9 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_heads(
     const int64_t tile_floats = (int64_t) head_dim*group_size;
     const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size) + head_dim + group_size + 2;
     const int64_t pipeline_scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
-    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
+    const int64_t residual_scratch_floats = ggml_kvarn_v_body_has_explicit_residual(
+        v_body, head_dim, group_size, value_bits, v_layout) ? tile_floats : 0;
+    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats + residual_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
     ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
     GGML_ASSERT(k_body->ne[1] == n_heads);
@@ -4328,7 +4359,9 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_pending_records(
     const int64_t tile_floats = (int64_t) head_dim*group_size;
     const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size) + head_dim + group_size + 2;
     const int64_t pipeline_scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
-    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
+    const int64_t residual_scratch_floats = ggml_kvarn_v_body_has_explicit_residual(
+        v_body, head_dim, group_size, value_bits, v_layout) ? tile_floats : 0;
+    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats + residual_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
     ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
     GGML_ASSERT(ggml_nelements(scratch) >= scratch_floats);
@@ -4436,7 +4469,9 @@ struct ggml_tensor * ggml_kvarn_store_kv_body_direct_records(
     const int64_t tile_floats = (int64_t) head_dim*group_size;
     const int64_t per_pipeline = tile_floats + 2*MAX(head_dim, group_size) + head_dim + group_size + 2;
     const int64_t pipeline_scratch_floats = head_dim >= 256 ? 2*per_pipeline : per_pipeline;
-    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats;
+    const int64_t residual_scratch_floats = ggml_kvarn_v_body_has_explicit_residual(
+        v_body, head_dim, group_size, value_bits, v_layout) ? tile_floats : 0;
+    const int64_t scratch_floats = 2*tile_floats + pipeline_scratch_floats + residual_scratch_floats;
     GGML_ASSERT(k_body->ne[0] >= k_body_bytes);
     ggml_kvarn_assert_v_body_shape(v_body, v_body_bytes, v_layout);
     GGML_ASSERT(k_body->ne[1] >= n_records);
@@ -4510,12 +4545,17 @@ void ggml_kvarn_store_body_set_v_layout(
         int32_t v_layout;
     } params;
     memcpy(&params, store->op_params, sizeof(params));
-    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    GGML_ASSERT(v_layout >= GGML_KVARN_V_LAYOUT_LEGACY && v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3);
     params.v_layout = params.is_v ? v_layout : GGML_KVARN_V_LAYOUT_LEGACY;
     const int64_t body_bytes = params.is_v ?
         ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.bits, params.v_layout) :
         ggml_kvarn_packed_body_bytes(params.head_dim, params.group_size, params.bits);
     ggml_kvarn_assert_v_body_shape(store, body_bytes, params.is_v ? params.v_layout : GGML_KVARN_V_LAYOUT_LEGACY);
+    if (params.is_v && params.v_layout >= GGML_KVARN_V_LAYOUT_LEGACY_R1 && params.v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3) {
+        const int64_t n = (int64_t) params.head_dim*params.group_size;
+        const int64_t base = n + 2*MAX(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
+        GGML_ASSERT(ggml_nelements(store->src[2]) >= base + n);
+    }
     ggml_set_op_params(store, &params, sizeof(params));
 }
 
@@ -4540,11 +4580,27 @@ void ggml_kvarn_store_kv_body_set_v_layout(
         int32_t v_layout;
     } params;
     memcpy(&params, store->op_params, sizeof(params));
-    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    GGML_ASSERT(v_layout >= GGML_KVARN_V_LAYOUT_LEGACY && v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3);
     params.v_layout = v_layout;
+    if (v_layout >= GGML_KVARN_V_LAYOUT_LEGACY_R1 && v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3) {
+        GGML_ASSERT(params.key_bits == 8 && params.value_bits == 2 && params.group_size == 128 &&
+                (v_layout == GGML_KVARN_V_LAYOUT_SPARSE_R3 ? params.head_dim == 512 :
+                 (params.head_dim == 256 || params.head_dim == 512)));
+    }
     const int64_t v_body_bytes =
         ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.value_bits, params.v_layout);
     ggml_kvarn_assert_v_body_shape(store->src[6], v_body_bytes, params.v_layout);
+    if (params.v_layout >= GGML_KVARN_V_LAYOUT_LEGACY_R1 && params.v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3) {
+        const int64_t n = (int64_t) params.head_dim*params.group_size;
+        if (params.src_layout == 1 && params.n_record_batch > 0) {
+            const int64_t tiles = (int64_t) params.n_heads*params.n_record_batch;
+            GGML_ASSERT(ggml_nelements(store->src[4]) >= tiles*(3*n + 2*(params.head_dim + params.group_size + 2)));
+        } else {
+            const int64_t per_pipeline = n + 2*MAX(params.head_dim, params.group_size) + params.head_dim + params.group_size + 2;
+            const int64_t prefix = params.n_heads > 1 || params.n_record_batch > 0 ? 2*n : 0;
+            GGML_ASSERT(ggml_nelements(store->src[4]) >= prefix + 2*per_pipeline + n);
+        }
+    }
     ggml_set_op_params(store, &params, sizeof(params));
 }
 
@@ -4796,8 +4852,13 @@ void ggml_kvarn_attn_mixed_set_v_layout(
         int32_t v_layout;
     } params;
     memcpy(&params, attn->op_params, sizeof(params));
-    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    GGML_ASSERT(v_layout >= GGML_KVARN_V_LAYOUT_LEGACY && v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3);
     params.v_layout = v_layout;
+    if (v_layout >= GGML_KVARN_V_LAYOUT_LEGACY_R1 && v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3) {
+        GGML_ASSERT(params.key_bits == 8 && params.value_bits == 2 && params.group_size == 128 &&
+                (v_layout == GGML_KVARN_V_LAYOUT_SPARSE_R3 ? params.head_dim == 512 :
+                 (params.head_dim == 256 || params.head_dim == 512)));
+    }
     const int64_t v_body_bytes =
         ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.value_bits, params.v_layout);
     ggml_kvarn_assert_v_body_shape(attn->src[4], v_body_bytes, params.v_layout);
@@ -4902,7 +4963,7 @@ void ggml_kvarn_materialize_kv_set_v_layout(
         int32_t debug_raw_body;
     } params;
     memcpy(&params, materialize->op_params, sizeof(params));
-    GGML_ASSERT(v_layout == GGML_KVARN_V_LAYOUT_LEGACY || v_layout == GGML_KVARN_V_LAYOUT_TURBO_CANONICAL);
+    GGML_ASSERT(v_layout >= GGML_KVARN_V_LAYOUT_LEGACY && v_layout <= GGML_KVARN_V_LAYOUT_SPARSE_R3);
     params.v_layout = params.is_v ? v_layout : GGML_KVARN_V_LAYOUT_LEGACY;
     const int64_t body_bytes = params.is_v ?
         ggml_kvarn_v_body_bytes_for_layout(params.head_dim, params.group_size, params.bits, params.v_layout) :

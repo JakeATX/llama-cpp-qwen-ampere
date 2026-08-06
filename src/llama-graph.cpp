@@ -3474,9 +3474,6 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & idxs = inp_kvarn->get_sink_tail_idxs();
         const llama_kvarn_layer_view layer = inp_kvarn->mctx_kvarn->get_layer_view(il);
         const bool kvarn_paper_frame = kvarn_graph_paper_frame_enabled();
-        if (kvarn_paper_frame) {
-            (void) kvarn_graph_paper_mixed_frame_enabled();
-        }
         ggml_tensor * kvarn_H = nullptr;
         if (kvarn_paper_frame) {
             if (layer.head_dim_k != layer.head_dim_v) {

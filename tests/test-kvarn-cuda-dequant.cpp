@@ -5422,7 +5422,1656 @@ static void test_canonical_turbo_v_mixed_attention() {
     cudaFree(scores_d);
 }
 
+static std::vector<uint16_t> r1_oracle_factors(
+        const std::vector<float> & raw,
+        const std::vector<uint8_t> & packed,
+        const std::vector<float> & scales,
+        uint32_t head_dim,
+        const std::vector<uint16_t> * prior = nullptr) {
+    constexpr uint32_t group = 128;
+    std::vector<float> residual(size_t(group)*head_dim);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t i = size_t(g)*head_dim + d;
+            const uint32_t q = (packed[i >> 2] >> ((i & 3u)*2u)) & 3u;
+            residual[i] = raw[i] - (float(q)*scales[head_dim + g] + scales[head_dim + group + g])*scales[d];
+            if (prior != nullptr) {
+                residual[i] -= f16_bits_to_f32((*prior)[g])*f16_bits_to_f32((*prior)[group + d]);
+            }
+        }
+    }
+    uint32_t best_d = 0;
+    double best_e = -1.0;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        double e = 0.0;
+        for (uint32_t g = 0; g < group; ++g) e += double(residual[size_t(g)*head_dim + d])*residual[size_t(g)*head_dim + d];
+        if (e > best_e) { best_e = e; best_d = d; }
+    }
+    std::vector<float> u(group), w(head_dim);
+    if (!(best_e > 1.0e-20)) return std::vector<uint16_t>(group + head_dim, 0);
+    for (uint32_t g = 0; g < group; ++g) u[g] = residual[size_t(g)*head_dim + best_d];
+    for (int iter = 0; iter < 4; ++iter) {
+        double u2 = 0.0;
+        for (float x : u) u2 += double(x)*x;
+        if (!(u2 > 1.0e-20)) return std::vector<uint16_t>(group + head_dim, 0);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            double s = 0.0;
+            for (uint32_t g = 0; g < group; ++g) s += double(residual[size_t(g)*head_dim + d])*u[g];
+            w[d] = float(s/u2);
+        }
+        double w2 = 0.0;
+        for (float x : w) w2 += double(x)*x;
+        if (!(w2 > 1.0e-20)) return std::vector<uint16_t>(group + head_dim, 0);
+        for (uint32_t g = 0; g < group; ++g) {
+            double s = 0.0;
+            for (uint32_t d = 0; d < head_dim; ++d) s += double(residual[size_t(g)*head_dim + d])*w[d];
+            u[g] = float(s/w2);
+        }
+    }
+    double u2 = 0.0;
+    for (float x : u) u2 += double(x)*x;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        double s = 0.0;
+        for (uint32_t g = 0; g < group; ++g) s += double(residual[size_t(g)*head_dim + d])*u[g];
+        w[d] = float(s/u2);
+    }
+    double u2n = 0.0, w2n = 0.0;
+    for (float x : u) u2n += double(x)*x;
+    uint32_t sign_d = 0;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        w2n += double(w[d])*w[d];
+        if (std::fabs(w[d]) > std::fabs(w[sign_d])) sign_d = d;
+    }
+    const float balance = std::sqrt(float(std::sqrt(w2n)/std::sqrt(u2n)));
+    const float sign = w[sign_d] < 0.0f ? -1.0f : 1.0f;
+    std::vector<uint16_t> out(group + head_dim);
+    for (uint32_t g = 0; g < group; ++g) out[g] = f32_to_f16_bits(u[g]*balance*sign);
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        out[group + d] = f32_to_f16_bits(w[d]*sign/balance);
+    }
+    return out;
+}
+
+// R3-only provisional-factor oracle using the production kernel's documented
+// float reduction order.  This is intentionally separate from the selector
+// oracle below: it supplies the exact fp16 interval endpoint/W representation
+// whose one-ulp boundaries differ from the older ordered-double ALS oracle.
+static std::vector<uint16_t> r3_full_factor_float_oracle(
+        const std::vector<float> & raw,
+        const std::vector<uint8_t> & packed,
+        const std::vector<float> & scales,
+        uint32_t head_dim,
+        const std::vector<uint16_t> & component1,
+        const std::vector<uint16_t> & component2) {
+    constexpr uint32_t group = 128;
+    std::vector<float> residual(size_t(group)*head_dim);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t i = size_t(g)*head_dim + d;
+            const uint32_t q = (packed[i >> 2] >> ((i & 3u)*2u)) & 3u;
+            const float affine = float(q)*scales[head_dim + g] + scales[head_dim + group + g];
+            float r = raw[i] - affine*scales[d];
+            r -= f16_bits_to_f32(component1[g])*f16_bits_to_f32(component1[group + d]);
+            r -= f16_bits_to_f32(component2[g])*f16_bits_to_f32(component2[group + d]);
+            residual[i] = r;
+        }
+    }
+    uint32_t best_d = 0;
+    float best_e = -1.0f;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        float e = 0.0f;
+        for (uint32_t g = 0; g < group; ++g) {
+            const float r = residual[size_t(g)*head_dim + d];
+            e += r*r;
+        }
+        if (e > best_e) { best_e = e; best_d = d; }
+    }
+    if (!(best_e > 1.0e-20f)) return std::vector<uint16_t>(group + head_dim, 0);
+    std::vector<float> u(group), w(head_dim);
+    for (uint32_t g = 0; g < group; ++g) u[g] = residual[size_t(g)*head_dim + best_d];
+    for (int iter = 0; iter < 4; ++iter) {
+        float u2 = 0.0f;
+        for (float x : u) u2 += x*x;
+        if (!(u2 > 1.0e-20f)) return std::vector<uint16_t>(group + head_dim, 0);
+        const float inv_u2 = 1.0f/u2;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            float sum = 0.0f;
+            for (uint32_t g = 0; g < group; ++g) {
+                sum += residual[size_t(g)*head_dim + d]*u[g];
+            }
+            w[d] = sum*inv_u2;
+        }
+        float w2 = 0.0f;
+        for (float x : w) w2 += x*x;
+        if (!(w2 > 1.0e-20f)) return std::vector<uint16_t>(group + head_dim, 0);
+        const float inv_w2 = 1.0f/w2;
+        for (uint32_t g = 0; g < group; ++g) {
+            float sum = 0.0f;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                sum += residual[size_t(g)*head_dim + d]*w[d];
+            }
+            u[g] = sum*inv_w2;
+        }
+    }
+    float u2 = 0.0f;
+    for (float x : u) u2 += x*x;
+    if (!(u2 > 1.0e-20f)) return std::vector<uint16_t>(group + head_dim, 0);
+    const float inv_u2 = 1.0f/u2;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        float sum = 0.0f;
+        for (uint32_t g = 0; g < group; ++g) {
+            sum += residual[size_t(g)*head_dim + d]*u[g];
+        }
+        w[d] = sum*inv_u2;
+    }
+    float un2 = 0.0f, wn2 = 0.0f, max_abs = -1.0f;
+    uint32_t sign_d = 0;
+    for (float x : u) un2 += x*x;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        wn2 += w[d]*w[d];
+        const float a = std::fabs(w[d]);
+        if (a > max_abs) { max_abs = a; sign_d = d; }
+    }
+    if (!(un2 > 1.0e-20f) || !(wn2 > 1.0e-20f)) return std::vector<uint16_t>(group + head_dim, 0);
+    const float balance = std::sqrt(std::sqrt(wn2)/std::sqrt(un2));
+    const float sign = w[sign_d] < 0.0f ? -1.0f : 1.0f;
+    std::vector<uint16_t> out(group + head_dim);
+    for (uint32_t g = 0; g < group; ++g) out[g] = f32_to_f16_bits(u[g]*balance*sign);
+    for (uint32_t d = 0; d < head_dim; ++d) out[group + d] = f32_to_f16_bits(w[d]*sign/balance);
+    return out;
+}
+
+static void test_legacy_r1_store_dequant(uint32_t head_dim) {
+    constexpr uint32_t group = 128;
+    const size_t n = size_t(group)*head_dim;
+    std::vector<float> k(n), v(n);
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        k[size_t(d)*group + g] = 0.02f*std::sin(float(11*d + 7*g)*0.013f);
+        v[size_t(g)*head_dim + d] = 0.04f*std::cos(float(5*d + 17*g)*0.009f) + 0.011f*std::sin(float(d + 31*g)*0.017f);
+    }
+    std::vector<float> v_rot;
+    llama_kvarn_hadamard_channels(v, v_rot, group, head_dim, false);
+    const size_t k_bytes = n;
+    const size_t v_prefix = n/4;
+    const size_t v_bytes = v_prefix + 2*(group + head_dim);
+    const size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb0 = nullptr, * vb0 = nullptr, * kb1 = nullptr, * vb1 = nullptr, * vb2 = nullptr, * vb3 = nullptr;
+    float * ks0 = nullptr, * vs0 = nullptr, * ks1 = nullptr, * vs1 = nullptr, * vs2 = nullptr;
+    const size_t per = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
+    require_cuda(cudaMalloc(&scratch, (2*per + n)*sizeof(float)), "cudaMalloc R1 scratch");
+    require_cuda(cudaMalloc(&kb0, k_bytes), "cudaMalloc R1 kb0"); require_cuda(cudaMalloc(&kb1, k_bytes), "cudaMalloc R1 kb1");
+    require_cuda(cudaMalloc(&vb0, v_bytes), "cudaMalloc R1 vb0"); require_cuda(cudaMalloc(&vb1, v_bytes), "cudaMalloc R1 vb1"); require_cuda(cudaMalloc(&vb2, v_bytes), "cudaMalloc R1 vb2"); require_cuda(cudaMalloc(&vb3, v_bytes), "cudaMalloc R1 vb3");
+    require_cuda(cudaMalloc(&ks0, ks_n*sizeof(float)), "cudaMalloc R1 ks0"); require_cuda(cudaMalloc(&ks1, ks_n*sizeof(float)), "cudaMalloc R1 ks1");
+    require_cuda(cudaMalloc(&vs0, vs_n*sizeof(float)), "cudaMalloc R1 vs0"); require_cuda(cudaMalloc(&vs1, vs_n*sizeof(float)), "cudaMalloc R1 vs1"); require_cuda(cudaMalloc(&vs2, vs_n*sizeof(float)), "cudaMalloc R1 vs2");
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_body_reference_minmax(kd, vd, kb0, vb0, ks0, vs0, scratch, head_dim, group, 8, 2, 4, 1.0f, 0, false, nullptr);
+    ggml_cuda_kvarn_store_body_reference_minmax(kd, vd, kb1, vb1, ks1, vs1, scratch, head_dim, group, 8, 2, 4, 1.0f, 3, false, nullptr);
+    ggml_cuda_kvarn_store_body_reference_minmax(kd, vd, kb1, vb2, ks1, vs1, scratch, head_dim, group, 8, 2, 4, 1.0f, 3, false, nullptr);
+    ggml_cuda_kvarn_store_v_body_reference_minmax(
+            vd, vb3, vs2, scratch, head_dim, group, 2, 4, 1.0f, 3, false, nullptr);
+    clear_paper_frame_env(); require_cuda(cudaDeviceSynchronize(), "R1 stores sync");
+    std::vector<uint8_t> p0(v_prefix), p1(v_bytes), p2(v_bytes), p3(v_bytes); std::vector<float> s0(vs_n), s1(vs_n), s2(vs_n);
+    require_cuda(cudaMemcpy(p0.data(), vb0, v_prefix, cudaMemcpyDeviceToHost), "copy R1 base"); require_cuda(cudaMemcpy(p1.data(), vb1, v_bytes, cudaMemcpyDeviceToHost), "copy R1"); require_cuda(cudaMemcpy(p2.data(), vb2, v_bytes, cudaMemcpyDeviceToHost), "copy R1 repeat"); require_cuda(cudaMemcpy(p3.data(), vb3, v_bytes, cudaMemcpyDeviceToHost), "copy standalone R1");
+    require_cuda(cudaMemcpy(s0.data(), vs0, vs_n*sizeof(float), cudaMemcpyDeviceToHost), "copy R1 base scales"); require_cuda(cudaMemcpy(s1.data(), vs1, vs_n*sizeof(float), cudaMemcpyDeviceToHost), "copy R1 scales"); require_cuda(cudaMemcpy(s2.data(), vs2, vs_n*sizeof(float), cudaMemcpyDeviceToHost), "copy standalone R1 scales");
+    require(std::equal(p0.begin(), p0.end(), p1.begin()), "R1 preserves packed V2 prefix bit-exactly");
+    require(std::memcmp(s0.data(), s1.data(), vs_n*sizeof(float)) == 0, "R1 preserves standard V scales bit-exactly");
+    require(p1 == p2, "R1 factor bytes are deterministic");
+    require(p1 == p3 && s1 == s2, "R1 standalone V store matches pipelined store bit-exactly");
+    if (head_dim == 256) {
+        std::vector<float> zero(n, 0.0f);
+        float * zero_d = cuda_upload(zero);
+        ggml_cuda_kvarn_store_v_body_reference_minmax(
+                zero_d, vb3, vs2, scratch, head_dim, group, 2, 4, 1.0f, 3, true, nullptr);
+        require_cuda(cudaDeviceSynchronize(), "R1 zero-residual store sync");
+        std::vector<uint8_t> zero_suffix(2*(group + head_dim));
+        require_cuda(cudaMemcpy(zero_suffix.data(), vb3 + v_prefix, zero_suffix.size(), cudaMemcpyDeviceToHost),
+                "copy R1 zero-residual suffix");
+        require(std::all_of(zero_suffix.begin(), zero_suffix.end(), [](uint8_t x) { return x == 0; }),
+                "R1 degenerate ALS writes an all-zero suffix");
+        cudaFree(zero_d);
+    }
+    const std::vector<uint16_t> oracle = r1_oracle_factors(v_rot, p0, s0, head_dim);
+    float factor_err = 0.0f;
+    for (size_t i = 0; i < oracle.size(); ++i) {
+        uint16_t got; std::memcpy(&got, p1.data() + v_prefix + 2*i, 2);
+        factor_err = std::max(factor_err, std::fabs(f16_bits_to_f32(got) - f16_bits_to_f32(oracle[i])));
+    }
+    require(factor_err < 2.0e-3f, "R1 CUDA factors match independent ordered-double oracle");
+    float * k_out = nullptr, * v_out = nullptr;
+    require_cuda(cudaMalloc(&k_out, n*sizeof(float)), "cudaMalloc R1 K dequant");
+    require_cuda(cudaMalloc(&v_out, n*sizeof(float)), "cudaMalloc R1 V dequant");
+    ggml_cuda_kvarn_dequant_body(kb1, vb1, ks1, vs1, k_out, v_out, head_dim, group, 8, 2, 3, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "R1 dequant sync");
+    std::vector<float> decoded(n); require_cuda(cudaMemcpy(decoded.data(), v_out, n*sizeof(float), cudaMemcpyDeviceToHost), "copy R1 dequant");
+    float dequant_err = 0.0f;
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        const size_t i = size_t(g)*head_dim + d;
+        const uint32_t q = (p0[i >> 2] >> ((i & 3u)*2u)) & 3u;
+        const float base = (float(q)*s0[head_dim + g] + s0[head_dim + group + g])*s0[d];
+        const float expected = base + f16_bits_to_f32(oracle[g])*f16_bits_to_f32(oracle[group + d]);
+        dequant_err = std::max(dequant_err, std::fabs(decoded[i] - expected));
+    }
+    require(dequant_err < 2.0e-3f, "R1 central CUDA dequant matches independent oracle reconstruction");
+
+    uint16_t * materialize_dummy_h = nullptr, * materialized_d = nullptr;
+    float * materialize_dummy_f = nullptr;
+    require_cuda(cudaMalloc(&materialize_dummy_h, head_dim*sizeof(uint16_t)), "cudaMalloc R1 materialize half dummy");
+    require_cuda(cudaMalloc(&materialize_dummy_f, head_dim*sizeof(float)), "cudaMalloc R1 materialize float dummy");
+    require_cuda(cudaMalloc(&materialized_d, n*sizeof(uint16_t)), "cudaMalloc R1 materialized V");
+    ggml_cuda_kvarn_materialize_kv_f16(
+            materialize_dummy_h, vb1, vs1, materialize_dummy_f, materialized_d,
+            1, 0, 1, 0, 0, 0, 1, head_dim, group, 2, 3, 0, nullptr,
+            head_dim, head_dim, v_bytes, v_bytes, vs_n, vs_n,
+            head_dim, head_dim, head_dim, head_dim, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "R1 materialize sync");
+    std::vector<uint16_t> materialized(n);
+    require_cuda(cudaMemcpy(materialized.data(), materialized_d, n*sizeof(uint16_t), cudaMemcpyDeviceToHost),
+            "copy R1 materialized V");
+    for (size_t i = 0; i < n; ++i) {
+        require(materialized[i] == f32_to_f16_bits(decoded[i]),
+                "R1 materialize operation consumes residual suffix");
+    }
+    cudaFree(materialize_dummy_h); cudaFree(materialize_dummy_f); cudaFree(materialized_d);
+
+    const uint32_t n_head = head_dim == 256 ? 2u : 1u;
+    std::vector<float> q(size_t(n_head)*head_dim, 0.0f), attn_ref(size_t(n_head)*head_dim, 0.0f);
+    for (uint32_t ih = 0; ih < n_head; ++ih) for (uint32_t d = 0; d < head_dim; ++d) {
+        double sum = 0.0;
+        for (uint32_t g = 0; g < group; ++g) sum += decoded[size_t(g)*head_dim + d];
+        attn_ref[size_t(ih)*head_dim + d] = float(sum/group);
+    }
+    float * qd = cuda_upload(q), * outd = nullptr, * scoresd = nullptr;
+    uint16_t * dummyh = nullptr; float * dummyf = nullptr;
+    const size_t scores_n = kvarn_test_attn_scores_floats(group, 1, 1, head_dim, group);
+    require_cuda(cudaMalloc(&outd, attn_ref.size()*sizeof(float)), "cudaMalloc R1 attention out");
+    require_cuda(cudaMalloc(&scoresd, scores_n*sizeof(float)), "cudaMalloc R1 attention scores");
+    require_cuda(cudaMalloc(&dummyh, head_dim*sizeof(uint16_t)), "cudaMalloc R1 attention half dummy");
+    require_cuda(cudaMalloc(&dummyf, head_dim*sizeof(float)), "cudaMalloc R1 attention float dummy");
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            qd, dummyh, dummyh, kb1, vb1, ks1, vs1, dummyf, dummyf, nullptr,
+            outd, scoresd, 1, n_head, 1, 0, 1, 0, 0, 0, head_dim, group, 8, 2,
+            head_dim, size_t(n_head)*head_dim, head_dim, size_t(n_head)*head_dim,
+            head_dim, head_dim, head_dim, head_dim,
+            k_bytes, v_bytes, k_bytes, v_bytes, ks_n, vs_n, ks_n, vs_n,
+            0, 0, 0, 1.0f/std::sqrt(float(head_dim)), nullptr,
+            nullptr, int64_t(scores_n), 1, nullptr, 0, 0.0f, 3u);
+    require_cuda(cudaDeviceSynchronize(), "R1 production attention sync");
+    std::vector<float> attn(attn_ref.size()); require_cuda(cudaMemcpy(attn.data(), outd, attn.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R1 attention");
+    float attn_err = 0.0f; for (size_t i = 0; i < attn.size(); ++i) attn_err = std::max(attn_err, std::fabs(attn[i] - attn_ref[i]));
+    require(attn_err < 3.0e-3f, "R1 production mixed-attention path consumes residual suffix");
+    cudaFree(qd); cudaFree(outd); cudaFree(scoresd); cudaFree(dummyh); cudaFree(dummyf);
+    cudaFree(k_out); cudaFree(v_out);
+    cudaFree(kd); cudaFree(vd); cudaFree(scratch); cudaFree(kb0); cudaFree(kb1); cudaFree(vb0); cudaFree(vb1); cudaFree(vb2); cudaFree(vb3); cudaFree(ks0); cudaFree(ks1); cudaFree(vs0); cudaFree(vs1); cudaFree(vs2);
+}
+
+static void test_legacy_r2_store_dequant(uint32_t head_dim) {
+    constexpr uint32_t group = 128;
+    const size_t n = size_t(group)*head_dim;
+    const size_t k_bytes = n, v_prefix = n/4, factor_bytes = 2*(group + head_dim);
+    const size_t v_r1_bytes = v_prefix + factor_bytes, v_r2_bytes = v_prefix + 2*factor_bytes;
+    const size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    std::vector<float> k(n), v(n);
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        k[size_t(d)*group + g] = 0.017f*std::sin(float(13*d + 5*g)*0.011f);
+        v[size_t(g)*head_dim + d] = 0.043f*std::cos(float(7*d + 19*g)*0.008f) +
+            0.009f*std::sin(float(3*d + 23*g)*0.015f);
+    }
+    std::vector<float> v_rot;
+    llama_kvarn_hadamard_channels(v, v_rot, group, head_dim, false);
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb1 = nullptr, * kb2 = nullptr, * vb1 = nullptr, * vb2 = nullptr;
+    float * ks1 = nullptr, * ks2 = nullptr, * vs1 = nullptr, * vs2 = nullptr;
+    const size_t per = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
+    require_cuda(cudaMalloc(&scratch, (2*per + n)*sizeof(float)), "cudaMalloc R2 scratch");
+    require_cuda(cudaMalloc(&kb1, k_bytes), "cudaMalloc R2 reference K body");
+    require_cuda(cudaMalloc(&kb2, k_bytes), "cudaMalloc R2 K body");
+    require_cuda(cudaMalloc(&vb1, v_r1_bytes), "cudaMalloc R2 R1 V body");
+    require_cuda(cudaMalloc(&vb2, v_r2_bytes), "cudaMalloc R2 V body");
+    require_cuda(cudaMalloc(&ks1, ks_n*sizeof(float)), "cudaMalloc R2 reference K scales");
+    require_cuda(cudaMalloc(&ks2, ks_n*sizeof(float)), "cudaMalloc R2 K scales");
+    require_cuda(cudaMalloc(&vs1, vs_n*sizeof(float)), "cudaMalloc R2 reference V scales");
+    require_cuda(cudaMalloc(&vs2, vs_n*sizeof(float)), "cudaMalloc R2 V scales");
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb1, vb1, ks1, vs1, scratch, head_dim, group, 8, 2, 4, 1.0f, 3, false, nullptr);
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb2, vb2, ks2, vs2, scratch, head_dim, group, 8, 2, 4, 1.0f, 4, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "R2 stores sync");
+    std::vector<uint8_t> p1(v_r1_bytes), p2(v_r2_bytes);
+    std::vector<float> s1(vs_n), s2(vs_n);
+    require_cuda(cudaMemcpy(p1.data(), vb1, p1.size(), cudaMemcpyDeviceToHost), "copy R2 R1 V body");
+    require_cuda(cudaMemcpy(p2.data(), vb2, p2.size(), cudaMemcpyDeviceToHost), "copy R2 V body");
+    require_cuda(cudaMemcpy(s1.data(), vs1, s1.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R2 R1 V scales");
+    require_cuda(cudaMemcpy(s2.data(), vs2, s2.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R2 V scales");
+    require(std::equal(p1.begin(), p1.end(), p2.begin()), "R2 preserves the complete R1 body byte-exactly");
+    require(std::memcmp(s1.data(), s2.data(), vs_n*sizeof(float)) == 0, "R2 preserves R1 V scales byte-exactly");
+
+    std::vector<uint8_t> packed(p2.begin(), p2.begin() + v_prefix);
+    const std::vector<uint16_t> oracle1 = r1_oracle_factors(v_rot, packed, s2, head_dim);
+    const std::vector<uint16_t> oracle2 = r1_oracle_factors(v_rot, packed, s2, head_dim, &oracle1);
+    float factor1_err = 0.0f, factor2_err = 0.0f;
+    for (size_t i = 0; i < oracle1.size(); ++i) {
+        uint16_t got1, got2;
+        std::memcpy(&got1, p2.data() + v_prefix + 2*i, 2);
+        std::memcpy(&got2, p2.data() + v_prefix + factor_bytes + 2*i, 2);
+        factor1_err = std::max(factor1_err, std::fabs(f16_bits_to_f32(got1) - f16_bits_to_f32(oracle1[i])));
+        factor2_err = std::max(factor2_err, std::fabs(f16_bits_to_f32(got2) - f16_bits_to_f32(oracle2[i])));
+    }
+    require(factor1_err < 2.0e-3f, "R2 component 1 matches independent ordered-double oracle");
+    require(factor2_err < 2.0e-3f, "R2 component 2 matches independent deflated ordered-double oracle");
+
+    float * k_out = nullptr, * v_out = nullptr;
+    require_cuda(cudaMalloc(&k_out, n*sizeof(float)), "cudaMalloc R2 K dequant");
+    require_cuda(cudaMalloc(&v_out, n*sizeof(float)), "cudaMalloc R2 V dequant");
+    ggml_cuda_kvarn_dequant_body(kb2, vb2, ks2, vs2, k_out, v_out, head_dim, group, 8, 2, 4, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "R2 dequant sync");
+    std::vector<float> decoded(n);
+    require_cuda(cudaMemcpy(decoded.data(), v_out, n*sizeof(float), cudaMemcpyDeviceToHost), "copy R2 dequant");
+    float dequant_err = 0.0f;
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        const size_t i = size_t(g)*head_dim + d;
+        const uint32_t q = (packed[i >> 2] >> ((i & 3u)*2u)) & 3u;
+        const float expected = (float(q)*s2[head_dim + g] + s2[head_dim + group + g])*s2[d] +
+            f16_bits_to_f32(oracle1[g])*f16_bits_to_f32(oracle1[group + d]) +
+            f16_bits_to_f32(oracle2[g])*f16_bits_to_f32(oracle2[group + d]);
+        dequant_err = std::max(dequant_err, std::fabs(decoded[i] - expected));
+    }
+    require(dequant_err < 3.0e-3f, "R2 central CUDA dequant sums both independent residual components");
+
+    uint16_t * dummy_h = nullptr, * materialized = nullptr;
+    float * dummy_f = nullptr;
+    require_cuda(cudaMalloc(&dummy_h, head_dim*sizeof(uint16_t)), "cudaMalloc R2 materialize half dummy");
+    require_cuda(cudaMalloc(&dummy_f, head_dim*sizeof(float)), "cudaMalloc R2 materialize float dummy");
+    require_cuda(cudaMalloc(&materialized, n*sizeof(uint16_t)), "cudaMalloc R2 materialized V");
+    ggml_cuda_kvarn_materialize_kv_f16(
+            dummy_h, vb2, vs2, dummy_f, materialized,
+            1, 0, 1, 0, 0, 0, 1, head_dim, group, 2, 4, 0, nullptr,
+            head_dim, head_dim, v_r2_bytes, v_r2_bytes, vs_n, vs_n,
+            head_dim, head_dim, head_dim, head_dim, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "R2 materialize sync");
+    std::vector<uint16_t> materialized_h(n);
+    require_cuda(cudaMemcpy(materialized_h.data(), materialized, n*sizeof(uint16_t), cudaMemcpyDeviceToHost), "copy R2 materialized V");
+    for (size_t i = 0; i < n; ++i) {
+        require(materialized_h[i] == f32_to_f16_bits(decoded[i]), "R2 materialize consumes both residual components");
+    }
+
+    const uint32_t n_head = head_dim == 256 ? 2u : 1u;
+    std::vector<float> qv(size_t(n_head)*head_dim, 0.0f), attn_ref(size_t(n_head)*head_dim, 0.0f);
+    for (uint32_t h = 0; h < n_head; ++h) for (uint32_t d = 0; d < head_dim; ++d) {
+        double sum = 0.0;
+        for (uint32_t g = 0; g < group; ++g) sum += decoded[size_t(g)*head_dim + d];
+        attn_ref[size_t(h)*head_dim + d] = float(sum/group);
+    }
+    float * qd = cuda_upload(qv), * outd = nullptr, * scoresd = nullptr;
+    const size_t scores_n = kvarn_test_attn_scores_floats(group, 1, 1, head_dim, group);
+    require_cuda(cudaMalloc(&outd, attn_ref.size()*sizeof(float)), "cudaMalloc R2 attention out");
+    require_cuda(cudaMalloc(&scoresd, scores_n*sizeof(float)), "cudaMalloc R2 attention scores");
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            qd, dummy_h, dummy_h, kb2, vb2, ks2, vs2, dummy_f, dummy_f, nullptr,
+            outd, scoresd, 1, n_head, 1, 0, 1, 0, 0, 0, head_dim, group, 8, 2,
+            head_dim, size_t(n_head)*head_dim, head_dim, size_t(n_head)*head_dim,
+            head_dim, head_dim, head_dim, head_dim,
+            k_bytes, v_r2_bytes, k_bytes, v_r2_bytes, ks_n, vs_n, ks_n, vs_n,
+            0, 0, 0, 1.0f/std::sqrt(float(head_dim)), nullptr,
+            nullptr, int64_t(scores_n), 1, nullptr, 0, 0.0f, 4u);
+    require_cuda(cudaDeviceSynchronize(), "R2 production attention sync");
+    std::vector<float> attn(attn_ref.size());
+    require_cuda(cudaMemcpy(attn.data(), outd, attn.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R2 attention");
+    float attn_err = 0.0f;
+    for (size_t i = 0; i < attn.size(); ++i) attn_err = std::max(attn_err, std::fabs(attn[i] - attn_ref[i]));
+    require(attn_err < 4.0e-3f, "R2 production mixed-attention path consumes both residual components");
+
+    cudaFree(qd); cudaFree(outd); cudaFree(scoresd); cudaFree(dummy_h); cudaFree(dummy_f); cudaFree(materialized);
+    cudaFree(k_out); cudaFree(v_out); cudaFree(kd); cudaFree(vd); cudaFree(scratch);
+    cudaFree(kb1); cudaFree(kb2); cudaFree(vb1); cudaFree(vb2); cudaFree(ks1); cudaFree(ks2); cudaFree(vs1); cudaFree(vs2);
+}
+
+static void test_legacy_r3_store_dequant(uint32_t head_dim) {
+    constexpr uint32_t group = 128;
+    const size_t n = size_t(group)*head_dim;
+    const size_t k_bytes = n, v_prefix = n/4, factor_bytes = 2*(group + head_dim);
+    const size_t v_r2_bytes = v_prefix + 2*factor_bytes, v_r3_bytes = v_prefix + 3*factor_bytes;
+    const size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    if (head_dim == 256) {
+        require(v_r3_bytes == 10496, "D256 R3 V body bytes are exact");
+        require(k_bytes + v_r3_bytes + (ks_n + vs_n)*sizeof(float) == 47872,
+                "D256 R3 combined record bytes are exact");
+    }
+    std::vector<float> k(n), v(n);
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        k[size_t(d)*group + g] = 0.016f*std::sin(float(17*d + 7*g)*0.010f);
+        v[size_t(g)*head_dim + d] = 0.041f*std::cos(float(11*d + 13*g)*0.007f) +
+            0.012f*std::sin(float(5*d + 31*g)*0.014f);
+    }
+    std::vector<float> v_rot;
+    llama_kvarn_hadamard_channels(v, v_rot, group, head_dim, false);
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb2 = nullptr, * kb3 = nullptr, * vb2 = nullptr, * vb3 = nullptr;
+    float * ks2 = nullptr, * ks3 = nullptr, * vs2 = nullptr, * vs3 = nullptr;
+    const size_t per = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
+    require_cuda(cudaMalloc(&scratch, (2*per + n)*sizeof(float)), "cudaMalloc R3 scratch");
+    require_cuda(cudaMalloc(&kb2, k_bytes), "cudaMalloc R3 reference K body");
+    require_cuda(cudaMalloc(&kb3, k_bytes), "cudaMalloc R3 K body");
+    require_cuda(cudaMalloc(&vb2, v_r2_bytes), "cudaMalloc R3 R2 V body");
+    require_cuda(cudaMalloc(&vb3, v_r3_bytes), "cudaMalloc R3 V body");
+    require_cuda(cudaMalloc(&ks2, ks_n*sizeof(float)), "cudaMalloc R3 reference K scales");
+    require_cuda(cudaMalloc(&ks3, ks_n*sizeof(float)), "cudaMalloc R3 K scales");
+    require_cuda(cudaMalloc(&vs2, vs_n*sizeof(float)), "cudaMalloc R3 reference V scales");
+    require_cuda(cudaMalloc(&vs3, vs_n*sizeof(float)), "cudaMalloc R3 V scales");
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb2, vb2, ks2, vs2, scratch, head_dim, group, 8, 2, 4, 1.0f, 4, false, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "R3 default R2 control sync");
+    std::vector<uint8_t> k2_global(k_bytes), p2_global(v_r2_bytes);
+    std::vector<float> sk2_global(ks_n), s2_global(vs_n);
+    require_cuda(cudaMemcpy(k2_global.data(), kb2, k2_global.size(), cudaMemcpyDeviceToHost), "copy default R2 K body control");
+    require_cuda(cudaMemcpy(p2_global.data(), vb2, p2_global.size(), cudaMemcpyDeviceToHost), "copy default R2 V body control");
+    require_cuda(cudaMemcpy(sk2_global.data(), ks2, sk2_global.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy default R2 K scales control");
+    require_cuda(cudaMemcpy(s2_global.data(), vs2, s2_global.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy default R2 V scales control");
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb2, vb2, ks2, vs2, scratch, head_dim, group, 8, 2, 4, 1.0f, 4, false, nullptr);
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "");
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb3, vb3, ks3, vs3, scratch, head_dim, group, 8, 2, 4, 1.0f, 5, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "R3 stores sync");
+    std::vector<uint8_t> k2(k_bytes), k3(k_bytes), p2(v_r2_bytes), p3(v_r3_bytes);
+    std::vector<float> sk2(ks_n), sk3(ks_n), s2(vs_n), s3(vs_n);
+    require_cuda(cudaMemcpy(k2.data(), kb2, k2.size(), cudaMemcpyDeviceToHost), "copy R3 no-global R2 K body");
+    require_cuda(cudaMemcpy(k3.data(), kb3, k3.size(), cudaMemcpyDeviceToHost), "copy R3 K body");
+    require_cuda(cudaMemcpy(p2.data(), vb2, p2.size(), cudaMemcpyDeviceToHost), "copy R3 R2 V body");
+    require_cuda(cudaMemcpy(p3.data(), vb3, p3.size(), cudaMemcpyDeviceToHost), "copy R3 V body");
+    require_cuda(cudaMemcpy(sk2.data(), ks2, sk2.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 no-global R2 K scales");
+    require_cuda(cudaMemcpy(sk3.data(), ks3, sk3.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 K scales");
+    require_cuda(cudaMemcpy(s2.data(), vs2, s2.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 R2 V scales");
+    require_cuda(cudaMemcpy(s3.data(), vs3, s3.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 V scales");
+    require(k2_global != k2 || p2_global != p2 || sk2_global != sk2 || s2_global != s2,
+            "R2 retains its global-normalization default and remains sensitive to the environment override");
+    require(k2 == k3 && std::memcmp(sk2.data(), sk3.data(), ks_n*sizeof(float)) == 0,
+            "R3 K8 body and scales equal an R2 store with global normalization disabled");
+    require(std::equal(p2.begin(), p2.end(), p3.begin()),
+            "R3 components 1/2 preserve the no-global R2 body byte-exactly");
+    require(std::memcmp(s2.data(), s3.data(), vs_n*sizeof(float)) == 0,
+            "R3 V scales equal an R2 store with global normalization disabled");
+
+    llama_kvarn_params oracle_params = llama_kvarn_default_params();
+    oracle_params.key_bits = 8;
+    oracle_params.value_bits = 2;
+    oracle_params.group_size = group;
+    oracle_params.sinkhorn_iters = 4;
+    oracle_params.rtn_quantile = 1.0f;
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    const llama_kvarn_body_record no_global_oracle =
+        llama_kvarn_store_reference_frame(oracle_params, head_dim, k, v, true, false, false);
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "");
+    size_t oracle_packed_diff = 0;
+    for (size_t i = 0; i < k_bytes; ++i) oracle_packed_diff += k3[i] != no_global_oracle.k_body[i] ? 1 : 0;
+    for (size_t i = 0; i < v_prefix; ++i) oracle_packed_diff += p3[i] != no_global_oracle.v_body[i] ? 1 : 0;
+    std::vector<float> oracle_k_deq, oracle_v_deq;
+    llama_kvarn_dequant_reference(no_global_oracle, oracle_k_deq, oracle_v_deq);
+    double oracle_k_err = 0.0, oracle_k_norm = 0.0, oracle_v_err = 0.0, oracle_v_norm = 0.0;
+    for (uint32_t d = 0; d < head_dim; ++d) for (uint32_t g = 0; g < group; ++g) {
+        const size_t i = size_t(d)*group + g;
+        const float got = (float(k3[i])*sk3[d] + sk3[head_dim + d])*sk3[2*head_dim + g];
+        const double delta = double(got) - oracle_k_deq[i];
+        oracle_k_err += delta*delta;
+        oracle_k_norm += double(oracle_k_deq[i])*oracle_k_deq[i];
+    }
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        const size_t i = size_t(g)*head_dim + d;
+        const uint32_t q = (p3[i >> 2] >> ((i & 3u)*2u)) & 3u;
+        const float got = (float(q)*s3[head_dim + g] + s3[head_dim + group + g])*s3[d];
+        const double delta = double(got) - oracle_v_deq[i];
+        oracle_v_err += delta*delta;
+        oracle_v_norm += double(oracle_v_deq[i])*oracle_v_deq[i];
+    }
+    const double oracle_k_nmse = oracle_k_err/std::max(oracle_k_norm, 1.0e-30);
+    const double oracle_v_nmse = oracle_v_err/std::max(oracle_v_norm, 1.0e-30);
+    if (oracle_packed_diff > 4 || oracle_k_nmse >= 1.0e-7 || oracle_v_nmse >= 1.0e-7) {
+        std::fprintf(stderr, "R3 no-global oracle diff: head_dim=%u packed_diff=%zu k_nmse=%g v_nmse=%g\n",
+                head_dim, oracle_packed_diff, oracle_k_nmse, oracle_v_nmse);
+    }
+    require(oracle_packed_diff <= 4, "R3 packed K8/V2 prefix matches independent official no-global oracle");
+    require(oracle_k_nmse < 1.0e-7 && oracle_v_nmse < 1.0e-7,
+            "R3 dequantized K8/V2 prefix matches independent official no-global oracle");
+
+    set_paper_frame_env(true);
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb3, vb3, ks3, vs3, scratch, head_dim, group, 8, 2, 4, 1.0f, 5, false, nullptr);
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "");
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "R3 explicit no-global repeat sync");
+    std::vector<uint8_t> k3_repeat(k_bytes), p3_repeat(v_r3_bytes);
+    std::vector<float> sk3_repeat(ks_n), s3_repeat(vs_n);
+    require_cuda(cudaMemcpy(k3_repeat.data(), kb3, k3_repeat.size(), cudaMemcpyDeviceToHost), "copy R3 explicit no-global K body");
+    require_cuda(cudaMemcpy(p3_repeat.data(), vb3, p3_repeat.size(), cudaMemcpyDeviceToHost), "copy R3 explicit no-global V body");
+    require_cuda(cudaMemcpy(sk3_repeat.data(), ks3, sk3_repeat.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 explicit no-global K scales");
+    require_cuda(cudaMemcpy(s3_repeat.data(), vs3, s3_repeat.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 explicit no-global V scales");
+    require(k3_repeat == k3 && p3_repeat == p3 && sk3_repeat == sk3 && s3_repeat == s3,
+            "R3 default is byte-identical to the explicit global-normalization disable arm");
+
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb3, vb3, ks3, vs3, scratch, head_dim, group, 8, 2, 4, 1.0f, 5, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "restore default no-global R3 store sync");
+
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_v_body_reference_minmax(
+            vd, vb3, vs3, scratch, head_dim, group, 2, 4, 1.0f, 5, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "R3 standalone V store sync");
+    std::vector<uint8_t> p3_standalone(v_r3_bytes);
+    std::vector<float> s3_standalone(vs_n);
+    require_cuda(cudaMemcpy(p3_standalone.data(), vb3, p3_standalone.size(), cudaMemcpyDeviceToHost), "copy R3 standalone V body");
+    require_cuda(cudaMemcpy(s3_standalone.data(), vs3, s3_standalone.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 standalone V scales");
+    require(p3_standalone == p3 && s3_standalone == s3,
+            "R3 standalone V store matches the no-global pipelined store byte-exactly");
+
+    std::vector<uint8_t> packed(p3.begin(), p3.begin() + v_prefix);
+    std::vector<uint16_t> oracle1(group + head_dim), oracle2(group + head_dim);
+    for (size_t i = 0; i < oracle1.size(); ++i) {
+        std::memcpy(&oracle1[i], p3.data() + v_prefix + 2*i, 2);
+        std::memcpy(&oracle2[i], p3.data() + v_prefix + factor_bytes + 2*i, 2);
+    }
+    std::vector<float> deflated2(v_rot);
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        deflated2[size_t(g)*head_dim + d] -=
+            f16_bits_to_f32(oracle1[g])*f16_bits_to_f32(oracle1[group + d]);
+    }
+    const std::vector<uint16_t> expected_oracle3 =
+        r3_full_factor_float_oracle(v_rot, packed, s3, head_dim, oracle1, oracle2);
+    std::vector<uint16_t> got_component3(expected_oracle3.size());
+    float component3_error = 0.0f;
+    for (size_t i = 0; i < expected_oracle3.size(); ++i) {
+        std::memcpy(&got_component3[i], p3.data() + v_r2_bytes + 2*i, 2);
+        component3_error = std::max(component3_error,
+                std::fabs(f16_bits_to_f32(got_component3[i]) - f16_bits_to_f32(expected_oracle3[i])));
+    }
+    require(component3_error < 2.0e-3f,
+            "R3 component 3 matches the independent full-factor oracle");
+    float * k_out = nullptr, * v_out = nullptr;
+    require_cuda(cudaMalloc(&k_out, n*sizeof(float)), "cudaMalloc R3 K dequant");
+    require_cuda(cudaMalloc(&v_out, n*sizeof(float)), "cudaMalloc R3 V dequant");
+    ggml_cuda_kvarn_dequant_body(kb3, vb3, ks3, vs3, k_out, v_out, head_dim, group, 8, 2, 5, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "R3 dequant sync");
+    std::vector<float> decoded(n);
+    require_cuda(cudaMemcpy(decoded.data(), v_out, n*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 dequant");
+    float dequant_err = 0.0f;
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        const size_t i = size_t(g)*head_dim + d;
+        const uint32_t q = (packed[i >> 2] >> ((i & 3u)*2u)) & 3u;
+        const float expected = (float(q)*s3[head_dim + g] + s3[head_dim + group + g])*s3[d] +
+            f16_bits_to_f32(oracle1[g])*f16_bits_to_f32(oracle1[group + d]) +
+            f16_bits_to_f32(oracle2[g])*f16_bits_to_f32(oracle2[group + d]) +
+            f16_bits_to_f32(got_component3[g])*f16_bits_to_f32(got_component3[group + d]);
+        dequant_err = std::max(dequant_err, std::fabs(decoded[i] - expected));
+    }
+    require(dequant_err < 4.0e-3f, "R3 central CUDA dequant sums all three independent residual components");
+
+    if (head_dim == 256) {
+        constexpr uint32_t n_head = 2;
+        std::vector<float> q(size_t(n_head)*head_dim, 0.0f);
+        std::vector<float> expected(size_t(n_head)*head_dim, 0.0f);
+        for (uint32_t h = 0; h < n_head; ++h) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                double sum = 0.0;
+                for (uint32_t g = 0; g < group; ++g) {
+                    sum += decoded[size_t(g)*head_dim + d];
+                }
+                expected[size_t(h)*head_dim + d] = float(sum/double(group));
+            }
+        }
+        float * qd = cuda_upload(q), * outd = nullptr, * scoresd = nullptr, * dummyf = nullptr;
+        uint16_t * dummyh = nullptr;
+        const size_t scores_n = kvarn_test_attn_scores_floats(group, 1, 1, head_dim, group);
+        require_cuda(cudaMalloc(&outd, expected.size()*sizeof(float)), "cudaMalloc R3 scalar-GQA output");
+        require_cuda(cudaMalloc(&scoresd, scores_n*sizeof(float)), "cudaMalloc R3 scalar-GQA scores");
+        require_cuda(cudaMalloc(&dummyf, head_dim*sizeof(float)), "cudaMalloc R3 scalar-GQA float dummy");
+        require_cuda(cudaMalloc(&dummyh, head_dim*sizeof(uint16_t)), "cudaMalloc R3 scalar-GQA half dummy");
+        set_env_var("LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR", "1");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                qd, nullptr, dummyh, dummyh, kb3, vb3, ks3, vs3, dummyf, dummyf, nullptr,
+                outd, scoresd, 1, n_head, 1, 0, 1, 0, 0, 0, head_dim, group, 8, 2,
+                head_dim, size_t(n_head)*head_dim, head_dim, size_t(n_head)*head_dim,
+                head_dim, head_dim, head_dim, head_dim, head_dim, head_dim,
+                k_bytes, v_r3_bytes, k_bytes, v_r3_bytes, ks_n, vs_n, ks_n, vs_n,
+                0, 0, 0, 1.0f/std::sqrt(float(head_dim)), nullptr,
+                nullptr, int64_t(scores_n), 1, nullptr, 0, 0.0f, 5u);
+        set_env_var("LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR", "");
+        require_cuda(cudaGetLastError(), "R3 legacy scalar-GQA launch");
+        require_cuda(cudaDeviceSynchronize(), "R3 legacy scalar-GQA sync");
+        std::vector<float> got(expected.size());
+        require_cuda(cudaMemcpy(got.data(), outd, got.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy R3 legacy scalar-GQA output");
+        float max_err = 0.0f;
+        for (size_t i = 0; i < got.size(); ++i) {
+            max_err = std::max(max_err, std::fabs(got[i] - expected[i]));
+        }
+        require(max_err < 4.0e-3f,
+                "legacy mode5 scalar-GQA retains its packed residual AV behavior");
+        cudaFree(qd); cudaFree(outd); cudaFree(scoresd); cudaFree(dummyf); cudaFree(dummyh);
+    }
+
+    if (head_dim == 256) {
+        constexpr uint32_t n_queries = 2;
+        constexpr uint32_t n_head = 2;
+        const uint32_t selected[n_queries] = { 7, 83 };
+        std::vector<float> q(size_t(n_queries)*n_head*head_dim, 0.0f);
+        std::vector<uint16_t> mask(size_t(n_queries)*group, f32_to_f16_bits(-1.0e4f));
+        std::vector<float> expected(size_t(n_queries)*n_head*head_dim);
+        float residual_signal = 0.0f;
+        for (uint32_t iq = 0; iq < n_queries; ++iq) {
+            mask[size_t(iq)*group + selected[iq]] = f32_to_f16_bits(0.0f);
+            const uint32_t g = selected[iq];
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                const size_t i = size_t(g)*head_dim + d;
+                const uint32_t qv = (packed[i >> 2] >> ((i & 3u)*2u)) & 3u;
+                const float base = (float(qv)*s3[head_dim + g] + s3[head_dim + group + g])*s3[d];
+                const float residual =
+                    f16_bits_to_f32(oracle1[g])*f16_bits_to_f32(oracle1[group + d]) +
+                    f16_bits_to_f32(oracle2[g])*f16_bits_to_f32(oracle2[group + d]) +
+                    f16_bits_to_f32(got_component3[g])*f16_bits_to_f32(got_component3[group + d]);
+                for (uint32_t h = 0; h < n_head; ++h) {
+                    expected[(size_t(iq)*n_head + h)*head_dim + d] = base + residual;
+                }
+                residual_signal = std::max(residual_signal, std::fabs(residual));
+            }
+        }
+        require(residual_signal > 1.0e-3f, "R3 mirror attention oracle distinguishes residual suffix from base V2");
+
+        float * qd = cuda_upload(q), * outd = nullptr, * scoresd = nullptr, * dummyf = nullptr;
+        uint16_t * maskd = cuda_upload(mask), * dummyh = nullptr;
+        set_env_var("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR", "1");
+        set_env_var("LLAMA_KVARN_ATTN_REF_SCRATCH", "1");
+        require(env_enabled("LLAMA_KVARN_ATTN_REF_SCRATCH"), "R3 test enables the F32 body-mirror route");
+        const size_t scores_n = kvarn_test_attn_scores_floats(group, 1, 1, head_dim, group);
+        require_cuda(cudaMalloc(&outd, expected.size()*sizeof(float)), "cudaMalloc R3 mirror attention output");
+        require_cuda(cudaMalloc(&scoresd, scores_n*sizeof(float)), "cudaMalloc R3 mirror attention scores");
+        require_cuda(cudaMalloc(&dummyh, head_dim*sizeof(uint16_t)), "cudaMalloc R3 mirror attention half dummy");
+        require_cuda(cudaMalloc(&dummyf, head_dim*sizeof(float)), "cudaMalloc R3 mirror attention float dummy");
+        ggml_cuda_kvarn_attn_mixed_f16_batch(
+                qd, dummyh, dummyh, kb3, vb3, ks3, vs3, dummyf, dummyf, maskd,
+                outd, scoresd, n_queries, n_head, 1, 0, 1, 0, 0, 0, head_dim, group, 8, 2,
+                head_dim, size_t(n_head)*head_dim, head_dim, size_t(n_head)*head_dim,
+                head_dim, head_dim, head_dim, head_dim,
+                k_bytes, v_r3_bytes, k_bytes, v_r3_bytes, ks_n, vs_n, ks_n, vs_n,
+                size_t(group)*sizeof(uint16_t), sizeof(uint16_t), 2,
+                1.0f/std::sqrt(float(head_dim)), nullptr,
+                nullptr, int64_t(scores_n), 1, nullptr, 0, 0.0f, 5u);
+        set_env_var("LLAMA_KVARN_ATTN_ENABLE_256D_BODY_MIRROR", "");
+        set_env_var("LLAMA_KVARN_ATTN_REF_SCRATCH", "");
+        require_cuda(cudaDeviceSynchronize(), "R3 F32-mirror attention sync");
+        std::vector<float> got(expected.size());
+        require_cuda(cudaMemcpy(got.data(), outd, got.size()*sizeof(float), cudaMemcpyDeviceToHost),
+                "copy R3 F32-mirror attention output");
+        float mirror_err = 0.0f;
+        for (size_t i = 0; i < got.size(); ++i) mirror_err = std::max(mirror_err, std::fabs(got[i] - expected[i]));
+        require(mirror_err < 4.0e-3f, "R3 F32 body-mirror attention consumes all residual components");
+        cudaFree(qd); cudaFree(maskd); cudaFree(outd); cudaFree(scoresd); cudaFree(dummyh); cudaFree(dummyf);
+    }
+
+    cudaFree(k_out); cudaFree(v_out); cudaFree(kd); cudaFree(vd); cudaFree(scratch);
+    cudaFree(kb2); cudaFree(kb3); cudaFree(vb2); cudaFree(vb3); cudaFree(ks2); cudaFree(ks3); cudaFree(vs2); cudaFree(vs3);
+}
+
+static void test_legacy_r1_direct_batched() {
+    constexpr uint32_t head_dim = 256, group = 128, n_heads = 2, n_records = 2;
+    const size_t n = size_t(head_dim)*group, tiles = n_heads*n_records;
+    const size_t k_bytes = n, v_prefix = n/4, factor_bytes = 2*(group + head_dim);
+    const size_t v_bytes = v_prefix + factor_bytes, v_r2_bytes = v_prefix + 2*factor_bytes;
+    const size_t v_r3_bytes = v_prefix + 3*factor_bytes;
+    const size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    const size_t tile_head = head_dim, tile_group = n_heads*head_dim, tile_record = group*tile_group;
+    std::vector<float> k(tiles*n), v(tiles*n);
+    for (uint32_t r = 0; r < n_records; ++r) for (uint32_t g = 0; g < group; ++g)
+        for (uint32_t h = 0; h < n_heads; ++h) for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t off = size_t(r)*tile_record + size_t(g)*tile_group + size_t(h)*tile_head + d;
+            k[off] = 0.021f*std::sin(float(d + 13*g + 101*h + 997*r)*0.011f);
+            v[off] = 0.037f*std::cos(float(7*d + 19*g + 43*h + 313*r)*0.009f) + 0.008f*std::sin(float(d + g)*0.017f);
+        }
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb0 = nullptr, * vb0 = nullptr, * kb1 = nullptr, * vb1 = nullptr, * kb2 = nullptr, * vb2 = nullptr, * kb3 = nullptr, * vb3 = nullptr;
+    float * ks0 = nullptr, * vs0 = nullptr, * ks1 = nullptr, * vs1 = nullptr, * ks2 = nullptr, * vs2 = nullptr, * ks3 = nullptr, * vs3 = nullptr;
+    const size_t best = tiles*(head_dim + group + 2), scratch_n = 3*tiles*n + 2*best;
+    require_cuda(cudaMalloc(&scratch, scratch_n*sizeof(float)), "cudaMalloc direct R1 scratch");
+    require_cuda(cudaMalloc(&kb0, tiles*k_bytes), "cudaMalloc direct R1 kb0"); require_cuda(cudaMalloc(&kb1, tiles*k_bytes), "cudaMalloc direct R1 kb1");
+    require_cuda(cudaMalloc(&vb0, tiles*v_bytes), "cudaMalloc direct R1 vb0"); require_cuda(cudaMalloc(&vb1, tiles*v_bytes), "cudaMalloc direct R1 vb1");
+    require_cuda(cudaMalloc(&ks0, tiles*ks_n*sizeof(float)), "cudaMalloc direct R1 ks0"); require_cuda(cudaMalloc(&ks1, tiles*ks_n*sizeof(float)), "cudaMalloc direct R1 ks1");
+    require_cuda(cudaMalloc(&vs0, tiles*vs_n*sizeof(float)), "cudaMalloc direct R1 vs0"); require_cuda(cudaMalloc(&vs1, tiles*vs_n*sizeof(float)), "cudaMalloc direct R1 vs1");
+    require_cuda(cudaMalloc(&kb2, tiles*k_bytes), "cudaMalloc direct R2 K body");
+    require_cuda(cudaMalloc(&vb2, tiles*v_r2_bytes), "cudaMalloc direct R2 V body");
+    require_cuda(cudaMalloc(&ks2, tiles*ks_n*sizeof(float)), "cudaMalloc direct R2 K scales");
+    require_cuda(cudaMalloc(&vs2, tiles*vs_n*sizeof(float)), "cudaMalloc direct R2 V scales");
+    require_cuda(cudaMalloc(&kb3, tiles*k_bytes), "cudaMalloc direct R3 K body");
+    require_cuda(cudaMalloc(&vb3, tiles*v_r3_bytes), "cudaMalloc direct R3 V body");
+    require_cuda(cudaMalloc(&ks3, tiles*ks_n*sizeof(float)), "cudaMalloc direct R3 K scales");
+    require_cuda(cudaMalloc(&vs3, tiles*vs_n*sizeof(float)), "cudaMalloc direct R3 V scales");
+    set_paper_frame_env(true);
+    auto store = [&](uint8_t * kb, uint8_t * vb, float * ks, float * vs, uint32_t mode) {
+        ggml_cuda_kvarn_store_body_direct_records_minmax(
+                kd, vd, kb, vb, ks, vs, scratch, n_heads, n_records, head_dim, group, 8, 2, 4, 1.0f,
+                k_bytes, v_bytes, n_records*k_bytes, n_records*v_bytes,
+                ks_n, vs_n, n_records*ks_n, n_records*vs_n,
+                tile_head, tile_head, tile_group, tile_group, tile_record, tile_record,
+                scratch_n, mode, nullptr);
+    };
+    store(kb0, vb0, ks0, vs0, 0); store(kb1, vb1, ks1, vs1, 3);
+    ggml_cuda_kvarn_store_body_direct_records_minmax(
+            kd, vd, kb2, vb2, ks2, vs2, scratch, n_heads, n_records, head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_r2_bytes, n_records*k_bytes, n_records*v_r2_bytes,
+            ks_n, vs_n, n_records*ks_n, n_records*vs_n,
+            tile_head, tile_head, tile_group, tile_group, tile_record, tile_record,
+            scratch_n, 4, nullptr);
+    clear_paper_frame_env(); require_cuda(cudaDeviceSynchronize(), "direct R1 stores sync");
+    std::vector<uint8_t> base(tiles*v_bytes), r1(tiles*v_bytes); std::vector<float> s0(tiles*vs_n), s1(tiles*vs_n);
+    require_cuda(cudaMemcpy(base.data(), vb0, base.size(), cudaMemcpyDeviceToHost), "copy direct R1 base");
+    require_cuda(cudaMemcpy(r1.data(), vb1, r1.size(), cudaMemcpyDeviceToHost), "copy direct R1");
+    require_cuda(cudaMemcpy(s0.data(), vs0, s0.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct R1 base scales");
+    require_cuda(cudaMemcpy(s1.data(), vs1, s1.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct R1 scales");
+    bool any_nonzero = false;
+    for (uint32_t r = 0; r < n_records; ++r) for (uint32_t h = 0; h < n_heads; ++h) {
+        const size_t tile = size_t(r)*n_heads + h;
+        const size_t body_off = size_t(h)*n_records*v_bytes + size_t(r)*v_bytes;
+        const size_t scale_off = size_t(h)*n_records*vs_n + size_t(r)*vs_n;
+        require(std::memcmp(base.data() + body_off, r1.data() + body_off, v_prefix) == 0,
+                "direct R1 preserves packed V2 prefix bit-exactly");
+        require(std::memcmp(s0.data() + scale_off, s1.data() + scale_off, vs_n*sizeof(float)) == 0,
+                "direct R1 preserves V scales bit-exactly");
+        std::vector<float> raw(n), rot;
+        for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d)
+            raw[size_t(g)*head_dim + d] = v[size_t(r)*tile_record + size_t(g)*tile_group + size_t(h)*tile_head + d];
+        llama_kvarn_hadamard_channels(raw, rot, group, head_dim, false);
+        std::vector<uint8_t> prefix(v_prefix); std::memcpy(prefix.data(), r1.data() + body_off, v_prefix);
+        std::vector<float> scales(vs_n); std::memcpy(scales.data(), s1.data() + scale_off, vs_n*sizeof(float));
+        const std::vector<uint16_t> oracle = r1_oracle_factors(rot, prefix, scales, head_dim);
+        float err = 0.0f;
+        for (size_t i = 0; i < oracle.size(); ++i) {
+            uint16_t got; std::memcpy(&got, r1.data() + body_off + v_prefix + 2*i, 2);
+            const float x = f16_bits_to_f32(got); any_nonzero = any_nonzero || x != 0.0f;
+            require(std::isfinite(x), "direct R1 suffix factors are finite");
+            err = std::max(err, std::fabs(x - f16_bits_to_f32(oracle[i])));
+        }
+        require(err < 2.0e-3f, "direct batched R1 factors match independent oracle");
+        (void) tile;
+    }
+    require(any_nonzero, "direct R1 suffix is nonzero");
+
+    std::vector<uint8_t> r2(tiles*v_r2_bytes);
+    std::vector<float> s2(tiles*vs_n);
+    require_cuda(cudaMemcpy(r2.data(), vb2, r2.size(), cudaMemcpyDeviceToHost), "copy direct R2 body");
+    require_cuda(cudaMemcpy(s2.data(), vs2, s2.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct R2 scales");
+    for (uint32_t r = 0; r < n_records; ++r) for (uint32_t h = 0; h < n_heads; ++h) {
+        const size_t r1_off = size_t(h)*n_records*v_bytes + size_t(r)*v_bytes;
+        const size_t r2_off = size_t(h)*n_records*v_r2_bytes + size_t(r)*v_r2_bytes;
+        const size_t scale_off = size_t(h)*n_records*vs_n + size_t(r)*vs_n;
+        require(std::memcmp(r1.data() + r1_off, r2.data() + r2_off, v_bytes) == 0,
+                "direct R2 preserves complete R1 component bytes");
+        require(std::memcmp(s1.data() + scale_off, s2.data() + scale_off, vs_n*sizeof(float)) == 0,
+                "direct R2 preserves R1 scales");
+        std::vector<float> raw(n), rot;
+        for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d)
+            raw[size_t(g)*head_dim + d] = v[size_t(r)*tile_record + size_t(g)*tile_group + size_t(h)*tile_head + d];
+        llama_kvarn_hadamard_channels(raw, rot, group, head_dim, false);
+        std::vector<uint8_t> prefix(v_prefix);
+        std::memcpy(prefix.data(), r2.data() + r2_off, v_prefix);
+        std::vector<float> scales(vs_n);
+        std::memcpy(scales.data(), s2.data() + scale_off, vs_n*sizeof(float));
+        const std::vector<uint16_t> oracle1 = r1_oracle_factors(rot, prefix, scales, head_dim);
+        const std::vector<uint16_t> oracle2 = r1_oracle_factors(rot, prefix, scales, head_dim, &oracle1);
+        float err = 0.0f;
+        for (size_t i = 0; i < oracle2.size(); ++i) {
+            uint16_t got;
+            std::memcpy(&got, r2.data() + r2_off + v_bytes + 2*i, 2);
+            err = std::max(err, std::fabs(f16_bits_to_f32(got) - f16_bits_to_f32(oracle2[i])));
+        }
+        require(err < 2.0e-3f, "direct batched R2 component 2 matches independent deflated oracle");
+    }
+
+    set_paper_frame_env(true);
+    set_env_var("LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES", "1");
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    ggml_cuda_kvarn_store_body_direct_records_minmax(
+            kd, vd, kb2, vb2, ks2, vs2, scratch, n_heads, n_records, head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_r2_bytes, n_records*k_bytes, n_records*v_r2_bytes,
+            ks_n, vs_n, n_records*ks_n, n_records*vs_n,
+            tile_head, tile_head, tile_group, tile_group, tile_record, tile_record,
+            scratch_n, 4, nullptr);
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "");
+    ggml_cuda_kvarn_store_body_direct_records_minmax(
+            kd, vd, kb3, vb3, ks3, vs3, scratch, n_heads, n_records, head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_r3_bytes, n_records*k_bytes, n_records*v_r3_bytes,
+            ks_n, vs_n, n_records*ks_n, n_records*vs_n,
+            tile_head, tile_head, tile_group, tile_group, tile_record, tile_record,
+            scratch_n, 5, nullptr);
+    set_env_var("LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES", "");
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "direct no-global R2/R3 stores sync");
+    std::vector<uint8_t> k2_ng(tiles*k_bytes), k3_h(tiles*k_bytes), r2_ng(tiles*v_r2_bytes), r3_h(tiles*v_r3_bytes);
+    std::vector<float> sk2_ng(tiles*ks_n), sk3_h(tiles*ks_n), sv2_ng(tiles*vs_n), sv3_h(tiles*vs_n);
+    require_cuda(cudaMemcpy(k2_ng.data(), kb2, k2_ng.size(), cudaMemcpyDeviceToHost), "copy direct no-global R2 K body");
+    require_cuda(cudaMemcpy(k3_h.data(), kb3, k3_h.size(), cudaMemcpyDeviceToHost), "copy direct R3 K body");
+    require_cuda(cudaMemcpy(r2_ng.data(), vb2, r2_ng.size(), cudaMemcpyDeviceToHost), "copy direct no-global R2 V body");
+    require_cuda(cudaMemcpy(r3_h.data(), vb3, r3_h.size(), cudaMemcpyDeviceToHost), "copy direct R3 V body");
+    require_cuda(cudaMemcpy(sk2_ng.data(), ks2, sk2_ng.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct no-global R2 K scales");
+    require_cuda(cudaMemcpy(sk3_h.data(), ks3, sk3_h.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct R3 K scales");
+    require_cuda(cudaMemcpy(sv2_ng.data(), vs2, sv2_ng.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct no-global R2 V scales");
+    require_cuda(cudaMemcpy(sv3_h.data(), vs3, sv3_h.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy direct R3 V scales");
+    for (uint32_t r = 0; r < n_records; ++r) for (uint32_t h = 0; h < n_heads; ++h) {
+        const size_t k2_off = size_t(h)*n_records*k_bytes + size_t(r)*k_bytes;
+        const size_t r2_off = size_t(h)*n_records*v_r2_bytes + size_t(r)*v_r2_bytes;
+        const size_t r3_off = size_t(h)*n_records*v_r3_bytes + size_t(r)*v_r3_bytes;
+        const size_t sk_off = size_t(h)*n_records*ks_n + size_t(r)*ks_n;
+        const size_t sv_off = size_t(h)*n_records*vs_n + size_t(r)*vs_n;
+        require(std::memcmp(k2_ng.data() + k2_off, k3_h.data() + k2_off, k_bytes) == 0,
+                "direct R3 K body equals no-global R2");
+        require(std::memcmp(sk2_ng.data() + sk_off, sk3_h.data() + sk_off, ks_n*sizeof(float)) == 0,
+                "direct R3 K scales equal no-global R2");
+        require(std::memcmp(r2_ng.data() + r2_off, r3_h.data() + r3_off, v_r2_bytes) == 0,
+                "direct R3 components 1/2 equal no-global R2");
+        require(std::memcmp(sv2_ng.data() + sv_off, sv3_h.data() + sv_off, vs_n*sizeof(float)) == 0,
+                "direct R3 V scales equal no-global R2");
+        std::vector<float> raw(n), rot;
+        for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+            raw[size_t(g)*head_dim + d] =
+                v[size_t(r)*tile_record + size_t(g)*tile_group + size_t(h)*tile_head + d];
+        }
+        llama_kvarn_hadamard_channels(raw, rot, group, head_dim, false);
+        std::vector<uint8_t> prefix(v_prefix);
+        std::memcpy(prefix.data(), r3_h.data() + r3_off, v_prefix);
+        std::vector<float> scales(vs_n);
+        std::memcpy(scales.data(), sv3_h.data() + sv_off, vs_n*sizeof(float));
+        std::vector<uint16_t> oracle1(group + head_dim), oracle2(group + head_dim);
+        for (size_t i = 0; i < oracle1.size(); ++i) {
+            std::memcpy(&oracle1[i], r3_h.data() + r3_off + v_prefix + 2*i, 2);
+            std::memcpy(&oracle2[i], r3_h.data() + r3_off + v_prefix + factor_bytes + 2*i, 2);
+        }
+        std::vector<float> deflated2(rot);
+        for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+            deflated2[size_t(g)*head_dim + d] -=
+                f16_bits_to_f32(oracle1[g])*f16_bits_to_f32(oracle1[group + d]);
+        }
+        const std::vector<uint16_t> full_oracle3 =
+            r3_full_factor_float_oracle(rot, prefix, scales, head_dim, oracle1, oracle2);
+        float component3_err = 0.0f;
+        for (size_t i = 0; i < full_oracle3.size(); ++i) {
+            uint16_t got;
+            std::memcpy(&got, r3_h.data() + r3_off + v_r2_bytes + 2*i, 2);
+            component3_err = std::max(component3_err,
+                    std::fabs(f16_bits_to_f32(got) - f16_bits_to_f32(full_oracle3[i])));
+        }
+        require(component3_err < 2.0e-3f,
+                "direct R3 component 3 matches the independent full-factor oracle");
+    }
+    cudaFree(kd); cudaFree(vd); cudaFree(scratch); cudaFree(kb0); cudaFree(vb0); cudaFree(kb1); cudaFree(vb1); cudaFree(kb2); cudaFree(vb2); cudaFree(kb3); cudaFree(vb3);
+    cudaFree(ks0); cudaFree(vs0); cudaFree(ks1); cudaFree(vs1); cudaFree(ks2); cudaFree(vs2); cudaFree(ks3); cudaFree(vs3);
+}
+
+static void test_legacy_residual_pending_heads_strided_record_view(uint32_t turbo_v_mode) {
+    const uint32_t head_dim = turbo_v_mode == 6 ? 512u : 256u;
+    constexpr uint32_t group = 128, n_heads = 2;
+    constexpr uint32_t record_capacity = 3, record = 1;
+    constexpr uint8_t poison = 0xa5;
+    const size_t n = size_t(head_dim)*group;
+    const size_t k_bytes = n;
+    require(turbo_v_mode >= 3 && turbo_v_mode <= 6, "strided pending-head residual mode is supported");
+    const size_t rank = turbo_v_mode - 2;
+    const size_t v_bytes = turbo_v_mode == 6 ? 21504 : n/4 + rank*2*(group + head_dim);
+    const size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    const size_t pending_token_stride = size_t(n_heads)*head_dim;
+
+    std::vector<float> k(size_t(group)*pending_token_stride);
+    std::vector<float> v(k.size());
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t h = 0; h < n_heads; ++h)
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t off = size_t(g)*pending_token_stride + size_t(h)*head_dim + d;
+            k[off] = 0.019f*std::sin(float(d + 17*g + 97*h)*0.013f);
+            v[off] = 0.031f*std::cos(float(5*d + 11*g + 53*h)*0.009f) +
+                0.007f*std::sin(float(d + 29*g)*0.017f);
+        }
+
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb_ref = nullptr, * vb_ref = nullptr, * kb = nullptr, * vb = nullptr;
+    float * ks_ref = nullptr, * vs_ref = nullptr, * ks = nullptr, * vs = nullptr;
+    const size_t per = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
+    const size_t scratch_n = 3*n + 2*per;
+    require_cuda(cudaMalloc(&scratch, scratch_n*sizeof(float)), "cudaMalloc strided pending-head R1 scratch");
+    require_cuda(cudaMalloc(&kb_ref, n_heads*k_bytes), "cudaMalloc contiguous pending-head R1 K body");
+    require_cuda(cudaMalloc(&vb_ref, n_heads*v_bytes), "cudaMalloc contiguous pending-head R1 V body");
+    require_cuda(cudaMalloc(&ks_ref, n_heads*ks_n*sizeof(float)), "cudaMalloc contiguous pending-head R1 K scales");
+    require_cuda(cudaMalloc(&vs_ref, n_heads*vs_n*sizeof(float)), "cudaMalloc contiguous pending-head R1 V scales");
+    require_cuda(cudaMalloc(&kb, size_t(n_heads)*record_capacity*k_bytes), "cudaMalloc strided pending-head R1 K body");
+    require_cuda(cudaMalloc(&vb, size_t(n_heads)*record_capacity*v_bytes), "cudaMalloc strided pending-head R1 V body");
+    require_cuda(cudaMalloc(&ks, size_t(n_heads)*record_capacity*ks_n*sizeof(float)), "cudaMalloc strided pending-head R1 K scales");
+    require_cuda(cudaMalloc(&vs, size_t(n_heads)*record_capacity*vs_n*sizeof(float)), "cudaMalloc strided pending-head R1 V scales");
+    require_cuda(cudaMemset(kb, poison, size_t(n_heads)*record_capacity*k_bytes), "poison strided pending-head R1 K body");
+    require_cuda(cudaMemset(vb, poison, size_t(n_heads)*record_capacity*v_bytes), "poison strided pending-head R1 V body");
+    require_cuda(cudaMemset(ks, poison, size_t(n_heads)*record_capacity*ks_n*sizeof(float)), "poison strided pending-head R1 K scales");
+    require_cuda(cudaMemset(vs, poison, size_t(n_heads)*record_capacity*vs_n*sizeof(float)), "poison strided pending-head R1 V scales");
+
+    set_paper_frame_env(false);
+    ggml_cuda_kvarn_store_body_pending_heads_minmax(
+            kd, vd, kb_ref, vb_ref, ks_ref, vs_ref, scratch,
+            n_heads, head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_bytes, ks_n, vs_n,
+            pending_token_stride, pending_token_stride, turbo_v_mode, false, nullptr);
+    require_cuda(cudaGetLastError(), "contiguous pending-head residual store launch");
+    require_cuda(cudaDeviceSynchronize(), "contiguous pending-head residual store sync");
+    ggml_cuda_kvarn_store_body_pending_heads_minmax(
+            kd, vd,
+            kb + size_t(record)*k_bytes,
+            vb + size_t(record)*v_bytes,
+            ks + size_t(record)*ks_n,
+            vs + size_t(record)*vs_n,
+            scratch,
+            n_heads, head_dim, group, 8, 2, 4, 1.0f,
+            size_t(record_capacity)*k_bytes, size_t(record_capacity)*v_bytes,
+            size_t(record_capacity)*ks_n, size_t(record_capacity)*vs_n,
+            pending_token_stride, pending_token_stride, turbo_v_mode, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaGetLastError(), "strided pending-head R1 store launch");
+    require_cuda(cudaDeviceSynchronize(), "strided pending-head R1 store sync");
+
+    std::vector<uint8_t> kb_ref_h(size_t(n_heads)*k_bytes), vb_ref_h(size_t(n_heads)*v_bytes);
+    std::vector<uint8_t> ks_ref_h(size_t(n_heads)*ks_n*sizeof(float)), vs_ref_h(size_t(n_heads)*vs_n*sizeof(float));
+    std::vector<uint8_t> kb_h(size_t(n_heads)*record_capacity*k_bytes), vb_h(size_t(n_heads)*record_capacity*v_bytes);
+    std::vector<uint8_t> ks_h(size_t(n_heads)*record_capacity*ks_n*sizeof(float)), vs_h(size_t(n_heads)*record_capacity*vs_n*sizeof(float));
+    require_cuda(cudaMemcpy(kb_ref_h.data(), kb_ref, kb_ref_h.size(), cudaMemcpyDeviceToHost), "copy contiguous pending-head R1 K body");
+    require_cuda(cudaMemcpy(vb_ref_h.data(), vb_ref, vb_ref_h.size(), cudaMemcpyDeviceToHost), "copy contiguous pending-head R1 V body");
+    require_cuda(cudaMemcpy(ks_ref_h.data(), ks_ref, ks_ref_h.size(), cudaMemcpyDeviceToHost), "copy contiguous pending-head R1 K scales");
+    require_cuda(cudaMemcpy(vs_ref_h.data(), vs_ref, vs_ref_h.size(), cudaMemcpyDeviceToHost), "copy contiguous pending-head R1 V scales");
+    require_cuda(cudaMemcpy(kb_h.data(), kb, kb_h.size(), cudaMemcpyDeviceToHost), "copy strided pending-head R1 K body");
+    require_cuda(cudaMemcpy(vb_h.data(), vb, vb_h.size(), cudaMemcpyDeviceToHost), "copy strided pending-head R1 V body");
+    require_cuda(cudaMemcpy(ks_h.data(), ks, ks_h.size(), cudaMemcpyDeviceToHost), "copy strided pending-head R1 K scales");
+    require_cuda(cudaMemcpy(vs_h.data(), vs, vs_h.size(), cudaMemcpyDeviceToHost), "copy strided pending-head R1 V scales");
+
+    auto require_record_view = [&](const std::vector<uint8_t> & got, const std::vector<uint8_t> & ref,
+                                   size_t record_bytes, const char * match_msg, const char * guard_msg) {
+        for (uint32_t h = 0; h < n_heads; ++h) {
+            const size_t head_base = size_t(h)*record_capacity*record_bytes;
+            const size_t ref_base = size_t(h)*record_bytes;
+            require(std::memcmp(got.data() + head_base + size_t(record)*record_bytes,
+                                ref.data() + ref_base, record_bytes) == 0, match_msg);
+            for (uint32_t r = 0; r < record_capacity; ++r) {
+                if (r == record) continue;
+                const uint8_t * begin = got.data() + head_base + size_t(r)*record_bytes;
+                require(std::all_of(begin, begin + record_bytes,
+                                    [poison](uint8_t x) { return x == poison; }), guard_msg);
+            }
+        }
+    };
+    require_record_view(kb_h, kb_ref_h, k_bytes,
+            "strided pending-head R1 K body matches contiguous store",
+            "strided pending-head R1 K body preserves non-target records");
+    require_record_view(vb_h, vb_ref_h, v_bytes,
+            "strided pending-head R1 V body matches contiguous store",
+            "strided pending-head R1 V body preserves non-target records");
+    require_record_view(ks_h, ks_ref_h, ks_n*sizeof(float),
+            "strided pending-head R1 K scales match contiguous store",
+            "strided pending-head R1 K scales preserve non-target records");
+    require_record_view(vs_h, vs_ref_h, vs_n*sizeof(float),
+            "strided pending-head R1 V scales match contiguous store",
+            "strided pending-head R1 V scales preserve non-target records");
+
+    if (turbo_v_mode == 5) {
+        const size_t v_r2_bytes = n/4 + 2*2*(group + head_dim);
+        const size_t factor_bytes = 2*(group + head_dim);
+        set_paper_frame_env(false);
+        set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+        ggml_cuda_kvarn_store_body_pending_heads_minmax(
+                kd, vd, kb_ref, vb_ref, ks_ref, vs_ref, scratch,
+                n_heads, head_dim, group, 8, 2, 4, 1.0f,
+                k_bytes, v_r2_bytes, ks_n, vs_n,
+                pending_token_stride, pending_token_stride, 4, false, nullptr);
+        set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "");
+        clear_paper_frame_env();
+        require_cuda(cudaDeviceSynchronize(), "pending-head no-global R2 control sync");
+        std::vector<uint8_t> k_r2(size_t(n_heads)*k_bytes), v_r2(size_t(n_heads)*v_r2_bytes);
+        std::vector<uint8_t> sk_r2(size_t(n_heads)*ks_n*sizeof(float)), sv_r2(size_t(n_heads)*vs_n*sizeof(float));
+        require_cuda(cudaMemcpy(k_r2.data(), kb_ref, k_r2.size(), cudaMemcpyDeviceToHost), "copy pending-head no-global R2 K body");
+        require_cuda(cudaMemcpy(v_r2.data(), vb_ref, v_r2.size(), cudaMemcpyDeviceToHost), "copy pending-head no-global R2 V body");
+        require_cuda(cudaMemcpy(sk_r2.data(), ks_ref, sk_r2.size(), cudaMemcpyDeviceToHost), "copy pending-head no-global R2 K scales");
+        require_cuda(cudaMemcpy(sv_r2.data(), vs_ref, sv_r2.size(), cudaMemcpyDeviceToHost), "copy pending-head no-global R2 V scales");
+        for (uint32_t h = 0; h < n_heads; ++h) {
+            require(std::memcmp(k_r2.data() + size_t(h)*k_bytes, kb_ref_h.data() + size_t(h)*k_bytes, k_bytes) == 0,
+                    "pending-head R3 K body equals no-global R2");
+            require(std::memcmp(v_r2.data() + size_t(h)*v_r2_bytes, vb_ref_h.data() + size_t(h)*v_bytes, v_r2_bytes) == 0,
+                    "pending-head R3 components 1/2 equal no-global R2");
+            require(std::memcmp(sk_r2.data() + size_t(h)*ks_n*sizeof(float), ks_ref_h.data() + size_t(h)*ks_n*sizeof(float), ks_n*sizeof(float)) == 0,
+                    "pending-head R3 K scales equal no-global R2");
+            require(std::memcmp(sv_r2.data() + size_t(h)*vs_n*sizeof(float), vs_ref_h.data() + size_t(h)*vs_n*sizeof(float), vs_n*sizeof(float)) == 0,
+                    "pending-head R3 V scales equal no-global R2");
+            std::vector<float> raw(n);
+            for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+                raw[size_t(g)*head_dim + d] = v[size_t(g)*pending_token_stride + size_t(h)*head_dim + d];
+            }
+            std::vector<uint8_t> prefix(n/4);
+            std::memcpy(prefix.data(), vb_ref_h.data() + size_t(h)*v_bytes, prefix.size());
+            std::vector<float> scales(vs_n);
+            std::memcpy(scales.data(), vs_ref_h.data() + size_t(h)*vs_n*sizeof(float), vs_n*sizeof(float));
+            std::vector<uint16_t> oracle1(group + head_dim), oracle2(group + head_dim);
+            const uint8_t * body = vb_ref_h.data() + size_t(h)*v_bytes;
+            for (size_t i = 0; i < oracle1.size(); ++i) {
+                std::memcpy(&oracle1[i], body + prefix.size() + 2*i, 2);
+                std::memcpy(&oracle2[i], body + prefix.size() + factor_bytes + 2*i, 2);
+            }
+            std::vector<float> deflated2(raw);
+            for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+                deflated2[size_t(g)*head_dim + d] -=
+                    f16_bits_to_f32(oracle1[g])*f16_bits_to_f32(oracle1[group + d]);
+            }
+            const std::vector<uint16_t> full_oracle3 =
+                r3_full_factor_float_oracle(raw, prefix, scales, head_dim, oracle1, oracle2);
+            float component3_err = 0.0f;
+            for (size_t i = 0; i < full_oracle3.size(); ++i) {
+                uint16_t got;
+                std::memcpy(&got, vb_ref_h.data() + size_t(h)*v_bytes + v_r2_bytes + 2*i, 2);
+                component3_err = std::max(component3_err,
+                        std::fabs(f16_bits_to_f32(got) - f16_bits_to_f32(full_oracle3[i])));
+            }
+            require(component3_err < 2.0e-3f,
+                    "pending-head R3 component 3 matches the independent full-factor oracle");
+        }
+    }
+    cudaFree(kd); cudaFree(vd); cudaFree(scratch);
+    cudaFree(kb_ref); cudaFree(vb_ref); cudaFree(ks_ref); cudaFree(vs_ref);
+    cudaFree(kb); cudaFree(vb); cudaFree(ks); cudaFree(vs);
+}
+
+static void test_legacy_r3_pending_record_mixed_norm_controls() {
+    constexpr uint32_t head_dim = 256, group = 128, record_capacity = 3, record = 1;
+    constexpr uint8_t poison = 0xa5;
+    const size_t n = size_t(head_dim)*group;
+    const size_t k_bytes = n, factor_bytes = 2*(group + head_dim);
+    const size_t v_r2_bytes = n/4 + 2*factor_bytes, v_r3_bytes = n/4 + 3*factor_bytes;
+    const size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    std::vector<float> k(n), v(n);
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        k[size_t(g)*head_dim + d] = 0.018f*std::sin(float(7*d + 19*g)*0.013f);
+        v[size_t(g)*head_dim + d] = 0.039f*std::cos(float(11*d + 23*g)*0.009f) +
+            0.006f*std::sin(float(3*d + 5*g)*0.021f);
+    }
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb2 = nullptr, * vb2 = nullptr, * kb3 = nullptr, * vb3 = nullptr;
+    float * ks2 = nullptr, * vs2 = nullptr, * ks3 = nullptr, * vs3 = nullptr;
+    const size_t per = n + 2*std::max<size_t>(head_dim, group) + head_dim + group + 2;
+    const size_t scratch_n = 3*n + 2*per;
+    require_cuda(cudaMalloc(&scratch, scratch_n*sizeof(float)), "cudaMalloc R3 pending-record scratch");
+    require_cuda(cudaMalloc(&kb2, record_capacity*k_bytes), "cudaMalloc no-global R2 pending-record K body");
+    require_cuda(cudaMalloc(&vb2, record_capacity*v_r2_bytes), "cudaMalloc no-global R2 pending-record V body");
+    require_cuda(cudaMalloc(&ks2, record_capacity*ks_n*sizeof(float)), "cudaMalloc no-global R2 pending-record K scales");
+    require_cuda(cudaMalloc(&vs2, record_capacity*vs_n*sizeof(float)), "cudaMalloc no-global R2 pending-record V scales");
+    require_cuda(cudaMalloc(&kb3, record_capacity*k_bytes), "cudaMalloc R3 pending-record K body");
+    require_cuda(cudaMalloc(&vb3, record_capacity*v_r3_bytes), "cudaMalloc R3 pending-record V body");
+    require_cuda(cudaMalloc(&ks3, record_capacity*ks_n*sizeof(float)), "cudaMalloc R3 pending-record K scales");
+    require_cuda(cudaMalloc(&vs3, record_capacity*vs_n*sizeof(float)), "cudaMalloc R3 pending-record V scales");
+    require_cuda(cudaMemset(kb3, poison, record_capacity*k_bytes), "poison R3 pending-record K body");
+    require_cuda(cudaMemset(vb3, poison, record_capacity*v_r3_bytes), "poison R3 pending-record V body");
+    const int32_t record_index = record;
+    set_paper_frame_env(false);
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    ggml_cuda_kvarn_store_body_pending_records_minmax(
+            kd, vd, kb2, vb2, ks2, vs2, scratch, &record_index, 1,
+            head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_r2_bytes, record_capacity*k_bytes, record_capacity*v_r2_bytes,
+            ks_n, vs_n, record_capacity*ks_n, record_capacity*vs_n,
+            head_dim, head_dim, 4, false, nullptr);
+    set_env_var("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "");
+    ggml_cuda_kvarn_store_body_pending_records_minmax(
+            kd, vd, kb3, vb3, ks3, vs3, scratch, &record_index, 1,
+            head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_r3_bytes, record_capacity*k_bytes, record_capacity*v_r3_bytes,
+            ks_n, vs_n, record_capacity*ks_n, record_capacity*vs_n,
+            head_dim, head_dim, 5, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "R3 pending-record stores sync");
+    std::vector<uint8_t> k2(record_capacity*k_bytes), k3(record_capacity*k_bytes);
+    std::vector<uint8_t> v2(record_capacity*v_r2_bytes), v3(record_capacity*v_r3_bytes);
+    std::vector<float> sk2(record_capacity*ks_n), sk3(record_capacity*ks_n);
+    std::vector<float> sv2(record_capacity*vs_n), sv3(record_capacity*vs_n);
+    require_cuda(cudaMemcpy(k2.data(), kb2, k2.size(), cudaMemcpyDeviceToHost), "copy no-global R2 pending-record K body");
+    require_cuda(cudaMemcpy(k3.data(), kb3, k3.size(), cudaMemcpyDeviceToHost), "copy R3 pending-record K body");
+    require_cuda(cudaMemcpy(v2.data(), vb2, v2.size(), cudaMemcpyDeviceToHost), "copy no-global R2 pending-record V body");
+    require_cuda(cudaMemcpy(v3.data(), vb3, v3.size(), cudaMemcpyDeviceToHost), "copy R3 pending-record V body");
+    require_cuda(cudaMemcpy(sk2.data(), ks2, sk2.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy no-global R2 pending-record K scales");
+    require_cuda(cudaMemcpy(sk3.data(), ks3, sk3.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 pending-record K scales");
+    require_cuda(cudaMemcpy(sv2.data(), vs2, sv2.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy no-global R2 pending-record V scales");
+    require_cuda(cudaMemcpy(sv3.data(), vs3, sv3.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy R3 pending-record V scales");
+    require(std::memcmp(k2.data() + record*k_bytes, k3.data() + record*k_bytes, k_bytes) == 0,
+            "R3 pending-record K body equals no-global R2");
+    require(std::memcmp(v2.data() + record*v_r2_bytes, v3.data() + record*v_r3_bytes, v_r2_bytes) == 0,
+            "R3 pending-record components 1/2 equal no-global R2");
+    require(std::memcmp(sk2.data() + record*ks_n, sk3.data() + record*ks_n, ks_n*sizeof(float)) == 0,
+            "R3 pending-record K scales equal no-global R2");
+    require(std::memcmp(sv2.data() + record*vs_n, sv3.data() + record*vs_n, vs_n*sizeof(float)) == 0,
+            "R3 pending-record V scales equal no-global R2");
+    std::vector<uint8_t> prefix(n/4);
+    std::memcpy(prefix.data(), v3.data() + record*v_r3_bytes, prefix.size());
+    std::vector<float> scales(vs_n);
+    std::memcpy(scales.data(), sv3.data() + record*vs_n, vs_n*sizeof(float));
+    std::vector<uint16_t> oracle1(group + head_dim), oracle2(group + head_dim);
+    const uint8_t * body = v3.data() + record*v_r3_bytes;
+    for (size_t i = 0; i < oracle1.size(); ++i) {
+        std::memcpy(&oracle1[i], body + prefix.size() + 2*i, 2);
+        std::memcpy(&oracle2[i], body + prefix.size() + factor_bytes + 2*i, 2);
+    }
+    std::vector<float> deflated2(v);
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        deflated2[size_t(g)*head_dim + d] -=
+            f16_bits_to_f32(oracle1[g])*f16_bits_to_f32(oracle1[group + d]);
+    }
+    const std::vector<uint16_t> full_oracle3 =
+        r3_full_factor_float_oracle(v, prefix, scales, head_dim, oracle1, oracle2);
+    float component3_err = 0.0f;
+    for (size_t i = 0; i < full_oracle3.size(); ++i) {
+        uint16_t got;
+        std::memcpy(&got, v3.data() + record*v_r3_bytes + v_r2_bytes + 2*i, 2);
+        component3_err = std::max(component3_err,
+                std::fabs(f16_bits_to_f32(got) - f16_bits_to_f32(full_oracle3[i])));
+    }
+    require(component3_err < 2.0e-3f,
+            "pending-record R3 component 3 matches the independent full-factor oracle");
+    for (uint32_t r = 0; r < record_capacity; ++r) if (r != record) {
+        require(std::all_of(k3.begin() + size_t(r)*k_bytes, k3.begin() + size_t(r + 1)*k_bytes,
+                    [poison](uint8_t x) { return x == poison; }), "R3 pending-record K stride preserves neighbors");
+        require(std::all_of(v3.begin() + size_t(r)*v_r3_bytes, v3.begin() + size_t(r + 1)*v_r3_bytes,
+                    [poison](uint8_t x) { return x == poison; }), "R3 pending-record V stride preserves neighbors");
+    }
+    cudaFree(kd); cudaFree(vd); cudaFree(scratch);
+    cudaFree(kb2); cudaFree(vb2); cudaFree(ks2); cudaFree(vs2);
+    cudaFree(kb3); cudaFree(vb3); cudaFree(ks3); cudaFree(vs3);
+}
+
+static void test_sparse_d512_store_dequant_attention() {
+    constexpr uint32_t head_dim = 512, group = 128;
+    constexpr size_t n = size_t(head_dim)*group;
+    constexpr size_t k_bytes = n, v_prefix = n/4, v_bytes = 21504;
+    constexpr size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    constexpr size_t nnz = 1365;
+    std::vector<float> k(n), v(n);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            k[size_t(d)*group + g] = 0.019f*std::sin(float(13*d + 7*g)*0.011f);
+            v[size_t(g)*head_dim + d] =
+                0.041f*std::cos(float(5*d + 17*g)*0.009f) +
+                0.013f*std::sin(float(23*d + 3*g)*0.007f);
+        }
+    }
+    std::vector<float> v_rot;
+    llama_kvarn_hadamard_channels(v, v_rot, group, head_dim, false);
+
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb = nullptr, * vb = nullptr, * vb_repeat = nullptr;
+    float * ks = nullptr, * vs = nullptr, * vs_repeat = nullptr;
+    const size_t per = n + 2*head_dim + head_dim + group + 2;
+    require_cuda(cudaMalloc(&scratch, (2*per + n)*sizeof(float)), "cudaMalloc sparse D512 scratch");
+    require_cuda(cudaMalloc(&kb, k_bytes), "cudaMalloc sparse D512 K body");
+    require_cuda(cudaMalloc(&vb, v_bytes), "cudaMalloc sparse D512 V body");
+    require_cuda(cudaMalloc(&vb_repeat, v_bytes), "cudaMalloc sparse D512 repeat V body");
+    require_cuda(cudaMalloc(&ks, ks_n*sizeof(float)), "cudaMalloc sparse D512 K scales");
+    require_cuda(cudaMalloc(&vs, vs_n*sizeof(float)), "cudaMalloc sparse D512 V scales");
+    require_cuda(cudaMalloc(&vs_repeat, vs_n*sizeof(float)), "cudaMalloc sparse D512 repeat V scales");
+    require_cuda(cudaMemset(vb, 0xa5, v_bytes), "poison sparse D512 V body");
+    require_cuda(cudaMemset(vb_repeat, 0x5a, v_bytes), "poison sparse D512 repeat V body");
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_body_reference_minmax(
+            kd, vd, kb, vb, ks, vs, scratch, head_dim, group, 8, 2, 4, 1.0f, 6, false, nullptr);
+    ggml_cuda_kvarn_store_v_body_reference_minmax(
+            vd, vb_repeat, vs_repeat, scratch, head_dim, group, 2, 4, 1.0f, 6, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 stores sync");
+
+    std::vector<uint8_t> body(v_bytes), repeat(v_bytes);
+    std::vector<float> scales(vs_n), repeat_scales(vs_n);
+    require_cuda(cudaMemcpy(body.data(), vb, v_bytes, cudaMemcpyDeviceToHost), "copy sparse D512 body");
+    require_cuda(cudaMemcpy(repeat.data(), vb_repeat, v_bytes, cudaMemcpyDeviceToHost), "copy sparse D512 repeat body");
+    require_cuda(cudaMemcpy(scales.data(), vs, vs_n*sizeof(float), cudaMemcpyDeviceToHost), "copy sparse D512 scales");
+    require_cuda(cudaMemcpy(repeat_scales.data(), vs_repeat, vs_n*sizeof(float), cudaMemcpyDeviceToHost), "copy sparse D512 repeat scales");
+    require(body == repeat && scales == repeat_scales,
+            "sparse D512 standalone and pipelined stores overwrite poison deterministically");
+    require(body[v_prefix + 2389] == 0, "sparse D512 suffix writes its required zero pad");
+
+    struct ranked_entry { float magnitude; uint16_t d; };
+    std::vector<std::vector<ranked_entry>> ranked(group);
+    std::vector<float> base_rotated(n), residual(n);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t i = size_t(g)*head_dim + d;
+            const uint32_t q = (body[i >> 2] >> ((i & 3u)*2u)) & 3u;
+            base_rotated[i] = (float(q)*scales[head_dim + g] + scales[head_dim + group + g])*scales[d];
+            residual[i] = v_rot[i] - base_rotated[i];
+        }
+    }
+    for (uint32_t g = 0; g < group; ++g) {
+        ranked[g].reserve(head_dim);
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            const size_t i = size_t(g)*head_dim + d;
+            const float a = std::isnan(residual[i]) ? std::numeric_limits<float>::infinity() : std::fabs(residual[i]);
+            ranked[g].push_back({a, uint16_t(d)});
+        }
+        std::stable_sort(ranked[g].begin(), ranked[g].end(), [](const ranked_entry & a, const ranked_entry & b) {
+            return a.magnitude > b.magnitude || (a.magnitude == b.magnitude && a.d < b.d);
+        });
+    }
+    struct extra_entry { float magnitude; uint16_t g; uint16_t d; };
+    std::vector<extra_entry> extra;
+    extra.reserve(group);
+    for (uint32_t g = 0; g < group; ++g) {
+        const uint32_t d = ranked[g][10].d;
+        extra.push_back({ranked[g][10].magnitude, uint16_t(g), uint16_t(d)});
+    }
+    std::stable_sort(extra.begin(), extra.end(), [&](const extra_entry & a, const extra_entry & b) {
+        const uint32_t fa = uint32_t(a.g)*head_dim + a.d, fb = uint32_t(b.g)*head_dim + b.d;
+        return a.magnitude > b.magnitude || (a.magnitude == b.magnitude && fa < fb);
+    });
+    std::vector<uint8_t> keep_extra(group, 0);
+    for (uint32_t i = 0; i < 85; ++i) {
+        const extra_entry & candidate = extra[i];
+        keep_extra[candidate.g] = 1;
+    }
+    std::vector<std::vector<std::pair<uint8_t, uint16_t>>> oracle(head_dim);
+    for (uint32_t g = 0; g < group; ++g) {
+        for (uint32_t j = 0; j < 10u + keep_extra[g]; ++j) {
+            const uint32_t d = ranked[g][j].d;
+            oracle[d].push_back({uint8_t(g), f32_to_f16_bits(residual[size_t(g)*head_dim + d])});
+        }
+    }
+    const uint8_t * suffix = body.data() + v_prefix;
+    uint32_t total = 0;
+    float value_err = 0.0f;
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        uint16_t begin;
+        std::memcpy(&begin, suffix + 2*d, sizeof(begin));
+        require(begin == total, "sparse D512 col_start matches independent selection oracle");
+        for (const auto & entry : oracle[d]) {
+            require(suffix[1024 + total] == entry.first, "sparse D512 CSR rows are ascending and exact");
+            uint16_t got;
+            std::memcpy(&got, suffix + 2390 + 2*total, sizeof(got));
+            value_err = std::max(value_err, std::fabs(f16_bits_to_f32(got) - f16_bits_to_f32(entry.second)));
+            ++total;
+        }
+    }
+    require(total == nnz && value_err < 2.0e-4f,
+            "sparse D512 suffix has exactly 1365 independently selected fp16 residuals");
+
+    float * k_out = nullptr, * v_out = nullptr;
+    require_cuda(cudaMalloc(&k_out, n*sizeof(float)), "cudaMalloc sparse D512 K dequant");
+    require_cuda(cudaMalloc(&v_out, n*sizeof(float)), "cudaMalloc sparse D512 V dequant");
+    ggml_cuda_kvarn_dequant_body(kb, vb, ks, vs, k_out, v_out, head_dim, group, 8, 2, 6, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 dequant sync");
+    std::vector<float> decoded(n);
+    require_cuda(cudaMemcpy(decoded.data(), v_out, n*sizeof(float), cudaMemcpyDeviceToHost), "copy sparse D512 dequant");
+    std::vector<float> expected = base_rotated;
+    for (uint32_t d = 0; d < head_dim; ++d) for (const auto & entry : oracle[d]) {
+        expected[size_t(entry.first)*head_dim + d] += f16_bits_to_f32(entry.second);
+    }
+    float dequant_err = 0.0f;
+    for (size_t i = 0; i < n; ++i) dequant_err = std::max(dequant_err, std::fabs(decoded[i] - expected[i]));
+    require(dequant_err < 3.0e-4f, "sparse D512 central dequant explicitly scatters the CSR suffix");
+
+    uint16_t * materialized_d = nullptr, * materialize_dummy_h = nullptr;
+    float * materialize_dummy_f = nullptr;
+    require_cuda(cudaMalloc(&materialized_d, n*sizeof(uint16_t)), "cudaMalloc sparse D512 materialized V");
+    require_cuda(cudaMalloc(&materialize_dummy_h, head_dim*sizeof(uint16_t)), "cudaMalloc sparse D512 materialize half dummy");
+    require_cuda(cudaMalloc(&materialize_dummy_f, head_dim*sizeof(float)), "cudaMalloc sparse D512 materialize float dummy");
+    ggml_cuda_kvarn_materialize_kv_f16(
+            materialize_dummy_h, vb, vs, materialize_dummy_f, materialized_d,
+            1, 0, 1, 0, 0, 0, 1, head_dim, group, 2, 6, 0, nullptr,
+            head_dim, head_dim, v_bytes, v_bytes, vs_n, vs_n,
+            head_dim, head_dim, head_dim, head_dim, nullptr);
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 materialize sync");
+    std::vector<uint16_t> materialized(n);
+    require_cuda(cudaMemcpy(materialized.data(), materialized_d, n*sizeof(uint16_t), cudaMemcpyDeviceToHost),
+            "copy sparse D512 materialized V");
+    for (size_t i = 0; i < n; ++i) {
+        require(materialized[i] == f32_to_f16_bits(decoded[i]),
+                "sparse D512 materialize base-dequantizes then scatters the CSR suffix");
+    }
+
+    constexpr uint32_t n_head = 4;
+    std::vector<float> q(size_t(n_head)*head_dim, 0.0f), attn_ref(size_t(n_head)*head_dim, 0.0f);
+    for (uint32_t h = 0; h < n_head; ++h) for (uint32_t d = 0; d < head_dim; ++d) {
+        for (uint32_t g = 0; g < group; ++g) {
+            attn_ref[size_t(h)*head_dim + d] += expected[size_t(g)*head_dim + d]/float(group);
+        }
+    }
+    float * qd = cuda_upload(q), * outd = nullptr, * scoresd = nullptr, * dummyf = nullptr;
+    uint16_t * dummyh = nullptr;
+    const size_t scores_n = kvarn_test_attn_scores_floats(group, 1, 1, head_dim, group);
+    require_cuda(cudaMalloc(&outd, attn_ref.size()*sizeof(float)), "cudaMalloc sparse D512 attention output");
+    require_cuda(cudaMalloc(&scoresd, scores_n*sizeof(float)), "cudaMalloc sparse D512 attention scores");
+    require_cuda(cudaMalloc(&dummyf, head_dim*sizeof(float)), "cudaMalloc sparse D512 attention dummy float");
+    require_cuda(cudaMalloc(&dummyh, head_dim*sizeof(uint16_t)), "cudaMalloc sparse D512 attention dummy half");
+    set_env_var("LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR", "1");
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            qd, nullptr, dummyh, dummyh, kb, vb, ks, vs, dummyf, dummyf, nullptr,
+            outd, scoresd, 1, n_head, 1, 0, 1, 0, 0, 0, head_dim, group, 8, 2,
+            head_dim, size_t(n_head)*head_dim, head_dim, size_t(n_head)*head_dim,
+            head_dim, head_dim, head_dim, head_dim, head_dim, head_dim,
+            k_bytes, v_bytes, k_bytes, v_bytes, ks_n, vs_n, ks_n, vs_n,
+            0, 0, 0, 1.0f/std::sqrt(float(head_dim)), nullptr,
+            nullptr, int64_t(scores_n), 1, nullptr, 0, 0.0f, 6u);
+    set_env_var("LLAMA_KVARN_ATTN_REQUIRE_Q1_GQA_SCALAR", "");
+    require_cuda(cudaGetLastError(), "sparse D512 scalar-GQA mixed attention launch");
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 scalar-GQA mixed attention sync");
+    std::vector<float> attn(attn_ref.size());
+    require_cuda(cudaMemcpy(attn.data(), outd, attn.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy sparse D512 attention output");
+    float attn_err = 0.0f;
+    for (size_t i = 0; i < attn.size(); ++i) attn_err = std::max(attn_err, std::fabs(attn[i] - attn_ref[i]));
+    require(attn_err < 3.0e-4f, "sparse D512 scalar-GQA attention matches the independent AV reference");
+
+    cudaFree(qd); cudaFree(outd); cudaFree(scoresd); cudaFree(dummyf); cudaFree(dummyh);
+
+    constexpr uint32_t prompt_queries = 5;
+    constexpr uint32_t prompt_pending = 1024;
+    constexpr uint32_t prompt_tokens = group + prompt_pending;
+    constexpr int prompt_block = 256;
+    constexpr size_t prompt_pad_floats = 8;
+    const size_t q8_shmem =
+        (size_t(8)*2*head_dim + size_t(8)*2*prompt_tokens + prompt_block + prompt_pad_floats)*sizeof(float);
+    const size_t q4_shmem =
+        (size_t(4)*2*head_dim + size_t(4)*2*prompt_tokens + prompt_block + prompt_pad_floats)*sizeof(float);
+    int max_optin_shmem = 0;
+    require_cuda(cudaDeviceGetAttribute(&max_optin_shmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0),
+            "query sparse D512 prompt opt-in shared memory");
+    require(q8_shmem > size_t(max_optin_shmem) && q4_shmem <= size_t(max_optin_shmem),
+            "sparse D512 1152-token regression requires QT8 to exceed opt-in shared memory while QT4 fits");
+
+    std::vector<float> prompt_q(size_t(prompt_queries)*n_head*head_dim, 0.0f);
+    std::vector<float> prompt_ref(size_t(prompt_queries)*n_head*head_dim, 0.0f);
+    for (uint32_t iq = 0; iq < prompt_queries; ++iq) {
+        for (uint32_t h = 0; h < n_head; ++h) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float sum = 0.0f;
+                for (uint32_t g = 0; g < group; ++g) {
+                    sum += expected[size_t(g)*head_dim + d]/float(prompt_tokens);
+                }
+                prompt_ref[(size_t(iq)*n_head + h)*head_dim + d] = sum;
+            }
+        }
+    }
+    float * prompt_qd = cuda_upload(prompt_q);
+    float * prompt_outd = nullptr, * prompt_scoresd = nullptr;
+    float * prompt_kd = nullptr, * prompt_vd = nullptr;
+    uint16_t * prompt_dummyh = nullptr;
+    const size_t prompt_scores_n = kvarn_test_attn_scores_floats(prompt_tokens, 1, 1, head_dim, group);
+    require_cuda(cudaMalloc(&prompt_outd, prompt_ref.size()*sizeof(float)),
+            "cudaMalloc sparse D512 1152-token prompt output");
+    require_cuda(cudaMalloc(&prompt_scoresd, prompt_scores_n*sizeof(float)),
+            "cudaMalloc sparse D512 1152-token prompt scores");
+    require_cuda(cudaMalloc(&prompt_kd, size_t(prompt_pending)*head_dim*sizeof(float)),
+            "cudaMalloc sparse D512 1152-token pending K");
+    require_cuda(cudaMalloc(&prompt_vd, size_t(prompt_pending)*head_dim*sizeof(float)),
+            "cudaMalloc sparse D512 1152-token pending V");
+    require_cuda(cudaMalloc(&prompt_dummyh, head_dim*sizeof(uint16_t)),
+            "cudaMalloc sparse D512 1152-token half dummy");
+    require_cuda(cudaMemset(prompt_kd, 0, size_t(prompt_pending)*head_dim*sizeof(float)),
+            "zero sparse D512 1152-token pending K");
+    require_cuda(cudaMemset(prompt_vd, 0, size_t(prompt_pending)*head_dim*sizeof(float)),
+            "zero sparse D512 1152-token pending V");
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            prompt_qd, nullptr, prompt_dummyh, prompt_dummyh, kb, vb, ks, vs,
+            prompt_kd, prompt_vd, nullptr, prompt_outd, prompt_scoresd,
+            prompt_queries, n_head, 1, 0, 1, prompt_pending, 0, 0, head_dim, group, 8, 2,
+            head_dim, size_t(n_head)*head_dim, head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head)*head_dim, head_dim, head_dim, head_dim, head_dim,
+            k_bytes, v_bytes, k_bytes, v_bytes, ks_n, vs_n, ks_n, vs_n,
+            0, 0, 0, 1.0f/std::sqrt(float(head_dim)), nullptr,
+            nullptr, int64_t(prompt_scores_n), 1, nullptr, 0, 0.0f, 6u);
+    require_cuda(cudaGetLastError(), "sparse D512 1152-token QT8-to-QT4 fallback launch");
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 1152-token QT8-to-QT4 fallback sync");
+    std::vector<float> prompt_out(prompt_ref.size());
+    require_cuda(cudaMemcpy(prompt_out.data(), prompt_outd, prompt_out.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy sparse D512 1152-token QT8-to-QT4 fallback output");
+    float prompt_err = 0.0f;
+    size_t prompt_err_i = 0;
+    for (size_t i = 0; i < prompt_out.size(); ++i) {
+        const float err = std::fabs(prompt_out[i] - prompt_ref[i]);
+        if (err > prompt_err) {
+            prompt_err = err;
+            prompt_err_i = i;
+        }
+    }
+    if (prompt_err >= 3.0e-4f) {
+        std::fprintf(stderr,
+                "sparse D512 1152-token QT8-to-QT4 fallback max_err=%g index=%zu got=%g ref=%g\n",
+                double(prompt_err), prompt_err_i, double(prompt_out[prompt_err_i]), double(prompt_ref[prompt_err_i]));
+    }
+    require(prompt_err < 3.0e-4f,
+            "sparse D512 1152-token QT8-to-QT4 fallback matches the independent AV reference");
+    cudaFree(prompt_qd); cudaFree(prompt_outd); cudaFree(prompt_scoresd);
+    cudaFree(prompt_kd); cudaFree(prompt_vd); cudaFree(prompt_dummyh);
+
+    constexpr uint32_t long_pending = 2560;
+    constexpr uint32_t long_tokens = group + long_pending;
+    const size_t long_q4_ht2_shmem =
+        (size_t(4)*2*head_dim + size_t(4)*2*long_tokens + prompt_block + prompt_pad_floats)*sizeof(float);
+    const size_t long_q4_ht1_shmem =
+        (size_t(4)*head_dim + size_t(4)*long_tokens + prompt_block + prompt_pad_floats)*sizeof(float);
+    require(long_tokens == 2688 &&
+            long_q4_ht2_shmem > size_t(max_optin_shmem) &&
+            long_q4_ht1_shmem <= size_t(max_optin_shmem),
+            "sparse D512 2688-token regression requires QT4/HT2 to exceed opt-in shared memory while QT4/HT1 fits");
+
+    std::vector<float> long_ref(size_t(prompt_queries)*n_head*head_dim, 0.0f);
+    for (uint32_t iq = 0; iq < prompt_queries; ++iq) {
+        for (uint32_t h = 0; h < n_head; ++h) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float sum = 0.0f;
+                for (uint32_t g = 0; g < group; ++g) {
+                    sum += expected[size_t(g)*head_dim + d]/float(long_tokens);
+                }
+                long_ref[(size_t(iq)*n_head + h)*head_dim + d] = sum;
+            }
+        }
+    }
+    float * long_qd = cuda_upload(prompt_q);
+    float * long_outd = nullptr, * long_scoresd = nullptr;
+    float * long_kd = nullptr, * long_vd = nullptr;
+    uint16_t * long_dummyh = nullptr;
+    const size_t long_scores_n = kvarn_test_attn_scores_floats(long_tokens, 1, 1, head_dim, group);
+    require_cuda(cudaMalloc(&long_outd, long_ref.size()*sizeof(float)),
+            "cudaMalloc sparse D512 2688-token prompt output");
+    require_cuda(cudaMalloc(&long_scoresd, long_scores_n*sizeof(float)),
+            "cudaMalloc sparse D512 2688-token prompt scores");
+    require_cuda(cudaMalloc(&long_kd, size_t(long_pending)*head_dim*sizeof(float)),
+            "cudaMalloc sparse D512 2688-token pending K");
+    require_cuda(cudaMalloc(&long_vd, size_t(long_pending)*head_dim*sizeof(float)),
+            "cudaMalloc sparse D512 2688-token pending V");
+    require_cuda(cudaMalloc(&long_dummyh, head_dim*sizeof(uint16_t)),
+            "cudaMalloc sparse D512 2688-token half dummy");
+    require_cuda(cudaMemset(long_kd, 0, size_t(long_pending)*head_dim*sizeof(float)),
+            "zero sparse D512 2688-token pending K");
+    require_cuda(cudaMemset(long_vd, 0, size_t(long_pending)*head_dim*sizeof(float)),
+            "zero sparse D512 2688-token pending V");
+    ggml_cuda_kvarn_attn_mixed_f16_batch(
+            long_qd, nullptr, long_dummyh, long_dummyh, kb, vb, ks, vs,
+            long_kd, long_vd, nullptr, long_outd, long_scoresd,
+            prompt_queries, n_head, 1, 0, 1, long_pending, 0, 0, head_dim, group, 8, 2,
+            head_dim, size_t(n_head)*head_dim, head_dim, size_t(n_head)*head_dim,
+            head_dim, size_t(n_head)*head_dim, head_dim, head_dim, head_dim, head_dim,
+            k_bytes, v_bytes, k_bytes, v_bytes, ks_n, vs_n, ks_n, vs_n,
+            0, 0, 0, 1.0f/std::sqrt(float(head_dim)), nullptr,
+            nullptr, int64_t(long_scores_n), 1, nullptr, 0, 0.0f, 6u);
+    require_cuda(cudaGetLastError(), "sparse D512 2688-token QT4/HT2-to-HT1 fallback launch");
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 2688-token QT4/HT2-to-HT1 fallback sync");
+    std::vector<float> long_out(long_ref.size());
+    require_cuda(cudaMemcpy(long_out.data(), long_outd, long_out.size()*sizeof(float), cudaMemcpyDeviceToHost),
+            "copy sparse D512 2688-token QT4/HT2-to-HT1 fallback output");
+    float long_err = 0.0f;
+    size_t long_err_i = 0;
+    for (size_t i = 0; i < long_out.size(); ++i) {
+        const float err = std::fabs(long_out[i] - long_ref[i]);
+        if (err > long_err) {
+            long_err = err;
+            long_err_i = i;
+        }
+    }
+    if (long_err >= 3.0e-4f) {
+        std::fprintf(stderr,
+                "sparse D512 2688-token QT4/HT2-to-HT1 fallback max_err=%g index=%zu got=%g ref=%g\n",
+                double(long_err), long_err_i, double(long_out[long_err_i]), double(long_ref[long_err_i]));
+    }
+    require(long_err < 3.0e-4f,
+            "sparse D512 2688-token QT4/HT2-to-HT1 fallback matches the independent AV reference");
+    cudaFree(long_qd); cudaFree(long_outd); cudaFree(long_scoresd);
+    cudaFree(long_kd); cudaFree(long_vd); cudaFree(long_dummyh);
+
+    std::vector<float> zero_v(n, 0.0f);
+    require_cuda(cudaMemcpy(vd, zero_v.data(), n*sizeof(float), cudaMemcpyHostToDevice),
+            "upload sparse D512 zero-tie input");
+    require_cuda(cudaMemset(vb, 0xa5, v_bytes), "poison sparse D512 zero-tie V body");
+    require_cuda(cudaMemset(vb_repeat, 0x5a, v_bytes), "poison sparse D512 zero-tie repeat V body");
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_v_body_reference_minmax(
+            vd, vb, vs, scratch, head_dim, group, 2, 4, 1.0f, 6, false, nullptr);
+    ggml_cuda_kvarn_store_v_body_reference_minmax(
+            vd, vb_repeat, vs_repeat, scratch, head_dim, group, 2, 4, 1.0f, 6, false, nullptr);
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 zero-tie stores sync");
+    require_cuda(cudaMemcpy(body.data(), vb, v_bytes, cudaMemcpyDeviceToHost),
+            "copy sparse D512 zero-tie body");
+    require_cuda(cudaMemcpy(repeat.data(), vb_repeat, v_bytes, cudaMemcpyDeviceToHost),
+            "copy sparse D512 zero-tie repeat body");
+    require(body == repeat, "sparse D512 zero-tie selection is deterministic across poisoned outputs");
+    const uint8_t * zero_suffix = body.data() + v_prefix;
+    const auto zero_col_start = [&](uint32_t d) {
+        uint16_t start;
+        std::memcpy(&start, zero_suffix + 2*d, sizeof(start));
+        return uint32_t(start);
+    };
+    for (uint32_t d = 0; d < head_dim; ++d) {
+        const uint32_t expected_start = d <= 10 ? 128*d : 1365;
+        require(zero_col_start(d) == expected_start,
+                "sparse D512 absolute-residual ties prefer lower flat indices");
+    }
+    for (uint32_t i = 0; i < 85; ++i) {
+        require(zero_suffix[1024 + 1280 + i] == i,
+                "sparse D512 absolute-residual ties keep rows in flat order");
+    }
+
+    cudaFree(materialized_d); cudaFree(materialize_dummy_h); cudaFree(materialize_dummy_f);
+    cudaFree(k_out); cudaFree(v_out); cudaFree(kd); cudaFree(vd); cudaFree(scratch);
+    cudaFree(kb); cudaFree(vb); cudaFree(vb_repeat); cudaFree(ks); cudaFree(vs); cudaFree(vs_repeat);
+}
+
+static void test_sparse_d512_direct_and_pending_record() {
+    constexpr uint32_t head_dim = 512, group = 128, record_capacity = 3, record = 1;
+    constexpr size_t n = size_t(head_dim)*group, k_bytes = n, v_bytes = 21504;
+    constexpr size_t ks_n = 2*head_dim + group, vs_n = head_dim + 2*group;
+    constexpr uint8_t poison = 0xa5;
+    std::vector<float> k(n), v(n);
+    for (uint32_t g = 0; g < group; ++g) for (uint32_t d = 0; d < head_dim; ++d) {
+        k[size_t(g)*head_dim + d] = 0.017f*std::sin(float(7*d + 31*g)*0.009f);
+        v[size_t(g)*head_dim + d] = 0.038f*std::cos(float(11*d + 13*g)*0.007f);
+    }
+    float * kd = cuda_upload(k), * vd = cuda_upload(v), * scratch = nullptr;
+    uint8_t * kb_direct = nullptr, * vb_direct = nullptr, * kb_pending = nullptr, * vb_pending = nullptr;
+    float * ks_direct = nullptr, * vs_direct = nullptr, * ks_pending = nullptr, * vs_pending = nullptr;
+    const size_t per = n + 2*head_dim + head_dim + group + 2;
+    const size_t scratch_n = 3*n + 2*per;
+    require_cuda(cudaMalloc(&scratch, scratch_n*sizeof(float)), "cudaMalloc sparse D512 family scratch");
+    require_cuda(cudaMalloc(&kb_direct, k_bytes), "cudaMalloc sparse D512 direct K");
+    require_cuda(cudaMalloc(&vb_direct, v_bytes), "cudaMalloc sparse D512 direct V");
+    require_cuda(cudaMalloc(&ks_direct, ks_n*sizeof(float)), "cudaMalloc sparse D512 direct K scales");
+    require_cuda(cudaMalloc(&vs_direct, vs_n*sizeof(float)), "cudaMalloc sparse D512 direct V scales");
+    require_cuda(cudaMalloc(&kb_pending, record_capacity*k_bytes), "cudaMalloc sparse D512 pending K");
+    require_cuda(cudaMalloc(&vb_pending, record_capacity*v_bytes), "cudaMalloc sparse D512 pending V");
+    require_cuda(cudaMalloc(&ks_pending, record_capacity*ks_n*sizeof(float)), "cudaMalloc sparse D512 pending K scales");
+    require_cuda(cudaMalloc(&vs_pending, record_capacity*vs_n*sizeof(float)), "cudaMalloc sparse D512 pending V scales");
+    require_cuda(cudaMemset(kb_direct, 0x5a, k_bytes), "poison sparse D512 direct K");
+    require_cuda(cudaMemset(vb_direct, 0x5a, v_bytes), "poison sparse D512 direct V");
+    require_cuda(cudaMemset(kb_pending, poison, record_capacity*k_bytes), "poison sparse D512 pending K");
+    require_cuda(cudaMemset(vb_pending, poison, record_capacity*v_bytes), "poison sparse D512 pending V");
+    set_paper_frame_env(true);
+    ggml_cuda_kvarn_store_body_direct_records_minmax(
+            kd, vd, kb_direct, vb_direct, ks_direct, vs_direct, scratch,
+            1, 1, head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_bytes, k_bytes, v_bytes, ks_n, vs_n, ks_n, vs_n,
+            head_dim, head_dim, head_dim, head_dim, n, n,
+            scratch_n, 6, nullptr);
+    require_cuda(cudaGetLastError(), "sparse D512 direct store launch");
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 direct store sync");
+    const int32_t record_index = record;
+    ggml_cuda_kvarn_store_body_pending_records_minmax(
+            kd, vd, kb_pending, vb_pending, ks_pending, vs_pending, scratch,
+            &record_index, 1, head_dim, group, 8, 2, 4, 1.0f,
+            k_bytes, v_bytes, record_capacity*k_bytes, record_capacity*v_bytes,
+            ks_n, vs_n, record_capacity*ks_n, record_capacity*vs_n,
+            head_dim, head_dim, 6, false, nullptr);
+    require_cuda(cudaGetLastError(), "sparse D512 pending-record store launch");
+    clear_paper_frame_env();
+    require_cuda(cudaDeviceSynchronize(), "sparse D512 direct/pending stores sync");
+    std::vector<uint8_t> direct_k(k_bytes), direct_v(v_bytes);
+    std::vector<uint8_t> pending_k(record_capacity*k_bytes), pending_v(record_capacity*v_bytes);
+    require_cuda(cudaMemcpy(direct_k.data(), kb_direct, k_bytes, cudaMemcpyDeviceToHost), "copy sparse D512 direct K");
+    require_cuda(cudaMemcpy(direct_v.data(), vb_direct, v_bytes, cudaMemcpyDeviceToHost), "copy sparse D512 direct V");
+    require_cuda(cudaMemcpy(pending_k.data(), kb_pending, pending_k.size(), cudaMemcpyDeviceToHost), "copy sparse D512 pending K");
+    require_cuda(cudaMemcpy(pending_v.data(), vb_pending, pending_v.size(), cudaMemcpyDeviceToHost), "copy sparse D512 pending V");
+    auto require_sparse_suffix = [&](const uint8_t * body, const char * message) {
+        const uint8_t * suffix = body + n/4;
+        uint16_t previous = 0;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            uint16_t start;
+            std::memcpy(&start, suffix + 2*d, sizeof(start));
+            require(start >= previous && start <= 1365, message);
+            previous = start;
+        }
+        require(suffix[2389] == 0, message);
+    };
+    require_sparse_suffix(direct_v.data(), "sparse D512 direct store writes a valid complete suffix");
+    require_sparse_suffix(pending_v.data() + record*v_bytes,
+            "sparse D512 pending-record store writes a valid complete suffix");
+    require(std::any_of(direct_k.begin(), direct_k.end(), [](uint8_t x) { return x != 0x5a; }),
+            "sparse D512 direct store overwrites poisoned K bytes");
+    for (uint32_t r = 0; r < record_capacity; ++r) if (r != record) {
+        require(std::all_of(pending_k.begin() + size_t(r)*k_bytes, pending_k.begin() + size_t(r + 1)*k_bytes,
+                    [poison](uint8_t x) { return x == poison; }), "sparse D512 pending-record K preserves neighbors");
+        require(std::all_of(pending_v.begin() + size_t(r)*v_bytes, pending_v.begin() + size_t(r + 1)*v_bytes,
+                    [poison](uint8_t x) { return x == poison; }), "sparse D512 pending-record V preserves neighbors");
+    }
+    cudaFree(kd); cudaFree(vd); cudaFree(scratch);
+    cudaFree(kb_direct); cudaFree(vb_direct); cudaFree(ks_direct); cudaFree(vs_direct);
+    cudaFree(kb_pending); cudaFree(vb_pending); cudaFree(ks_pending); cudaFree(vs_pending);
+}
+
 int main() {
+    const char * sparse_families_only = std::getenv("LLAMA_KVARN_TEST_SPARSE_D512_FAMILIES_ONLY");
+    if (sparse_families_only != nullptr && std::strcmp(sparse_families_only, "0") != 0) {
+        test_sparse_d512_direct_and_pending_record();
+        return 0;
+    }
+    const char * sparse_heads_only = std::getenv("LLAMA_KVARN_TEST_SPARSE_D512_HEADS_ONLY");
+    if (sparse_heads_only != nullptr && std::strcmp(sparse_heads_only, "0") != 0) {
+        test_legacy_residual_pending_heads_strided_record_view(6);
+        return 0;
+    }
+    const char * sparse_only = std::getenv("LLAMA_KVARN_TEST_SPARSE_D512_ONLY");
+    if (sparse_only != nullptr && std::strcmp(sparse_only, "0") != 0) {
+        test_sparse_d512_store_dequant_attention();
+        test_sparse_d512_direct_and_pending_record();
+        test_legacy_residual_pending_heads_strided_record_view(6);
+        return 0;
+    }
+    const char * r1_only = std::getenv("LLAMA_KVARN_TEST_R1_ONLY");
+    if (r1_only != nullptr && std::strcmp(r1_only, "0") != 0) {
+        test_legacy_r1_store_dequant(256);
+        test_legacy_r1_store_dequant(512);
+        test_legacy_r2_store_dequant(256);
+        test_legacy_r2_store_dequant(512);
+        test_legacy_r3_store_dequant(256);
+        test_legacy_r3_store_dequant(512);
+        test_legacy_r1_direct_batched();
+        test_legacy_residual_pending_heads_strided_record_view(3);
+        test_legacy_residual_pending_heads_strided_record_view(4);
+        test_legacy_residual_pending_heads_strided_record_view(5);
+        test_legacy_r3_pending_record_mixed_norm_controls();
+        return 0;
+    }
     const char * materialize_only = std::getenv("LLAMA_KVARN_TEST_MATERIALIZE_ONLY");
     if (materialize_only != nullptr && std::strcmp(materialize_only, "0") != 0) {
         test_materialize_kv_window(8, 8);
@@ -5447,6 +7096,20 @@ int main() {
     test_materialize_kv_window(8, 8);
     test_materialize_kv_window(8, 2);
     test_raw_mirror_exact_key_lifecycle();
+    test_legacy_r1_store_dequant(256);
+    test_legacy_r1_store_dequant(512);
+    test_legacy_r2_store_dequant(256);
+    test_legacy_r2_store_dequant(512);
+    test_legacy_r3_store_dequant(256);
+    test_legacy_r3_store_dequant(512);
+    test_legacy_r1_direct_batched();
+    test_legacy_residual_pending_heads_strided_record_view(3);
+    test_legacy_residual_pending_heads_strided_record_view(4);
+    test_legacy_residual_pending_heads_strided_record_view(5);
+    test_legacy_r3_pending_record_mixed_norm_controls();
+    test_sparse_d512_store_dequant_attention();
+    test_sparse_d512_direct_and_pending_record();
+    test_legacy_residual_pending_heads_strided_record_view(6);
     const char * run_turbo_v_tests = std::getenv("LLAMA_KVARN_RUN_TURBO_V_TESTS");
     if (run_turbo_v_tests != nullptr && std::strcmp(run_turbo_v_tests, "0") != 0) {
         test_experimental_turbo_v_codec(128, 4, false);

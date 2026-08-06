@@ -1794,6 +1794,21 @@ extern "C" {
                    int32_t        sinkhorn_iters,
                    float          rtn_quantile);
 
+    enum ggml_kvarn_v_layout {
+        GGML_KVARN_V_LAYOUT_LEGACY          = 0,
+        GGML_KVARN_V_LAYOUT_TURBO_CANONICAL = 1,
+        // Standard asymmetric V quantization followed by a rank-one residual
+        // suffix: fp16 u[128], then fp16 w[head_dim].
+        GGML_KVARN_V_LAYOUT_LEGACY_R1       = 2,
+        // Standard asymmetric V quantization followed by two rank-one
+        // residual suffixes: fp16 u[128], fp16 w[head_dim], repeated twice.
+        GGML_KVARN_V_LAYOUT_LEGACY_R2       = 3,
+        // Standard asymmetric V quantization followed by three rank-one
+        // residual suffixes: fp16 u[128], fp16 w[head_dim], repeated three times.
+        GGML_KVARN_V_LAYOUT_LEGACY_R3       = 4,
+        GGML_KVARN_V_LAYOUT_SPARSE_R3       = 5,
+    };
+
     GGML_API void ggml_kvarn_store_body_set_v_layout(
             struct ggml_tensor * store,
                    int32_t       v_layout);

@@ -576,5 +576,6 @@ inline void ggml_cuda_kvarn_attn_mixed_f16_batch(
             k_scale_stride_head_floats, v_scale_stride_head_floats,
             kq_mask_stride_query_bytes, kq_mask_stride_token_bytes,
             kq_mask_type, scale,
-            stream, window_dev, scores_nelems, k_body_records_cap, raw_body_store_key, frame_flags, logit_softcap, turbo_v_mode);
+            stream, window_dev, scores_nelems, k_body_records_cap, raw_body_store_key, frame_flags, logit_softcap,
+            turbo_v_mode);
 }

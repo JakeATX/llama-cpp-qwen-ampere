@@ -188,6 +188,8 @@ int main(void) {
     assert(params.kvarn.key_bits == 2);
     assert(params.kvarn.value_bits == 2);
     assert(params.kvarn.group_size == 128);
+    assert(params.kvarn.value_residual_rank == 0);
+    assert(params.kvarn.value_sparse_residual == 0);
 
     argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_g128"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
@@ -195,6 +197,47 @@ int main(void) {
     assert(params.kvarn.key_bits == 8);
     assert(params.kvarn.value_bits == 2);
     assert(params.kvarn.group_size == 128);
+    assert(params.kvarn.value_residual_rank == 0);
+    assert(params.kvarn.value_sparse_residual == 0);
+
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_r1_g128"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kvarn.key_bits == 8);
+    assert(params.kvarn.value_bits == 2);
+    assert(params.kvarn.group_size == 128);
+    assert(params.kvarn.value_residual_rank == 1);
+    assert(params.kvarn.value_sparse_residual == 0);
+
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_r2_g128"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kvarn.key_bits == 8);
+    assert(params.kvarn.value_bits == 2);
+    assert(params.kvarn.group_size == 128);
+    assert(params.kvarn.value_residual_rank == 2);
+    assert(params.kvarn.value_sparse_residual == 0);
+
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_r3_g128"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kvarn.key_bits == 8);
+    assert(params.kvarn.value_bits == 2);
+    assert(params.kvarn.group_size == 128);
+    assert(params.kvarn.value_residual_rank == 3);
+    assert(params.kvarn.value_sparse_residual == 0);
+
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_r3s_g128"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kvarn.key_bits == 8);
+    assert(params.kvarn.value_bits == 2);
+    assert(params.kvarn.group_size == 128);
+    assert(params.kvarn.value_residual_rank == 3);
+    assert(params.kvarn.value_sparse_residual == 1);
+
+    params = {};
+    argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-preset", "kvarn_k8v2_r4_g128"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     params = {};
     argv = {"binary_name", "--kv-cache-quant", "kvarn", "--kvarn-rtn-quantile", "0"};
