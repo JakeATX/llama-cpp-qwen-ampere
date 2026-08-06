@@ -2244,17 +2244,18 @@ static __global__ void kvarn_sinkhorn_rows_logstd_parallel_kernel(
         return;
     }
 
-    float local_sum = 0.0f;
-    float local_ss  = 0.0f;
+    double local_sum = 0.0;
+    double local_ss  = 0.0;
     for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
         const float v = data[size_t(r)*cols + c];
-        local_sum += v;
-        local_ss  += v*v;
+        const double vd = double(v);
+        local_sum += vd;
+        local_ss  += vd*vd;
     }
 
-    extern __shared__ float shmem[];
-    float * sum_sh = shmem;
-    float * ss_sh  = shmem + blockDim.x;
+    extern __shared__ double logstd_shmem[];
+    double * sum_sh = logstd_shmem;
+    double * ss_sh  = logstd_shmem + blockDim.x;
     sum_sh[threadIdx.x] = local_sum;
     ss_sh[threadIdx.x]  = local_ss;
     __syncthreads();
@@ -2268,20 +2269,20 @@ static __global__ void kvarn_sinkhorn_rows_logstd_parallel_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const float n = float(cols);
-        float var = 0.0f;
+        const double n = double(cols);
+        double var = 0.0;
         if (cols > 1) {
-            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(cols - 1);
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/double(cols - 1);
         }
-        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const double stdv = sqrt(fmax(0.0, var));
         const float prev = init_scale != 0 ? 1.0f : row_scale[r];
-        const float next = kvarn_logstd_update_scale(prev, stdv);
+        const float next = kvarn_logstd_update_scale(prev, float(stdv));
         row_scale[r] = next;
-        sum_sh[0] = prev/next;
+        sum_sh[0] = double(prev/next);
     }
     __syncthreads();
 
-    const float factor = sum_sh[0];
+    const float factor = float(sum_sh[0]);
     for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
         data[size_t(r)*cols + c] *= factor;
     }
@@ -2298,17 +2299,18 @@ static __global__ void kvarn_sinkhorn_cols_logstd_parallel_kernel(
         return;
     }
 
-    float local_sum = 0.0f;
-    float local_ss  = 0.0f;
+    double local_sum = 0.0;
+    double local_ss  = 0.0;
     for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
         const float v = data[size_t(r)*cols + c];
-        local_sum += v;
-        local_ss  += v*v;
+        const double vd = double(v);
+        local_sum += vd;
+        local_ss  += vd*vd;
     }
 
-    extern __shared__ float shmem[];
-    float * sum_sh = shmem;
-    float * ss_sh  = shmem + blockDim.x;
+    extern __shared__ double logstd_shmem[];
+    double * sum_sh = logstd_shmem;
+    double * ss_sh  = logstd_shmem + blockDim.x;
     sum_sh[threadIdx.x] = local_sum;
     ss_sh[threadIdx.x]  = local_ss;
     __syncthreads();
@@ -2322,20 +2324,20 @@ static __global__ void kvarn_sinkhorn_cols_logstd_parallel_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const float n = float(rows);
-        float var = 0.0f;
+        const double n = double(rows);
+        double var = 0.0;
         if (rows > 1) {
-            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(rows - 1);
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/double(rows - 1);
         }
-        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const double stdv = sqrt(fmax(0.0, var));
         const float prev = init_scale != 0 ? 1.0f : col_scale[c];
-        const float next = kvarn_logstd_update_scale(prev, stdv);
+        const float next = kvarn_logstd_update_scale(prev, float(stdv));
         col_scale[c] = next;
-        sum_sh[0] = prev/next;
+        sum_sh[0] = double(prev/next);
     }
     __syncthreads();
 
-    const float factor = sum_sh[0];
+    const float factor = float(sum_sh[0]);
     for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
         data[size_t(r)*cols + c] *= factor;
     }
@@ -2636,7 +2638,7 @@ static void kvarn_sinkhorn_variance_normalize_parallel(
                 data, row_scale, col_scale, best_row_scale, best_col_scale, best_imbalance,
                 rows, cols);
 
-        const size_t logstd_shmem = size_t(2*block)*sizeof(float);
+        const size_t logstd_shmem = size_t(2*block)*sizeof(double);
         for (uint32_t iter = 0; iter < iters; ++iter) {
             kvarn_sinkhorn_cols_logstd_parallel_kernel<<<int(cols), block, logstd_shmem, stream>>>(data, col_scale, rows, cols, 0);
             kvarn_sinkhorn_rows_logstd_parallel_kernel<<<int(rows), block, logstd_shmem, stream>>>(data, row_scale, rows, cols, 0);
@@ -2899,17 +2901,18 @@ static __global__ void kvarn_sinkhorn_rows_logstd_batched_kernel(
     float * row_scale = row_scale_base + size_t(ih)*scale_head_stride_floats +
         size_t(record)*scale_record_stride_floats;
 
-    float local_sum = 0.0f;
-    float local_ss  = 0.0f;
+    double local_sum = 0.0;
+    double local_ss  = 0.0;
     for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
         const float v = tile_data[size_t(r)*cols + c];
-        local_sum += v;
-        local_ss  += v*v;
+        const double vd = double(v);
+        local_sum += vd;
+        local_ss  += vd*vd;
     }
 
-    extern __shared__ float shmem[];
-    float * sum_sh = shmem;
-    float * ss_sh  = shmem + blockDim.x;
+    extern __shared__ double logstd_shmem[];
+    double * sum_sh = logstd_shmem;
+    double * ss_sh  = logstd_shmem + blockDim.x;
     sum_sh[threadIdx.x] = local_sum;
     ss_sh[threadIdx.x]  = local_ss;
     __syncthreads();
@@ -2923,20 +2926,20 @@ static __global__ void kvarn_sinkhorn_rows_logstd_batched_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const float n = float(cols);
-        float var = 0.0f;
+        const double n = double(cols);
+        double var = 0.0;
         if (cols > 1) {
-            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(cols - 1);
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/double(cols - 1);
         }
-        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const double stdv = sqrt(fmax(0.0, var));
         const float prev = init_scale != 0 ? 1.0f : row_scale[r];
-        const float next = kvarn_logstd_update_scale(prev, stdv);
+        const float next = kvarn_logstd_update_scale(prev, float(stdv));
         row_scale[r] = next;
-        sum_sh[0] = prev/next;
+        sum_sh[0] = double(prev/next);
     }
     __syncthreads();
 
-    const float factor = sum_sh[0];
+    const float factor = float(sum_sh[0]);
     for (uint32_t c = threadIdx.x; c < cols; c += blockDim.x) {
         tile_data[size_t(r)*cols + c] *= factor;
     }
@@ -2959,17 +2962,18 @@ static __global__ void kvarn_sinkhorn_cols_logstd_batched_kernel(
     float * col_scale = col_scale_base + size_t(ih)*scale_head_stride_floats +
         size_t(record)*scale_record_stride_floats;
 
-    float local_sum = 0.0f;
-    float local_ss  = 0.0f;
+    double local_sum = 0.0;
+    double local_ss  = 0.0;
     for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
         const float v = tile_data[size_t(r)*cols + c];
-        local_sum += v;
-        local_ss  += v*v;
+        const double vd = double(v);
+        local_sum += vd;
+        local_ss  += vd*vd;
     }
 
-    extern __shared__ float shmem[];
-    float * sum_sh = shmem;
-    float * ss_sh  = shmem + blockDim.x;
+    extern __shared__ double logstd_shmem[];
+    double * sum_sh = logstd_shmem;
+    double * ss_sh  = logstd_shmem + blockDim.x;
     sum_sh[threadIdx.x] = local_sum;
     ss_sh[threadIdx.x]  = local_ss;
     __syncthreads();
@@ -2983,20 +2987,20 @@ static __global__ void kvarn_sinkhorn_cols_logstd_batched_kernel(
     }
 
     if (threadIdx.x == 0) {
-        const float n = float(rows);
-        float var = 0.0f;
+        const double n = double(rows);
+        double var = 0.0;
         if (rows > 1) {
-            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/float(rows - 1);
+            var = (ss_sh[0] - (sum_sh[0]*sum_sh[0])/n)/double(rows - 1);
         }
-        const float stdv = sqrtf(fmaxf(0.0f, var));
+        const double stdv = sqrt(fmax(0.0, var));
         const float prev = init_scale != 0 ? 1.0f : col_scale[c];
-        const float next = kvarn_logstd_update_scale(prev, stdv);
+        const float next = kvarn_logstd_update_scale(prev, float(stdv));
         col_scale[c] = next;
-        sum_sh[0] = prev/next;
+        sum_sh[0] = double(prev/next);
     }
     __syncthreads();
 
-    const float factor = sum_sh[0];
+    const float factor = float(sum_sh[0]);
     for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
         tile_data[size_t(r)*cols + c] *= factor;
     }
@@ -3188,7 +3192,7 @@ static void kvarn_sinkhorn_variance_normalize_batched(
                 n_tiles, n_heads, rows, cols,
                 scale_record_stride_floats, scale_head_stride_floats);
 
-        const size_t logstd_shmem = size_t(2*block)*sizeof(float);
+        const size_t logstd_shmem = size_t(2*block)*sizeof(double);
         for (uint32_t iter = 0; iter < iters; ++iter) {
             kvarn_sinkhorn_cols_logstd_batched_kernel<<<int(n_tiles*cols), block, logstd_shmem, stream>>>(
                     data, col_scale_base, n_heads, rows, cols,

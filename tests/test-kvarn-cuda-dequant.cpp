@@ -58,6 +58,23 @@ struct scoped_env_clear {
     }
 };
 
+struct scoped_env_override {
+    std::string name;
+    std::string value;
+    bool existed;
+
+    scoped_env_override(const char * env_name, const char * replacement) :
+        name(env_name),
+        value(std::getenv(env_name) == nullptr ? "" : std::getenv(env_name)),
+        existed(std::getenv(env_name) != nullptr) {
+        set_env_var(name.c_str(), replacement);
+    }
+
+    ~scoped_env_override() {
+        set_env_var(name.c_str(), existed ? value.c_str() : "");
+    }
+};
+
 static void set_paper_frame_env(bool enabled) {
     set_env_var("LLAMA_KVARN_ENABLE_PAPER_FRAME", enabled ? "1" : "");
     set_env_var("LLAMA_KVARN_DISABLE_PAPER_FRAME", enabled ? "" : "1");
@@ -6031,6 +6048,300 @@ static void test_deep_standard_packed_k8v2_numerical_dispatch() {
     test_deep_standard_packed_k8v2_numerical_dispatch_case(512, 4, 2);
 }
 
+static void test_logstd_varn_reduction_parity() {
+    constexpr uint32_t head_dim = 256;
+    constexpr uint32_t group = 128;
+    constexpr uint32_t n_heads = 2;
+    constexpr uint32_t n_records = 2;
+    constexpr uint32_t timing_repeats = 8;
+    const size_t n = size_t(head_dim)*group;
+
+    const scoped_env_override enable_logstd("LLAMA_KVARN_ENABLE_LOG_STD_SINKHORN", "1");
+    const scoped_env_override keep_logstd("LLAMA_KVARN_DISABLE_LOG_STD_SINKHORN", "");
+    const scoped_env_override disable_global("LLAMA_KVARN_DISABLE_GLOBAL_NORM", "1");
+    const scoped_env_override enable_frame("LLAMA_KVARN_ENABLE_PAPER_FRAME", "1");
+    const scoped_env_override keep_frame("LLAMA_KVARN_DISABLE_PAPER_FRAME", "");
+    const scoped_env_override keep_mixed_frame("LLAMA_KVARN_PAPER_MIXED_FRAME", "");
+    const scoped_env_override keep_direct("LLAMA_KVARN_DISABLE_DIRECT_RECORD_BATCH_PHASES", "");
+    const scoped_env_override require_direct("LLAMA_KVARN_REQUIRE_DIRECT_RECORD_BATCH_PHASES", "1");
+
+    llama_kvarn_params params = llama_kvarn_default_params();
+    params.key_bits = 8;
+    params.value_bits = 2;
+    params.sinkhorn_iters = 4;
+    params.rtn_quantile = 1.0f;
+    const llama_kvarn_layout layout = llama_kvarn_make_layout(params, head_dim);
+
+    const auto make_frame = [&](uint32_t ih, uint32_t record,
+                                std::vector<float> & k_frame,
+                                std::vector<float> & v_frame) {
+        k_frame.resize(n);
+        v_frame.resize(n);
+        const float phase = 0.37f*float(ih) + 0.53f*float(record);
+        for (uint32_t g = 0; g < group; ++g) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                k_frame[size_t(d)*group + g] =
+                    1000.0f +
+                    std::sin(0.13f*float(d) + 0.17f*float(g) + phase) +
+                    0.3f*std::cos(0.07f*float(d) - 0.11f*float(g) + 0.5f*phase);
+                v_frame[size_t(g)*head_dim + d] =
+                    900.0f +
+                    0.9f*std::cos(0.09f*float(d) + 0.15f*float(g) + phase) -
+                    0.4f*std::sin(0.05f*float(d) - 0.19f*float(g) + 0.25f*phase);
+            }
+        }
+    };
+
+    struct parity_stats {
+        size_t packed_diff = 0;
+        float scale_abs = 0.0f;
+        float scale_rel = 0.0f;
+        float dequant_max = 0.0f;
+        double dequant_nmse = 0.0;
+    };
+    const auto compare_record = [&](const llama_kvarn_body_record & reference,
+                                    const uint8_t * k_body,
+                                    const uint8_t * v_body,
+                                    const float * k_scales,
+                                    const float * v_scales) {
+        parity_stats stats;
+        llama_kvarn_body_record got;
+        got.layout = layout;
+        got.k_body.assign(k_body, k_body + layout.k_body_bytes);
+        got.v_body.assign(v_body, v_body + layout.v_body_bytes);
+        got.k_scales.assign(k_scales, k_scales + layout.k_scale_floats);
+        got.v_scales.assign(v_scales, v_scales + layout.v_scale_floats);
+        for (size_t i = 0; i < layout.k_body_bytes; ++i) {
+            stats.packed_diff += got.k_body[i] != reference.k_body[i] ? 1 : 0;
+        }
+        for (size_t i = 0; i < layout.v_body_bytes; ++i) {
+            stats.packed_diff += got.v_body[i] != reference.v_body[i] ? 1 : 0;
+        }
+        for (size_t i = 0; i < layout.k_scale_floats; ++i) {
+            const float err = std::fabs(got.k_scales[i] - reference.k_scales[i]);
+            stats.scale_abs = std::max(stats.scale_abs, err);
+            stats.scale_rel = std::max(stats.scale_rel,
+                    err/std::max(std::fabs(reference.k_scales[i]), 1.0e-6f));
+        }
+        for (size_t i = 0; i < layout.v_scale_floats; ++i) {
+            const float err = std::fabs(got.v_scales[i] - reference.v_scales[i]);
+            stats.scale_abs = std::max(stats.scale_abs, err);
+            stats.scale_rel = std::max(stats.scale_rel,
+                    err/std::max(std::fabs(reference.v_scales[i]), 1.0e-6f));
+        }
+        std::vector<float> ref_k, ref_v, got_k, got_v;
+        llama_kvarn_dequant_reference(reference, ref_k, ref_v);
+        llama_kvarn_dequant_reference(got, got_k, got_v);
+        double error_ss = 0.0;
+        double ref_ss = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            for (const auto pair : { std::pair<float, float>{ got_k[i], ref_k[i] },
+                                     std::pair<float, float>{ got_v[i], ref_v[i] } }) {
+                const double err = double(pair.first) - double(pair.second);
+                stats.dequant_max = std::max(stats.dequant_max, float(std::fabs(err)));
+                error_ss += err*err;
+                ref_ss += double(pair.second)*double(pair.second);
+            }
+        }
+        stats.dequant_nmse = error_ss/std::max(ref_ss, 1.0e-30);
+        return stats;
+    };
+    const auto merge_stats = [](parity_stats & dst, const parity_stats & src) {
+        dst.packed_diff += src.packed_diff;
+        dst.scale_abs = std::max(dst.scale_abs, src.scale_abs);
+        dst.scale_rel = std::max(dst.scale_rel, src.scale_rel);
+        dst.dequant_max = std::max(dst.dequant_max, src.dequant_max);
+        dst.dequant_nmse = std::max(dst.dequant_nmse, src.dequant_nmse);
+    };
+    const auto time_launch = [&](const std::function<void()> & launch) {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        require_cuda(cudaEventCreate(&start), "create VarN timing start event");
+        require_cuda(cudaEventCreate(&stop), "create VarN timing stop event");
+        launch();
+        require_cuda(cudaDeviceSynchronize(), "warm VarN timing launch");
+        require_cuda(cudaEventRecord(start), "record VarN timing start");
+        for (uint32_t i = 0; i < timing_repeats; ++i) {
+            launch();
+        }
+        require_cuda(cudaEventRecord(stop), "record VarN timing stop");
+        require_cuda(cudaEventSynchronize(stop), "sync VarN timing stop");
+        float elapsed_ms = 0.0f;
+        require_cuda(cudaEventElapsedTime(&elapsed_ms, start, stop), "read VarN timing");
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        return elapsed_ms/float(timing_repeats);
+    };
+
+    std::vector<float> single_k;
+    std::vector<float> single_v;
+    make_frame(0, 0, single_k, single_v);
+    const llama_kvarn_body_record single_ref = llama_kvarn_store_reference_frame(
+            params, head_dim, single_k, single_v, true, false, true);
+    float * single_k_d = cuda_upload(single_k);
+    float * single_v_d = cuda_upload(single_v);
+    uint8_t * single_k_body_d = nullptr;
+    uint8_t * single_v_body_d = nullptr;
+    float * single_k_scales_d = nullptr;
+    float * single_v_scales_d = nullptr;
+    float * single_scratch_d = nullptr;
+    const size_t tmp_rows = std::max<uint32_t>(head_dim, group);
+    const size_t pipeline_floats = n + 2*tmp_rows + head_dim + group + 2;
+    require_cuda(cudaMalloc(&single_k_body_d, layout.k_body_bytes), "malloc VarN single K body");
+    require_cuda(cudaMalloc(&single_v_body_d, layout.v_body_bytes), "malloc VarN single V body");
+    require_cuda(cudaMalloc(&single_k_scales_d, layout.k_scale_floats*sizeof(float)), "malloc VarN single K scales");
+    require_cuda(cudaMalloc(&single_v_scales_d, layout.v_scale_floats*sizeof(float)), "malloc VarN single V scales");
+    require_cuda(cudaMalloc(&single_scratch_d, 2*pipeline_floats*sizeof(float)), "malloc VarN single scratch");
+    const auto launch_single = [&] {
+        ggml_cuda_kvarn_store_body_reference_minmax(
+                single_k_d, single_v_d,
+                single_k_body_d, single_v_body_d,
+                single_k_scales_d, single_v_scales_d, single_scratch_d,
+                head_dim, group, 8, 2, params.sinkhorn_iters, 1.0f,
+                0u, true, nullptr);
+    };
+    const float single_ms = time_launch(launch_single);
+    std::vector<uint8_t> single_k_body(layout.k_body_bytes);
+    std::vector<uint8_t> single_v_body(layout.v_body_bytes);
+    std::vector<float> single_k_scales(layout.k_scale_floats);
+    std::vector<float> single_v_scales(layout.v_scale_floats);
+    require_cuda(cudaMemcpy(single_k_body.data(), single_k_body_d, single_k_body.size(), cudaMemcpyDeviceToHost), "copy VarN single K body");
+    require_cuda(cudaMemcpy(single_v_body.data(), single_v_body_d, single_v_body.size(), cudaMemcpyDeviceToHost), "copy VarN single V body");
+    require_cuda(cudaMemcpy(single_k_scales.data(), single_k_scales_d, single_k_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy VarN single K scales");
+    require_cuda(cudaMemcpy(single_v_scales.data(), single_v_scales_d, single_v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy VarN single V scales");
+    const parity_stats single_stats = compare_record(
+            single_ref, single_k_body.data(), single_v_body.data(),
+            single_k_scales.data(), single_v_scales.data());
+
+    const size_t tile_head_stride = head_dim;
+    const size_t tile_group_stride = size_t(head_dim)*n_heads;
+    const size_t tile_record_stride = size_t(head_dim)*n_heads*group;
+    std::vector<float> batched_k(size_t(n_records)*tile_record_stride);
+    std::vector<float> batched_v(batched_k.size());
+    std::vector<llama_kvarn_body_record> batched_refs(size_t(n_heads)*n_records);
+    for (uint32_t r = 0; r < n_records; ++r) {
+        for (uint32_t ih = 0; ih < n_heads; ++ih) {
+            std::vector<float> k_frame;
+            std::vector<float> v_frame;
+            make_frame(ih, r, k_frame, v_frame);
+            std::vector<float> raw_k(n);
+            std::vector<float> raw_v(n);
+            for (uint32_t g = 0; g < group; ++g) {
+                std::vector<float> k_col(head_dim);
+                std::vector<float> v_row(head_dim);
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    k_col[d] = k_frame[size_t(d)*group + g];
+                    v_row[d] = v_frame[size_t(g)*head_dim + d];
+                }
+                k_col = hadamard_vector(k_col);
+                v_row = hadamard_vector(v_row);
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    raw_k[size_t(d)*group + g] = k_col[d];
+                    raw_v[size_t(g)*head_dim + d] = v_row[d];
+                    const size_t dst = size_t(r)*tile_record_stride + size_t(g)*tile_group_stride +
+                        size_t(ih)*tile_head_stride + d;
+                    batched_k[dst] = k_col[d];
+                    batched_v[dst] = v_row[d];
+                }
+            }
+            batched_refs[size_t(ih)*n_records + r] = llama_kvarn_store_reference_frame(
+                    params, head_dim, raw_k, raw_v, true, false, false);
+        }
+    }
+    const size_t k_body_head_stride = size_t(n_records)*layout.k_body_bytes;
+    const size_t v_body_head_stride = size_t(n_records)*layout.v_body_bytes;
+    const size_t k_scale_head_stride = size_t(n_records)*layout.k_scale_floats;
+    const size_t v_scale_head_stride = size_t(n_records)*layout.v_scale_floats;
+    const size_t total_tiles = size_t(n_heads)*n_records;
+    const size_t data_floats = total_tiles*n;
+    const size_t best_floats = total_tiles*(size_t(head_dim) + group + 2);
+    const size_t batched_scratch_floats = 2*data_floats + 2*best_floats;
+    std::vector<uint8_t> batched_k_body(total_tiles*layout.k_body_bytes);
+    std::vector<uint8_t> batched_v_body(total_tiles*layout.v_body_bytes);
+    std::vector<float> batched_k_scales(total_tiles*layout.k_scale_floats);
+    std::vector<float> batched_v_scales(total_tiles*layout.v_scale_floats);
+    float * batched_k_d = cuda_upload(batched_k);
+    float * batched_v_d = cuda_upload(batched_v);
+    uint8_t * batched_k_body_d = nullptr;
+    uint8_t * batched_v_body_d = nullptr;
+    float * batched_k_scales_d = nullptr;
+    float * batched_v_scales_d = nullptr;
+    float * batched_scratch_d = nullptr;
+    require_cuda(cudaMalloc(&batched_k_body_d, batched_k_body.size()), "malloc VarN batched K body");
+    require_cuda(cudaMalloc(&batched_v_body_d, batched_v_body.size()), "malloc VarN batched V body");
+    require_cuda(cudaMalloc(&batched_k_scales_d, batched_k_scales.size()*sizeof(float)), "malloc VarN batched K scales");
+    require_cuda(cudaMalloc(&batched_v_scales_d, batched_v_scales.size()*sizeof(float)), "malloc VarN batched V scales");
+    require_cuda(cudaMalloc(&batched_scratch_d, batched_scratch_floats*sizeof(float)), "malloc VarN batched scratch");
+    const auto launch_batched = [&] {
+        ggml_cuda_kvarn_store_body_direct_records_minmax(
+                batched_k_d, batched_v_d,
+                batched_k_body_d, batched_v_body_d,
+                batched_k_scales_d, batched_v_scales_d, batched_scratch_d,
+                n_heads, n_records, head_dim, group, 8, 2,
+                params.sinkhorn_iters, 1.0f,
+                layout.k_body_bytes, layout.v_body_bytes,
+                k_body_head_stride, v_body_head_stride,
+                layout.k_scale_floats, layout.v_scale_floats,
+                k_scale_head_stride, v_scale_head_stride,
+                tile_head_stride, tile_head_stride,
+                tile_group_stride, tile_group_stride,
+                tile_record_stride, tile_record_stride,
+                batched_scratch_floats, 0u, nullptr);
+    };
+    const float batched_ms = time_launch(launch_batched);
+    require_cuda(cudaMemcpy(batched_k_body.data(), batched_k_body_d, batched_k_body.size(), cudaMemcpyDeviceToHost), "copy VarN batched K body");
+    require_cuda(cudaMemcpy(batched_v_body.data(), batched_v_body_d, batched_v_body.size(), cudaMemcpyDeviceToHost), "copy VarN batched V body");
+    require_cuda(cudaMemcpy(batched_k_scales.data(), batched_k_scales_d, batched_k_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy VarN batched K scales");
+    require_cuda(cudaMemcpy(batched_v_scales.data(), batched_v_scales_d, batched_v_scales.size()*sizeof(float), cudaMemcpyDeviceToHost), "copy VarN batched V scales");
+    parity_stats batched_stats;
+    for (uint32_t ih = 0; ih < n_heads; ++ih) {
+        for (uint32_t r = 0; r < n_records; ++r) {
+            const size_t body_k_off = size_t(ih)*k_body_head_stride + size_t(r)*layout.k_body_bytes;
+            const size_t body_v_off = size_t(ih)*v_body_head_stride + size_t(r)*layout.v_body_bytes;
+            const size_t scale_k_off = size_t(ih)*k_scale_head_stride + size_t(r)*layout.k_scale_floats;
+            const size_t scale_v_off = size_t(ih)*v_scale_head_stride + size_t(r)*layout.v_scale_floats;
+            merge_stats(batched_stats, compare_record(
+                    batched_refs[size_t(ih)*n_records + r],
+                    batched_k_body.data() + body_k_off,
+                    batched_v_body.data() + body_v_off,
+                    batched_k_scales.data() + scale_k_off,
+                    batched_v_scales.data() + scale_v_off));
+        }
+    }
+
+    std::fprintf(stderr,
+            "VarN double-reduction parity: single diff=%zu scale_abs=%g scale_rel=%g dequant_max=%g nmse=%g time_ms=%g; "
+            "batched diff=%zu scale_abs=%g scale_rel=%g dequant_max=%g nmse=%g time_ms=%g\n",
+            single_stats.packed_diff, double(single_stats.scale_abs), double(single_stats.scale_rel),
+            double(single_stats.dequant_max), single_stats.dequant_nmse, double(single_ms),
+            batched_stats.packed_diff, double(batched_stats.scale_abs), double(batched_stats.scale_rel),
+            double(batched_stats.dequant_max), batched_stats.dequant_nmse, double(batched_ms));
+    const size_t packed_bytes_per_record = layout.k_body_bytes + layout.v_body_bytes;
+    require(single_stats.packed_diff*100 <= packed_bytes_per_record &&
+            single_stats.scale_rel < 2.5e-4f && single_stats.dequant_max < 1.0f &&
+            single_stats.dequant_nmse < 2.0e-11,
+            "single-record production VarN store matches the double CPU reference");
+    require(batched_stats.packed_diff*100 <= total_tiles*packed_bytes_per_record &&
+            batched_stats.scale_rel < 2.5e-4f && batched_stats.dequant_max < 1.0f &&
+            batched_stats.dequant_nmse < 2.0e-11,
+            "batched production VarN store matches the double CPU reference");
+
+    cudaFree(single_k_d);
+    cudaFree(single_v_d);
+    cudaFree(single_k_body_d);
+    cudaFree(single_v_body_d);
+    cudaFree(single_k_scales_d);
+    cudaFree(single_v_scales_d);
+    cudaFree(single_scratch_d);
+    cudaFree(batched_k_d);
+    cudaFree(batched_v_d);
+    cudaFree(batched_k_body_d);
+    cudaFree(batched_v_body_d);
+    cudaFree(batched_k_scales_d);
+    cudaFree(batched_v_scales_d);
+    cudaFree(batched_scratch_d);
+}
+
 static void test_experimental_turbo_v_codec(uint32_t head_dim, uint32_t bits, bool canonical_layout) {
     const uint32_t group = 128;
     const size_t n = size_t(head_dim)*group;
@@ -7977,6 +8288,7 @@ static int run_all_tests() {
     test_fused_paper_frame_sinktail_batch();
     test_gemma512_sinktail_production_shape_sampled();
     test_deep_standard_packed_k8v2_numerical_dispatch();
+    test_logstd_varn_reduction_parity();
     test_materialize_kv_window(8, 8);
     test_materialize_kv_window(8, 2);
     test_raw_mirror_exact_key_lifecycle();
