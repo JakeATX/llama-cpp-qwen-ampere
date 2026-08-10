@@ -1777,19 +1777,23 @@ static bool run_fill_invalidation(
 
 static void * create_direct_session(
         ggml_backend_t cuda, ggml_backend_t cpu) {
-    if (!ggml_moe_cache.session_create) {
+    const ggml_moe_cache_api api =
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
+    if (!api.session_create) {
         return nullptr;
     }
     void * backends[] = { cuda, cpu };
-    return ggml_moe_cache.session_create(backends, 2, nullptr);
+    return api.session_create(backends, 2, nullptr);
 }
 
 static bool run_explicit_session_config(
         ggml_backend_t cuda, ggml_backend_t cpu) {
     configure_cache(nullptr);
+    const ggml_moe_cache_api api =
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
     ggml_moe_cache_config config = {};
-    if (!ggml_moe_cache.query_config ||
-        !ggml_moe_cache.query_config(0, 4, &config)) {
+    if (!api.query_config ||
+        !api.query_config(0, 4, &config)) {
         fprintf(stderr, "cache-explicit-config: failed to query configuration\n");
         return false;
     }
@@ -1797,27 +1801,27 @@ static bool run_explicit_session_config(
     set_env("GGML_CUDA_MOE_CACHE", "0");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "off");
     void * backends[] = { cuda, cpu };
-    void * session = ggml_moe_cache.session_create(backends, 2, &config);
+    void * session = api.session_create(backends, 2, &config);
     const bool ok = session != nullptr;
     if (session) {
-        ggml_moe_cache.session_destroy(session);
+        api.session_destroy(session);
     }
     bool invalid_rejected = true;
     for (int overlap_cpu_rows : { -2, 9 }) {
         config.overlap_cpu_rows = overlap_cpu_rows;
-        void * invalid = ggml_moe_cache.session_create(backends, 2, &config);
+        void * invalid = api.session_create(backends, 2, &config);
         invalid_rejected &= invalid == nullptr;
         if (invalid) {
-            ggml_moe_cache.session_destroy(invalid);
+            api.session_destroy(invalid);
         }
     }
     config.overlap_cpu_rows = 0;
     for (int min_expert_explicit : { -1, 2 }) {
         config.min_expert_explicit = min_expert_explicit;
-        void * invalid = ggml_moe_cache.session_create(backends, 2, &config);
+        void * invalid = api.session_create(backends, 2, &config);
         invalid_rejected &= invalid == nullptr;
         if (invalid) {
-            ggml_moe_cache.session_destroy(invalid);
+            api.session_destroy(invalid);
         }
     }
     configure_cache(nullptr);
@@ -1829,13 +1833,17 @@ static bool direct_begin_ready(
         const char * name, const void * base, size_t expert_size,
         int64_t direct_n_in, int64_t direct_n_out,
         int direct_type, int64_t direct_n_expert) {
-    void * node = ggml_moe_cache.begin(
+    const ggml_moe_cache_api api = ggml_moe_cache_active();
+    if (!api.begin || !api.end) {
+        return false;
+    }
+    void * node = api.begin(
             name, base, expert_size, direct_n_in, direct_n_out,
             direct_type, direct_n_expert, 1, 1);
     if (!node) {
         return false;
     }
-    ggml_moe_cache.end(node);
+    api.end(node);
     return true;
 }
 
@@ -1866,41 +1874,43 @@ static bool run_policy_diagnostics(
     }
 
     const size_t expert_size = ggml_nbytes(weights) / weights->ne[2];
-    ggml_moe_cache.session_enter(session);
-    void * first = ggml_moe_cache.begin(
+    const ggml_moe_cache_api api =
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
+    api.session_enter(session);
+    void * first = api.begin(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type,
             weights->ne[2], 1, 1);
     const bool census_waited = first == nullptr;
     if (first) {
-        ggml_moe_cache.end(first);
+        api.end(first);
     }
-    void * second = ggml_moe_cache.begin(
+    void * second = api.begin(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type,
             weights->ne[2], 1, 1);
     const bool census_completed = second != nullptr;
     if (second) {
-        ggml_moe_cache.end(second);
+        api.end(second);
     }
     for (int64_t n_tokens : { 2, 3 }) {
-        void * oversize = ggml_moe_cache.begin(
+        void * oversize = api.begin(
                 weights->name, weights->data, expert_size,
                 weights->ne[0], weights->ne[1], weights->type,
                 weights->ne[2], n_tokens, n_tokens);
         if (oversize) {
-            ggml_moe_cache.end(oversize);
+            api.end(oversize);
         }
     }
-    void * excess_rows = ggml_moe_cache.begin(
+    void * excess_rows = api.begin(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type,
             weights->ne[2], 1, 65);
     if (excess_rows) {
-        ggml_moe_cache.end(excess_rows);
+        api.end(excess_rows);
     }
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    api.session_leave(session);
+    api.session_destroy(session);
 
     const std::string log = capture.get();
     const bool configured =

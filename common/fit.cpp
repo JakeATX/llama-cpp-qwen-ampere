@@ -191,8 +191,17 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
         result.reason = "disabled";
         return result;
     }
-    if (!ggml_moe_cache.query_config || !ggml_moe_cache.query_device ||
-        !ggml_moe_cache.query_shape) {
+    // Probe the provider that owns the fitted devices; fall back to the
+    // thread's active provider (first registered) when no device is given.
+    ggml_moe_cache_api api = ggml_moe_cache_active();
+    if (!devices.empty()) {
+        const ggml_moe_cache_api owned =
+            ggml_moe_cache_get(ggml_backend_dev_backend_reg(devices[0]));
+        if (owned.owner) {
+            api = owned;
+        }
+    }
+    if (!api.query_config || !api.query_device || !api.query_shape) {
         result.reason = "no cache provider is loaded";
         return result;
     }
@@ -202,7 +211,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
         automatic = params->mode == COMMON_MOE_CACHE_MODE_AUTO ? 1 : 0;
     }
     ggml_moe_cache_config config = {};
-    if (!ggml_moe_cache.query_config(automatic, params->budget_mib, &config)) {
+    if (!api.query_config(automatic, params->budget_mib, &config)) {
         result.reason = "the cache provider is disabled";
         return result;
     }
@@ -219,7 +228,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
     size_t min_expert_bytes = 0;
     for (size_t index = 0; index < devices.size(); index++) {
         ggml_moe_cache_device_caps caps = {};
-        if (!ggml_moe_cache.query_device(devices[index], &config, &caps)) {
+        if (!api.query_device(devices[index], &config, &caps)) {
             continue;
         }
         if (margins[index] < 0 || memory[index].free < margins[index]) {
@@ -242,7 +251,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
         const size_t tensor_bytes = (size_t)tensor.n_expert * tensor.expert_size;
         ggml_moe_cache_shape_caps caps = {};
         const bool cacheable = tensor.expert_size >= min_expert_bytes &&
-            ggml_moe_cache.query_shape(tensor.type, tensor.n_input, tensor.n_output,
+            api.query_shape(tensor.type, tensor.n_input, tensor.n_output,
                     tensor.n_expert, tensor.expert_size, &caps);
         shape_inputs.push_back({tensor.type, tensor.expert_size, tensor_bytes,
                 caps.scratch_bytes, caps.pool_bytes, cacheable});
