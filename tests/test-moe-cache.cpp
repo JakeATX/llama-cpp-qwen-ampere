@@ -101,6 +101,13 @@ static void test_provider_session_destroy(void * session) { (void) session; }
 static void test_provider_session_enter(void * session) { (void) session; }
 static void test_provider_session_leave(void * session) { (void) session; }
 
+// The tests exercise the active (first registered) provider directly. The
+// registry is the source of truth; snapshot the table once per process.
+static ggml_moe_cache_api & active_api() {
+    static ggml_moe_cache_api api = ggml_moe_cache_active();
+    return api;
+}
+
 struct reset_buffer_context {
     uint8_t data[64];
     bool reset = false;
@@ -1936,15 +1943,19 @@ static int direct_plan_one(
         const char * name, const void * base, size_t expert_size,
         int64_t direct_n_in, int64_t direct_n_out,
         int direct_type, int64_t direct_n_expert, int32_t expert) {
-    void * node = ggml_moe_cache.begin(
+    const ggml_moe_cache_api api = ggml_moe_cache_active();
+    if (!api.begin || !api.plan || !api.end) {
+        return -1;
+    }
+    void * node = api.begin(
             name, base, expert_size, direct_n_in, direct_n_out,
             direct_type, direct_n_expert, 1, 1);
     if (!node) {
         return -1;
     }
     int32_t slot = -1;
-    const int hits = ggml_moe_cache.plan(node, &expert, 1, &slot);
-    ggml_moe_cache.end(node);
+    const int hits = api.plan(node, &expert, 1, &slot);
+    api.end(node);
     return hits;
 }
 
@@ -1954,16 +1965,20 @@ static int direct_plan_many(
         int direct_type, int64_t direct_n_expert,
         const int32_t * experts, int n_experts,
         int64_t direct_n_tokens = 1) {
-    void * node = ggml_moe_cache.begin(
+    const ggml_moe_cache_api api = ggml_moe_cache_active();
+    if (!api.begin || !api.plan || !api.end) {
+        return -1;
+    }
+    void * node = api.begin(
             name, base, expert_size, direct_n_in, direct_n_out,
             direct_type, direct_n_expert, direct_n_tokens, n_experts);
     if (!node) {
         return -1;
     }
     std::vector<int32_t> slots(n_experts, -1);
-    const int hits = ggml_moe_cache.plan(
+    const int hits = api.plan(
             node, experts, n_experts, slots.data());
-    ggml_moe_cache.end(node);
+    api.end(node);
     return hits;
 }
 
@@ -1996,8 +2011,9 @@ static bool run_fused_partial_invalidation(
         const uint8_t * gate_row,
         const std::vector<float> & reference,
         log_capture & capture) {
-    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
-        !ggml_moe_cache.end) {
+    const ggml_moe_cache_api api =
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(cuda)));
+    if (!api.fused_begin || !api.collect || !api.end) {
         fprintf(stderr, "cache-fused-partial: incomplete cache API\n");
         return false;
     }
@@ -2027,7 +2043,7 @@ static bool run_fused_partial_invalidation(
         (const float *)activations->data,
     };
 
-    ggml_moe_cache.session_enter(session);
+    api.session_enter(session);
     bool pool_ready = false;
     for (int step = 0; step < 80 && !pool_ready; step++) {
         const bool up_ready = direct_begin_ready(
@@ -2049,7 +2065,7 @@ static bool run_fused_partial_invalidation(
                        uint64_t expected_mask,
                        const int * reference_rows) {
         uint64_t hit_mask = 0;
-        void * node = ggml_moe_cache.fused_begin(
+        void * node = api.fused_begin(
                 &up, &gate, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -2058,7 +2074,7 @@ static bool run_fused_partial_invalidation(
                 experts, n_ids, 1, act_rows, &hit_mask);
         if (!node || hit_mask != expected_mask) {
             if (node) {
-                ggml_moe_cache.end(node);
+                api.end(node);
             }
             return false;
         }
@@ -2073,8 +2089,8 @@ static bool run_fused_partial_invalidation(
             }
         }
         const bool collected =
-            ggml_moe_cache.collect(node, n_hits, rows, n_out) == 1;
-        ggml_moe_cache.end(node);
+            active_api().collect(node, n_hits, rows, n_out) == 1;
+        active_api().end(node);
         if (!collected) {
             return false;
         }
@@ -2110,7 +2126,7 @@ static bool run_fused_partial_invalidation(
                 weights, unchanged_row, 0, expert_size);
         const int32_t expert = 0;
         uint64_t hit_mask = 0;
-        void * node = ggml_moe_cache.fused_begin(
+        void * node = active_api().fused_begin(
                 &up, &gate, GGML_GLU_OP_SWIGLU,
                 -std::numeric_limits<float>::infinity(),
                 std::numeric_limits<float>::infinity(),
@@ -2118,7 +2134,7 @@ static bool run_fused_partial_invalidation(
                 std::numeric_limits<float>::infinity(),
                 &expert, 1, 1, act_rows, &hit_mask);
         if (node) {
-            ggml_moe_cache.end(node);
+            active_api().end(node);
             return false;
         }
         if (hit_mask != 0 || !wait_for_direct_resident(weights, expert)) {
@@ -2132,8 +2148,8 @@ static bool run_fused_partial_invalidation(
         invalidated(up_weights, up_row);
     const bool gate_invalidation_ok = up_invalidation_ok &&
         invalidated(gate_weights, gate_row);
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_leave(session);
+    active_api().session_destroy(session);
 
     const bool stats_ok = has_positive_field(
             capture.get(), "fusion-nodes=");
@@ -2161,7 +2177,7 @@ static bool run_cpu_overlap_policy(
     }
 
     const size_t expert_size = ggml_nbytes(weights) / weights->ne[2];
-    ggml_moe_cache.session_enter(session);
+    active_api().session_enter(session);
     bool ok = wait_for_direct_pool(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
@@ -2190,8 +2206,8 @@ static bool run_cpu_overlap_policy(
                 weights->ne[0], weights->ne[1], weights->type,
                 weights->ne[2], experts, 2) == 1;
     }
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_leave(session);
+    active_api().session_destroy(session);
 
     ok &= has_positive_field(capture.get(), "cpu-overlap=");
     configure_cache(nullptr);
@@ -2214,7 +2230,7 @@ static bool run_adaptive_cpu_overlap_policy(
     }
 
     const size_t expert_size = ggml_nbytes(weights) / weights->ne[2];
-    ggml_moe_cache.session_enter(session);
+    active_api().session_enter(session);
     bool ok = wait_for_direct_pool(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
@@ -2258,8 +2274,8 @@ static bool run_adaptive_cpu_overlap_policy(
                 weights->ne[2], multi_token_experts,
                 multi_n_used * multi_n_tokens, multi_n_tokens) == 30;
     }
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_leave(session);
+    active_api().session_destroy(session);
 
     ok &= capture.get().find("cpu-overlap=auto") != std::string::npos;
     ok &= has_positive_field(capture.get(), "cpu-overlap=");
@@ -2270,9 +2286,9 @@ static bool run_adaptive_cpu_overlap_policy(
 
 static bool run_scope_isolation(
         ggml_backend_t cuda, ggml_backend_t cpu, ggml_tensor * weights) {
-    if (!ggml_moe_cache.session_enter || !ggml_moe_cache.session_leave ||
-        !ggml_moe_cache.begin || !ggml_moe_cache.end ||
-        !ggml_moe_cache.invalidate || !ggml_moe_cache.session_destroy) {
+    if (!active_api().session_enter || !active_api().session_leave ||
+        !active_api().begin || !active_api().end ||
+        !active_api().invalidate || !active_api().session_destroy) {
         fprintf(stderr, "cache-scope: incomplete cache API\n");
         return false;
     }
@@ -2285,51 +2301,51 @@ static bool run_scope_isolation(
     }
 
     const size_t expert_size = ggml_nbytes(weights) / weights->ne[2];
-    ggml_moe_cache.session_enter(outer);
+    active_api().session_enter(outer);
     const bool warmed = wait_for_direct_pool(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
-    ggml_moe_cache.session_leave(outer);
+    active_api().session_leave(outer);
 
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "1048576");
     void * dormant = create_direct_session(cuda, cpu);
     if (!dormant) {
         fprintf(stderr, "cache-scope: failed to create dormant session\n");
-        ggml_moe_cache.session_destroy(outer);
+        active_api().session_destroy(outer);
         return false;
     }
-    ggml_moe_cache.session_enter(dormant);
+    active_api().session_enter(dormant);
     const bool dormant_begin = direct_begin_ready(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
-    ggml_moe_cache.session_leave(dormant);
+    active_api().session_leave(dormant);
 
-    ggml_moe_cache.session_enter(outer);
+    active_api().session_enter(outer);
     const bool outer_before = direct_begin_ready(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
 
-    ggml_moe_cache.session_enter(nullptr);
+    active_api().session_enter(nullptr);
     const bool null_leaked = direct_begin_ready(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
-    ggml_moe_cache.session_leave(nullptr);
+    active_api().session_leave(nullptr);
     const bool outer_after_null = direct_begin_ready(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
 
-    ggml_moe_cache.session_enter(dormant);
+    active_api().session_enter(dormant);
     const bool dormant_leaked = direct_begin_ready(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
-    ggml_moe_cache.session_leave(dormant);
+    active_api().session_leave(dormant);
     const bool outer_after_dormant = direct_begin_ready(
             weights->name, weights->data, expert_size,
             weights->ne[0], weights->ne[1], weights->type, weights->ne[2]);
-    ggml_moe_cache.session_leave(outer);
+    active_api().session_leave(outer);
 
-    ggml_moe_cache.session_destroy(dormant);
-    ggml_moe_cache.session_destroy(outer);
+    active_api().session_destroy(dormant);
+    active_api().session_destroy(outer);
     const bool ok = warmed && !dormant_begin && outer_before &&
         !null_leaked && outer_after_null &&
         !dormant_leaked && outer_after_dormant;
@@ -2358,19 +2374,19 @@ static bool run_shape_liveness(
     std::vector<uint8_t> shape_a(shape_a_expert * shape_experts);
     std::vector<uint8_t> shape_b(shape_b_expert * shape_experts);
 
-    ggml_moe_cache.session_enter(session);
+    active_api().session_enter(session);
     (void)direct_begin_ready(
             "blk.2.ffn_up_exps.weight", shape_a.data(), shape_a_expert,
             shape_a_in, shape_out, GGML_TYPE_Q4_0, shape_experts);
-    ggml_moe_cache.invalidate(shape_a.data(), shape_a.size());
+    active_api().invalidate(shape_a.data(), shape_a.size());
     const bool shape_b_ready = wait_for_direct_pool(
             "blk.3.ffn_up_exps.weight", shape_b.data(), shape_b_expert,
             shape_b_in, shape_out, GGML_TYPE_Q4_0, shape_experts);
     const bool shape_a_ready = wait_for_direct_pool(
             "blk.2.ffn_up_exps.weight", shape_a.data(), shape_a_expert,
             shape_a_in, shape_out, GGML_TYPE_Q4_0, shape_experts);
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_leave(session);
+    active_api().session_destroy(session);
 
     const bool ok = shape_b_ready && shape_a_ready;
     printf("cache-shape-liveness: %s\n", ok ? "OK" : "FAIL");
@@ -2403,7 +2419,7 @@ static bool run_exact_shape_inventory(
     std::vector<uint8_t> second(expert_size * second_n_expert);
     std::vector<uint8_t> late(expert_size);
 
-    ggml_moe_cache.session_enter(session);
+    active_api().session_enter(session);
     (void)direct_begin_ready(
             "blk.7.ffn_up_exps.weight", first.data(), expert_size,
             direct_n_in, direct_n_out, GGML_TYPE_Q4_0, first_n_expert);
@@ -2440,8 +2456,8 @@ static bool run_exact_shape_inventory(
                 "blk.9.ffn_up_exps.weight", late.data(), expert_size,
                 direct_n_in, direct_n_out, GGML_TYPE_Q4_0, 1, 0) == 1;
     }
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_leave(session);
+    active_api().session_destroy(session);
 
     const std::string log = capture.get();
     const bool ok = ready &&
@@ -2481,7 +2497,7 @@ static bool run_complete_pool_allocation(
             8, std::vector<uint8_t>(common_expert * direct_n_expert));
     std::vector<uint8_t> rare_tensor(rare_expert * direct_n_expert);
 
-    ggml_moe_cache.session_enter(session);
+    active_api().session_enter(session);
     for (const auto & tensor : common_tensors) {
         (void)direct_begin_ready(
                 "blk.9.ffn_up_exps.weight", tensor.data(), common_expert,
@@ -2497,8 +2513,8 @@ static bool run_complete_pool_allocation(
     const bool rare_ready = direct_begin_ready(
             "blk.9.ffn_down_exps.weight", rare_tensor.data(), rare_expert,
             direct_n_in, rare_n_out, GGML_TYPE_Q4_0, direct_n_expert);
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_leave(session);
+    active_api().session_destroy(session);
 
     const bool ok = common_ready && rare_ready;
     printf("cache-complete-pools: %s\n", ok ? "OK" : "FAIL");
@@ -2528,10 +2544,10 @@ static bool run_shared_budget(
     if (!first || !second) {
         fprintf(stderr, "cache-shared-budget: failed to create sessions\n");
         if (first) {
-            ggml_moe_cache.session_destroy(first);
+            active_api().session_destroy(first);
         }
         if (second) {
-            ggml_moe_cache.session_destroy(second);
+            active_api().session_destroy(second);
         }
         configure_cache(nullptr);
         return false;
@@ -2544,20 +2560,20 @@ static bool run_shared_budget(
         ggml_row_size(GGML_TYPE_Q4_0, direct_n_in) * direct_n_out;
     std::vector<uint8_t> weights(expert_size * direct_n_expert);
 
-    ggml_moe_cache.session_enter(first);
+    active_api().session_enter(first);
     const bool first_ready = wait_for_direct_pool(
             "blk.6.ffn_up_exps.weight", weights.data(), expert_size,
             direct_n_in, direct_n_out, GGML_TYPE_Q4_0, direct_n_expert);
-    ggml_moe_cache.session_leave(first);
+    active_api().session_leave(first);
 
-    ggml_moe_cache.session_enter(second);
+    active_api().session_enter(second);
     const bool second_ready = wait_for_direct_pool(
             "blk.6.ffn_up_exps.weight", weights.data(), expert_size,
             direct_n_in, direct_n_out, GGML_TYPE_Q4_0, direct_n_expert);
-    ggml_moe_cache.session_leave(second);
+    active_api().session_leave(second);
 
-    ggml_moe_cache.session_destroy(second);
-    ggml_moe_cache.session_destroy(first);
+    active_api().session_destroy(second);
+    active_api().session_destroy(first);
 
     const std::string shared_log = capture.get();
     const bool divided = count_field_at_least(shared_log, "granted=", 8) == 2 &&
@@ -2567,12 +2583,12 @@ static bool run_shared_budget(
     void * replacement = create_direct_session(cuda, cpu);
     bool replacement_ready = false;
     if (replacement) {
-        ggml_moe_cache.session_enter(replacement);
+        active_api().session_enter(replacement);
         replacement_ready = wait_for_direct_pool(
                 "blk.6.ffn_up_exps.weight", weights.data(), expert_size,
                 direct_n_in, direct_n_out, GGML_TYPE_Q4_0, direct_n_expert);
-        ggml_moe_cache.session_leave(replacement);
-        ggml_moe_cache.session_destroy(replacement);
+        active_api().session_leave(replacement);
+        active_api().session_destroy(replacement);
     }
     const std::string replacement_log = capture.get();
     const bool released = max_field_value(replacement_log, "granted=") >= 20;
@@ -2584,31 +2600,31 @@ static bool run_shared_budget(
     set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", reserve.c_str());
     void * low = create_direct_session(cuda, cpu);
     if (high) {
-        ggml_moe_cache.session_destroy(high);
+        active_api().session_destroy(high);
     }
     void * after_high = create_direct_session(cuda, cpu);
 
     bool low_ready = false;
     if (low) {
-        ggml_moe_cache.session_enter(low);
+        active_api().session_enter(low);
         low_ready = wait_for_direct_pool(
                 "blk.6.ffn_up_exps.weight", weights.data(), expert_size,
                 direct_n_in, direct_n_out, GGML_TYPE_Q4_0, direct_n_expert);
-        ggml_moe_cache.session_leave(low);
+        active_api().session_leave(low);
     }
     bool after_high_ready = false;
     if (after_high) {
-        ggml_moe_cache.session_enter(after_high);
+        active_api().session_enter(after_high);
         after_high_ready = wait_for_direct_pool(
                 "blk.6.ffn_up_exps.weight", weights.data(), expert_size,
                 direct_n_in, direct_n_out, GGML_TYPE_Q4_0, direct_n_expert);
-        ggml_moe_cache.session_leave(after_high);
+        active_api().session_leave(after_high);
     }
     if (after_high) {
-        ggml_moe_cache.session_destroy(after_high);
+        active_api().session_destroy(after_high);
     }
     if (low) {
-        ggml_moe_cache.session_destroy(low);
+        active_api().session_destroy(low);
     }
     const std::string reserve_log = capture.get();
     const bool reserve_lowered = high && low && after_high &&
@@ -2655,7 +2671,7 @@ static bool run_route_override(
     set_env("GGML_CUDA_MOE_CACHE_NDEV", "2");
     capture.clear();
     void * backends[] = { cuda, second_cuda, cpu };
-    void * session = ggml_moe_cache.session_create(backends, 3, nullptr);
+    void * session = active_api().session_create(backends, 3, nullptr);
     if (!session) {
         fprintf(stderr,
                 "cache-route-override: failed to create session\n");
@@ -2675,42 +2691,42 @@ static bool run_route_override(
     std::vector<uint8_t> shape_a(shape_a_expert * shape_experts);
     std::vector<uint8_t> shape_b(shape_b_expert * shape_experts);
 
-    ggml_moe_cache.session_enter(session);
+    active_api().session_enter(session);
     const bool shape_a_ready = wait_for_direct_pool(
             "blk.4.ffn_up_exps.weight", shape_a.data(), shape_a_expert,
             shape_a_in, shape_a_out, GGML_TYPE_Q4_0, shape_experts);
     const bool shape_b_ready = wait_for_direct_pool(
             "blk.4.ffn_down_exps.weight", shape_b.data(), shape_b_expert,
             shape_b_in, shape_b_out, GGML_TYPE_Q4_0, shape_experts);
-    ggml_moe_cache.session_leave(session);
+    active_api().session_leave(session);
 
     ggml_moe_cache_config config = {};
     ggml_moe_cache_device_caps first_caps = {};
     ggml_moe_cache_device_caps second_caps = {};
-    const bool queried = ggml_moe_cache.query_config(0, 8, &config) &&
-        ggml_moe_cache.query_device(first_device, &config, &first_caps) &&
-        ggml_moe_cache.query_device(second_device, &config, &second_caps);
+    const bool queried = active_api().query_config(0, 8, &config) &&
+        active_api().query_device(first_device, &config, &first_caps) &&
+        active_api().query_device(second_device, &config, &second_caps);
     const bool expect_parallel = queried && first_caps.compute_capability >= 800 &&
         second_caps.compute_capability >= 800;
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_destroy(session);
     const bool fill_policy = capture.get().find(
             expect_parallel ? "fills=parallel" : "fills=serial") != std::string::npos;
 
     ggml_moe_cache_config automatic = {};
     capture.clear();
     const bool automatic_queried =
-        ggml_moe_cache.query_config(1, 4, &automatic);
+        active_api().query_config(1, 4, &automatic);
     void * dormant = automatic_queried
-        ? ggml_moe_cache.session_create(backends, 3, &automatic) : nullptr;
+        ? active_api().session_create(backends, 3, &automatic) : nullptr;
     const bool dormant_created = dormant != nullptr;
     bool dormant_begin = false;
     if (dormant) {
-        ggml_moe_cache.session_enter(dormant);
+        active_api().session_enter(dormant);
         dormant_begin = direct_begin_ready(
                 "blk.4.ffn_up_exps.weight", shape_a.data(), shape_a_expert,
                 shape_a_in, shape_a_out, GGML_TYPE_Q4_0, shape_experts);
-        ggml_moe_cache.session_leave(dormant);
-        ggml_moe_cache.session_destroy(dormant);
+        active_api().session_leave(dormant);
+        active_api().session_destroy(dormant);
     }
     const bool slab_floor = dormant_created && !dormant_begin &&
         capture.get().find("automatic slab floor") != std::string::npos;
@@ -2745,7 +2761,7 @@ static bool run_admission_policy_once(
     std::vector<uint8_t> weights(expert_size * policy_n_expert);
     const char * name = "blk.5.ffn_up_exps.weight";
 
-    ggml_moe_cache.session_enter(session);
+    active_api().session_enter(session);
     bool ok = wait_for_direct_pool(
             name, weights.data(), expert_size,
             policy_n_in, policy_n_out,
@@ -2804,8 +2820,8 @@ static bool run_admission_policy_once(
         ok &= hit;
     }
 
-    ggml_moe_cache.session_leave(session);
-    ggml_moe_cache.session_destroy(session);
+    active_api().session_leave(session);
+    active_api().session_destroy(session);
     const std::string log = capture.get();
     const long long expected_enqueued =
         new_expert_misses == 8 ? 65 : 64;
@@ -3157,7 +3173,7 @@ int main() {
         ? create_direct_session(reloaded_cuda, cpu) : nullptr;
     const bool reload_ok = reloaded_session != nullptr;
     if (reloaded_session) {
-        ggml_moe_cache.session_destroy(reloaded_session);
+        active_api().session_destroy(reloaded_session);
     }
     if (reloaded_cuda) {
         ggml_backend_reg_t reloaded_reg =

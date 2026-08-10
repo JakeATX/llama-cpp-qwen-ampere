@@ -583,16 +583,29 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 static bool llama_model_has_cacheable_moe_weights(
         const llama_model & model, llama_moe_cache_mode mode, size_t budget_mib,
         const std::vector<ggml_backend_t> & backends) {
+    // Probe the provider that owns the model's backends; fall back to the
+    // thread's active provider (first registered).
+    ggml_moe_cache_api api = ggml_moe_cache_active();
+    for (ggml_backend_t backend : backends) {
+        if (!backend) {
+            continue;
+        }
+        const ggml_moe_cache_api owned =
+            ggml_moe_cache_get(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        if (owned.owner) {
+            api = owned;
+            break;
+        }
+    }
     if (mode == LLAMA_MOE_CACHE_MODE_OFF ||
-        !ggml_moe_cache.query_config || !ggml_moe_cache.query_device ||
-        !ggml_moe_cache.query_shape) {
+        !api.query_config || !api.query_device || !api.query_shape) {
         return false;
     }
 
     ggml_moe_cache_config config = {};
     const int automatic = mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED
         ? -1 : mode == LLAMA_MOE_CACHE_MODE_AUTO;
-    if (!ggml_moe_cache.query_config(automatic, budget_mib, &config)) {
+    if (!api.query_config(automatic, budget_mib, &config)) {
         return false;
     }
 
@@ -603,7 +616,7 @@ static bool llama_model_has_cacheable_moe_weights(
             continue;
         }
         ggml_moe_cache_device_caps caps = {};
-        if (!ggml_moe_cache.query_device(
+        if (!api.query_device(
                     ggml_backend_get_device(backend), &config, &caps) ||
             std::find(physical_devices.begin(), physical_devices.end(),
                     caps.physical_device) != physical_devices.end()) {
@@ -635,7 +648,7 @@ static bool llama_model_has_cacheable_moe_weights(
         }
 
         ggml_moe_cache_shape_caps shape = {};
-        if (ggml_moe_cache.query_shape(
+        if (api.query_shape(
                     tensor->type, tensor->ne[0], tensor->ne[1], tensor->ne[2],
                     tensor->nb[2], &shape)) {
             const size_t slab_bytes = std::max(
