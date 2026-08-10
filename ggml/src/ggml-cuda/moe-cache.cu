@@ -3150,6 +3150,8 @@ static void moe_cache_register(const void * owner) {
     ggml_moe_cache_register(&api);
 }
 
+#endif // !defined(GGML_USE_MUSA)
+
 #if defined(GGML_USE_MUSA)
 void ggml_cuda_moe_cache_register(void * reg) {
     (void) reg;

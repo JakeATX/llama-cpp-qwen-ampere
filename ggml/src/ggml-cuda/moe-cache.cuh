@@ -1,7 +1,7 @@
 #pragma once
 
 // MoE expert cache registration entry point, called from ggml_backend_cuda_reg().
-// Populates ggml_moe_cache (see ggml-backend-moe-cache.h).
+// Registers the provider API with the backend registry (see ggml-backend-moe-cache.h).
 
 #include <stddef.h>
 

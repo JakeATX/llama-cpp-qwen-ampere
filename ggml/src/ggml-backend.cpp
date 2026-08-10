@@ -14,6 +14,10 @@
 #include "ggml-impl.h"
 #include "ggml-backend-moe-cache.h"
 
+#include <algorithm>
+#include <mutex>
+#include <vector>
+
 // MoE expert cache providers, keyed by backend registration object. Multiple
 // backends (CUDA, Metal, Vulkan, HIP) can register; each scheduler picks the
 // provider that owns a device in its backend set.
