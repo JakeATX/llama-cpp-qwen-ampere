@@ -14,13 +14,86 @@
 #include "ggml-impl.h"
 #include "ggml-backend-moe-cache.h"
 
-// Optional MoE expert cache function table, populated by a supporting backend.
-struct ggml_moe_cache_api ggml_moe_cache = {};
+// MoE expert cache providers, keyed by backend registration object. Multiple
+// backends (CUDA, Metal, Vulkan, HIP) can register; each scheduler picks the
+// provider that owns a device in its backend set.
+static std::mutex g_moe_cache_registry_mu;
+static std::vector<ggml_moe_cache_api> g_moe_cache_providers;
+
+void ggml_moe_cache_register(const ggml_moe_cache_api * api) {
+    if (!api || !api->owner || !api->session_create || !api->session_destroy ||
+        !api->session_enter || !api->session_leave) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (ggml_moe_cache_api & existing : g_moe_cache_providers) {
+        if (existing.owner == api->owner) {
+            existing = *api; // refresh: a rebuilt library re-registers
+            return;
+        }
+    }
+    g_moe_cache_providers.push_back(*api);
+}
 
 void ggml_moe_cache_unregister(const void * owner) {
-    if (ggml_moe_cache.owner == owner) {
-        ggml_moe_cache = {};
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    g_moe_cache_providers.erase(
+        std::remove_if(g_moe_cache_providers.begin(), g_moe_cache_providers.end(),
+            [owner](const ggml_moe_cache_api & api) { return api.owner == owner; }),
+        g_moe_cache_providers.end());
+}
+
+ggml_moe_cache_api ggml_moe_cache_get(const void * owner) {
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (api.owner == owner) {
+            return api;
+        }
     }
+    return ggml_moe_cache_api{};
+}
+
+// The provider table the current thread is executing under. Set by the
+// scheduler scope while a graph with a cache session runs; the CPU backend
+// reads it to reach the session's provider callbacks.
+static thread_local ggml_moe_cache_api t_moe_cache_active;
+
+ggml_moe_cache_api ggml_moe_cache_active(void) {
+    if (t_moe_cache_active.owner) {
+        return t_moe_cache_active;
+    }
+    // Direct CPU users outside a scheduler scope fall back to the first
+    // registered provider.
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (api.session_create && api.session_destroy) {
+            return api;
+        }
+    }
+    return ggml_moe_cache_api{};
+}
+
+// Providers whose backend owns at least one device in the scheduler set, in
+// registration order. Returns copies: the scheduler keeps the selected copy
+// with its session so later registration changes cannot alter the callbacks.
+static std::vector<ggml_moe_cache_api> ggml_moe_cache_provider_candidates(
+        void * const * backends, int n_backends) {
+    std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+    std::vector<ggml_moe_cache_api> result;
+    for (const ggml_moe_cache_api & api : g_moe_cache_providers) {
+        if (!api.session_create || !api.session_destroy ||
+            !api.session_enter || !api.session_leave) {
+            continue;
+        }
+        for (int b = 0; b < n_backends; b++) {
+            ggml_backend_dev_t device = ggml_backend_get_device((ggml_backend_t) backends[b]);
+            if (device && (const void *) ggml_backend_dev_backend_reg(device) == api.owner) {
+                result.push_back(api);
+                break;
+            }
+        }
+    }
+    return result;
 }
 
 #include <assert.h>
@@ -30,6 +103,7 @@ void ggml_moe_cache_unregister(const void * owner) {
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 #include <vector>
 
 #ifdef __APPLE__
@@ -94,12 +168,22 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
 
 static void ggml_backend_moe_cache_invalidate_buffer(
         ggml_backend_buffer_t buffer, const void * address, size_t size) {
-    if (!ggml_moe_cache.invalidate || !buffer || !address || size == 0 ||
+    if (!buffer || !address || size == 0 ||
         buffer->usage != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
         !ggml_backend_buffer_is_host(buffer)) {
         return;
     }
-    ggml_moe_cache.invalidate(address, size);
+    // Each registered provider invalidates its own sessions.
+    std::vector<ggml_moe_cache_api> providers;
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cache_registry_mu);
+        providers = g_moe_cache_providers;
+    }
+    for (const ggml_moe_cache_api & api : providers) {
+        if (api.invalidate) {
+            api.invalidate(address, size);
+        }
+    }
 }
 
 // backend buffer
@@ -876,6 +960,9 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    // The provider table selected for this session. Copied at creation so a
+    // later registration change cannot alter the session's callbacks.
+    struct ggml_moe_cache_api moe_cache_api;
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1663,10 +1750,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct moe_cache_scope {
         void * session;
         void (*leave)(void *);
+        ggml_moe_cache_api previous_active;
 
-        explicit moe_cache_scope(void * session)
-            : session(session), leave(ggml_moe_cache.session_leave) {
-            auto enter = ggml_moe_cache.session_enter;
+        explicit moe_cache_scope(void * session, void (*enter)(void *),
+                                 void (*leave_fn)(void *),
+                                 const ggml_moe_cache_api & active_api)
+            : session(session), leave(leave_fn), previous_active(t_moe_cache_active) {
+            t_moe_cache_active = active_api;
             if (enter && leave) {
                 enter(session);
             } else {
@@ -1675,11 +1765,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         ~moe_cache_scope() {
+            t_moe_cache_active = previous_active;
             if (leave) {
                 leave(session);
             }
         }
-    } cache_scope(sched->moe_cache_session);
+    } cache_scope(sched->moe_cache_session,
+                  sched->moe_cache_api.session_enter,
+                  sched->moe_cache_api.session_leave,
+                  sched->moe_cache_api);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1927,12 +2021,20 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    if (ggml_moe_cache.session_create) {
+    {
         void * cache_backends[GGML_SCHED_MAX_BACKENDS];
         for (int b = 0; b < n_backends; b++) {
             cache_backends[b] = backends[b];
         }
-        sched->moe_cache_session = ggml_moe_cache.session_create(cache_backends, n_backends, nullptr);
+        for (const ggml_moe_cache_api & api :
+                ggml_moe_cache_provider_candidates(cache_backends, n_backends)) {
+            void * session = api.session_create(cache_backends, n_backends, nullptr);
+            if (session) {
+                sched->moe_cache_session = session;
+                sched->moe_cache_api = api;
+                break;
+            }
+        }
     }
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
@@ -1950,18 +2052,12 @@ void ggml_backend_sched_set_moe_cache(
         return;
     }
 
-    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
-        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+    if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
+        sched->moe_cache_api.session_destroy(sched->moe_cache_session);
     }
     sched->moe_cache_session = nullptr;
-    if (mode == GGML_MOE_CACHE_MODE_OFF ||
-        !ggml_moe_cache.query_config || !ggml_moe_cache.session_create) {
-        return;
-    }
-
-    ggml_moe_cache_config config = {};
-    const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
-    if (!ggml_moe_cache.query_config(automatic, budget_mib, &config)) {
+    sched->moe_cache_api = ggml_moe_cache_api{};
+    if (mode == GGML_MOE_CACHE_MODE_OFF) {
         return;
     }
 
@@ -1969,16 +2065,32 @@ void ggml_backend_sched_set_moe_cache(
     for (int index = 0; index < sched->n_backends; index++) {
         cache_backends[index] = sched->backends[index];
     }
-    sched->moe_cache_session = ggml_moe_cache.session_create(
-            cache_backends, sched->n_backends, &config);
+
+    // Probe the providers against this scheduler's backend set and pick the
+    // first one that can create a session, retrying another provider when
+    // session_create returns null.
+    const int automatic = mode == GGML_MOE_CACHE_MODE_AUTO ? 1 : 0;
+    for (const ggml_moe_cache_api & api :
+            ggml_moe_cache_provider_candidates(cache_backends, sched->n_backends)) {
+        ggml_moe_cache_config config = {};
+        if (!api.query_config || !api.query_config(automatic, budget_mib, &config)) {
+            continue;
+        }
+        void * session = api.session_create(cache_backends, sched->n_backends, &config);
+        if (session) {
+            sched->moe_cache_session = session;
+            sched->moe_cache_api = api;
+            break;
+        }
+    }
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
-    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
-        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+    if (sched->moe_cache_session && sched->moe_cache_api.session_destroy) {
+        sched->moe_cache_api.session_destroy(sched->moe_cache_session);
         sched->moe_cache_session = NULL;
     }
     for (int b = 0; b < sched->n_backends; b++) {

@@ -99,8 +99,16 @@ struct ggml_moe_cache_api {
     void (*invalidate)(const void * base, size_t size);
 };
 
-GGML_API struct ggml_moe_cache_api ggml_moe_cache;
+GGML_API void ggml_moe_cache_register(const struct ggml_moe_cache_api * api);
 GGML_API void ggml_moe_cache_unregister(const void * owner);
+// Returns a copy of the provider table registered for owner, zeroed if absent.
+// The scheduler keeps this copy with its session so later registration changes
+// cannot alter the session's callbacks.
+GGML_API struct ggml_moe_cache_api ggml_moe_cache_get(const void * owner);
+// Active provider table for the current thread: set by the scheduler while it
+// executes a graph with a cache session; falls back to the first registered
+// provider for direct CPU users.
+GGML_API struct ggml_moe_cache_api ggml_moe_cache_active(void);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode, size_t budget_mib);
 

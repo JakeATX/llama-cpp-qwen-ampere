@@ -7,7 +7,7 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     return 0;
 }
 
-static void ggml_moe_cache_register(const void * owner) {
+static void moe_cache_register_stub(const void * owner) {
     (void) owner;
 }
 
@@ -920,16 +920,20 @@ static int moe_cache_query_config(
     return 1;
 }
 
+// Backend registration object this provider registered under. Set by
+// moe_cache_register; query_device matches it against the device's backend.
+static const void * g_moe_cache_owner = nullptr;
+
 static int moe_cache_query_device(
         void * opaque, const ggml_moe_cache_config * config,
         ggml_moe_cache_device_caps * result) {
-    if (!opaque || !config || !result || !ggml_moe_cache.owner) {
+    if (!opaque || !config || !result || !g_moe_cache_owner) {
         return 0;
     }
 
     ggml_backend_dev_t device = (ggml_backend_dev_t)opaque;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-    if ((const void *)reg != ggml_moe_cache.owner) {
+    if ((const void *)reg != g_moe_cache_owner) {
         return 0;
     }
 
@@ -3125,29 +3129,34 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
     return freed;
 }
 
-static void ggml_moe_cache_register(const void * owner) {
-    if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
-        return;
-    }
-    ggml_moe_cache.owner = owner;
-    ggml_moe_cache.query_config = moe_cache_query_config;
-    ggml_moe_cache.query_device = moe_cache_query_device;
-    ggml_moe_cache.query_shape = moe_cache_query_shape;
-    ggml_moe_cache.session_create = moe_cache_session_create;
-    ggml_moe_cache.session_destroy = moe_cache_session_destroy;
-    ggml_moe_cache.session_enter = moe_cache_session_enter;
-    ggml_moe_cache.session_leave = moe_cache_session_leave;
-    ggml_moe_cache.begin = moe_cache_begin;
-    ggml_moe_cache.plan = moe_cache_plan;
-    ggml_moe_cache.dispatch = moe_cache_dispatch;
-    ggml_moe_cache.collect = moe_cache_collect;
-    ggml_moe_cache.end = moe_cache_end;
-    ggml_moe_cache.fused_begin = moe_cache_fused_begin;
-    ggml_moe_cache.invalidate = moe_cache_invalidate;
+static void moe_cache_register(const void * owner) {
+    g_moe_cache_owner = owner;
+    ggml_moe_cache_api api = {};
+    api.owner = owner;
+    api.query_config = moe_cache_query_config;
+    api.query_device = moe_cache_query_device;
+    api.query_shape = moe_cache_query_shape;
+    api.session_create = moe_cache_session_create;
+    api.session_destroy = moe_cache_session_destroy;
+    api.session_enter = moe_cache_session_enter;
+    api.session_leave = moe_cache_session_leave;
+    api.begin = moe_cache_begin;
+    api.plan = moe_cache_plan;
+    api.dispatch = moe_cache_dispatch;
+    api.collect = moe_cache_collect;
+    api.end = moe_cache_end;
+    api.fused_begin = moe_cache_fused_begin;
+    api.invalidate = moe_cache_invalidate;
+    ggml_moe_cache_register(&api);
 }
 
-#endif
-
+#if defined(GGML_USE_MUSA)
 void ggml_cuda_moe_cache_register(void * reg) {
-    ggml_moe_cache_register(reg);
+    (void) reg;
+    moe_cache_register_stub(reg);
 }
+#else
+void ggml_cuda_moe_cache_register(void * reg) {
+    moe_cache_register(reg);
+}
+#endif

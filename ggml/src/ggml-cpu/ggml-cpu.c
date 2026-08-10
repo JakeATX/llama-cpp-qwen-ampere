@@ -1694,20 +1694,22 @@ static void ggml_compute_forward_mul_mat_id_impl(
     }
 
     if (ith == 0) {
+        // Provider table selected for this scheduler session (thread-local).
+        const struct ggml_moe_cache_api moe_cache = ggml_moe_cache_active();
         ggml_backend_buffer_t src0_buffer =
             src0->view_src ? src0->view_src->buffer : src0->buffer;
         if (allow_moe_cache &&
-            ggml_moe_cache.begin && ggml_moe_cache.plan &&
-            ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
+            moe_cache.begin && moe_cache.plan &&
+            moe_cache.dispatch && moe_cache.collect && moe_cache.end &&
             src0->op == GGML_OP_NONE && src0_buffer &&
             ggml_backend_buffer_is_host(src0_buffer) &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32) {
-            moe_cache_node = ggml_moe_cache.begin(src0->name, src0->data, nb02,
-                                                  ne00, ne01, (int) type, ne02,
-                                                  ids->ne[1], moe_cache_n_rows);
+            moe_cache_node = moe_cache.begin(src0->name, src0->data, nb02,
+                                             ne00, ne01, (int) type, ne02,
+                                             ids->ne[1], moe_cache_n_rows);
             if (moe_cache_node && !moe_cache_rows_fit) {
-                ggml_moe_cache.end(moe_cache_node);
+                moe_cache.end(moe_cache_node);
                 moe_cache_node = NULL;
             } else if (moe_cache_node) {
                 int32_t expert_ids[MOE_CACHE_MAX_TOPK];
@@ -1716,7 +1718,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                         expert_ids[iid1*n_ids + id] = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
                     }
                 }
-                ggml_moe_cache.plan(moe_cache_node, expert_ids, n_ids * ids->ne[1], moe_cache_slot_idx);
+                moe_cache.plan(moe_cache_node, expert_ids, n_ids * ids->ne[1], moe_cache_slot_idx);
             }
         }
 
@@ -1755,8 +1757,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
         }
 
         if (moe_cache_node && moe_cache_n_hits > 0) {
-            if (!ggml_moe_cache.dispatch(moe_cache_node, (int) type, ne00, ne01,
-                                         moe_cache_n_hits, moe_cache_compact, moe_cache_acts)) {
+            if (!moe_cache.dispatch(moe_cache_node, (int) type, ne00, ne01,
+                                    moe_cache_n_hits, moe_cache_compact, moe_cache_acts)) {
                 for (int i = 0; i < moe_cache_n_hits; i++) {
                     const int expert = moe_cache_experts[i];
                     MMID_MATRIX_ROW(expert, matrix_row_counts[expert]) =
@@ -1764,11 +1766,11 @@ static void ggml_compute_forward_mul_mat_id_impl(
                     matrix_row_counts[expert] += 1;
                 }
                 moe_cache_n_hits = 0;
-                ggml_moe_cache.end(moe_cache_node);
+                moe_cache.end(moe_cache_node);
                 moe_cache_node = NULL;
             }
         } else if (moe_cache_node) {
-            ggml_moe_cache.end(moe_cache_node);
+            moe_cache.end(moe_cache_node);
             moe_cache_node = NULL;
         }
     }
@@ -1843,7 +1845,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
     }
 
     if (ith == 0 && moe_cache_node) {
-        if (!ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
+        const struct ggml_moe_cache_api moe_cache = ggml_moe_cache_active();
+        if (!moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
             const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
             const size_t row_size = ggml_row_size(vec_dot_type, ne10);
             for (int i = 0; i < moe_cache_n_hits; i++) {
@@ -1858,7 +1861,7 @@ static void ggml_compute_forward_mul_mat_id_impl(
                     matrix_rows, row_size, src1_cont, wdata);
             }
         }
-        ggml_moe_cache.end(moe_cache_node);
+        moe_cache.end(moe_cache_node);
     }
 }
 
@@ -3238,8 +3241,9 @@ static bool ggml_moe_cache_can_fuse(
         const struct ggml_cgraph * cgraph,
         int node_n,
         struct ggml_moe_cache_fusion * fusion) {
-    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
-        !ggml_moe_cache.end) {
+    const struct ggml_moe_cache_api moe_cache = ggml_moe_cache_active();
+    if (!moe_cache.fused_begin || !moe_cache.collect ||
+        !moe_cache.end) {
         return false;
     }
 
@@ -3413,6 +3417,7 @@ static int ggml_cpu_try_fuse_moe_cache(
         !params->wdata || params->wsize < MOE_CACHE_FUSED_WORK_SIZE) {
         return 0;
     }
+    const struct ggml_moe_cache_api moe_cache = ggml_moe_cache_active();
 
     struct ggml_tensor * up = fusion.up;
     struct ggml_tensor * gate = fusion.gate;
@@ -3454,7 +3459,7 @@ static int ggml_cpu_try_fuse_moe_cache(
                 state->acts[row] = (const float *)((const char *)acts->data + token*acts->nb[2] + (id % acts->ne[1])*acts->nb[1]);
             }
         }
-        state->node = ggml_moe_cache.fused_begin(
+        state->node = moe_cache.fused_begin(
                 &up_desc, &gate_desc, (int)GGML_GLU_OP_SWIGLU,
                 fusion.up_min, fusion.up_max,
                 fusion.gate_min, fusion.gate_max,
@@ -3496,9 +3501,9 @@ static int ggml_cpu_try_fuse_moe_cache(
             fusion.clamped, fusion.up_min, fusion.up_max,
             fusion.gate_min, fusion.gate_max);
     if (params->ith == 0) {
-        state->collect_ok = ggml_moe_cache.collect(
+        state->collect_ok = moe_cache.collect(
                 state->node, state->n_hits, state->rows, glu->ne[0]);
-        ggml_moe_cache.end(state->node);
+        moe_cache.end(state->node);
         state->node = NULL;
     }
     ggml_barrier(params->threadpool);

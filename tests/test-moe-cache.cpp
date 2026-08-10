@@ -90,6 +90,17 @@ static void record_invalidation(const void * base, size_t size) {
     }
 }
 
+static void * test_provider_session_create(
+        void * const * backends, int n_backends,
+        const struct ggml_moe_cache_config * config) {
+    (void) backends; (void) n_backends; (void) config;
+    return nullptr;
+}
+
+static void test_provider_session_destroy(void * session) { (void) session; }
+static void test_provider_session_enter(void * session) { (void) session; }
+static void test_provider_session_leave(void * session) { (void) session; }
+
 struct reset_buffer_context {
     uint8_t data[64];
     bool reset = false;
@@ -104,11 +115,6 @@ static void reset_buffer_reset(ggml_backend_buffer_t buffer) {
 }
 
 static bool run_invalidation_hook_coverage(ggml_backend_t cpu) {
-    if (!ggml_moe_cache.invalidate) {
-        fprintf(stderr, "cache-invalidation-hooks: cache API is not registered\n");
-        return false;
-    }
-
     const ggml_init_params params = {
         4 * ggml_tensor_overhead(),
         nullptr,
@@ -130,11 +136,22 @@ static bool run_invalidation_hook_coverage(ggml_backend_t cpu) {
     }
     ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 
+    // Register a test provider whose invalidate hook records buffer mutations.
+    // The provider registry is the supported way to install a hook: the buffer
+    // mutation path iterates the registered providers.
+    static int dummy_owner = 0;
+    ggml_moe_cache_api test_api = {};
+    test_api.owner = &dummy_owner;
+    test_api.session_create = test_provider_session_create;
+    test_api.session_destroy = test_provider_session_destroy;
+    test_api.session_enter = test_provider_session_enter;
+    test_api.session_leave = test_provider_session_leave;
+    test_api.invalidate = record_invalidation;
+    ggml_moe_cache_register(&test_api);
+
     std::vector<float> data(64, 0.25f);
     std::vector<invalidation_record> records;
-    auto original_invalidate = ggml_moe_cache.invalidate;
     invalidation_records = &records;
-    ggml_moe_cache.invalidate = record_invalidation;
 
     bool ok = true;
     auto check = [&](const char * operation,
@@ -233,7 +250,7 @@ static bool run_invalidation_hook_coverage(ggml_backend_t cpu) {
     buffer = nullptr;
     check("buffer free", {{buffer_base, buffer_size}});
 
-    ggml_moe_cache.invalidate = original_invalidate;
+    ggml_moe_cache_unregister(&dummy_owner);
     invalidation_records = nullptr;
     ggml_free(ctx);
     printf("cache-invalidation-hooks: %s\n", ok ? "OK" : "FAIL");
@@ -399,15 +416,16 @@ static void configure_cache(
 
 static bool run_capability_queries(
         ggml_backend_dev_t cuda_device, ggml_backend_t cpu) {
-    if (!ggml_moe_cache.query_config || !ggml_moe_cache.query_device ||
-        !ggml_moe_cache.query_shape) {
+    const ggml_moe_cache_api api =
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(cuda_device));
+    if (!api.query_config || !api.query_device || !api.query_shape) {
         fprintf(stderr, "cache-capabilities: query API is incomplete\n");
         return false;
     }
 
     configure_cache(nullptr);
     ggml_moe_cache_config config = {};
-    bool ok = ggml_moe_cache.query_config(1, 0, &config) == 1;
+    bool ok = api.query_config(1, 0, &config) == 1;
     ok &= config.min_devices == 2;
     ok &= config.budget_bytes == 4u * 1024 * 1024;
     ok &= config.reserve_bytes == 0;
@@ -417,32 +435,32 @@ static bool run_capability_queries(
     ok &= config.overlap_cpu_rows == 0;
 
     ggml_moe_cache_device_caps device = {};
-    ok &= ggml_moe_cache.query_device(cuda_device, &config, &device) == 1;
+    ok &= api.query_device(cuda_device, &config, &device) == 1;
     ok &= device.logical_device >= 0;
     ok &= device.physical_device >= 0;
     ok &= device.compute_capability >= config.min_compute_capability;
     ok &= device.min_expert_bytes == 1024;
-    ok &= ggml_moe_cache.query_device(cpu->device, &config, &device) == 0;
+    ok &= api.query_device(cpu->device, &config, &device) == 0;
 
     const size_t expert_size = ggml_row_size(GGML_TYPE_Q4_0, n_in) * n_out;
     ggml_moe_cache_shape_caps shape = {};
-    ok &= ggml_moe_cache.query_shape(
+    ok &= api.query_shape(
             GGML_TYPE_Q4_0, n_in, n_out, 64, expert_size, &shape) == 1;
     ok &= shape.pool_bytes == expert_size * 64;
     ok &= shape.minimum_bytes == shape.scratch_bytes + shape.pool_bytes;
-    ok &= ggml_moe_cache.query_shape(
+    ok &= api.query_shape(
             GGML_TYPE_F32, n_in, n_out, 64, expert_size, &shape) == 0;
-    ok &= ggml_moe_cache.query_shape(
+    ok &= api.query_shape(
             GGML_TYPE_Q4_0, n_in, n_out, 64, expert_size - 1, &shape) == 0;
-    ok &= ggml_moe_cache.query_shape(
+    ok &= api.query_shape(
             GGML_TYPE_Q4_0, n_in, n_out, 1, expert_size, &shape) == 1;
     ok &= shape.pool_bytes == expert_size * 64;
-    ok &= ggml_moe_cache.query_shape(
+    ok &= api.query_shape(
             GGML_TYPE_Q4_0, n_in, n_out, 0, expert_size, &shape) == 0;
 
     set_env("GGML_CUDA_MOE_CACHE", "0");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "off");
-    ok &= ggml_moe_cache.query_config(-1, 0, &config) == 0;
+    ok &= api.query_config(-1, 0, &config) == 0;
 
     set_env("GGML_CUDA_MOE_CACHE", "1");
     set_env("GGML_CUDA_MOE_CACHE_MODE", "auto");
@@ -451,7 +469,7 @@ static bool run_capability_queries(
     set_env("GGML_CUDA_MOE_CACHE_MAX_BATCH", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_MIN_CC", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", nullptr);
-    ok &= ggml_moe_cache.query_config(1, 0, &config) == 1;
+    ok &= api.query_config(1, 0, &config) == 1;
     ok &= config.min_devices == 2;
     ok &= config.minimum_slab_bytes == 1024u * 1024 * 1024;
     ok &= config.min_compute_capability == 800;
@@ -459,10 +477,10 @@ static bool run_capability_queries(
     ok &= config.min_expert_explicit == 0;
     ok &= config.max_batch == 8;
     ok &= config.overlap_cpu_rows == -1;
-    ok &= ggml_moe_cache.query_device(cuda_device, &config, &device) == 1;
+    ok &= api.query_device(cuda_device, &config, &device) == 1;
     ok &= device.min_expert_bytes == 512u * 1024;
 
-    ok &= ggml_moe_cache.query_config(0, 0, &config) == 1;
+    ok &= api.query_config(0, 0, &config) == 1;
     ok &= config.min_devices == 1;
     ok &= config.minimum_slab_bytes == 0;
     ok &= config.min_compute_capability == 700;
@@ -470,7 +488,7 @@ static bool run_capability_queries(
     ok &= config.min_expert_explicit == 0;
     ok &= config.max_batch == 8;
     ok &= config.overlap_cpu_rows == -1;
-    ok &= ggml_moe_cache.query_device(cuda_device, &config, &device) == 1;
+    ok &= api.query_device(cuda_device, &config, &device) == 1;
     ok &= device.min_expert_bytes == (device.compute_capability >= 800
             ? 512u * 1024 : 1024u * 1024);
     configure_cache(nullptr);
