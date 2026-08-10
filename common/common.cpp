@@ -1253,6 +1253,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.tensor_split, params.tensor_split + llama_max_devices());
         const std::vector<llama_model_tensor_buft_override> tbo_before =
             params.tensor_buft_overrides;
+        const common_moe_cache_params moe_cache_before = params.moe_cache;
 
         const common_params_fit_status fit_status = common_fit_params(
             params.model.path.c_str(), &mparams, &cparams,
@@ -1272,6 +1273,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             cparams = cparams_before;
             std::copy(tensor_split_before.begin(), tensor_split_before.end(), params.tensor_split);
             params.tensor_buft_overrides = tbo_before;
+            params.moe_cache = moe_cache_before;
             // Re-point at the restored arrays (the override vector may have moved).
             mparams.tensor_split = params.tensor_split;
             mparams.tensor_buft_overrides = params.tensor_buft_overrides.empty()
