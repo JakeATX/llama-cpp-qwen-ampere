@@ -41,6 +41,9 @@ static thread_local int g_session_suppressed = 0;
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
 
+// Backend registration object this provider was registered under.
+static const void * g_moe_cache_owner = nullptr;
+
 // ---------------------------------------------------------------------------
 // Metal device extension
 // ---------------------------------------------------------------------------
@@ -139,13 +142,13 @@ static int metal_query_config(int automatic, size_t budget_mib,
 
 static int metal_query_device(void * opaque, const ggml_moe_cache_config * config,
                                ggml_moe_cache_device_caps * result) {
-    if (!opaque || !config || !result || !ggml_moe_cache.owner) {
+    if (!opaque || !config || !result || !g_moe_cache_owner) {
         return 0;
     }
 
     ggml_backend_dev_t device = (ggml_backend_dev_t)opaque;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-    if ((const void *)reg != ggml_moe_cache.owner) {
+    if ((const void *)reg != g_moe_cache_owner) {
         return 0;
     }
 
@@ -392,6 +395,16 @@ static void metal_session_destroy(void * opaque) {
         return;
     }
     {
+        // Stop new scopes/nodes and wait for in-flight work to drain before
+        // touching device resources a CPU worker may still be using.
+        std::unique_lock<std::mutex> lock(session->mu);
+        session->stopping = true;
+        session->cv.notify_all();
+        session->idle_cv.wait(lock, [&] {
+            return session->active_scopes == 0 && session->active_nodes == 0;
+        });
+    }
+    {
         std::lock_guard<std::mutex> lock(g_registry_mu);
         g_sessions.erase(session);
     }
@@ -430,6 +443,7 @@ static void metal_session_enter(void * opaque) {
         g_session_suppressed++;
         return;
     }
+    std::lock_guard<std::mutex> lock(session->mu);
     session->active_scopes++;
 }
 
@@ -449,8 +463,12 @@ static void metal_session_leave(void * opaque) {
     }
     moe_cache_session * active = found->active;
     g_session_stack.erase(std::next(found).base());
-    if (active && active->active_scopes > 0) {
-        active->active_scopes--;
+    if (active) {
+        std::lock_guard<std::mutex> lock(active->mu);
+        if (active->active_scopes > 0) {
+            active->active_scopes--;
+        }
+        active->idle_cv.notify_all();
     }
 }
 
@@ -529,9 +547,14 @@ static void * metal_begin(const char * name, const void * host_base,
         dispatch_lock = std::unique_lock<std::mutex>(
                 dev.dispatch_mu, std::try_to_lock);
     } catch (...) {
+        dev.contention_bypasses++;
         return nullptr;
     }
-    if (!dispatch_lock.owns_lock() || dev.dead.load()) {
+    if (!dispatch_lock.owns_lock()) {
+        dev.contention_bypasses++;
+        return nullptr;
+    }
+    if (dev.dead.load()) {
         return nullptr;
     }
 
@@ -562,6 +585,10 @@ static void * metal_begin(const char * name, const void * host_base,
     node->n_tokens = n_tokens;
     node->wtype = wtype;
     node->dispatch_lock = std::move(dispatch_lock);
+
+    // Own the node for the caller; destroy() waits for this to reach zero.
+    std::lock_guard<std::mutex> session_lock(session->mu);
+    session->active_nodes++;
     return node.release();
 }
 
@@ -792,10 +819,27 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
 
     [cmd_buf commit];
     [cmd_buf waitUntilCompleted];
+
+    // A failed command buffer leaves out_buf with undefined contents. Do not
+    // publish it: report failure so the CPU path recomputes these rows.
+    const bool cmd_ok = [cmd_buf status] == MTLCommandBufferStatusCompleted;
+    if (!cmd_ok) {
+        NSError * mtl_err = [cmd_buf error];
+        MOE_CACHE_LOG("[moe-cache] Metal%d: command buffer failed (status=%ld, error=%s); "
+                      "dropping the matvec so the CPU path recomputes\n",
+                      dev.physical, (long)[cmd_buf status],
+                      mtl_err ? [[mtl_err localizedDescription] UTF8String] : "none");
+    }
     [cmd_buf release];
 
     [ids_buf release];
     [act_buf release];
+    if (!cmd_ok) {
+        [out_buf release];
+        dev.dispatch_failures++;
+        return 0;
+    }
+
     if (dev.out_buffer) {
         [dev.out_buffer release];
     }
@@ -863,6 +907,7 @@ static void metal_end(void * opaque) {
             }
         }
         session.active_nodes--;
+        session.idle_cv.notify_all();
     }
 }
 
@@ -914,33 +959,31 @@ static void metal_invalidate(const void * base, size_t size) {
 // Registration
 // ---------------------------------------------------------------------------
 
-// Each backend wires its own function table into the global
-// ggml_moe_cache. The register helper is static (internal linkage) so
-// multiple backends can be linked into one binary without duplicate
-// symbols; the owner is the backend reg pointer so that query_device
-// can match ggml_backend_dev_backend_reg(device).
+// Each backend wires its own function table into the provider registry
+// (ggml-backend-moe-cache.h). The owner is the backend reg pointer so that
+// query_device can match ggml_backend_dev_backend_reg(device).
 
-static void ggml_moe_cache_register(const void * owner) {
-    if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
-        return;
-    }
-    ggml_moe_cache.owner = owner;
-    ggml_moe_cache.query_config = metal_query_config;
-    ggml_moe_cache.query_device = metal_query_device;
-    ggml_moe_cache.query_shape = metal_query_shape;
-    ggml_moe_cache.session_create = metal_session_create;
-    ggml_moe_cache.session_destroy = metal_session_destroy;
-    ggml_moe_cache.session_enter = metal_session_enter;
-    ggml_moe_cache.session_leave = metal_session_leave;
-    ggml_moe_cache.begin = metal_begin;
-    ggml_moe_cache.plan = metal_plan;
-    ggml_moe_cache.dispatch = metal_dispatch;
-    ggml_moe_cache.collect = metal_collect;
-    ggml_moe_cache.end = metal_end;
-    ggml_moe_cache.fused_begin = metal_fused_begin;
-    ggml_moe_cache.invalidate = metal_invalidate;
+static void metal_register(const void * owner) {
+    g_moe_cache_owner = owner;
+    ggml_moe_cache_api api = {};
+    api.owner = owner;
+    api.query_config = metal_query_config;
+    api.query_device = metal_query_device;
+    api.query_shape = metal_query_shape;
+    api.session_create = metal_session_create;
+    api.session_destroy = metal_session_destroy;
+    api.session_enter = metal_session_enter;
+    api.session_leave = metal_session_leave;
+    api.begin = metal_begin;
+    api.plan = metal_plan;
+    api.dispatch = metal_dispatch;
+    api.collect = metal_collect;
+    api.end = metal_end;
+    api.fused_begin = metal_fused_begin;
+    api.invalidate = metal_invalidate;
+    ggml_moe_cache_register(&api);
 }
 
 extern "C" void ggml_metal_moe_cache_register(void * reg) {
-    ggml_moe_cache_register(reg);
+    metal_register(reg);
 }

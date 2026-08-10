@@ -56,6 +56,9 @@ static thread_local int g_session_suppressed = 0;
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
 
+// Backend registration object this provider was registered under.
+static const void * g_moe_cache_owner = nullptr;
+
 // ---------------------------------------------------------------------------
 // Vulkan device extension
 // ---------------------------------------------------------------------------
@@ -519,13 +522,13 @@ static int vk_moe_query_config(int automatic, size_t budget_mib,
 
 static int vk_moe_query_device(void * opaque, const ggml_moe_cache_config * config,
                                ggml_moe_cache_device_caps * result) {
-    if (!opaque || !config || !result || !ggml_moe_cache.owner) {
+    if (!opaque || !config || !result || !g_moe_cache_owner) {
         return 0;
     }
 
     ggml_backend_dev_t device = (ggml_backend_dev_t)opaque;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-    if ((const void *)reg != ggml_moe_cache.owner) {
+    if ((const void *)reg != g_moe_cache_owner) {
         return 0;
     }
 
@@ -776,6 +779,16 @@ static void vk_moe_session_destroy(void * opaque) {
         return;
     }
     {
+        // Stop new scopes/nodes and wait for in-flight work to drain before
+        // freeing device resources a CPU worker may still be using.
+        std::unique_lock<std::mutex> lock(session->mu);
+        session->stopping = true;
+        session->cv.notify_all();
+        session->idle_cv.wait(lock, [&] {
+            return session->active_scopes == 0 && session->active_nodes == 0;
+        });
+    }
+    {
         std::lock_guard<std::mutex> lock(g_registry_mu);
         g_sessions.erase(session);
     }
@@ -806,6 +819,7 @@ static void vk_moe_session_enter(void * opaque) {
         g_session_suppressed++;
         return;
     }
+    std::lock_guard<std::mutex> lock(session->mu);
     session->active_scopes++;
 }
 
@@ -825,8 +839,12 @@ static void vk_moe_session_leave(void * opaque) {
     }
     moe_cache_session * active = found->active;
     g_session_stack.erase(std::next(found).base());
-    if (active && active->active_scopes > 0) {
-        active->active_scopes--;
+    if (active) {
+        std::lock_guard<std::mutex> lock(active->mu);
+        if (active->active_scopes > 0) {
+            active->active_scopes--;
+        }
+        active->idle_cv.notify_all();
     }
 }
 
@@ -876,9 +894,14 @@ static void * vk_moe_begin(const char * name, const void * host_base,
         dispatch_lock = std::unique_lock<std::mutex>(
                 dev.dispatch_mu, std::try_to_lock);
     } catch (...) {
+        dev.contention_bypasses++;
         return nullptr;
     }
-    if (!dispatch_lock.owns_lock() || dev.dead.load()) {
+    if (!dispatch_lock.owns_lock()) {
+        dev.contention_bypasses++;
+        return nullptr;
+    }
+    if (dev.dead.load()) {
         return nullptr;
     }
 
@@ -909,6 +932,10 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     node->n_tokens = n_tokens;
     node->wtype = wtype;
     node->dispatch_lock = std::move(dispatch_lock);
+
+    // Own the node for the caller; destroy() waits for this to reach zero.
+    std::lock_guard<std::mutex> session_lock(session->mu);
+    session->active_nodes++;
     return node.release();
 }
 
@@ -964,10 +991,12 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
     const int fill_budget = std::min(n_misses, n_fills);
 
     // Pre-fill stage: host-visible slabs are filled inline; device-local
-    // slabs are filled through the staging buffer in one batch.
+    // slabs are filled through the staging buffer in one batch. Pending
+    // slots stay in 'copying' until the batch transfer is confirmed so a
+    // failed submit can never publish stale slab bytes as a hit.
     struct pending_fill {
         int slot;
-        const void * source;
+        int index; // ids[] / slot_indices[] position
     };
     std::vector<pending_fill> pending;
     vk_buf * slab_buf = nullptr;
@@ -1051,28 +1080,30 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
         if (dev.host_mapped && pool.slab) {
             memcpy(pool.slab + (size_t)slot_index * node->expert_size,
                    source, node->expert_size);
+            // Host-mapped fill is a plain memcpy that cannot fail; promote now.
+            slot.state = moe_cache_slot_state::valid;
+            moe_cache_lru_push_back(pool, slot_index);
+            slot.readers++;
+            node->pins[node->n_pins++] = {&pool, slot_index};
+            slot_indices[index] = slot_index;
+            dev.inserts++;
+            dev.fills++;
+            dev.hits++;
+            hits++;
         } else if (slab_buf) {
             memcpy((char *)dev.staging.mapped +
                        (size_t)(fills_done - 1) * node->expert_size,
                    source, node->expert_size);
+            pending.push_back({slot_index, index});
+            // stays in 'copying' until the batch copy below succeeds
         }
-        pending.push_back({slot_index, source});
-
-        slot.state = moe_cache_slot_state::valid;
-        moe_cache_lru_push_back(pool, slot_index);
-
-        slot.readers++;
-        node->pins[node->n_pins++] = {&pool, slot_index};
-        slot_indices[index] = slot_index;
-        dev.inserts++;
-        dev.fills++;
-        dev.hits++;
-        hits++;
     }
 
-    // Batch-copy staged payloads into the device-local slab.
+    // Batch-copy staged payloads into the device-local slab, then promote
+    // the pending slots. On failure roll them back so a later node cannot
+    // consume the stale entries as hits.
     if (!pending.empty() && !dev.host_mapped && slab_buf) {
-        vk_submit_and_wait(dev, [&](VkCommandBuffer cmd) {
+        const bool copy_ok = vk_submit_and_wait(dev, [&](VkCommandBuffer cmd) {
             std::vector<VkBufferCopy> regions;
             regions.reserve(pending.size());
             for (size_t i = 0; i < pending.size(); i++) {
@@ -1086,6 +1117,34 @@ static int vk_moe_plan(void * opaque, const int32_t * ids, int n_ids,
                             (uint32_t)regions.size(), regions.data());
             return true;
         });
+
+        if (copy_ok) {
+            for (const pending_fill & fill : pending) {
+                moe_cache_slot & pslot = pool.slots[fill.slot];
+                pslot.state = moe_cache_slot_state::valid;
+                moe_cache_lru_push_back(pool, fill.slot);
+                pslot.readers++;
+                node->pins[node->n_pins++] = {&pool, fill.slot};
+                slot_indices[fill.index] = fill.slot;
+                dev.inserts++;
+                dev.fills++;
+                dev.hits++;
+                hits++;
+            }
+        } else {
+            // Roll back: erase map entry, free the slot, keep slot_indices
+            // at -1 so the CPU path recomputes these rows. The slab contents
+            // are unknown after a failed transfer; mark the device dead so no
+            // later node can hit stale entries.
+            for (const pending_fill & fill : pending) {
+                moe_cache_slot_reset(pool, fill.slot, true);
+                dev.fill_failures++;
+            }
+            dev.dead.store(true);
+            MOE_CACHE_LOG("[moe-cache] Vulkan%d: staged fill transfer failed; "
+                          "rolled back %zu fills and disabled the device cache\n",
+                          dev.physical, pending.size());
+        }
     }
 
     dev.nodes++;
@@ -1371,6 +1430,7 @@ static void vk_moe_end(void * opaque) {
             }
         }
         session.active_nodes--;
+        session.idle_cv.notify_all();
     }
 }
 
@@ -1422,36 +1482,34 @@ static void vk_moe_invalidate(const void * base, size_t size) {
 // Registration
 // ---------------------------------------------------------------------------
 
-// Each backend wires its own function table into the global
-// ggml_moe_cache. The register helper is static (internal linkage) so
-// multiple backends can be linked into one binary without duplicate
-// symbols; the owner is the backend reg pointer so that query_device
-// can match ggml_backend_dev_backend_reg(device).
+// Each backend wires its own function table into the provider registry
+// (ggml-backend-moe-cache.h). The owner is the backend reg pointer so that
+// query_device can match ggml_backend_dev_backend_reg(device).
 
-static void ggml_moe_cache_register(const void * owner) {
-    if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
-        return;
-    }
-    ggml_moe_cache.owner = owner;
-    ggml_moe_cache.query_config = vk_moe_query_config;
-    ggml_moe_cache.query_device = vk_moe_query_device;
-    ggml_moe_cache.query_shape = vk_moe_query_shape;
-    ggml_moe_cache.session_create = vk_moe_session_create;
-    ggml_moe_cache.session_destroy = vk_moe_session_destroy;
-    ggml_moe_cache.session_enter = vk_moe_session_enter;
-    ggml_moe_cache.session_leave = vk_moe_session_leave;
-    ggml_moe_cache.begin = vk_moe_begin;
-    ggml_moe_cache.plan = vk_moe_plan;
-    ggml_moe_cache.dispatch = vk_moe_dispatch;
-    ggml_moe_cache.collect = vk_moe_collect;
-    ggml_moe_cache.end = vk_moe_end;
-    ggml_moe_cache.fused_begin = vk_moe_fused_begin;
-    ggml_moe_cache.invalidate = vk_moe_invalidate;
+static void vk_moe_register(const void * owner) {
+    g_moe_cache_owner = owner;
+    ggml_moe_cache_api api = {};
+    api.owner = owner;
+    api.query_config = vk_moe_query_config;
+    api.query_device = vk_moe_query_device;
+    api.query_shape = vk_moe_query_shape;
+    api.session_create = vk_moe_session_create;
+    api.session_destroy = vk_moe_session_destroy;
+    api.session_enter = vk_moe_session_enter;
+    api.session_leave = vk_moe_session_leave;
+    api.begin = vk_moe_begin;
+    api.plan = vk_moe_plan;
+    api.dispatch = vk_moe_dispatch;
+    api.collect = vk_moe_collect;
+    api.end = vk_moe_end;
+    api.fused_begin = vk_moe_fused_begin;
+    api.invalidate = vk_moe_invalidate;
+    ggml_moe_cache_register(&api);
 }
 
 // Prior declaration so the definition below does not trip -Wmissing-declarations.
 extern "C" void ggml_vulkan_moe_cache_register(void * reg);
 
 extern "C" void ggml_vulkan_moe_cache_register(void * reg) {
-    ggml_moe_cache_register(reg);
+    vk_moe_register(reg);
 }

@@ -238,6 +238,10 @@ struct moe_cache_device {
     long long inserts = 0;
     long long fills = 0;
     long long fill_failures = 0;
+    // Dispatch mutex contention that turned a potential cache hit into a
+    // complete CPU fallback (try_to_lock failed). Measured first so a bounded
+    // wait or per-device FIFO can be justified with data.
+    long long contention_bypasses = 0;
     long long evictions = 0;
     long long insert_skips = 0;
     long long admission_skips = 0;
