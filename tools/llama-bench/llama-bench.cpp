@@ -2563,13 +2563,22 @@ int llama_bench(int argc, char ** argv) {
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
             common_moe_cache_params fit_moe_cache = common_moe_cache_from_bench_mode(inst.moe_cache);
 
-            common_fit_params(inst.model.c_str(), &mparams, &cparams,
+            const common_params_fit_status fit_status = common_fit_params(
+                inst.model.c_str(), &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
                 &fit_moe_cache,
                 margins.data(),
                 inst.fit_min_ctx,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                // Never report PP/TG numbers for a failed fit. The logger is
+                // suppressed by default, so print an unconditional diagnostic.
+                fprintf(stderr,
+                    "%s: error: failed to fit parameters for benchmark %d/%zu (status=%d); skipping this case\n",
+                    __func__, params_idx, params_count, (int) fit_status);
+                continue;
+            }
             cache_fit_selected = fit_moe_cache.fit_selected;
        }
 

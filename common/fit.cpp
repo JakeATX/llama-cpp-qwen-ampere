@@ -1216,15 +1216,38 @@ static void common_params_fit_impl(
                 pattern_strings.clear();
                 pattern_strings.reserve(total_layers);
 
+                // Per-layer routed-expert bytes from tensor metadata. Evicting
+                // layers in ascending footprint order makes the search minimize
+                // the bytes evicted, not just the number of prefix layers.
+                std::vector<int64_t> layer_bytes(total_layers, 0);
+                for (const llama_moe_tensor_info & tensor : moe_tensors) {
+                    if (tensor.layer >= 0 && tensor.layer < total_layers &&
+                        tensor.n_expert > 0 && tensor.expert_size > 0 &&
+                        (uint64_t)tensor.n_expert <= INT64_MAX / (int64_t)tensor.expert_size) {
+                        layer_bytes[tensor.layer] +=
+                            (int64_t)tensor.n_expert * (int64_t)tensor.expert_size;
+                    }
+                }
+                std::vector<int> order(total_layers);
+                for (int i = 0; i < total_layers; i++) {
+                    order[i] = i;
+                }
+                std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+                    return layer_bytes[a] != layer_bytes[b]
+                        ? layer_bytes[a] < layer_bytes[b] : a < b;
+                });
+
                 int lo = 0, hi = total_layers;
                 int best_n_evict = -1;
+                int64_t best_evicted_bytes = 0;
                 dmds_t best_memory;
                 common_moe_cache_fit_result best_cache_fit;
 
                 while (lo <= hi) {
-                    int mid = lo + (hi - lo) / 2;
+                    const int mid = lo + (hi - lo) / 2;
 
-                    // Build candidate: all layers on main GPU, first 'mid' layers' experts to CPU
+                    // Build candidate: all layers on main GPU, the 'mid'
+                    // smallest-footprint layers' experts moved to CPU
                     std::vector<float> candidate_split(llama_max_devices(), 0.0f);
                     std::vector<llama_model_tensor_buft_override> candidate_overrides(ntbo, {nullptr, nullptr});
                     llama_model_params candidate = *mparams;
@@ -1237,11 +1260,11 @@ static void common_params_fit_impl(
                     }
                     candidate.tensor_split = candidate_split.data();
 
-                    // Per-layer overrides: evict first 'mid' layers' experts to CPU
+                    // Per-layer overrides: evict the chosen layers' experts to CPU
                     pattern_strings.clear();
                     int n_overrides = 0;
                     for (int i = 0; i < mid && n_overrides < (int)ntbo - 1; i++) {
-                        pattern_strings.push_back(llm_ffn_exps_block_regex(i));
+                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
                         candidate_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
                     }
                     candidate_overrides[n_overrides] = {nullptr, nullptr};
@@ -1271,6 +1294,10 @@ static void common_params_fit_impl(
                                 moe_cache, moe_tensors, devs, candidate_memory, margins);
                         if (cf.feasible) {
                             best_n_evict = mid;
+                            best_evicted_bytes = 0;
+                            for (int i = 0; i < mid; i++) {
+                                best_evicted_bytes += layer_bytes[order[i]];
+                            }
                             best_memory = std::move(candidate_memory);
                             best_cache_fit = cf;
                             hi = mid - 1;  // Try fewer evictions
@@ -1296,7 +1323,7 @@ static void common_params_fit_impl(
                     pattern_strings.clear();
                     int n_overrides = 0;
                     for (int i = 0; i < best_n_evict && n_overrides < (int)ntbo - 1; i++) {
-                        pattern_strings.push_back(llm_ffn_exps_block_regex(i));
+                        pattern_strings.push_back(llm_ffn_exps_block_regex(order[i]));
                         tensor_buft_overrides[n_overrides++] = {pattern_strings.back().c_str(), ggml_backend_cpu_buffer_type()};
                     }
                     tensor_buft_overrides[n_overrides] = {nullptr, nullptr};
@@ -1309,10 +1336,15 @@ static void common_params_fit_impl(
                         ? 100.0 * (double)std::min(best_cache_fit.cache_bytes, best_cache_fit.expert_bytes) /
                             (double)best_cache_fit.expert_bytes
                         : 0.0;
+                    const int64_t kept_bytes = best_cache_fit.expert_bytes > (size_t)best_evicted_bytes
+                        ? (int64_t)best_cache_fit.expert_bytes - best_evicted_bytes : 0;
                     LOG_INF("%s: MoE cache soft mode selected partial-eviction placement: %d/%d layers keep experts GPU-resident, "
-                            "%zu MiB projected cache capacity for %zu MiB of routed expert weights (up to %.1f%% coverage)\n",
+                            "%zu MiB of %zu MiB routed expert bytes evicted (%zu MiB kept), "
+                            "%zu MiB projected cache capacity (up to %.1f%% coverage)\n",
                             __func__, n_kept, total_layers,
-                            best_cache_fit.cache_bytes / MiB, best_cache_fit.expert_bytes / MiB, coverage);
+                            best_evicted_bytes / MiB, best_cache_fit.expert_bytes / MiB,
+                            kept_bytes / MiB,
+                            best_cache_fit.cache_bytes / MiB, coverage);
                     for (const common_moe_cache_fit_device & device : best_cache_fit.devices) {
                         LOG_INF("%s: MoE cache fit CUDA%d leaves %zu MiB after reserve; minimum complete pool set is %zu MiB\n",
                                 __func__, device.physical_device, device.cache_bytes / MiB,

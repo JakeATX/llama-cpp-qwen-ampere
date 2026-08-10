@@ -92,6 +92,9 @@ struct llama_moe_tensor_info {
     int64_t n_input;
     int64_t n_output;
     int64_t n_expert;
+    // Transformer block index parsed from the tensor name ("blk.<N>..."),
+    // or -1 when the layer cannot be determined.
+    int64_t layer;
 };
 
 LLAMA_API size_t llama_model_get_moe_tensor_info(

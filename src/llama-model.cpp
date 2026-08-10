@@ -2898,6 +2898,15 @@ size_t llama_model_get_moe_tensor_info(
             continue;
         }
 
+        int64_t layer = -1;
+        if (name.compare(0, 4, "blk.") == 0) {
+            char * end = nullptr;
+            const long parsed = strtol(name.c_str() + 4, &end, 10);
+            if (end != name.c_str() + 4) {
+                layer = parsed;
+            }
+        }
+
         if (info && count < capacity) {
             info[count] = {
                 tensor->type,
@@ -2905,6 +2914,7 @@ size_t llama_model_get_moe_tensor_info(
                 tensor->ne[0],
                 tensor->ne[1],
                 tensor->ne[2],
+                layer,
             };
         }
         count++;

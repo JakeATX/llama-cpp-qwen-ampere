@@ -600,16 +600,16 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
-#else
-            CUresult create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
-            if (create_result == CUDA_ERROR_OUT_OF_MEMORY &&
+            // On OOM, surrender MoE cache storage and retry once. Each vendor
+            // returns its own error enum from cuMemCreate (CUresult on CUDA,
+            // hipError_t on HIP, MUresult on MUSA); auto + the per-vendor
+            // cudaErrorMemoryAllocation alias keeps this portable.
+            auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+            if (create_result == cudaErrorMemoryAllocation &&
                 ggml_moe_cache_trim(device) > 0) {
                 create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
             CU_CHECK(create_result);
-#endif
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
