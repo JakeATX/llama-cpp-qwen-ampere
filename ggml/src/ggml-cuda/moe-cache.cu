@@ -234,6 +234,10 @@ struct moe_cache_device {
     long long fused_nodes = 0;
     long long nodes = 0;
     long long collect_calls = 0;
+    // Dispatch mutex contention that turned a potential cache hit into a
+    // complete CPU fallback (try_to_lock failed). Measured first so a bounded
+    // wait or per-device FIFO can be justified with data.
+    long long contention_bypasses = 0;
     std::atomic<int> error_logs{0};
 };
 
@@ -1451,7 +1455,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         used += pool.n_slots - pool.free_slots.size();
     }
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld bypass=%lld\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
             used, slots, device.inserts, device.fills, device.fill_failures,
@@ -1463,7 +1467,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.pair_both, device.pair_up_only,
             device.pair_gate_only, device.pair_neither,
             device.fused_attempts,
-            device.fused_nodes);
+            device.fused_nodes, device.contention_bypasses);
 }
 
 static void moe_cache_log_configuration(moe_cache_session & session) {
@@ -2081,6 +2085,7 @@ static void * moe_cache_begin(
         dispatch_lock = std::unique_lock<std::mutex>(
                 device.dispatch_mu, std::try_to_lock);
     } catch (...) {
+        device.contention_bypasses++;
         std::lock_guard<std::mutex> lock(session->mu);
         auto source = session->active_sources.find(host_base);
         if (source != session->active_sources.end() && --source->second.references == 0) {
@@ -2089,6 +2094,9 @@ static void * moe_cache_begin(
         session->active_nodes--;
         session->idle_cv.notify_all();
         return nullptr;
+    }
+    if (!dispatch_lock.owns_lock()) {
+        device.contention_bypasses++;
     }
     if (!dispatch_lock.owns_lock() || device.dead.load()) {
         std::lock_guard<std::mutex> lock(session->mu);
@@ -2802,8 +2810,12 @@ static void * moe_cache_fused_begin(
         dispatch_lock = std::unique_lock<std::mutex>(
                 selected->dispatch_mu, std::try_to_lock);
     } catch (...) {
+        selected->contention_bypasses++;
         release_active();
         return nullptr;
+    }
+    if (!dispatch_lock.owns_lock()) {
+        selected->contention_bypasses++;
     }
     if (!dispatch_lock.owns_lock() || selected->dead.load()) {
         release_active();
