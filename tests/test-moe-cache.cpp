@@ -433,7 +433,7 @@ static bool run_capability_queries(
     configure_cache(nullptr);
     ggml_moe_cache_config config = {};
     bool ok = api.query_config(1, 0, &config) == 1;
-    ok &= config.min_devices == 2;
+    ok &= config.min_devices == 1; // automatic mode now accepts a single device
     ok &= config.budget_bytes == 4u * 1024 * 1024;
     ok &= config.reserve_bytes == 0;
     ok &= config.minimum_slab_bytes == 1024u * 1024 * 1024;
@@ -477,7 +477,7 @@ static bool run_capability_queries(
     set_env("GGML_CUDA_MOE_CACHE_MIN_CC", nullptr);
     set_env("GGML_CUDA_MOE_CACHE_OVERLAP_CPU_ROWS", nullptr);
     ok &= api.query_config(1, 0, &config) == 1;
-    ok &= config.min_devices == 2;
+    ok &= config.min_devices == 1; // automatic mode now accepts a single device
     ok &= config.minimum_slab_bytes == 1024u * 1024 * 1024;
     ok &= config.min_compute_capability == 800;
     ok &= config.min_expert_bytes == 512u * 1024;
@@ -2738,6 +2738,67 @@ static bool run_route_override(
     return ok;
 }
 
+static bool run_single_gpu_auto(
+        ggml_backend_dev_t cuda_device, ggml_backend_t cuda, ggml_backend_t cpu,
+        log_capture & capture) {
+    const ggml_moe_cache_api api =
+        ggml_moe_cache_get(ggml_backend_dev_backend_reg(cuda_device));
+    if (!api.query_config || !api.session_create || !api.session_destroy) {
+        printf("cache-single-gpu-auto: FAIL (incomplete cache API)\n");
+        return false;
+    }
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    ggml_backend_dev_memory(cuda_device, &free_bytes, &total_bytes);
+    if (free_bytes < 1024u * 1024 * 1024 + 64u * 1024 * 1024) {
+        printf("cache-single-gpu-auto: SKIP (device free memory below the auto slab floor)\n");
+        return true;
+    }
+
+    configure_cache(nullptr);
+    set_env("GGML_CUDA_MOE_CACHE_MODE", "auto");
+    set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "2048");
+    set_env("GGML_CUDA_MOE_CACHE_RESERVE_MB", "0");
+    capture.clear();
+
+    ggml_moe_cache_config config = {};
+    if (!api.query_config(1, 2048, &config)) {
+        printf("cache-single-gpu-auto: FAIL (query_config)\n");
+        return false;
+    }
+    bool ok = config.min_devices == 1 &&
+        config.minimum_slab_bytes == 1024u * 1024 * 1024;
+
+    void * backends[] = { cuda, cpu };
+    void * session = api.session_create(backends, 2, &config);
+    ok &= session != nullptr;
+    if (session) {
+        constexpr int64_t shape_in = 1024;
+        constexpr int64_t shape_out = 160;
+        constexpr int64_t shape_experts = 64;
+        const size_t expert_size =
+            ggml_row_size(GGML_TYPE_Q4_0, shape_in) * shape_out;
+        std::vector<uint8_t> data(expert_size * shape_experts);
+        active_api().session_enter(session);
+        const bool ready = wait_for_direct_pool(
+                "blk.4.ffn_up_exps.weight", data.data(), expert_size,
+                shape_in, shape_out, GGML_TYPE_Q4_0, shape_experts);
+        const bool no_dormant_log =
+            capture.get().find("automatic slab floor") == std::string::npos;
+        active_api().session_leave(session);
+        api.session_destroy(session);
+        ok &= ready && no_dormant_log;
+        if (!ready) {
+            fprintf(stderr, "cache-single-gpu-auto: auto session did not engage\n%s\n",
+                    capture.get().c_str());
+        }
+    }
+    configure_cache(nullptr);
+    printf("cache-single-gpu-auto: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+
 static bool run_admission_policy_once(
         ggml_backend_t cuda, ggml_backend_t cpu,
         int new_expert_misses, log_capture & capture) {
@@ -3153,6 +3214,7 @@ int main() {
     ok &= run_complete_pool_allocation(cuda, cpu);
     ok &= run_shared_budget(cuda, cpu, capture);
     ok &= run_route_override(cuda_device, cuda, cpu, capture);
+    ok &= run_single_gpu_auto(cuda_device, cuda, cpu, capture);
     ok &= run_admission_policy(cuda, cpu, capture);
 
     free_graph(clamped_fused_graph);

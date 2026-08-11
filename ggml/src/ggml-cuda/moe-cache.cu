@@ -915,7 +915,7 @@ static int moe_cache_query_config(
     result->min_expert_explicit = config.min_expert_explicit;
     result->max_batch = config.max_batch;
     result->min_compute_capability = config.min_compute_capability;
-    result->min_devices = config.automatic ? 2 : 1;
+    result->min_devices = 1; // automatic mode accepts a single device when the slab floor is met
     result->overlap_cpu_rows = config.overlap_cpu_rows;
     return 1;
 }
@@ -1525,7 +1525,8 @@ static void * moe_cache_session_create(
                 return nullptr;
             }
             config.enabled = true;
-            config.automatic = supplied_config->min_devices > 1;
+            // automatic iff the provider advertised the auto slab floor; device count no longer implies the mode
+            config.automatic = supplied_config->minimum_slab_bytes > 0;
             config.budget_mb = supplied_config->budget_bytes / MiB;
             config.reserve_mb = supplied_config->reserve_bytes / MiB;
             config.minimum_slab_bytes = supplied_config->minimum_slab_bytes;
@@ -1582,8 +1583,7 @@ static void * moe_cache_session_create(
             session->devices.emplace_back(new moe_cache_device(logical, physical));
         }
 
-        if (session->devices.empty() ||
-            (session->config.automatic && session->devices.size() < 2)) {
+        if (session->devices.empty()) {
             return nullptr;
         }
         if (!session->config.min_expert_explicit) {
@@ -1898,11 +1898,10 @@ static void * moe_cache_begin(
             }
         }
         if (budget_devices == 0 ||
-            (session->config.automatic &&
-             (budget_devices < 2 || slab_devices < 2))) {
-            if (session->config.automatic && slab_devices < 2) {
-                MOE_CACHE_LOG("[moe-cache] session dormant: only %d devices satisfy the %zu MiB automatic slab floor\n",
-                        slab_devices, session->config.minimum_slab_bytes >> 20);
+            (session->config.automatic && slab_devices < 1)) {
+            if (session->config.automatic && slab_devices < 1) {
+                MOE_CACHE_LOG("[moe-cache] session dormant: no device satisfies the %zu MiB automatic slab floor\n",
+                        session->config.minimum_slab_bytes >> 20);
             }
             session->dormant.store(true);
             lock.unlock();
@@ -1911,7 +1910,7 @@ static void * moe_cache_begin(
             }
             return nullptr;
         }
-        if (session->config.automatic && eligible_devices < 2) {
+        if (session->config.automatic && eligible_devices < 1) {
             return nullptr;
         }
 

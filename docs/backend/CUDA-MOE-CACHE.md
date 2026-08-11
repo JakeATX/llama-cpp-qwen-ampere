@@ -10,12 +10,14 @@ Use `--moe-cache MODE` with programs that use the common argument parser:
 
 | Mode | Cache budget | Weight repacking | Device requirements |
 | --- | --- | --- | --- |
-| `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least two eligible selected CUDA devices, compute capability 8.0 or newer |
+| `auto` | Free VRAM minus the reserve | Preserved unless cache-aware fit selects canonical CPU experts | At least one eligible selected CUDA device that clears the 1 GiB automatic slab floor, compute capability 8.0 or newer |
 | `on` | Free VRAM minus the reserve | Disabled | At least one eligible selected CUDA device, compute capability 7.0 or newer |
 | `N` | At most `N` MiB per device, after the reserve | Disabled | Same as `on` |
 | `off` or `0` | No cache session | Preserved unless changed separately | None |
 
 `auto` is the default. When the complete model fits, or dense weights do not fit without routed experts, normal placement and repacking are preserved. When routed experts must spill and a cache is feasible, cache-aware fit keeps canonical expert weights in host memory, puts all dense layers on the main GPU when possible, and preserves the remaining VRAM for cache pools. Use `on` or a positive budget to force canonical CPU weights when automatic placement is not wanted.
+
+A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
 
 The cache only sees experts assigned to host memory. Cache-aware fit uses a no-allocation model load to inventory exact expert shapes, aliases, model memory, context memory, and compute memory before choosing between stock and cache placement. Explicit `--cpu-moe`, `--n-cpu-moe`, tensor overrides, GPU layers, or tensor splits remain authoritative and can prevent fit from changing placement.
 
@@ -180,7 +182,7 @@ CUDA output can differ slightly from CPU output because the hit path uses CUDA a
 
 Public writes to a cached host weight buffer invalidate the affected byte range before the write begins. Invalidation cancels overlapping queued fills, waits for overlapping active reads and transfers, and removes overlapping slots and demand records. The same process runs before a host allocation is released or stops being a weight buffer. Callers must still obey the normal backend synchronization rules when mutating a weight used by concurrent graph execution. Scheduler teardown stops admission, cancels queued work, waits for active graph scopes and nodes, joins fill workers, and then frees device storage.
 
-The normal CUDA allocator may trim an active expert cache as a last attempt to satisfy an allocation. Trimming frees all cache storage on that device and leaves it disabled for the rest of the session. Device scratch growth also retries once after releasing the superseded scratch allocation when replacement overlap causes an out-of-memory result. A session becomes permanently dormant when no nonzero device budget remains, or when `auto` drops below two devices that satisfy its slab floor; any remaining cache devices are then trimmed as well.
+The normal CUDA allocator may trim an active expert cache as a last attempt to satisfy an allocation. Trimming frees all cache storage on that device and leaves it disabled for the rest of the session. Device scratch growth also retries once after releasing the superseded scratch allocation when replacement overlap causes an out-of-memory result. A session becomes permanently dormant when no nonzero device budget remains, or when `auto` has no device that satisfies its slab floor; any remaining cache devices are then trimmed as well.
 
 ## Diagnostics and developer controls
 

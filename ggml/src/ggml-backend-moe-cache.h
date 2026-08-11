@@ -18,6 +18,8 @@ struct ggml_moe_cache_config {
     int32_t min_expert_explicit;
     int32_t max_batch;
     int32_t min_compute_capability;
+    // minimum number of selected devices the session needs; 1 for every mode,
+    // automatic mode still enforces its 1 GiB slab floor per device
     int32_t min_devices;
     // -1 selects the provider policy; 0..8 is a fixed total per node.
     int32_t overlap_cpu_rows;

@@ -286,7 +286,7 @@ static void * metal_session_create(void * const * backends, int n_backends,
                 return nullptr;
             }
             config.enabled = true;
-            config.automatic = supplied_config->min_devices > 1;
+            config.automatic = supplied_config->minimum_slab_bytes > 0;
             config.budget_mb = supplied_config->budget_bytes / MiB;
             config.reserve_mb = supplied_config->reserve_bytes / MiB;
             config.minimum_slab_bytes = supplied_config->minimum_slab_bytes;
