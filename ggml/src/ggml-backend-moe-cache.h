@@ -62,6 +62,10 @@ struct ggml_moe_cache_api {
     int (*query_config)(int automatic, size_t budget_mib, struct ggml_moe_cache_config * config);
     int (*query_device)(void * device, const struct ggml_moe_cache_config * config, struct ggml_moe_cache_device_caps * caps);
     int (*query_shape)(int wtype, int64_t n_in, int64_t n_out, int64_t n_expert, size_t expert_size, struct ggml_moe_cache_shape_caps * caps);
+    // Fused SwiGLU path: 1 when this provider can fuse up * GLU(gate) for the
+    // weight type. CUDA implements this and covers the canonical list exactly;
+    // providers without a fused path leave it NULL.
+    int (*query_fused)(int wtype);
 
     // The scheduler owns one cache session. backends contains the scheduler's actual backend set, so the provider can use only selected CUDA devices.
     void * (*session_create)(void * const * backends, int n_backends, const struct ggml_moe_cache_config * config);
@@ -105,9 +109,11 @@ struct ggml_moe_cache_api {
 // (CUDA/HIP, Vulkan, Metal) must accept exactly this set in query_shape and
 // begin; a provider that silently accepts less produces silent partial
 // coverage. Keep in sync with the CUDA kernel case tables in
-// ggml-cuda/mmvq.cu (ggml_cuda_moe_cache_mmv_supported /
-// ggml_cuda_moe_cache_mmv_fused_supported); moe-cache.cu asserts the match at
-// registration time.
+// ggml-cuda/mmvq.cu: the plain dispatch tables
+// (ggml_cuda_moe_cache_mmv_supported) and the fused SwiGLU tables
+// (ggml_cuda_moe_cache_mmv_fused_supported) must both equal this list - a
+// canonical type missing from the fused tables silently skips the fusion
+// optimization. moe-cache.cu asserts both directions at registration time.
 // enum tag form: ggml.h declares the type without a typedef, so bare
 // ggml_type is invalid in C (ggml-cpu.c includes this header as C).
 static const enum ggml_type ggml_moe_cache_types[] = {
