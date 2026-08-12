@@ -1587,23 +1587,6 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::get_k_idx(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
-    const int32_t ikv = map_layer_ids.at(il);
-    auto * k_idx = layers[ikv].k_idx;
-    GGML_ASSERT(k_idx);
-
-    const uint64_t kv_size = get_size();
-    const int64_t  n_idx   = k_idx->ne[0];
-    const uint32_t ns      = sinfo.s1 - sinfo.s0 + 1;
-
-    return ggml_view_4d(ctx, k_idx,
-            n_idx, 1, n_kv, ns,
-            ggml_row_size(k_idx->type, n_idx),
-            ggml_row_size(k_idx->type, n_idx),
-            ggml_row_size(k_idx->type, n_idx*kv_size),
-            ggml_row_size(k_idx->type, n_idx*kv_size)*sinfo.s0);
-}
-
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
