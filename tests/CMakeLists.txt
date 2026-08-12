@@ -258,12 +258,37 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_build_and_test(test-model-resolution.cpp)
+# the test serves its repos from an httplib server, and the library links it privately
+target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build(test-moe-cache.cpp)
+    if (GGML_CUDA)
+        # The test compares the cache's budget grants against cudaMemGetInfo,
+        # the same query the cache uses. On UMA devices (GB10, Jetson) the
+        # backend device memory API reports /proc/meminfo instead, so the
+        # reserve calculation must match the cache's own view.
+        find_package(CUDAToolkit QUIET)
+        if (CUDAToolkit_FOUND)
+            target_compile_definitions(test-moe-cache PRIVATE GGML_CUDA=1)
+            target_include_directories(test-moe-cache PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+            target_link_libraries(test-moe-cache PRIVATE CUDA::cudart)
+        endif()
+    endif()
+    llama_test(test-moe-cache LABEL "main;backend")
+    # The test exits 77 when no CUDA device is present. ctest only treats that
+    # as a skip when SKIP_RETURN_CODE says so; without it, every CPU-only
+    # runner records the skip as a failure.
+    set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
+
+llama_build_and_test(test-moe-cache-fit.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
