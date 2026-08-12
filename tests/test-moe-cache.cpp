@@ -3,6 +3,10 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-backend-moe-cache.h"
 
+#ifdef GGML_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -321,7 +325,8 @@ static ggml_backend_dev_t find_cuda_device() {
     for (size_t index = 0; index < ggml_backend_dev_count(); index++) {
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
-        if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+        if ((ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+             ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
             strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
             return device;
         }
@@ -335,7 +340,8 @@ static ggml_backend_dev_t find_other_cuda_device(
         ggml_backend_dev_t device = ggml_backend_dev_get(index);
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         if (device != excluded &&
-            ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+            (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+             ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_IGPU) &&
             strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
             return device;
         }
@@ -2527,7 +2533,48 @@ static bool run_shared_budget(
     configure_cache(nullptr);
     size_t free_bytes = 0;
     size_t total_bytes = 0;
+#ifdef GGML_CUDA
+    // The cache's budget path queries cudaMemGetInfo, not the backend device
+    // memory API. On UMA devices (Grace Blackwell, Jetson/Orin) the backend
+    // reports /proc/meminfo while cudaMemGetInfo reports the CUDA view, and
+    // the two disagree. Match the cache's query so the reserve leaves the
+    // expected remainder on every device class.
+    {
+        int prev_device = 0;
+        cudaError_t err = cudaGetDevice(&prev_device);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "cache-shared-budget: cudaGetDevice failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        // Restore the device afterwards: run_route_override runs next and
+        // exercises routing across two devices, so the current device must
+        // not leak out of this test. Fall back to the current device rather
+        // than device 0 when the physical device is not reported.
+        const long physical = cuda_physical_device(cuda->device);
+        const int target = physical >= 0 ? (int) physical : prev_device;
+        if (target != prev_device) {
+            err = cudaSetDevice(target);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "cache-shared-budget: cudaSetDevice failed: %s\n",
+                        cudaGetErrorString(err));
+                return false;
+            }
+        }
+        err = cudaMemGetInfo(&free_bytes, &total_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "cache-shared-budget: cudaMemGetInfo failed: %s\n",
+                    cudaGetErrorString(err));
+            cudaSetDevice(prev_device);
+            return false;
+        }
+        if (target != prev_device) {
+            cudaSetDevice(prev_device);
+        }
+    }
+#else
     ggml_backend_dev_memory(cuda->device, &free_bytes, &total_bytes);
+#endif
     const size_t free_mib = free_bytes >> 20;
     if (free_mib < 64) {
         printf("cache-shared-budget: SKIP (insufficient free VRAM)\n");
@@ -2915,7 +2962,7 @@ int main() {
     ggml_backend_dev_t cuda_device = find_cuda_device();
     if (!cuda_device) {
         printf("SKIP: CUDA backend unavailable\n");
-        return 77; // ctest SKIP_RETURN_CODE: a hard skip must not read as a pass
+        return 77; // ctest interprets 77 as SKIP_RETURN_CODE
     }
     ggml_backend_reg_t cuda_reg =
         ggml_backend_dev_backend_reg(cuda_device);

@@ -53,6 +53,7 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
     for (const common_moe_cache_fit_device_input & input : device_inputs) {
         if (input.physical_device < 0 || input.free_bytes < 0 || input.used_bytes > INT64_MAX) {
             result.reason = "device memory accounting overflowed";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
             return result;
         }
 
@@ -76,12 +77,14 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
         device.compute_capability = std::min(device.compute_capability, input.compute_capability);
         if ((int64_t)input.used_bytes > INT64_MAX - device.used_bytes) {
             result.reason = "device memory accounting overflowed";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
             return result;
         }
         device.used_bytes += (int64_t)input.used_bytes;
     }
     if (result.devices.empty()) {
         result.reason = "no selected device satisfies the cache hardware policy";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
 
@@ -100,6 +103,7 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
     for (const common_moe_cache_fit_shape_input & shape : shapes) {
         if (shape.tensor_bytes == 0 || shape.tensor_bytes > SIZE_MAX - result.expert_bytes) {
             result.reason = "the routed expert tensor inventory overflowed";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
             return result;
         }
         result.expert_bytes += shape.tensor_bytes;
@@ -133,10 +137,12 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
     }
     if (supported_bytes == 0) {
         result.reason = "no routed expert shape is cacheable";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
     if (supported_bytes != result.expert_bytes) {
         result.reason = "some routed expert weights would remain permanently uncached";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
 
@@ -154,6 +160,7 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
     minimum_pool_bytes = std::max(minimum_pool_bytes, minimum_slab_bytes);
     if (minimum_pool_bytes > SIZE_MAX - scratch_bytes) {
         result.reason = "the minimum cache pool inventory overflowed";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
     result.minimum_device_bytes = scratch_bytes + minimum_pool_bytes;
@@ -172,6 +179,9 @@ common_moe_cache_fit_result common_moe_cache_plan_fit(
     }
     if (useful_devices < min_devices) {
         result.reason = "too few devices can hold the minimum expert pools";
+        LOG_INF("%s: MoE cache fit: %s (useful=%d, min=%d, min_device_bytes=%zu MiB)\n", __func__,
+                result.reason.c_str(), useful_devices, min_devices,
+                result.minimum_device_bytes >> 20);
         return result;
     }
 
@@ -203,6 +213,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
     }
     if (!api.query_config || !api.query_device || !api.query_shape) {
         result.reason = "no cache provider is loaded";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
 
@@ -213,14 +224,17 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
     ggml_moe_cache_config config = {};
     if (!api.query_config(automatic, params->budget_mib, &config)) {
         result.reason = "the cache provider is disabled";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
     if (tensors.empty()) {
         result.reason = "the model has no routed expert weight tensors";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
     if (memory.size() != devices.size() + 1 || margins.size() != devices.size()) {
         result.reason = "the fitted device inventory changed";
+        LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
         return result;
     }
 
@@ -233,6 +247,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
         }
         if (margins[index] < 0 || memory[index].free < margins[index]) {
             result.reason = "the fitted device margin exceeds free memory";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
             return result;
         }
         device_inputs.push_back({caps.physical_device, caps.compute_capability,
@@ -246,6 +261,7 @@ static common_moe_cache_fit_result common_moe_cache_evaluate_fit(
         if (tensor.n_expert <= 0 || tensor.expert_size == 0 ||
             (uint64_t)tensor.n_expert > SIZE_MAX / tensor.expert_size) {
             result.reason = "the model has an invalid routed expert tensor size";
+            LOG_INF("%s: MoE cache fit: %s\n", __func__, result.reason.c_str());
             return result;
         }
         const size_t tensor_bytes = (size_t)tensor.n_expert * tensor.expert_size;
@@ -1223,7 +1239,7 @@ static void common_params_fit_impl(
                 for (const llama_moe_tensor_info & tensor : moe_tensors) {
                     if (tensor.layer >= 0 && tensor.layer < total_layers &&
                         tensor.n_expert > 0 && tensor.expert_size > 0 &&
-                        (uint64_t)tensor.n_expert <= INT64_MAX / (int64_t)tensor.expert_size) {
+                        (uint64_t)tensor.n_expert <= (uint64_t)(INT64_MAX / (int64_t)tensor.expert_size)) {
                         layer_bytes[tensor.layer] +=
                             (int64_t)tensor.n_expert * (int64_t)tensor.expert_size;
                     }

@@ -143,9 +143,11 @@ llama_kv_cache::llama_kv_cache(
     // Qwen2.5: 4 KV heads / 28 Q heads = 7:1 → turbo3 K PPL catastrophic (2887 vs 7.4 baseline)
     // Mistral:  8 KV heads / 32 Q heads = 4:1 → turbo3 K works fine (+4.4% PPL)
     // Threshold: GQA ratio >= 6 triggers auto-asymmetric.
+    // MLA models (DeepSeek-V4) have no separate V cache (V = view of K),
+    // so K and V types must be identical — skip auto-asymmetric for MLA.
     {
         const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
-        if (k_is_turbo) {
+        if (k_is_turbo && !hparams.is_mla()) {
             const uint32_t n_head    = hparams.n_head(0);
             const uint32_t n_head_kv = hparams.n_head_kv(0);
             const uint32_t gqa_ratio = (n_head_kv > 0) ? n_head / n_head_kv : 1;
@@ -416,9 +418,6 @@ llama_kv_cache::llama_kv_cache(
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
-        std::vector<ggml_tensor *> k_idx_stream;
-
-        ggml_tensor * k_idx = nullptr;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_size, k->nb[1], s*k->nb[2]) : nullptr);

@@ -600,12 +600,19 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            // On OOM, surrender MoE cache storage and retry once. Each vendor
-            // returns its own error enum from cuMemCreate (CUresult on CUDA,
-            // hipError_t on HIP, MUresult on MUSA); auto + the per-vendor
-            // cudaErrorMemoryAllocation alias keeps this portable.
+            // On OOM, surrender MoE cache storage and retry once. cuMemCreate is
+            // a driver-API call, so on CUDA it returns CUresult while
+            // cudaErrorMemoryAllocation is a runtime-API cudaError_t; comparing
+            // them is -Werror=enum-compare even though both happen to be 2. On
+            // HIP and MUSA the vendor headers alias cuMemCreate onto the runtime
+            // error type, so the runtime constant is the correct one there.
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+            const auto cu_err_out_of_memory = cudaErrorMemoryAllocation;
+#else
+            const CUresult cu_err_out_of_memory = CUDA_ERROR_OUT_OF_MEMORY;
+#endif
             auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
-            if (create_result == cudaErrorMemoryAllocation &&
+            if (create_result == cu_err_out_of_memory &&
                 ggml_moe_cache_trim(device) > 0) {
                 create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
