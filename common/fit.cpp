@@ -1213,13 +1213,13 @@ static void common_params_fit_impl(
                     ? 100.0 * (double)std::min(soft_fit.cache_bytes, soft_fit.expert_bytes) /
                         (double)soft_fit.expert_bytes
                     : 0.0;
-                LOG_INF("%s: MoE cache soft mode selected stock placement with %zu MiB projected cache capacity for %zu MiB of routed expert weights (up to %.1f%% coverage, no expert eviction)\n",
+                LOG_INF("%s: MoE cache soft mode selected stock placement with %" PRId64 " MiB projected cache capacity for %" PRId64 " MiB of routed expert weights (up to %.1f%% coverage, no expert eviction)\n",
                         __func__,
-                        soft_fit.cache_bytes / MiB, soft_fit.expert_bytes / MiB, coverage);
+                        (int64_t)(soft_fit.cache_bytes / MiB), (int64_t)(soft_fit.expert_bytes / MiB), coverage);
                 for (const common_moe_cache_fit_device & device : soft_fit.devices) {
-                    LOG_INF("%s: MoE cache fit CUDA%d leaves %zu MiB after reserve; minimum complete pool set is %zu MiB\n",
-                            __func__, device.physical_device, device.cache_bytes / MiB,
-                            soft_fit.minimum_device_bytes / MiB);
+                    LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+                            __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+                            (int64_t)(soft_fit.minimum_device_bytes / MiB));
                 }
             } else if (cache_candidate_valid) {
                 // Step 2: spare-VRAM insufficient, try partial expert eviction
@@ -1355,16 +1355,16 @@ static void common_params_fit_impl(
                     const int64_t kept_bytes = best_cache_fit.expert_bytes > (size_t)best_evicted_bytes
                         ? (int64_t)best_cache_fit.expert_bytes - best_evicted_bytes : 0;
                     LOG_INF("%s: MoE cache soft mode selected partial-eviction placement: %d/%d layers keep experts GPU-resident, "
-                            "%zu MiB of %zu MiB routed expert bytes evicted (%zu MiB kept), "
-                            "%zu MiB projected cache capacity (up to %.1f%% coverage)\n",
+                            "%" PRId64 " MiB of %" PRId64 " MiB routed expert bytes evicted (%" PRId64 " MiB kept), "
+                            "%" PRId64 " MiB projected cache capacity (up to %.1f%% coverage)\n",
                             __func__, n_kept, total_layers,
-                            best_evicted_bytes / MiB, best_cache_fit.expert_bytes / MiB,
-                            kept_bytes / MiB,
-                            best_cache_fit.cache_bytes / MiB, coverage);
+                            (int64_t)(best_evicted_bytes / MiB), (int64_t)(best_cache_fit.expert_bytes / MiB),
+                            (int64_t)(kept_bytes / MiB),
+                            (int64_t)(best_cache_fit.cache_bytes / MiB), coverage);
                     for (const common_moe_cache_fit_device & device : best_cache_fit.devices) {
-                        LOG_INF("%s: MoE cache fit CUDA%d leaves %zu MiB after reserve; minimum complete pool set is %zu MiB\n",
-                                __func__, device.physical_device, device.cache_bytes / MiB,
-                                best_cache_fit.minimum_device_bytes / MiB);
+                        LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+                                __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+                                (int64_t)(best_cache_fit.minimum_device_bytes / MiB));
                     }
                     return;
                 }
@@ -1387,13 +1387,13 @@ static void common_params_fit_impl(
                     ? 100.0 * (double)std::min(cache_fit.cache_bytes, cache_fit.expert_bytes) /
                         (double)cache_fit.expert_bytes
                     : 0.0;
-                LOG_INF("%s: MoE cache fit selected %s dense placement with %zu MiB projected cache capacity for %zu MiB of routed expert weights (up to %.1f%% coverage)\n",
+                LOG_INF("%s: MoE cache fit selected %s dense placement with %" PRId64 " MiB projected cache capacity for %" PRId64 " MiB of routed expert weights (up to %.1f%% coverage)\n",
                         __func__, cache_candidate_main ? "main-device" : "packed",
-                        cache_fit.cache_bytes / MiB, cache_fit.expert_bytes / MiB, coverage);
+                        (int64_t)(cache_fit.cache_bytes / MiB), (int64_t)(cache_fit.expert_bytes / MiB), coverage);
                 for (const common_moe_cache_fit_device & device : cache_fit.devices) {
-                    LOG_INF("%s: MoE cache fit CUDA%d leaves %zu MiB after reserve; minimum complete pool set is %zu MiB\n",
-                            __func__, device.physical_device, device.cache_bytes / MiB,
-                            cache_fit.minimum_device_bytes / MiB);
+                    LOG_INF("%s: MoE cache fit CUDA%d leaves %" PRId64 " MiB after reserve; minimum complete pool set is %" PRId64 " MiB\n",
+                            __func__, device.physical_device, (int64_t)(device.cache_bytes / MiB),
+                            (int64_t)(cache_fit.minimum_device_bytes / MiB));
                 }
                 return;
             }
