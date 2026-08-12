@@ -72,6 +72,25 @@ struct moe_cache_metal_device : public moe_cache_device {
     struct ggml_metal_pipeline_with_params mmv_pipeline_q4_0;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q4_K;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q6_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q5_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q1_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q2_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q4_1;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q5_0;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q5_1;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q2_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_q3_K;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq2_xxs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq2_xs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq2_s;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq3_xxs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq3_s;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq1_s;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq1_m;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq4_nl;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_iq4_xs;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_mxfp4;
+    struct ggml_metal_pipeline_with_params mmv_pipeline_nvfp4;
 
     // Tracked MTLBuffers for slab pools.
     std::vector<id<MTLBuffer>> slab_buffers;
@@ -167,8 +186,8 @@ static int metal_query_shape(int wtype, int64_t n_in, int64_t n_out,
     if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) {
         return 0;
     }
-    if (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) {
+    // canonical list from ggml-backend-moe-cache.h; single source of truth
+    if (!ggml_moe_cache_wtype_supported(wtype)) {
         return 0;
     }
 
@@ -337,8 +356,52 @@ static void * metal_session_create(void * const * backends, int n_backends,
             ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_K_f32");
         struct ggml_metal_pipeline_with_params p_q6_K =
             ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q6_K_f32");
+        struct ggml_metal_pipeline_with_params p_q5_K =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q5_K_f32");
+        struct ggml_metal_pipeline_with_params p_q1_0 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q1_0_f32");
+        struct ggml_metal_pipeline_with_params p_q2_0 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q2_0_f32");
+        struct ggml_metal_pipeline_with_params p_q4_1 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_1_f32");
+        struct ggml_metal_pipeline_with_params p_q5_0 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q5_0_f32");
+        struct ggml_metal_pipeline_with_params p_q5_1 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q5_1_f32");
+        struct ggml_metal_pipeline_with_params p_q2_K =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q2_K_f32");
+        struct ggml_metal_pipeline_with_params p_q3_K =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q3_K_f32");
+        struct ggml_metal_pipeline_with_params p_iq2_xxs =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq2_xxs_f32");
+        struct ggml_metal_pipeline_with_params p_iq2_xs =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq2_xs_f32");
+        struct ggml_metal_pipeline_with_params p_iq2_s =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq2_s_f32");
+        struct ggml_metal_pipeline_with_params p_iq3_xxs =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq3_xxs_f32");
+        struct ggml_metal_pipeline_with_params p_iq3_s =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq3_s_f32");
+        struct ggml_metal_pipeline_with_params p_iq1_s =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq1_s_f32");
+        struct ggml_metal_pipeline_with_params p_iq1_m =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq1_m_f32");
+        struct ggml_metal_pipeline_with_params p_iq4_nl =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq4_nl_f32");
+        struct ggml_metal_pipeline_with_params p_iq4_xs =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq4_xs_f32");
+        struct ggml_metal_pipeline_with_params p_mxfp4 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_mxfp4_f32");
+        struct ggml_metal_pipeline_with_params p_nvfp4 =
+            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_nvfp4_f32");
         if (!p_q8_0.pipeline || !p_q4_0.pipeline ||
-            !p_q4_K.pipeline || !p_q6_K.pipeline) {
+            !p_q4_K.pipeline || !p_q6_K.pipeline || !p_q5_K.pipeline ||
+            !p_q1_0.pipeline || !p_q2_0.pipeline || !p_q4_1.pipeline ||
+            !p_q5_0.pipeline || !p_q5_1.pipeline || !p_q2_K.pipeline ||
+            !p_q3_K.pipeline || !p_iq2_xxs.pipeline || !p_iq2_xs.pipeline ||
+            !p_iq2_s.pipeline || !p_iq3_xxs.pipeline || !p_iq3_s.pipeline ||
+            !p_iq1_s.pipeline || !p_iq1_m.pipeline || !p_iq4_nl.pipeline ||
+            !p_iq4_xs.pipeline || !p_mxfp4.pipeline || !p_nvfp4.pipeline) {
             MOE_CACHE_LOG("[moe-cache] Metal: one or more moe cache kernels missing\n");
             ggml_metal_library_free(lib);
             return nullptr;
@@ -370,6 +433,25 @@ static void * metal_session_create(void * const * backends, int n_backends,
         dev->mmv_pipeline_q4_0 = p_q4_0;
         dev->mmv_pipeline_q4_K = p_q4_K;
         dev->mmv_pipeline_q6_K = p_q6_K;
+        dev->mmv_pipeline_q5_K = p_q5_K;
+        dev->mmv_pipeline_q1_0 = p_q1_0;
+        dev->mmv_pipeline_q2_0 = p_q2_0;
+        dev->mmv_pipeline_q4_1 = p_q4_1;
+        dev->mmv_pipeline_q5_0 = p_q5_0;
+        dev->mmv_pipeline_q5_1 = p_q5_1;
+        dev->mmv_pipeline_q2_K = p_q2_K;
+        dev->mmv_pipeline_q3_K = p_q3_K;
+        dev->mmv_pipeline_iq2_xxs = p_iq2_xxs;
+        dev->mmv_pipeline_iq2_xs = p_iq2_xs;
+        dev->mmv_pipeline_iq2_s = p_iq2_s;
+        dev->mmv_pipeline_iq3_xxs = p_iq3_xxs;
+        dev->mmv_pipeline_iq3_s = p_iq3_s;
+        dev->mmv_pipeline_iq1_s = p_iq1_s;
+        dev->mmv_pipeline_iq1_m = p_iq1_m;
+        dev->mmv_pipeline_iq4_nl = p_iq4_nl;
+        dev->mmv_pipeline_iq4_xs = p_iq4_xs;
+        dev->mmv_pipeline_mxfp4 = p_mxfp4;
+        dev->mmv_pipeline_nvfp4 = p_nvfp4;
         session->devices.push_back(std::move(dev));
 
         MOE_CACHE_LOG("[moe-cache] Metal session created (budget=%zu MiB)\n",
@@ -519,8 +601,7 @@ static void * metal_begin(const char * name, const void * host_base,
     if (!name || !host_base || !moe_cache_tensor_name_supported(name) ||
         n_tokens < 1 || expert_size < session->config.min_expert_bytes ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
-        (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-         wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K)) {
+        !ggml_moe_cache_wtype_supported(wtype)) {
         return nullptr;
     }
     if (n_rows < n_tokens || n_rows % n_tokens != 0 ||
@@ -753,9 +834,29 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
     // Select pipeline by weight type.
     struct ggml_metal_pipeline_with_params pipeline = dev.mmv_pipeline_q8_0;
     switch (wtype) {
+        case GGML_TYPE_Q8_0: pipeline = dev.mmv_pipeline_q8_0; break;
         case GGML_TYPE_Q4_0: pipeline = dev.mmv_pipeline_q4_0; break;
         case GGML_TYPE_Q4_K: pipeline = dev.mmv_pipeline_q4_K; break;
         case GGML_TYPE_Q6_K: pipeline = dev.mmv_pipeline_q6_K; break;
+        case GGML_TYPE_Q5_K: pipeline = dev.mmv_pipeline_q5_K; break;
+        case GGML_TYPE_Q1_0: pipeline = dev.mmv_pipeline_q1_0; break;
+        case GGML_TYPE_Q2_0: pipeline = dev.mmv_pipeline_q2_0; break;
+        case GGML_TYPE_Q4_1: pipeline = dev.mmv_pipeline_q4_1; break;
+        case GGML_TYPE_Q5_0: pipeline = dev.mmv_pipeline_q5_0; break;
+        case GGML_TYPE_Q5_1: pipeline = dev.mmv_pipeline_q5_1; break;
+        case GGML_TYPE_Q2_K: pipeline = dev.mmv_pipeline_q2_K; break;
+        case GGML_TYPE_Q3_K: pipeline = dev.mmv_pipeline_q3_K; break;
+        case GGML_TYPE_IQ2_XXS: pipeline = dev.mmv_pipeline_iq2_xxs; break;
+        case GGML_TYPE_IQ2_XS: pipeline = dev.mmv_pipeline_iq2_xs; break;
+        case GGML_TYPE_IQ2_S: pipeline = dev.mmv_pipeline_iq2_s; break;
+        case GGML_TYPE_IQ3_XXS: pipeline = dev.mmv_pipeline_iq3_xxs; break;
+        case GGML_TYPE_IQ3_S: pipeline = dev.mmv_pipeline_iq3_s; break;
+        case GGML_TYPE_IQ1_S: pipeline = dev.mmv_pipeline_iq1_s; break;
+        case GGML_TYPE_IQ1_M: pipeline = dev.mmv_pipeline_iq1_m; break;
+        case GGML_TYPE_IQ4_NL: pipeline = dev.mmv_pipeline_iq4_nl; break;
+        case GGML_TYPE_IQ4_XS: pipeline = dev.mmv_pipeline_iq4_xs; break;
+        case GGML_TYPE_MXFP4: pipeline = dev.mmv_pipeline_mxfp4; break;
+        case GGML_TYPE_NVFP4: pipeline = dev.mmv_pipeline_nvfp4; break;
         default: break;
     }
     if (!pipeline.pipeline) {

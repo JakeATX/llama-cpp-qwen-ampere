@@ -47,6 +47,44 @@ extern const uint64_t moe_cache_mv_q4_K_len;
 extern const unsigned char moe_cache_mv_q4_K_data[];
 extern const uint64_t moe_cache_mv_q6_K_len;
 extern const unsigned char moe_cache_mv_q6_K_data[];
+extern const uint64_t moe_cache_mv_q5_K_len;
+extern const unsigned char moe_cache_mv_q5_K_data[];
+extern const uint64_t moe_cache_mv_q1_0_len;
+extern const unsigned char moe_cache_mv_q1_0_data[];
+extern const uint64_t moe_cache_mv_q2_0_len;
+extern const unsigned char moe_cache_mv_q2_0_data[];
+extern const uint64_t moe_cache_mv_q4_1_len;
+extern const unsigned char moe_cache_mv_q4_1_data[];
+extern const uint64_t moe_cache_mv_q5_0_len;
+extern const unsigned char moe_cache_mv_q5_0_data[];
+extern const uint64_t moe_cache_mv_q5_1_len;
+extern const unsigned char moe_cache_mv_q5_1_data[];
+extern const uint64_t moe_cache_mv_q2_K_len;
+extern const unsigned char moe_cache_mv_q2_K_data[];
+extern const uint64_t moe_cache_mv_q3_K_len;
+extern const unsigned char moe_cache_mv_q3_K_data[];
+extern const uint64_t moe_cache_mv_iq2_xxs_len;
+extern const unsigned char moe_cache_mv_iq2_xxs_data[];
+extern const uint64_t moe_cache_mv_iq2_xs_len;
+extern const unsigned char moe_cache_mv_iq2_xs_data[];
+extern const uint64_t moe_cache_mv_iq2_s_len;
+extern const unsigned char moe_cache_mv_iq2_s_data[];
+extern const uint64_t moe_cache_mv_iq3_xxs_len;
+extern const unsigned char moe_cache_mv_iq3_xxs_data[];
+extern const uint64_t moe_cache_mv_iq3_s_len;
+extern const unsigned char moe_cache_mv_iq3_s_data[];
+extern const uint64_t moe_cache_mv_iq1_s_len;
+extern const unsigned char moe_cache_mv_iq1_s_data[];
+extern const uint64_t moe_cache_mv_iq1_m_len;
+extern const unsigned char moe_cache_mv_iq1_m_data[];
+extern const uint64_t moe_cache_mv_iq4_nl_len;
+extern const unsigned char moe_cache_mv_iq4_nl_data[];
+extern const uint64_t moe_cache_mv_iq4_xs_len;
+extern const unsigned char moe_cache_mv_iq4_xs_data[];
+extern const uint64_t moe_cache_mv_mxfp4_len;
+extern const unsigned char moe_cache_mv_mxfp4_data[];
+extern const uint64_t moe_cache_mv_nvfp4_len;
+extern const unsigned char moe_cache_mv_nvfp4_data[];
 
 // Thread-local session stack (owned by this backend; independent of CUDA's).
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
@@ -91,6 +129,25 @@ struct moe_cache_vulkan_device : public moe_cache_device {
     VkPipeline pipeline_q4_0 = VK_NULL_HANDLE;
     VkPipeline pipeline_q4_K = VK_NULL_HANDLE;
     VkPipeline pipeline_q6_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_q5_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_q1_0 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q2_0 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q4_1 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q5_0 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q5_1 = VK_NULL_HANDLE;
+    VkPipeline pipeline_q2_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_q3_K = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq2_xxs = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq2_xs = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq2_s = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq3_xxs = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq3_s = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq1_s = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq1_m = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq4_nl = VK_NULL_HANDLE;
+    VkPipeline pipeline_iq4_xs = VK_NULL_HANDLE;
+    VkPipeline pipeline_mxfp4 = VK_NULL_HANDLE;
+    VkPipeline pipeline_nvfp4 = VK_NULL_HANDLE;
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout ds_layout = VK_NULL_HANDLE;
     VkDescriptorPool ds_pool = VK_NULL_HANDLE;
@@ -135,6 +192,25 @@ struct moe_cache_vulkan_device : public moe_cache_device {
         if (pipeline_q4_0) { vkDestroyPipeline(vk_device, pipeline_q4_0, nullptr); pipeline_q4_0 = VK_NULL_HANDLE; }
         if (pipeline_q4_K) { vkDestroyPipeline(vk_device, pipeline_q4_K, nullptr); pipeline_q4_K = VK_NULL_HANDLE; }
         if (pipeline_q6_K) { vkDestroyPipeline(vk_device, pipeline_q6_K, nullptr); pipeline_q6_K = VK_NULL_HANDLE; }
+        if (pipeline_q5_K) { vkDestroyPipeline(vk_device, pipeline_q5_K, nullptr); pipeline_q5_K = VK_NULL_HANDLE; }
+        if (pipeline_q1_0) { vkDestroyPipeline(vk_device, pipeline_q1_0, nullptr); pipeline_q1_0 = VK_NULL_HANDLE; }
+        if (pipeline_q2_0) { vkDestroyPipeline(vk_device, pipeline_q2_0, nullptr); pipeline_q2_0 = VK_NULL_HANDLE; }
+        if (pipeline_q4_1) { vkDestroyPipeline(vk_device, pipeline_q4_1, nullptr); pipeline_q4_1 = VK_NULL_HANDLE; }
+        if (pipeline_q5_0) { vkDestroyPipeline(vk_device, pipeline_q5_0, nullptr); pipeline_q5_0 = VK_NULL_HANDLE; }
+        if (pipeline_q5_1) { vkDestroyPipeline(vk_device, pipeline_q5_1, nullptr); pipeline_q5_1 = VK_NULL_HANDLE; }
+        if (pipeline_q2_K) { vkDestroyPipeline(vk_device, pipeline_q2_K, nullptr); pipeline_q2_K = VK_NULL_HANDLE; }
+        if (pipeline_q3_K) { vkDestroyPipeline(vk_device, pipeline_q3_K, nullptr); pipeline_q3_K = VK_NULL_HANDLE; }
+        if (pipeline_iq2_xxs) { vkDestroyPipeline(vk_device, pipeline_iq2_xxs, nullptr); pipeline_iq2_xxs = VK_NULL_HANDLE; }
+        if (pipeline_iq2_xs) { vkDestroyPipeline(vk_device, pipeline_iq2_xs, nullptr); pipeline_iq2_xs = VK_NULL_HANDLE; }
+        if (pipeline_iq2_s) { vkDestroyPipeline(vk_device, pipeline_iq2_s, nullptr); pipeline_iq2_s = VK_NULL_HANDLE; }
+        if (pipeline_iq3_xxs) { vkDestroyPipeline(vk_device, pipeline_iq3_xxs, nullptr); pipeline_iq3_xxs = VK_NULL_HANDLE; }
+        if (pipeline_iq3_s) { vkDestroyPipeline(vk_device, pipeline_iq3_s, nullptr); pipeline_iq3_s = VK_NULL_HANDLE; }
+        if (pipeline_iq1_s) { vkDestroyPipeline(vk_device, pipeline_iq1_s, nullptr); pipeline_iq1_s = VK_NULL_HANDLE; }
+        if (pipeline_iq1_m) { vkDestroyPipeline(vk_device, pipeline_iq1_m, nullptr); pipeline_iq1_m = VK_NULL_HANDLE; }
+        if (pipeline_iq4_nl) { vkDestroyPipeline(vk_device, pipeline_iq4_nl, nullptr); pipeline_iq4_nl = VK_NULL_HANDLE; }
+        if (pipeline_iq4_xs) { vkDestroyPipeline(vk_device, pipeline_iq4_xs, nullptr); pipeline_iq4_xs = VK_NULL_HANDLE; }
+        if (pipeline_mxfp4) { vkDestroyPipeline(vk_device, pipeline_mxfp4, nullptr); pipeline_mxfp4 = VK_NULL_HANDLE; }
+        if (pipeline_nvfp4) { vkDestroyPipeline(vk_device, pipeline_nvfp4, nullptr); pipeline_nvfp4 = VK_NULL_HANDLE; }
         if (vk_cmd_pool) {
             vkDestroyCommandPool(vk_device, vk_cmd_pool, nullptr);
             vk_cmd_pool = VK_NULL_HANDLE;
@@ -423,7 +499,30 @@ static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
     dev.pipeline_q4_0 = vk_create_pipeline(dev, moe_cache_mv_q4_0_data, moe_cache_mv_q4_0_len);
     dev.pipeline_q4_K = vk_create_pipeline(dev, moe_cache_mv_q4_K_data, moe_cache_mv_q4_K_len);
     dev.pipeline_q6_K = vk_create_pipeline(dev, moe_cache_mv_q6_K_data, moe_cache_mv_q6_K_len);
-    if (!dev.pipeline_q8_0 || !dev.pipeline_q4_0 || !dev.pipeline_q4_K || !dev.pipeline_q6_K) {
+    dev.pipeline_q5_K = vk_create_pipeline(dev, moe_cache_mv_q5_K_data, moe_cache_mv_q5_K_len);
+    dev.pipeline_q1_0 = vk_create_pipeline(dev, moe_cache_mv_q1_0_data, moe_cache_mv_q1_0_len);
+    dev.pipeline_q2_0 = vk_create_pipeline(dev, moe_cache_mv_q2_0_data, moe_cache_mv_q2_0_len);
+    dev.pipeline_q4_1 = vk_create_pipeline(dev, moe_cache_mv_q4_1_data, moe_cache_mv_q4_1_len);
+    dev.pipeline_q5_0 = vk_create_pipeline(dev, moe_cache_mv_q5_0_data, moe_cache_mv_q5_0_len);
+    dev.pipeline_q5_1 = vk_create_pipeline(dev, moe_cache_mv_q5_1_data, moe_cache_mv_q5_1_len);
+    dev.pipeline_q2_K = vk_create_pipeline(dev, moe_cache_mv_q2_K_data, moe_cache_mv_q2_K_len);
+    dev.pipeline_q3_K = vk_create_pipeline(dev, moe_cache_mv_q3_K_data, moe_cache_mv_q3_K_len);
+    dev.pipeline_iq2_xxs = vk_create_pipeline(dev, moe_cache_mv_iq2_xxs_data, moe_cache_mv_iq2_xxs_len);
+    dev.pipeline_iq2_xs = vk_create_pipeline(dev, moe_cache_mv_iq2_xs_data, moe_cache_mv_iq2_xs_len);
+    dev.pipeline_iq2_s = vk_create_pipeline(dev, moe_cache_mv_iq2_s_data, moe_cache_mv_iq2_s_len);
+    dev.pipeline_iq3_xxs = vk_create_pipeline(dev, moe_cache_mv_iq3_xxs_data, moe_cache_mv_iq3_xxs_len);
+    dev.pipeline_iq3_s = vk_create_pipeline(dev, moe_cache_mv_iq3_s_data, moe_cache_mv_iq3_s_len);
+    dev.pipeline_iq1_s = vk_create_pipeline(dev, moe_cache_mv_iq1_s_data, moe_cache_mv_iq1_s_len);
+    dev.pipeline_iq1_m = vk_create_pipeline(dev, moe_cache_mv_iq1_m_data, moe_cache_mv_iq1_m_len);
+    dev.pipeline_iq4_nl = vk_create_pipeline(dev, moe_cache_mv_iq4_nl_data, moe_cache_mv_iq4_nl_len);
+    dev.pipeline_iq4_xs = vk_create_pipeline(dev, moe_cache_mv_iq4_xs_data, moe_cache_mv_iq4_xs_len);
+    dev.pipeline_mxfp4 = vk_create_pipeline(dev, moe_cache_mv_mxfp4_data, moe_cache_mv_mxfp4_len);
+    dev.pipeline_nvfp4 = vk_create_pipeline(dev, moe_cache_mv_nvfp4_data, moe_cache_mv_nvfp4_len);
+    if (!dev.pipeline_q8_0 || !dev.pipeline_q4_0 || !dev.pipeline_q4_K || !dev.pipeline_q6_K || !dev.pipeline_q5_K ||
+        !dev.pipeline_q1_0 || !dev.pipeline_q2_0 || !dev.pipeline_q4_1 || !dev.pipeline_q5_0 || !dev.pipeline_q5_1 ||
+        !dev.pipeline_q2_K || !dev.pipeline_q3_K || !dev.pipeline_iq2_xxs || !dev.pipeline_iq2_xs || !dev.pipeline_iq2_s ||
+        !dev.pipeline_iq3_xxs || !dev.pipeline_iq3_s || !dev.pipeline_iq1_s || !dev.pipeline_iq1_m || !dev.pipeline_iq4_nl ||
+        !dev.pipeline_iq4_xs || !dev.pipeline_mxfp4 || !dev.pipeline_nvfp4) {
         return false;
     }
 
@@ -547,8 +646,8 @@ static int vk_moe_query_shape(int wtype, int64_t n_in, int64_t n_out,
     if (!result || n_in <= 0 || n_out <= 0 || n_expert <= 0) {
         return 0;
     }
-    if (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-        wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K) {
+    // canonical list from ggml-backend-moe-cache.h; single source of truth
+    if (!ggml_moe_cache_wtype_supported(wtype)) {
         return 0;
     }
 
@@ -866,8 +965,7 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     if (!name || !host_base || !moe_cache_tensor_name_supported(name) ||
         n_tokens < 1 || expert_size < session->config.min_expert_bytes ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
-        (wtype != GGML_TYPE_Q8_0 && wtype != GGML_TYPE_Q4_0 &&
-         wtype != GGML_TYPE_Q4_K && wtype != GGML_TYPE_Q6_K)) {
+        !ggml_moe_cache_wtype_supported(wtype)) {
         return nullptr;
     }
     if (n_rows < n_tokens || n_rows % n_tokens != 0 ||
@@ -1210,9 +1308,29 @@ static int vk_moe_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out
     // select pipeline by weight type
     VkPipeline pipeline = dev.pipeline_q8_0;
     switch (wtype) {
+        case GGML_TYPE_Q8_0: pipeline = dev.pipeline_q8_0; break;
         case GGML_TYPE_Q4_0: pipeline = dev.pipeline_q4_0; break;
         case GGML_TYPE_Q4_K: pipeline = dev.pipeline_q4_K; break;
         case GGML_TYPE_Q6_K: pipeline = dev.pipeline_q6_K; break;
+        case GGML_TYPE_Q5_K: pipeline = dev.pipeline_q5_K; break;
+        case GGML_TYPE_Q1_0: pipeline = dev.pipeline_q1_0; break;
+        case GGML_TYPE_Q2_0: pipeline = dev.pipeline_q2_0; break;
+        case GGML_TYPE_Q4_1: pipeline = dev.pipeline_q4_1; break;
+        case GGML_TYPE_Q5_0: pipeline = dev.pipeline_q5_0; break;
+        case GGML_TYPE_Q5_1: pipeline = dev.pipeline_q5_1; break;
+        case GGML_TYPE_Q2_K: pipeline = dev.pipeline_q2_K; break;
+        case GGML_TYPE_Q3_K: pipeline = dev.pipeline_q3_K; break;
+        case GGML_TYPE_IQ2_XXS: pipeline = dev.pipeline_iq2_xxs; break;
+        case GGML_TYPE_IQ2_XS: pipeline = dev.pipeline_iq2_xs; break;
+        case GGML_TYPE_IQ2_S: pipeline = dev.pipeline_iq2_s; break;
+        case GGML_TYPE_IQ3_XXS: pipeline = dev.pipeline_iq3_xxs; break;
+        case GGML_TYPE_IQ3_S: pipeline = dev.pipeline_iq3_s; break;
+        case GGML_TYPE_IQ1_S: pipeline = dev.pipeline_iq1_s; break;
+        case GGML_TYPE_IQ1_M: pipeline = dev.pipeline_iq1_m; break;
+        case GGML_TYPE_IQ4_NL: pipeline = dev.pipeline_iq4_nl; break;
+        case GGML_TYPE_IQ4_XS: pipeline = dev.pipeline_iq4_xs; break;
+        case GGML_TYPE_MXFP4: pipeline = dev.pipeline_mxfp4; break;
+        case GGML_TYPE_NVFP4: pipeline = dev.pipeline_nvfp4; break;
         default: break;
     }
     if (!pipeline) {

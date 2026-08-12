@@ -101,6 +101,56 @@ struct ggml_moe_cache_api {
     void (*invalidate)(const void * base, size_t size);
 };
 
+// Canonical expert weight type set for the MoE cache. Every provider
+// (CUDA/HIP, Vulkan, Metal) must accept exactly this set in query_shape and
+// begin; a provider that silently accepts less produces silent partial
+// coverage. Keep in sync with the CUDA kernel case tables in
+// ggml-cuda/mmvq.cu (ggml_cuda_moe_cache_mmv_supported /
+// ggml_cuda_moe_cache_mmv_fused_supported); moe-cache.cu asserts the match at
+// registration time.
+// enum tag form: ggml.h declares the type without a typedef, so bare
+// ggml_type is invalid in C (ggml-cpu.c includes this header as C).
+static const enum ggml_type ggml_moe_cache_types[] = {
+    GGML_TYPE_Q1_0,
+    GGML_TYPE_Q2_0,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_MXFP4,
+    GGML_TYPE_NVFP4,
+    GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K,
+    GGML_TYPE_IQ2_XXS,
+    GGML_TYPE_IQ2_XS,
+    GGML_TYPE_IQ2_S,
+    GGML_TYPE_IQ3_XXS,
+    GGML_TYPE_IQ3_S,
+    GGML_TYPE_IQ1_S,
+    GGML_TYPE_IQ1_M,
+    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_IQ4_XS,
+};
+
+static inline int ggml_moe_cache_wtype_count(void) {
+    return (int) (sizeof(ggml_moe_cache_types) / sizeof(ggml_moe_cache_types[0]));
+}
+
+// Single source of truth for cacheable weight types. Providers call this from
+// both query_shape and begin so the two gates cannot drift apart.
+static inline int ggml_moe_cache_wtype_supported(int wtype) {
+    for (int i = 0; i < ggml_moe_cache_wtype_count(); i++) {
+        if ((int) ggml_moe_cache_types[i] == wtype) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 GGML_API void ggml_moe_cache_register(const struct ggml_moe_cache_api * api);
 GGML_API void ggml_moe_cache_unregister(const void * owner);
 // Returns a copy of the provider table registered for owner, zeroed if absent.
