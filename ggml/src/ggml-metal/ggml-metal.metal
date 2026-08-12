@@ -13982,7 +13982,7 @@ static inline void kernel_moe_cache_mv_block_dot(
         for (int l = 0; l < 4; l++) {
             const int idx = (int)((aux32_g >> (8*l)) & 0xFF);
             const uint8_t signs = ksigns_iq2xs[(aux32_s >> (7*l)) & 127];
-            constant uint8_t * grid = iq2xxs_grid + idx;
+            constant uint8_t * grid = (constant uint8_t *)(iq2xxs_grid + idx);
             for (int i = 0; i < 8; i++) {
                 const int g = (int)grid[i];
                 const int sgn = (signs >> i) & 1;
@@ -14013,7 +14013,7 @@ static inline void kernel_moe_cache_mv_block_dot(
             const uint16_t q2w = q2[l];
             const int idx = (int)(q2w & 511);
             const uint8_t signs = ksigns_iq2xs[q2w >> 9];
-            constant uint8_t * grid = iq2xs_grid + idx;
+            constant uint8_t * grid = (constant uint8_t *)(iq2xs_grid + idx);
             int sumi = 0;
             for (int i = 0; i < 8; i++) {
                 const int g = (int)grid[i];
@@ -14044,7 +14044,7 @@ static inline void kernel_moe_cache_mv_block_dot(
         for (int l = 0; l < 4; l++) {
             const int idx = (int)w_block->qs[4*ib32 + l] | ((qh << (8 - 2*l)) & 0x300);
             const uint8_t sg = w_block->qs[32 + 4*ib32 + l];
-            constant uint8_t * grid = iq2s_grid + idx;
+            constant uint8_t * grid = (constant uint8_t *)(iq2s_grid + idx);
             int sumi = 0;
             for (int i = 0; i < 8; i++) {
                 const int g = (int)grid[i];
@@ -14075,8 +14075,8 @@ static inline void kernel_moe_cache_mv_block_dot(
         const float d_a = (float)a_block[ib32].d;
         int sumi = 0;
         for (int l = 0; l < 4; l++) {
-            constant uint8_t * grid1 = iq3xxs_grid + w_block->qs[8*ib32 + 2*l + 0];
-            constant uint8_t * grid2 = iq3xxs_grid + w_block->qs[8*ib32 + 2*l + 1];
+            constant uint8_t * grid1 = (constant uint8_t *)(iq3xxs_grid + w_block->qs[8*ib32 + 2*l + 0]);
+            constant uint8_t * grid2 = (constant uint8_t *)(iq3xxs_grid + w_block->qs[8*ib32 + 2*l + 1]);
             const uint8_t signs = ksigns_iq2xs[(aux32 >> (7*l)) & 127];
             for (int i = 0; i < 4; i++) {
                 const int g1 = (int)grid1[i];
@@ -14106,8 +14106,8 @@ static inline void kernel_moe_cache_mv_block_dot(
         const float d_a = (float)a_block[ib32].d;
         int sumi = 0;
         for (int l = 0; l < 4; l++) {
-            constant uint8_t * grid1 = iq3s_grid + (w_block->qs[8*ib32 + 2*l + 0] | ((qh << (8 - 2*l)) & 256));
-            constant uint8_t * grid2 = iq3s_grid + (w_block->qs[8*ib32 + 2*l + 1] | ((qh << (7 - 2*l)) & 256));
+            constant uint8_t * grid1 = (constant uint8_t *)(iq3s_grid + (w_block->qs[8*ib32 + 2*l + 0] | ((qh << (8 - 2*l)) & 256)));
+            constant uint8_t * grid2 = (constant uint8_t *)(iq3s_grid + (w_block->qs[8*ib32 + 2*l + 1] | ((qh << (7 - 2*l)) & 256)));
             const uint8_t sg = w_block->signs[4*ib32 + l];
             for (int i = 0; i < 4; i++) {
                 const int g1 = (int)grid1[i];
