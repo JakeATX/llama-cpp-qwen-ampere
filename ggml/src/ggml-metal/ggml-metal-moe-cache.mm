@@ -885,7 +885,9 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
         return 0;
     }
 
-    id<MTLCommandBuffer> cmd_buf = [dev.mtl_queue newCommandBuffer];
+    // MTLCommandQueue has no -newCommandBuffer; the selector is -commandBuffer,
+    // which returns an autoreleased buffer (+0), so it must not be released here.
+    id<MTLCommandBuffer> cmd_buf = [dev.mtl_queue commandBuffer];
     if (!cmd_buf) {
         [ids_buf release];
         [act_buf release];
@@ -895,7 +897,6 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
     ggml_metal_encoder_t enc = ggml_metal_encoder_init(
             (ggml_metal_cmd_buf_t)cmd_buf, true);
     if (!enc) {
-        [cmd_buf release];
         [ids_buf release];
         [act_buf release];
         [out_buf release];
@@ -931,7 +932,6 @@ static int metal_dispatch(void * opaque, int wtype, int64_t n_in, int64_t n_out,
                       dev.physical, (long)[cmd_buf status],
                       mtl_err ? [[mtl_err localizedDescription] UTF8String] : "none");
     }
-    [cmd_buf release];
 
     [ids_buf release];
     [act_buf release];
