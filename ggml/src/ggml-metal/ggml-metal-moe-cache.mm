@@ -1085,6 +1085,9 @@ static void metal_register(const void * owner) {
     ggml_moe_cache_register(&api);
 }
 
+// Prior declaration so the definition below does not trip -Wmissing-prototypes.
+extern "C" void ggml_metal_moe_cache_register(void * reg);
+
 extern "C" void ggml_metal_moe_cache_register(void * reg) {
     metal_register(reg);
 }
