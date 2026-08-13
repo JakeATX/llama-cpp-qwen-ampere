@@ -93,7 +93,23 @@ static __global__ void flash_attn_ext_vec(
     // Turbo KQ dot does byte extraction + centroid lookup + scalar mul, not vectorized f16 loads.
     // nthreads_KQ=1: each thread computes a full KQ product alone — eliminates warp_reduce_sum
     // shuffle and halves KQ loop iterations. Each thread holds full Q vector in registers.
-    constexpr int nthreads_KQ = K_is_turbo ? 1 : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
+    //
+    // That last property is what makes it unaffordable at large D. Q_reg below is
+    // [ncols][(D/2)/nthreads_KQ], so with nthreads_KQ=1 the per-thread Q working set grows
+    // linearly with D: at D=256, ncols=2 it is float2[2][128] = 2 KiB per lane. Measured
+    // spills for K=turbo at D=256 (issue #294):
+    //
+    //     gfx908 (CDNA)    550-586 VGPR (255 + 295-330)
+    //     gfx1100 (RDNA3)  884-907 VGPR (256 + 628-651)
+    //     gfx1030 (RDNA2)  890-976 VGPR (256 + 634-720)
+    //
+    // while the same shapes with a non-turbo K spill nothing. Above D=128 the reduction
+    // shuffle is much cheaper than the spill, so fall back to the split the other
+    // unquantized K types already use. The turbo KQ dots are templated on nthreads and
+    // stride correctly for any value, and warp_reduce_sum<nthreads_KQ> is a no-op at 1,
+    // so both settings are already supported by the kernel.
+    constexpr int nthreads_KQ = K_is_turbo ? (D > 128 ? 128 / cpy_nb : 1)
+                                           : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
     constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
     // Turbo V dequant is scalar (byte extract + LUT), not vectorized loads.
     // Halve nthreads_V to double V_cols_per_iter (process 2 V rows per loop iteration),
