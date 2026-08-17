@@ -10,6 +10,8 @@
 #include <mutex>
 #include <string>
 
+extern "C" void ggml_metal_moe_cache_register(void * reg);
+
 #define GGML_METAL_NAME "MTL"
 #define GGML_METAL_MAX_DEVICES 16
 
@@ -943,6 +945,11 @@ ggml_backend_reg_t ggml_backend_metal_reg(void) {
 
         initialized = true;
     }
+
+    // No GGML_USE_* guard: that macro is defined for consumers of the backend
+    // (ggml-backend-reg.cpp), not for this target, so guarding here compiled the
+    // registration out entirely and the provider never installed.
+    ggml_metal_moe_cache_register(&reg);
 
     return &reg;
 }

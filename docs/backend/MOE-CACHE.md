@@ -71,6 +71,8 @@ Use `--moe-cache MODE` with programs that use the common argument parser:
 
 A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
 
+A single device is eligible for `auto` when free VRAM minus the reserve clears the 1 GiB automatic slab floor. Below that floor `auto` stays dormant so small pools do not thrash; shrink `GGML_CUDA_MOE_CACHE_RESERVE_MB` (default 3072 MiB) to give the floor room on a constrained card.
+
 The cache only sees experts assigned to host memory. Cache-aware fit uses a no-allocation model load to inventory exact expert shapes, aliases, model memory, context memory, and compute memory before choosing between stock and cache placement. Explicit `--cpu-moe`, `--n-cpu-moe`, tensor overrides, GPU layers, or tensor splits remain authoritative and can prevent fit from changing placement.
 
 The cache considers only backends selected for the scheduler. It does not discover or use an unselected device.

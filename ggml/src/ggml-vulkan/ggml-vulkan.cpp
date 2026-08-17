@@ -1,5 +1,5 @@
-#include "ggml-vulkan.h"
 #include <vulkan/vulkan_core.h>
+#include "ggml-vulkan.h"
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
 #include "ggml-cpu.h"
@@ -94,6 +94,8 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include "ggml-backend-impl.h"
 
 #include "ggml-vulkan-shaders.hpp"
+
+extern "C" void ggml_vulkan_moe_cache_register(void * reg);
 
 // remove this once it's more widely available in the SDK
 #if !defined(VK_KHR_shader_bfloat16)
@@ -17965,6 +17967,51 @@ bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
 }
 
+VkDevice ggml_backend_vk_get_device_handle(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return VK_NULL_HANDLE;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device) {
+        return VK_NULL_HANDLE;
+    }
+    return (VkDevice)ctx->device->device;
+}
+
+VkQueue ggml_backend_vk_get_queue_handle(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return VK_NULL_HANDLE;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device || !ctx->device->compute_queue ||
+        !ctx->device->compute_queue->handle) {
+        return VK_NULL_HANDLE;
+    }
+    return (VkQueue)ctx->device->compute_queue->handle->queue;
+}
+
+VkPhysicalDevice ggml_backend_vk_get_physical_device(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return VK_NULL_HANDLE;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device) {
+        return VK_NULL_HANDLE;
+    }
+    return (VkPhysicalDevice)ctx->device->physical_device;
+}
+
+uint32_t ggml_backend_vk_get_queue_family(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return 0;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    if (!ctx->device || !ctx->device->compute_queue) {
+        return 0;
+    }
+    return ctx->device->compute_queue->queue_family_index;
+}
+
 int ggml_backend_vk_get_device_count() {
     return ggml_vk_get_device_count();
 }
@@ -18983,6 +19030,9 @@ ggml_backend_reg_t ggml_backend_vk_reg() {
     };
     try {
         ggml_vk_instance_init();
+        // No GGML_USE_* guard: see the Metal backend; that macro is not defined
+        // for this target, so the registration was compiled out.
+        ggml_vulkan_moe_cache_register(&reg);
         return &reg;
     } catch (const vk::SystemError& e) {
         VK_LOG_DEBUG("ggml_backend_vk_reg() -> Error: System error: " << e.what());
