@@ -469,6 +469,17 @@ static VkPipeline vk_create_pipeline(moe_cache_vulkan_device & dev,
     return pipeline;
 }
 
+// Create a moe-cache kernel pipeline, logging the name on failure.
+static VkPipeline vk_moe_pipeline_create(moe_cache_vulkan_device & dev,
+                                         const char * name,
+                                         const unsigned char * spv, uint64_t spv_len) {
+    VkPipeline pipeline = vk_create_pipeline(dev, spv, spv_len);
+    if (!pipeline) {
+        MOE_CACHE_LOG("[moe-cache] Vulkan: moe cache kernel missing: %s\n", name);
+    }
+    return pipeline;
+}
+
 static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
     // descriptor set layout: 4 storage buffers + 1 uniform buffer
     VkDescriptorSetLayoutBinding bindings[5] = {};
@@ -499,29 +510,29 @@ static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
         return false;
     }
 
-    dev.pipeline_q8_0 = vk_create_pipeline(dev, moe_cache_mv_q8_0_data, moe_cache_mv_q8_0_len);
-    dev.pipeline_q4_0 = vk_create_pipeline(dev, moe_cache_mv_q4_0_data, moe_cache_mv_q4_0_len);
-    dev.pipeline_q4_K = vk_create_pipeline(dev, moe_cache_mv_q4_K_data, moe_cache_mv_q4_K_len);
-    dev.pipeline_q6_K = vk_create_pipeline(dev, moe_cache_mv_q6_K_data, moe_cache_mv_q6_K_len);
-    dev.pipeline_q5_K = vk_create_pipeline(dev, moe_cache_mv_q5_K_data, moe_cache_mv_q5_K_len);
-    dev.pipeline_q1_0 = vk_create_pipeline(dev, moe_cache_mv_q1_0_data, moe_cache_mv_q1_0_len);
-    dev.pipeline_q2_0 = vk_create_pipeline(dev, moe_cache_mv_q2_0_data, moe_cache_mv_q2_0_len);
-    dev.pipeline_q4_1 = vk_create_pipeline(dev, moe_cache_mv_q4_1_data, moe_cache_mv_q4_1_len);
-    dev.pipeline_q5_0 = vk_create_pipeline(dev, moe_cache_mv_q5_0_data, moe_cache_mv_q5_0_len);
-    dev.pipeline_q5_1 = vk_create_pipeline(dev, moe_cache_mv_q5_1_data, moe_cache_mv_q5_1_len);
-    dev.pipeline_q2_K = vk_create_pipeline(dev, moe_cache_mv_q2_K_data, moe_cache_mv_q2_K_len);
-    dev.pipeline_q3_K = vk_create_pipeline(dev, moe_cache_mv_q3_K_data, moe_cache_mv_q3_K_len);
-    dev.pipeline_iq2_xxs = vk_create_pipeline(dev, moe_cache_mv_iq2_xxs_data, moe_cache_mv_iq2_xxs_len);
-    dev.pipeline_iq2_xs = vk_create_pipeline(dev, moe_cache_mv_iq2_xs_data, moe_cache_mv_iq2_xs_len);
-    dev.pipeline_iq2_s = vk_create_pipeline(dev, moe_cache_mv_iq2_s_data, moe_cache_mv_iq2_s_len);
-    dev.pipeline_iq3_xxs = vk_create_pipeline(dev, moe_cache_mv_iq3_xxs_data, moe_cache_mv_iq3_xxs_len);
-    dev.pipeline_iq3_s = vk_create_pipeline(dev, moe_cache_mv_iq3_s_data, moe_cache_mv_iq3_s_len);
-    dev.pipeline_iq1_s = vk_create_pipeline(dev, moe_cache_mv_iq1_s_data, moe_cache_mv_iq1_s_len);
-    dev.pipeline_iq1_m = vk_create_pipeline(dev, moe_cache_mv_iq1_m_data, moe_cache_mv_iq1_m_len);
-    dev.pipeline_iq4_nl = vk_create_pipeline(dev, moe_cache_mv_iq4_nl_data, moe_cache_mv_iq4_nl_len);
-    dev.pipeline_iq4_xs = vk_create_pipeline(dev, moe_cache_mv_iq4_xs_data, moe_cache_mv_iq4_xs_len);
-    dev.pipeline_mxfp4 = vk_create_pipeline(dev, moe_cache_mv_mxfp4_data, moe_cache_mv_mxfp4_len);
-    dev.pipeline_nvfp4 = vk_create_pipeline(dev, moe_cache_mv_nvfp4_data, moe_cache_mv_nvfp4_len);
+    dev.pipeline_q8_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q8_0", moe_cache_mv_q8_0_data, moe_cache_mv_q8_0_len);
+    dev.pipeline_q4_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q4_0", moe_cache_mv_q4_0_data, moe_cache_mv_q4_0_len);
+    dev.pipeline_q4_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q4_K", moe_cache_mv_q4_K_data, moe_cache_mv_q4_K_len);
+    dev.pipeline_q6_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q6_K", moe_cache_mv_q6_K_data, moe_cache_mv_q6_K_len);
+    dev.pipeline_q5_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q5_K", moe_cache_mv_q5_K_data, moe_cache_mv_q5_K_len);
+    dev.pipeline_q1_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q1_0", moe_cache_mv_q1_0_data, moe_cache_mv_q1_0_len);
+    dev.pipeline_q2_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q2_0", moe_cache_mv_q2_0_data, moe_cache_mv_q2_0_len);
+    dev.pipeline_q4_1 = vk_moe_pipeline_create(dev, "moe_cache_mv_q4_1", moe_cache_mv_q4_1_data, moe_cache_mv_q4_1_len);
+    dev.pipeline_q5_0 = vk_moe_pipeline_create(dev, "moe_cache_mv_q5_0", moe_cache_mv_q5_0_data, moe_cache_mv_q5_0_len);
+    dev.pipeline_q5_1 = vk_moe_pipeline_create(dev, "moe_cache_mv_q5_1", moe_cache_mv_q5_1_data, moe_cache_mv_q5_1_len);
+    dev.pipeline_q2_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q2_K", moe_cache_mv_q2_K_data, moe_cache_mv_q2_K_len);
+    dev.pipeline_q3_K = vk_moe_pipeline_create(dev, "moe_cache_mv_q3_K", moe_cache_mv_q3_K_data, moe_cache_mv_q3_K_len);
+    dev.pipeline_iq2_xxs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq2_xxs", moe_cache_mv_iq2_xxs_data, moe_cache_mv_iq2_xxs_len);
+    dev.pipeline_iq2_xs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq2_xs", moe_cache_mv_iq2_xs_data, moe_cache_mv_iq2_xs_len);
+    dev.pipeline_iq2_s = vk_moe_pipeline_create(dev, "moe_cache_mv_iq2_s", moe_cache_mv_iq2_s_data, moe_cache_mv_iq2_s_len);
+    dev.pipeline_iq3_xxs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq3_xxs", moe_cache_mv_iq3_xxs_data, moe_cache_mv_iq3_xxs_len);
+    dev.pipeline_iq3_s = vk_moe_pipeline_create(dev, "moe_cache_mv_iq3_s", moe_cache_mv_iq3_s_data, moe_cache_mv_iq3_s_len);
+    dev.pipeline_iq1_s = vk_moe_pipeline_create(dev, "moe_cache_mv_iq1_s", moe_cache_mv_iq1_s_data, moe_cache_mv_iq1_s_len);
+    dev.pipeline_iq1_m = vk_moe_pipeline_create(dev, "moe_cache_mv_iq1_m", moe_cache_mv_iq1_m_data, moe_cache_mv_iq1_m_len);
+    dev.pipeline_iq4_nl = vk_moe_pipeline_create(dev, "moe_cache_mv_iq4_nl", moe_cache_mv_iq4_nl_data, moe_cache_mv_iq4_nl_len);
+    dev.pipeline_iq4_xs = vk_moe_pipeline_create(dev, "moe_cache_mv_iq4_xs", moe_cache_mv_iq4_xs_data, moe_cache_mv_iq4_xs_len);
+    dev.pipeline_mxfp4 = vk_moe_pipeline_create(dev, "moe_cache_mv_mxfp4", moe_cache_mv_mxfp4_data, moe_cache_mv_mxfp4_len);
+    dev.pipeline_nvfp4 = vk_moe_pipeline_create(dev, "moe_cache_mv_nvfp4", moe_cache_mv_nvfp4_data, moe_cache_mv_nvfp4_len);
     if (!dev.pipeline_q8_0 || !dev.pipeline_q4_0 || !dev.pipeline_q4_K || !dev.pipeline_q6_K || !dev.pipeline_q5_K ||
         !dev.pipeline_q1_0 || !dev.pipeline_q2_0 || !dev.pipeline_q4_1 || !dev.pipeline_q5_0 || !dev.pipeline_q5_1 ||
         !dev.pipeline_q2_K || !dev.pipeline_q3_K || !dev.pipeline_iq2_xxs || !dev.pipeline_iq2_xs || !dev.pipeline_iq2_s ||

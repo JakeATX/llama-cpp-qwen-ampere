@@ -287,6 +287,19 @@ static moe_cache_pool * metal_find_or_create_pool(
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
+// Get-or-compile a moe-cache kernel pipeline, logging the name on failure.
+// The backend caches pipelines lazily; get_pipeline alone only returns
+// already-compiled ones, so every lookup on a fresh library would miss.
+static struct ggml_metal_pipeline_with_params metal_pipeline_get(
+        ggml_metal_library_t lib, const char * name) {
+    struct ggml_metal_pipeline_with_params res =
+        ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    if (!res.pipeline) {
+        MOE_CACHE_LOG("[moe-cache] Metal: moe cache kernel missing: %s\n", name);
+    }
+    return res;
+}
+
 static void * metal_session_create(void * const * backends, int n_backends,
                                     const ggml_moe_cache_config * supplied_config) {
     try {
@@ -353,51 +366,51 @@ static void * metal_session_create(void * const * backends, int n_backends,
         }
 
         struct ggml_metal_pipeline_with_params p_q8_0 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q8_0_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q8_0_f32");
         struct ggml_metal_pipeline_with_params p_q4_0 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_0_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q4_0_f32");
         struct ggml_metal_pipeline_with_params p_q4_K =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_K_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q4_K_f32");
         struct ggml_metal_pipeline_with_params p_q6_K =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q6_K_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q6_K_f32");
         struct ggml_metal_pipeline_with_params p_q5_K =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q5_K_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q5_K_f32");
         struct ggml_metal_pipeline_with_params p_q1_0 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q1_0_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q1_0_f32");
         struct ggml_metal_pipeline_with_params p_q2_0 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q2_0_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q2_0_f32");
         struct ggml_metal_pipeline_with_params p_q4_1 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q4_1_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q4_1_f32");
         struct ggml_metal_pipeline_with_params p_q5_0 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q5_0_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q5_0_f32");
         struct ggml_metal_pipeline_with_params p_q5_1 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q5_1_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q5_1_f32");
         struct ggml_metal_pipeline_with_params p_q2_K =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q2_K_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q2_K_f32");
         struct ggml_metal_pipeline_with_params p_q3_K =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_q3_K_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_q3_K_f32");
         struct ggml_metal_pipeline_with_params p_iq2_xxs =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq2_xxs_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq2_xxs_f32");
         struct ggml_metal_pipeline_with_params p_iq2_xs =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq2_xs_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq2_xs_f32");
         struct ggml_metal_pipeline_with_params p_iq2_s =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq2_s_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq2_s_f32");
         struct ggml_metal_pipeline_with_params p_iq3_xxs =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq3_xxs_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq3_xxs_f32");
         struct ggml_metal_pipeline_with_params p_iq3_s =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq3_s_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq3_s_f32");
         struct ggml_metal_pipeline_with_params p_iq1_s =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq1_s_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq1_s_f32");
         struct ggml_metal_pipeline_with_params p_iq1_m =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq1_m_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq1_m_f32");
         struct ggml_metal_pipeline_with_params p_iq4_nl =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq4_nl_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq4_nl_f32");
         struct ggml_metal_pipeline_with_params p_iq4_xs =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_iq4_xs_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_iq4_xs_f32");
         struct ggml_metal_pipeline_with_params p_mxfp4 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_mxfp4_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_mxfp4_f32");
         struct ggml_metal_pipeline_with_params p_nvfp4 =
-            ggml_metal_library_get_pipeline(lib, "kernel_moe_cache_mv_nvfp4_f32");
+            metal_pipeline_get(lib, "kernel_moe_cache_mv_nvfp4_f32");
         if (!p_q8_0.pipeline || !p_q4_0.pipeline ||
             !p_q4_K.pipeline || !p_q6_K.pipeline || !p_q5_K.pipeline ||
             !p_q1_0.pipeline || !p_q2_0.pipeline || !p_q4_1.pipeline ||
