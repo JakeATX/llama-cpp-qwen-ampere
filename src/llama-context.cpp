@@ -971,8 +971,10 @@ llama_memory_t llama_context::get_memory() const {
 // `want_k` selects K (true) or V (false). Returns GGML_TYPE_COUNT when the
 // memory object has no single representative K/V type (pure recurrent
 // memory, or a composite cache like DSV4 whose sub-caches - raw token
-// attention, CSA/HCA compressed blocks, lightning-indexer keys - can each
-// end up with different effective types, e.g. via TurboQuant auto-asymmetric).
+// attention, CSA/HCA compressed blocks, lightning-indexer keys - are
+// configured independently and need not share a single type. Note that
+// auto-asymmetric is not the reason here: it skips MLA architectures, DSV4
+// included, so it never rewrites these.
 static enum ggml_type llama_memory_get_kv_type(const llama_memory_i * mem, bool want_k) {
     if (!mem) {
         return GGML_TYPE_COUNT;
@@ -1008,8 +1010,8 @@ static enum ggml_type llama_memory_get_kv_type(const llama_memory_i * mem, bool 
 
     // DSV4: raw token attention (iSWA), plus CSA/HCA compressed block caches
     // and a lightning-indexer key cache. These are independent llama_kv_cache
-    // instances that can each be rewritten differently by auto-asymmetric, so
-    // there is no single type that represents "the" cache - be honest about it.
+    // instances configured independently, so there is no single type that
+    // represents "the" cache - be honest about it rather than picking one.
     if (dynamic_cast<const llama_kv_cache_dsv4 *>(mem)) {
         return GGML_TYPE_COUNT;
     }
