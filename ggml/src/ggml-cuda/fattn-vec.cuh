@@ -94,21 +94,22 @@ static __global__ void flash_attn_ext_vec(
     // nthreads_KQ=1: each thread computes a full KQ product alone — eliminates warp_reduce_sum
     // shuffle and halves KQ loop iterations. Each thread holds full Q vector in registers.
     //
-    // That last property is what makes it unaffordable at large D. Q_reg below is
-    // [ncols][(D/2)/nthreads_KQ], so with nthreads_KQ=1 the per-thread Q working set grows
-    // linearly with D: at D=256, ncols=2 it is float2[2][128] = 2 KiB per lane. Measured
-    // spills for K=turbo at D=256 (issue #294):
+    // That last property is what makes it unaffordable in general: Q_reg below is
+    // [ncols][(D/2)/nthreads_KQ], so at nthreads_KQ=1 the per-lane Q working set is the whole
+    // Q vector. Measured spill for turbo K (issue #294): ~4.3 KB/lane at ncols=2 on SM 86,
+    // 295-786 VGPRs across CDNA/RDNA2/RDNA3/RDNA4, at both hsk=128 and hsk=256.
     //
-    //     gfx908 (CDNA)    550-586 VGPR (255 + 295-330)
-    //     gfx1100 (RDNA3)  884-907 VGPR (256 + 628-651)
-    //     gfx1030 (RDNA2)  890-976 VGPR (256 + 634-720)
+    // The shared-memory LUT paths below are the exception. They compute the full D-length dot
+    // per lane with no nthreads_KQ striding and never call warp_reduce_sum, so they structurally
+    // require nthreads_KQ==1; raising it there makes every lane redundantly recompute the whole
+    // dot (correct, but measured at -12.6% / -31.1% turbo2 decode at 8K / 32K on SM 86).
+    // Those same shapes are also the ones that do not spill. So the split is gated on the LUT
+    // being inactive rather than on D: keep 1 exactly where the LUT runs, split everywhere else.
     //
-    // while the same shapes with a non-turbo K spill nothing. Above D=128 the reduction
-    // shuffle is much cheaper than the spill, so fall back to the split the other
-    // unquantized K types already use. The turbo KQ dots are templated on nthreads and
-    // stride correctly for any value, and warp_reduce_sum<nthreads_KQ> is a no-op at 1,
-    // so both settings are already supported by the kernel.
-    constexpr int nthreads_KQ = K_is_turbo ? (D > 128 ? 128 / cpy_nb : 1)
+    // Kept in sync with n_centroids_lut below; turbo4 never gets a LUT (shmem budget).
+    constexpr bool turbo_lut_active = (ncols == 1) && (D <= 256) &&
+        (type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0);
+    constexpr int nthreads_KQ = K_is_turbo ? (turbo_lut_active ? 1 : 128 / cpy_nb)
                                            : (K_is_unquantized ? 128 / cpy_nb : nthreads_KQ_q);
     constexpr bool V_is_turbo = (type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO4_0);
     // Turbo V dequant is scalar (byte extract + LUT), not vectorized loads.
@@ -164,8 +165,8 @@ static __global__ void flash_attn_ext_vec(
     // then the hot loop does turbo_lut[d][idx] (shmem read, no multiply).
     // turbo4 excluded: 16 centroids × D exceeds shmem budget.
     // Stride = n_centroids+1 to avoid bank conflicts.
-    constexpr int n_centroids_lut = (D <= 256 && type_K == GGML_TYPE_TURBO3_0) ? 8 :
-                                    (D <= 256 && type_K == GGML_TYPE_TURBO2_0) ? 4 : 0;
+    constexpr int n_centroids_lut = !turbo_lut_active ? 0 :
+                                    (type_K == GGML_TYPE_TURBO3_0) ? 8 : 4;
     constexpr int lut_stride = n_centroids_lut > 0 ? n_centroids_lut + 1 : 1;
     __shared__ half turbo_lut[n_centroids_lut > 0 ? D : 1][lut_stride];
 
