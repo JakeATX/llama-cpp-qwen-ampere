@@ -53,10 +53,9 @@ static const void * g_moe_cache_owner = nullptr;
 // ---------------------------------------------------------------------------
 
 struct moe_cache_metal_device : public moe_cache_device {
-    moe_cache_metal_device(id<MTLDevice> dev, id<MTLCommandQueue> q)
-        : moe_cache_device(0, 0), mtl_device(dev), mtl_queue(q) {
+    moe_cache_metal_device(id<MTLDevice> dev, ggml_metal_device_t ctx)
+        : moe_cache_device(0, 0), mtl_device(dev), ctx_dev(ctx) {
         [mtl_device retain];
-        [mtl_queue retain];
     }
 
     ~moe_cache_metal_device() {
@@ -65,12 +64,21 @@ struct moe_cache_metal_device : public moe_cache_device {
             [out_buffer release];
             out_buffer = nil;
         }
-        [mtl_queue release];
+        if (mtl_queue) {
+            [mtl_queue release];
+            mtl_queue = nil;
+        }
         [mtl_device release];
     }
 
     id<MTLDevice> mtl_device;
-    id<MTLCommandQueue> mtl_queue;
+    // Backend device context; the library is compiled from it on first use.
+    ggml_metal_device_t ctx_dev = nullptr;
+    // Command queue, library, and pipelines are created lazily on the first
+    // begin, so a context that never uses the cache allocates no GPU objects.
+    id<MTLCommandQueue> mtl_queue = nil;
+    std::once_flag init_once;
+    bool init_ok = false;
     ggml_metal_library_t lib = nullptr;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q8_0;
     struct ggml_metal_pipeline_with_params mmv_pipeline_q4_0;
@@ -300,69 +308,18 @@ static struct ggml_metal_pipeline_with_params metal_pipeline_get(
     return res;
 }
 
-static void * metal_session_create(void * const * backends, int n_backends,
-                                    const ggml_moe_cache_config * supplied_config) {
-    try {
-        moe_cache_config config = moe_cache_read_config();
-        if (supplied_config) {
-            constexpr size_t MiB = 1024 * 1024;
-            if (supplied_config->budget_bytes % MiB != 0 ||
-                supplied_config->reserve_bytes % MiB != 0 ||
-                supplied_config->minimum_slab_bytes % MiB != 0 ||
-                supplied_config->min_expert_bytes == 0 ||
-                supplied_config->min_expert_explicit < 0 ||
-                supplied_config->min_expert_explicit > 1 ||
-                supplied_config->max_batch < 1 ||
-                supplied_config->max_batch > moe_cache_batch_max ||
-                supplied_config->min_devices < 1 ||
-                supplied_config->min_compute_capability < 0 ||
-                supplied_config->min_compute_capability > 999 ||
-                supplied_config->overlap_cpu_rows < -1 ||
-                supplied_config->overlap_cpu_rows > 8) {
-                return nullptr;
-            }
-            config.enabled = true;
-            config.automatic = supplied_config->minimum_slab_bytes > 0;
-            config.budget_mb = supplied_config->budget_bytes / MiB;
-            config.reserve_mb = supplied_config->reserve_bytes / MiB;
-            config.minimum_slab_bytes = supplied_config->minimum_slab_bytes;
-            config.min_expert_bytes = supplied_config->min_expert_bytes;
-            config.min_expert_explicit = supplied_config->min_expert_explicit;
-            config.max_batch = supplied_config->max_batch;
-            config.min_compute_capability = supplied_config->min_compute_capability;
-            config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
-        }
-        if (!config.enabled) {
-            return nullptr;
-        }
-
-        // Find the Metal backend among the scheduler's backends.
-        ggml_metal_device_t ctx_dev = nullptr;
-        id<MTLDevice> mtl_dev = nil;
-        for (int i = 0; i < n_backends; i++) {
-            ggml_backend_t be = (ggml_backend_t)backends[i];
-            if (!be || !ggml_backend_is_metal(be)) {
-                continue;
-            }
-            ggml_backend_dev_t dev = ggml_backend_get_device(be);
-            if (!dev || !dev->context) {
-                continue;
-            }
-            ctx_dev = (ggml_metal_device_t)dev->context;
-            mtl_dev = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(ctx_dev);
-            break;
-        }
-        if (!mtl_dev) {
-            MOE_CACHE_LOG("[moe-cache] no Metal device found\n");
-            return nullptr;
-        }
-
+// Compile the moe-cache pipelines and create the command queue on first use.
+// session_create only keeps bookkeeping state, so a context that never uses
+// the cache pays no GPU setup cost.
+static bool metal_device_ensure_ready(moe_cache_metal_device & dev, size_t budget_mb) {
+    std::call_once(dev.init_once, [&]() {
         // Load the shared kernel library (same embedded source as the
         // backend; contains kernel_moe_cache_mv_* from ggml-metal.metal).
-        ggml_metal_library_t lib = ggml_metal_library_init(ctx_dev);
+        ggml_metal_library_t lib = ggml_metal_library_init(dev.ctx_dev);
         if (!lib) {
             MOE_CACHE_LOG("[moe-cache] Metal library init failed\n");
-            return nullptr;
+            dev.dead.store(true);
+            return;
         }
 
         struct ggml_metal_pipeline_with_params p_q8_0 =
@@ -421,58 +378,121 @@ static void * metal_session_create(void * const * backends, int n_backends,
             !p_iq4_xs.pipeline || !p_mxfp4.pipeline || !p_nvfp4.pipeline) {
             MOE_CACHE_LOG("[moe-cache] Metal: one or more moe cache kernels missing\n");
             ggml_metal_library_free(lib);
-            return nullptr;
+            dev.dead.store(true);
+            return;
         }
 
-        id<MTLCommandQueue> queue = [mtl_dev newCommandQueue];
+        id<MTLCommandQueue> queue = [dev.mtl_device newCommandQueue];
         if (!queue) {
             ggml_metal_library_free(lib);
+            dev.dead.store(true);
+            return;
+        }
+
+        dev.mtl_queue = queue;
+        dev.lib = lib;
+        dev.mmv_pipeline_q8_0 = p_q8_0;
+        dev.mmv_pipeline_q4_0 = p_q4_0;
+        dev.mmv_pipeline_q4_K = p_q4_K;
+        dev.mmv_pipeline_q6_K = p_q6_K;
+        dev.mmv_pipeline_q5_K = p_q5_K;
+        dev.mmv_pipeline_q1_0 = p_q1_0;
+        dev.mmv_pipeline_q2_0 = p_q2_0;
+        dev.mmv_pipeline_q4_1 = p_q4_1;
+        dev.mmv_pipeline_q5_0 = p_q5_0;
+        dev.mmv_pipeline_q5_1 = p_q5_1;
+        dev.mmv_pipeline_q2_K = p_q2_K;
+        dev.mmv_pipeline_q3_K = p_q3_K;
+        dev.mmv_pipeline_iq2_xxs = p_iq2_xxs;
+        dev.mmv_pipeline_iq2_xs = p_iq2_xs;
+        dev.mmv_pipeline_iq2_s = p_iq2_s;
+        dev.mmv_pipeline_iq3_xxs = p_iq3_xxs;
+        dev.mmv_pipeline_iq3_s = p_iq3_s;
+        dev.mmv_pipeline_iq1_s = p_iq1_s;
+        dev.mmv_pipeline_iq1_m = p_iq1_m;
+        dev.mmv_pipeline_iq4_nl = p_iq4_nl;
+        dev.mmv_pipeline_iq4_xs = p_iq4_xs;
+        dev.mmv_pipeline_mxfp4 = p_mxfp4;
+        dev.mmv_pipeline_nvfp4 = p_nvfp4;
+        dev.init_ok = true;
+        MOE_CACHE_LOG("[moe-cache] Metal session ready (budget=%zu MiB)\n", budget_mb);
+    });
+    return dev.init_ok;
+}
+
+static void * metal_session_create(void * const * backends, int n_backends,
+                                    const ggml_moe_cache_config * supplied_config) {
+    try {
+        moe_cache_config config = moe_cache_read_config();
+        if (supplied_config) {
+            constexpr size_t MiB = 1024 * 1024;
+            if (supplied_config->budget_bytes % MiB != 0 ||
+                supplied_config->reserve_bytes % MiB != 0 ||
+                supplied_config->minimum_slab_bytes % MiB != 0 ||
+                supplied_config->min_expert_bytes == 0 ||
+                supplied_config->min_expert_explicit < 0 ||
+                supplied_config->min_expert_explicit > 1 ||
+                supplied_config->max_batch < 1 ||
+                supplied_config->max_batch > moe_cache_batch_max ||
+                supplied_config->min_devices < 1 ||
+                supplied_config->min_compute_capability < 0 ||
+                supplied_config->min_compute_capability > 999 ||
+                supplied_config->overlap_cpu_rows < -1 ||
+                supplied_config->overlap_cpu_rows > 8) {
+                return nullptr;
+            }
+            config.enabled = true;
+            config.automatic = supplied_config->minimum_slab_bytes > 0;
+            config.budget_mb = supplied_config->budget_bytes / MiB;
+            config.reserve_mb = supplied_config->reserve_bytes / MiB;
+            config.minimum_slab_bytes = supplied_config->minimum_slab_bytes;
+            config.min_expert_bytes = supplied_config->min_expert_bytes;
+            config.min_expert_explicit = supplied_config->min_expert_explicit;
+            config.max_batch = supplied_config->max_batch;
+            config.min_compute_capability = supplied_config->min_compute_capability;
+            config.overlap_cpu_rows = supplied_config->overlap_cpu_rows;
+        }
+        if (!config.enabled) {
             return nullptr;
         }
 
+        // Find the Metal backend among the scheduler's backends.
+        ggml_metal_device_t ctx_dev = nullptr;
+        id<MTLDevice> mtl_dev = nil;
+        for (int i = 0; i < n_backends; i++) {
+            ggml_backend_t be = (ggml_backend_t)backends[i];
+            if (!be || !ggml_backend_is_metal(be)) {
+                continue;
+            }
+            ggml_backend_dev_t dev = ggml_backend_get_device(be);
+            if (!dev || !dev->context) {
+                continue;
+            }
+            ctx_dev = (ggml_metal_device_t)dev->context;
+            mtl_dev = (__bridge id<MTLDevice>)ggml_metal_device_get_obj(ctx_dev);
+            break;
+        }
+        if (!mtl_dev) {
+            MOE_CACHE_LOG("[moe-cache] no Metal device found\n");
+            return nullptr;
+        }
+
+        // GPU resources (command queue, library, pipelines) are created
+        // lazily on the first begin; a context that never uses the cache
+        // allocates none of them.
         std::unique_ptr<moe_cache_session> session(new (std::nothrow) moe_cache_session());
         if (!session) {
-            [queue release];
-            ggml_metal_library_free(lib);
             return nullptr;
         }
         session->config = std::move(config);
 
         std::unique_ptr<moe_cache_metal_device> dev(new (std::nothrow)
-                moe_cache_metal_device(mtl_dev, queue));
-        [queue release];
+                moe_cache_metal_device(mtl_dev, ctx_dev));
         if (!dev) {
-            ggml_metal_library_free(lib);
             return nullptr;
         }
-        dev->lib = lib;
-        dev->mmv_pipeline_q8_0 = p_q8_0;
-        dev->mmv_pipeline_q4_0 = p_q4_0;
-        dev->mmv_pipeline_q4_K = p_q4_K;
-        dev->mmv_pipeline_q6_K = p_q6_K;
-        dev->mmv_pipeline_q5_K = p_q5_K;
-        dev->mmv_pipeline_q1_0 = p_q1_0;
-        dev->mmv_pipeline_q2_0 = p_q2_0;
-        dev->mmv_pipeline_q4_1 = p_q4_1;
-        dev->mmv_pipeline_q5_0 = p_q5_0;
-        dev->mmv_pipeline_q5_1 = p_q5_1;
-        dev->mmv_pipeline_q2_K = p_q2_K;
-        dev->mmv_pipeline_q3_K = p_q3_K;
-        dev->mmv_pipeline_iq2_xxs = p_iq2_xxs;
-        dev->mmv_pipeline_iq2_xs = p_iq2_xs;
-        dev->mmv_pipeline_iq2_s = p_iq2_s;
-        dev->mmv_pipeline_iq3_xxs = p_iq3_xxs;
-        dev->mmv_pipeline_iq3_s = p_iq3_s;
-        dev->mmv_pipeline_iq1_s = p_iq1_s;
-        dev->mmv_pipeline_iq1_m = p_iq1_m;
-        dev->mmv_pipeline_iq4_nl = p_iq4_nl;
-        dev->mmv_pipeline_iq4_xs = p_iq4_xs;
-        dev->mmv_pipeline_mxfp4 = p_mxfp4;
-        dev->mmv_pipeline_nvfp4 = p_nvfp4;
         session->devices.push_back(std::move(dev));
 
-        MOE_CACHE_LOG("[moe-cache] Metal session created (budget=%zu MiB)\n",
-                session->config.budget_mb);
         moe_cache_session * result = session.get();
         try {
             std::lock_guard<std::mutex> lock(g_registry_mu);
@@ -641,6 +661,15 @@ static void * metal_begin(const char * name, const void * host_base,
     }
     moe_cache_metal_device & dev =
         static_cast<moe_cache_metal_device &>(*session->devices[0]);
+    // A zero budget can never create a pool; skip GPU setup entirely.
+    if (session->config.budget_mb == 0) {
+        return nullptr;
+    }
+    // Compile the pipelines and create the command queue on first use, before
+    // the dispatch lock so a one-time compile does not block other workers.
+    if (!metal_device_ensure_ready(dev, session->config.budget_mb)) {
+        return nullptr;
+    }
 
     std::unique_lock<std::mutex> dispatch_lock;
     try {

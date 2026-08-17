@@ -128,6 +128,11 @@ struct moe_cache_vulkan_device : public moe_cache_device {
     // true when a DEVICE_LOCAL|HOST_VISIBLE memory type exists (UMA).
     bool host_mapped = false;
 
+    // Command pool and pipelines are created lazily on the first begin, so a
+    // context that never uses the cache allocates no GPU objects.
+    std::once_flag init_once;
+    bool init_ok = false;
+
     // pipelines, one per supported weight type
     VkPipeline pipeline_q8_0 = VK_NULL_HANDLE;
     VkPipeline pipeline_q4_0 = VK_NULL_HANDLE;
@@ -567,6 +572,32 @@ static bool vk_load_pipelines(moe_cache_vulkan_device & dev) {
     return true;
 }
 
+// Create the command pool and compile the moe-cache pipelines on first use.
+// session_create only keeps bookkeeping state, so a context that never uses
+// the cache pays no GPU setup cost.
+static bool vk_device_ensure_ready(moe_cache_vulkan_device & dev, size_t budget_mb) {
+    std::call_once(dev.init_once, [&]() {
+        VkCommandPoolCreateInfo cpci = {};
+        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpci.queueFamilyIndex = dev.vk_queue_family;
+        if (vkCreateCommandPool(dev.vk_device, &cpci, nullptr, &dev.vk_cmd_pool) != VK_SUCCESS) {
+            dev.dead.store(true);
+            return;
+        }
+        if (!vk_load_pipelines(dev)) {
+            MOE_CACHE_LOG("[moe-cache] Vulkan pipeline creation failed\n");
+            dev.free_resources();
+            dev.dead.store(true);
+            return;
+        }
+        dev.init_ok = true;
+        MOE_CACHE_LOG("[moe-cache] Vulkan session ready (budget=%zu MiB, %s)\n",
+                budget_mb, dev.host_mapped ? "host-mapped" : "device-local");
+    });
+    return dev.init_ok;
+}
+
 // ---------------------------------------------------------------------------
 // Quantize activations to Q8_1 (scalar, reference quality)
 // ---------------------------------------------------------------------------
@@ -853,25 +884,10 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
             }
         }
 
-        VkCommandPoolCreateInfo cpci = {};
-        cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-        cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        cpci.queueFamilyIndex = queue_family;
-        if (vkCreateCommandPool(vk_device, &cpci, nullptr, &dev->vk_cmd_pool) != VK_SUCCESS) {
-            return nullptr;
-        }
-
-        if (!vk_load_pipelines(*dev)) {
-            MOE_CACHE_LOG("[moe-cache] Vulkan pipeline creation failed\n");
-            return nullptr;
-        }
-
+        // GPU resources (command pool, pipelines) are created lazily on the
+        // first begin; a context that never uses the cache allocates none.
         session->devices.push_back(std::move(dev));
 
-        MOE_CACHE_LOG("[moe-cache] Vulkan session created (budget=%zu MiB, %s)\n",
-                session->config.budget_mb,
-                static_cast<moe_cache_vulkan_device &>(*session->devices[0]).host_mapped
-                    ? "host-mapped" : "device-local");
         moe_cache_session * result = session.get();
         try {
             std::lock_guard<std::mutex> lock(g_registry_mu);
@@ -1003,6 +1019,15 @@ static void * vk_moe_begin(const char * name, const void * host_base,
     }
     moe_cache_vulkan_device & dev =
         static_cast<moe_cache_vulkan_device &>(*session->devices[0]);
+    // A zero budget can never create a pool; skip GPU setup entirely.
+    if (session->config.budget_mb == 0) {
+        return nullptr;
+    }
+    // Create the command pool and compile the pipelines on first use, before
+    // the dispatch lock so a one-time compile does not block other workers.
+    if (!vk_device_ensure_ready(dev, session->config.budget_mb)) {
+        return nullptr;
+    }
 
     std::unique_lock<std::mutex> dispatch_lock;
     try {
