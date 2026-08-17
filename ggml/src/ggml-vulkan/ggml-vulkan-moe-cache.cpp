@@ -842,6 +842,11 @@ static void * vk_moe_session_create(void * const * backends, int n_backends,
         if (!config.enabled) {
             return nullptr;
         }
+        // A zero budget can never create a pool; bail before querying
+        // VkPhysicalDeviceMemoryProperties and creating the device object.
+        if (!supplied_config && config.budget_mb == 0) {
+            return nullptr;
+        }
 
         // Find the Vulkan backend among the scheduler's backends.
         ggml_backend_t vk_backend = nullptr;

@@ -469,6 +469,12 @@ static void * metal_session_create(void * const * backends, int n_backends,
         if (!config.enabled) {
             return nullptr;
         }
+        // A zero budget can never create a pool; bail before retaining the
+        // MTLDevice, which would trigger an AppleParavirtCommandQueue retain
+        // cycle reported by `leaks` on macOS CI.
+        if (!supplied_config && config.budget_mb == 0) {
+            return nullptr;
+        }
 
         // Find the Metal backend among the scheduler's backends.
         ggml_metal_device_t ctx_dev = nullptr;
