@@ -14276,20 +14276,34 @@ static inline void kernel_moe_cache_mv_block_dot(
     }
 }
 
+// Host binds all six scalars as one packed blob at buffer index 4
+// (ggml_metal_encoder_set_bytes(enc, args, sizeof(args), 4)), so the kernel must
+// take a single struct there. Six separate `constant int64_t &` parameters would
+// claim indices 4..9, leaving every field after n_in unbound.
+struct moe_cache_mv_args {
+    int64_t n_in;
+    int64_t n_out;
+    int64_t expert_stride;
+    int64_t row_stride;
+    int64_t n_hits;
+    int64_t padded_n_in;
+};
+
 template <typename block_t, short qk>
 kernel void kernel_moe_cache_mv_generic(
     device const char * slab,
     device const int32_t * ids,
     device const block_q8_1 * act_q8,
     device float * dst,
-    constant int64_t & n_in,
-    constant int64_t & n_out,
-    constant int64_t & expert_stride,
-    constant int64_t & row_stride,
-    constant int64_t & n_hits,
-    constant int64_t & padded_n_in,
+    constant moe_cache_mv_args & args,
     uint id [[thread_position_in_grid]]
 ) {
+    const int64_t n_in          = args.n_in;
+    const int64_t n_out         = args.n_out;
+    const int64_t expert_stride = args.expert_stride;
+    const int64_t row_stride    = args.row_stride;
+    const int64_t n_hits        = args.n_hits;
+    const int64_t padded_n_in   = args.padded_n_in;
     const int64_t hit = (int64_t)id / n_out;
     const int64_t row = (int64_t)id - hit * n_out;
 
@@ -14318,137 +14332,114 @@ kernel void kernel_moe_cache_mv_generic(
 template [[host_name("kernel_moe_cache_mv_q8_0_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q8_0, QK8_0>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q4_0_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q4_0, QK4_0>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q4_K_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q4_K, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q6_K_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q6_K, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q5_K_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q5_K, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q1_0_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q1_0, QK1_0>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q2_0_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q2_0, QK2_0>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q4_1_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q4_1, QK4_1>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q5_0_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q5_0, QK5_0>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q5_1_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q5_1, QK5_1>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q2_K_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q2_K, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_q3_K_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_q3_K, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq2_xxs_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq2_xxs, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq2_xs_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq2_xs, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq2_s_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq2_s, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq3_xxs_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq3_xxs, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq3_s_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq3_s, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq1_s_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq1_s, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq1_m_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq1_m, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq4_nl_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq4_nl, QK4_NL>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_iq4_xs_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_iq4_xs, QK_K>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_mxfp4_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_mxfp4, QK_MXFP4>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
 
 template [[host_name("kernel_moe_cache_mv_nvfp4_f32")]]
 kernel void kernel_moe_cache_mv_generic<block_nvfp4, QK_NVFP4>(
     device const char *, device const int32_t *, device const block_q8_1 *,
-    device float *, constant int64_t &, constant int64_t &, constant int64_t &,
-    constant int64_t &, constant int64_t &, constant int64_t &, uint);
+    device float *, constant moe_cache_mv_args &, uint);
