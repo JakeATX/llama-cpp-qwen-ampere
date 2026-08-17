@@ -40,6 +40,10 @@ static thread_local int g_session_suppressed = 0;
 // Global session registry for invalidate()/teardown paths.
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
+// Live-session count, so invalidate() can bail before taking g_registry_mu.
+// invalidate runs on every backend buffer write; with no cache active that was
+// one mutex acquire per write during model load.
+static std::atomic<size_t> g_session_count{0};
 
 // Backend registration object this provider was registered under.
 static const void * g_moe_cache_owner = nullptr;
@@ -460,6 +464,7 @@ static void * metal_session_create(void * const * backends, int n_backends,
         try {
             std::lock_guard<std::mutex> lock(g_registry_mu);
             g_sessions.insert(result);
+            g_session_count.store(g_sessions.size(), std::memory_order_release);
         } catch (...) {
             return nullptr;
         }
@@ -489,6 +494,7 @@ static void metal_session_destroy(void * opaque) {
     {
         std::lock_guard<std::mutex> lock(g_registry_mu);
         g_sessions.erase(session);
+        g_session_count.store(g_sessions.size(), std::memory_order_release);
     }
     for (auto & dev_ptr : session->devices) {
         moe_cache_metal_device & dev =
@@ -1036,6 +1042,9 @@ static void * metal_fused_begin(const ggml_moe_cache_tensor_desc * up,
 
 static void metal_invalidate(const void * base, size_t size) {
     if (!base || size == 0) {
+        return;
+    }
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
         return;
     }
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);
