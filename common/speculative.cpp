@@ -1614,18 +1614,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
-        // deferred rows at or past the incoming batch positions are stale: either a
-        // new prompt rewound the sequence, or they hold candidates a later verify
-        // rejected. Drop them and clear matching draft cells before any decode.
-        if (defer_enabled && !defer.tok.empty()) {
+        // The draft memory can retain speculative rows after a rewind (context
+        // shift, rollback, or a new prompt). Trim them before the next decode.
+        if (!is_mem_shared) {
+            auto * mem_dft = llama_get_memory(ctx_dft);
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] < 0) {
                     continue;
                 }
                 const llama_pos pos_min_in = batch_in.pos[i_batch_beg[seq_id]];
-                if (drop_deferred_from(seq_id, pos_min_in)) {
-                    llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos_min_in, -1);
+                llama_memory_seq_rm(mem_dft, seq_id, pos_min_in, -1);
+            }
+        }
+
+        // Deferred rows at or past the incoming batch positions are stale: either a
+        // new prompt rewound the sequence, or they hold candidates a later verify
+        // rejected. Drop them before any decode.
+        if (defer_enabled && !defer.tok.empty()) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
                 }
+                drop_deferred_from(seq_id, batch_in.pos[i_batch_beg[seq_id]]);
             }
         }
 
