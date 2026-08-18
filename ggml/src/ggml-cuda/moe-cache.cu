@@ -87,6 +87,9 @@ struct moe_cache_slot {
     int prev = -1;
     int next = -1;
     int readers = 0;
+    // Resident hit count since the slot was populated. Used by the heat-aware
+    // eviction policy to keep frequently-used experts resident.
+    uint32_t uses = 0;
     moe_cache_slot_state state = moe_cache_slot_state::free;
 };
 
@@ -148,6 +151,7 @@ struct moe_cache_config {
     int admit_after = 2;
     bool admit_after_explicit = false;
     int readmit_after = 8;
+    int hot_uses = 4;
     int queue_max = 128;
     size_t queue_mb = 512;
     int stats_every = 0;
@@ -218,6 +222,9 @@ struct moe_cache_device {
     long long fills = 0;
     long long fill_failures = 0;
     long long evictions = 0;
+    // Evictions that sacrificed a hot (frequently-used) expert because every
+    // eligible slot was hot. A steady zero means hot experts stay resident.
+    long long heat_evictions = 0;
     long long insert_skips = 0;
     long long admission_skips = 0;
     long long dispatch_failures = 0;
@@ -580,6 +587,9 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_THROTTLE", 1, 1024, value)) {
         config.readmit_after = (int)value;
     }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_HOT_USES", 0, 1 << 30, value)) {
+        config.hot_uses = (int)value;
+    }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_QUEUE", 1, 65536, value)) {
         config.queue_max = (int)value;
     }
@@ -754,6 +764,7 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     slot.key = {};
     slot.generation++;
     slot.readers = 0;
+    slot.uses = 0;
     slot.state = moe_cache_slot_state::free;
     slot.prev = -1;
     slot.next = -1;
@@ -1459,11 +1470,11 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         used += pool.n_slots - pool.free_slots.size();
     }
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld bypass=%lld\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld heat=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld fusion=%lld/%lld pairs=%lld/%lld/%lld/%lld fusion-attempts=%lld fusion-nodes=%lld bypass=%lld\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
             used, slots, device.inserts, device.fills, device.fill_failures,
-            device.evictions, device.insert_skips,
+            device.evictions, device.heat_evictions, device.insert_skips,
             device.admission_skips, device.queue.size(), device.queued_bytes >> 20,
             device.dispatch_failures, device.collect_failures,
             device.activation_dedup, device.overlap_rows,
@@ -1490,7 +1501,7 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             std::to_string(session.config.readmit_after) + "-replace"
         : "1-complete/" + std::to_string(session.config.admit_after) +
             "-partial/" + std::to_string(session.config.readmit_after) + "-replace";
-    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s cpu-overlap=%s fills=%s\n",
+    MOE_CACHE_LOG("[moe-cache] configured: mode=%s devices=%zu budget=%s reserve=%zu MiB min-slab=%zu MiB min-expert=%zu KiB max-batch=%d admit=%s hot=%d cpu-overlap=%s fills=%s\n",
             session.config.automatic ? "auto" : "on",
             session.devices.size(), budget.c_str(),
             session.config.reserve_mb,
@@ -1498,6 +1509,7 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             session.config.min_expert_bytes >> 10,
             session.config.max_batch,
             admission.c_str(),
+            session.config.hot_uses,
             overlap_cpu_rows.c_str(),
             session.config.serial_fill ? "serial" : "parallel");
 }
@@ -2211,17 +2223,38 @@ static int moe_cache_lookup_or_queue_locked(
         slot_index = pool.free_slots.back();
         pool.free_slots.pop_back();
     } else {
-        int candidate = pool.lru_head;
-        while (candidate >= 0 && pool.slots[candidate].readers > 0) {
-            candidate = pool.slots[candidate].next;
+        // Prefer the least-recently-used slot whose uses is at or below the hot
+        // threshold, so a frequently-used (hot) expert stays resident.
+        int candidate = -1;
+        int fallback = -1;
+        for (int c = pool.lru_head; c >= 0; c = pool.slots[c].next) {
+            moe_cache_slot & s = pool.slots[c];
+            if (s.readers > 0) {
+                continue;
+            }
+            if (fallback < 0) {
+                fallback = c;
+            }
+            if ((int)s.uses <= session.config.hot_uses) {
+                candidate = c;
+                break;
+            }
+        }
+        if (candidate < 0) {
+            candidate = fallback;
         }
         if (candidate < 0) {
             device.insert_skips++;
             return -1;
         }
         slot_index = candidate;
+        const bool sacrificed_hot =
+            (int)pool.slots[slot_index].uses > session.config.hot_uses;
         moe_cache_slot_reset(pool, slot_index, false);
         device.evictions++;
+        if (sacrificed_hot) {
+            device.heat_evictions++;
+        }
     }
 
     moe_cache_slot & slot = pool.slots[slot_index];
@@ -2294,6 +2327,7 @@ static int moe_cache_plan(
 
         moe_cache_slot & slot = pool.slots[slot_index];
         slot.readers++;
+        slot.uses++;
         moe_cache_lru_remove(pool, slot_index);
         moe_cache_lru_push_back(pool, slot_index);
         node->pins[node->n_pins++] = {&pool, slot_index};
@@ -2891,7 +2925,9 @@ static void * moe_cache_fused_begin(
                 moe_cache_slot & up_slot = pool->slots[resident_up[index]];
                 moe_cache_slot & gate_slot = pool->slots[resident_gate[index]];
                 up_slot.readers++;
+                up_slot.uses++;
                 gate_slot.readers++;
+                gate_slot.uses++;
                 moe_cache_lru_remove(*pool, resident_up[index]);
                 moe_cache_lru_push_back(*pool, resident_up[index]);
                 moe_cache_lru_remove(*pool, resident_gate[index]);
@@ -2923,6 +2959,7 @@ static void * moe_cache_fused_begin(
                 if (up_slot >= 0) {
                     moe_cache_slot & slot = pool->slots[up_slot];
                     slot.readers++;
+                    slot.uses++;
                     moe_cache_lru_remove(*pool, up_slot);
                     moe_cache_lru_push_back(*pool, up_slot);
                     selected->hits++;
@@ -2937,6 +2974,7 @@ static void * moe_cache_fused_begin(
                 if (gate_slot >= 0) {
                     moe_cache_slot & slot = pool->slots[gate_slot];
                     slot.readers++;
+                    slot.uses++;
                     moe_cache_lru_remove(*pool, gate_slot);
                     moe_cache_lru_push_back(*pool, gate_slot);
                     selected->hits++;
