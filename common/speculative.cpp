@@ -1513,6 +1513,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // The draft KV can retain cells from a position rewind (context shift,
+        // rollback, or a new prompt) for a sequence that had no rows in the last
+        // process() batch, so its stale cells were not trimmed there. Drop them
+        // here, keyed on the flush batch's own per-seq positions, before decode,
+        // or the position consistency check (X < Y) fails.
+        auto * mem_dft = llama_get_memory(ctx_dft);
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            llama_pos pos_min = -1;
+            for (size_t k = 0; k < defer.pos.size(); ++k) {
+                if (defer.seq[k] == seq_id) {
+                    pos_min = pos_min < 0 ? defer.pos[k] : std::min(pos_min, defer.pos[k]);
+                }
+            }
+            if (pos_min >= 0 && !llama_memory_seq_rm(mem_dft, seq_id, pos_min, -1)) {
+                SPC_ERR("failed to trim draft memory for sequence %d at deferred flush\n", (int) seq_id);
+                return false;
+            }
+        }
+
         common_batch_clear(batch);
         for (size_t k = 0; k < defer.tok.size(); ++k) {
             common_batch_add(batch, defer.tok[k], defer.pos[k], { defer.seq[k] }, false);
