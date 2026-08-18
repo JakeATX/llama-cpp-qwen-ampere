@@ -1869,6 +1869,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     }
                 }
 
+                // The chain batch starts at the deferred catch-up rows, which can sit
+                // below the draft KV max from an earlier/rejected draft (position
+                // rewind or a repeated decode). Drop the draft cells at/above the
+                // batch's own minimum position before decoding so the position
+                // consistency check (X < Y) holds; the chain re-writes that region.
+                if (batch.n_tokens > 0) {
+                    llama_pos pos_min = batch.pos[0];
+                    for (int k = 1; k < batch.n_tokens; ++k) {
+                        pos_min = std::min(pos_min, batch.pos[k]);
+                    }
+                    auto * mem_dft = llama_get_memory(ctx_dft);
+                    if (!llama_memory_seq_rm(mem_dft, seq_one, pos_min, -1)) {
+                        SPC_ERR("failed to trim draft memory for sequence %d before chain decode\n", (int) seq_one);
+                        return;
+                    }
+                }
+
                 // TODO(mtp-chain): llama_set_mtp_chain() is provided by the llama API
                 // backport (llama-ext.h / llama-context.cpp); the chain decode depends
                 // on its in-graph chained sampling writing [token, prob] pairs to logits
