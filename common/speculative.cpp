@@ -1569,7 +1569,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_dft = this->params.ctx_dft;
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        const llama_pos pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
+        llama_pos pos_max_defer = -1;
+        if (defer_enabled) {
+            for (size_t k = 0; k < defer.pos.size(); ++k) {
+                if (defer.seq[k] == seq_id) {
+                    pos_max_defer = std::max(pos_max_defer, defer.pos[k]);
+                }
+            }
+        }
+        const llama_pos pos_max = std::max(pos_max_mem, pos_max_defer);
 
         if (pos_max < N - 1 && !is_mem_shared) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
