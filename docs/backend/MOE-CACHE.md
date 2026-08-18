@@ -114,7 +114,8 @@ By default:
 - A device queue is limited to 128 jobs and 512 MiB.
 - Each device has one low-priority fill stream.
 - Independent device workers run concurrently when at least two compute capability 8.0 or newer devices are selected. Fills remain serialized on single-device or older-device configurations.
-- Full pools use heat-aware eviction. The victim is the least-recently-used expert whose resident hit count is at or below `GGML_CUDA_MOE_CACHE_HOT_USES` (default 4); only when every eligible slot is hot does the policy fall back to the LRU head. A frequently-used expert therefore stays resident instead of being evicted just because a few tokens skipped it. After a successful fill, an expert needs eight fresh misses before it can replace another entry.
+- Full pools use heat-aware eviction. The victim is the least-recently-used expert whose resident hit count is at or below `GGML_CUDA_MOE_CACHE_HOT_USES` (default 4); only when every eligible slot is hot does the policy fall back to the LRU head. A frequently-used expert therefore stays resident instead of being evicted just because a few tokens skipped it.
+- Replacement admission is throttled independently: after a successful fill, an expert needs `GGML_CUDA_MOE_CACHE_THROTTLE` (default 8) fresh misses before it can replace another full-pool entry.
 
 The default maximum is eight tokens. Larger prompt-processing nodes bypass the cache, while single-token decode and current speculative verification batches remain eligible in `auto`, `on`, and fixed-budget modes.
 
