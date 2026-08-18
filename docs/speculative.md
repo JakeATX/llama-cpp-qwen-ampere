@@ -79,6 +79,11 @@ See:
 - #22105
 
 
+### Chained MTP (`--spec-chain N`)
+
+Chained MTP drafts N tokens in one GPU decode. It currently supports dense Qwen3.5-family models and requires flash attention. For recurrent models, batch and ubatch sizes below N + 2 are raised to N + 2.
+
+
 ### Adaptive MTP (`draft-mtp-adaptive`)
 
 Multi Token Prediction (MTP) with an adaptive draft depth. Same machinery as `draft-mtp`
@@ -247,11 +252,11 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         HuggingFace repository for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
 --spec-draft-n-max                      N
-                                        number of tokens to draft for speculative decoding (default: 8)
+                                        number of tokens to draft for speculative decoding (default: 3)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
---spec-chain / --no-spec-chain
-                                        chained MTP drafting: all draft tokens in one GPU decode (default: on).
-                                        Requires flash attention. MTP only.
+--spec-chain                            0|1|N
+                                        chained MTP drafting: all draft tokens in one GPU decode (default: off).
+                                        Use N to enable and set the draft depth.
                                         (env: LLAMA_ARG_SPEC_CHAIN)
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
@@ -378,7 +383,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `draft-eagle3` | Use an EAGLE-3 draft model that reads the target's hidden states |
 | `draft-dflash` | Use a DFlash block-diffusion draft model that emits a block per step |
 | `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
-| `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model. Chained drafting enabled by default (`--spec-chain`); use `--no-spec-chain` to disable. Default depth n=8. |
+| `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
 | `draft-mtp-adaptive` | MTP with an adaptive draft depth tuned per sequence at runtime |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |

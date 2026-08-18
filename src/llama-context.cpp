@@ -271,6 +271,21 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    if (cparams.n_rs_seq > 0) {
+        const uint32_t n_batch_min = cparams.n_rs_seq + 2;
+        if (cparams.n_ctx < n_batch_min) {
+            throw std::runtime_error(format("n_ctx (%u) must be at least n_rs_seq + 2 (%u)", cparams.n_ctx, n_batch_min));
+        }
+        if (cparams.n_batch < n_batch_min) {
+            LLAMA_LOG_WARN("%s: n_batch (%u) is too small for n_rs_seq=%u; increasing to %u\n", __func__, cparams.n_batch, cparams.n_rs_seq, n_batch_min);
+            cparams.n_batch = n_batch_min;
+        }
+        if (cparams.n_ubatch < n_batch_min) {
+            LLAMA_LOG_WARN("%s: n_ubatch (%u) is too small for n_rs_seq=%u; increasing to %u\n", __func__, cparams.n_ubatch, cparams.n_rs_seq, n_batch_min);
+            cparams.n_ubatch = n_batch_min;
+        }
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
     cparams.op_offload = params.op_offload;
@@ -713,8 +728,6 @@ void llama_context::sched_reserve() {
             __func__, moe_cache_requested,
             moe_cache_eligible ? moe_cache_requested : "off");
 
-    gf_res_alloced = nullptr;
-
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
@@ -845,20 +858,6 @@ void llama_context::sched_reserve() {
         }
     }
 
-    // experimental: per-shape scheduler pool for small decode graphs. Every recurring
-    // batch shape keeps its own scheduler, allocation, and cached graph, so shapes
-    // alternating under speculative decoding stop evicting each other. Off unless
-    // LLAMA_SCHED_POOL=N (number of slots).
-    static const int sched_pool_env = [] {
-        const char * env = getenv("LLAMA_SCHED_POOL");
-        return env != nullptr ? atoi(env) : 0;
-    }();
-    if (sched_pool_env > 0 && !model.hparams.no_alloc) {
-        sched_pool_max = std::min(sched_pool_env, 16);
-    }
-
-    sched_active = sched.get();
-
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -896,10 +895,6 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
-
-    for (auto & s : sched_pool) {
-        ggml_backend_sched_synchronize(s.sched.get());
-    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -997,16 +992,10 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        // reset the previous graph results to make sure that they won't be reused
+        // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
-        gf_res_alloced = nullptr;
-
-        for (auto & s : sched_pool) {
-            s.gf_res->reset();
-            s.alloced = nullptr;
-        }
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -3988,6 +3977,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_model_supports_mtp_chain(const llama_model * model) {
+    return model != nullptr && model->arch == LLM_ARCH_QWEN35;
 }
 
 void llama_set_mtp_chain(llama_context * ctx, bool value) {

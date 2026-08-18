@@ -548,7 +548,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
 
     // chained drafting: rows 1..n-1 take their inputs from the previous row's
     // in-graph argmax and hidden state, so one decode drafts n_tokens tokens
-    if (params.cparams.mtp_chain && n_tokens > 1 && ubatch.n_seqs_unq == 1 && ubatch.token) {
+    if (params.cparams.mtp_chain && ubatch.n_seqs_unq == 1 && ubatch.token) {
         const auto * mctx_kv = static_cast<const llama_kv_cache_context *>(mctx);
 
         // per-step causal masks: row j of the stock kq mask (the mask builder pads

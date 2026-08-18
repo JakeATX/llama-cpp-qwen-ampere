@@ -57,6 +57,11 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
     return result.empty() ? "default" : result;
 }
 
+static bool common_speculative_mtp_chain_enabled(const common_params_speculative_draft & params) {
+    const char * env = getenv("LLAMA_SPEC_CHAIN");
+    return params.chain || (env != nullptr && std::strcmp(env, "0") != 0);
+}
+
 struct common_speculative_config {
     common_speculative_type type;
     common_params_speculative params;
@@ -1311,6 +1316,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<llama_sampler *> backend_chains;
 
     int32_t n_embd = 0;
+    int32_t batch_capacity = 0;
+    int32_t ubatch_capacity = 0;
 
     // One MTP draft driver, three modes (set once in the ctor):
     //   is_mem_shared (gemma4): shares the target KV, runs all heads in one graph.
@@ -1355,6 +1362,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int> n_last;  // [n_seq] drafts attempted in the most recent draft() call
     std::vector<common_speculative_adaptive> adaptive_ctrl; // [n_seq] per-seq adaptive depth controller
 
+    int32_t defer_capacity() const {
+        const int32_t draft_rows = std::max(this->params.n_max, (int32_t) n_seq);
+        const int32_t decode_capacity = std::min(batch_capacity, ubatch_capacity);
+        return std::min(defer_max, std::max(0, decode_capacity - draft_rows));
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq, bool adaptive = false)
         : common_speculative_impl(adaptive ? COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE : COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1383,11 +1396,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
-        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        batch_capacity = (int32_t) llama_n_batch(ctx_dft);
+        ubatch_capacity = (int32_t) llama_n_ubatch(ctx_dft);
+        batch = llama_batch_init(/*n_tokens=*/ batch_capacity, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * batch_capacity);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1398,13 +1412,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
-        // backward compat: LLAMA_SPEC_CHAIN env var overrides --no-spec-chain
-        const bool chain_enabled = this->params.chain || getenv("LLAMA_SPEC_CHAIN") != nullptr;
+        const bool chain_enabled = common_speculative_mtp_chain_enabled(this->params);
+
+        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        chain_graph   = !is_mem_shared && !chain_heads && chain_enabled && llama_model_supports_mtp_chain(llama_get_model(ctx_dft));
+
+        if (chain_enabled && !is_mem_shared && !chain_heads && !chain_graph) {
+            SPC_WRN("%s", "chained MTP is not supported for this model; using sequential MTP\n");
+        }
 
         // offload draft sampling to the backend (chained drafting outputs several
         // rows per sequence, which backend sampling does not support)
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling && !chain_enabled) {
+        if (this->params.backend_sampling && !chain_graph) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
@@ -1418,15 +1442,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
-
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
-        chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
-
         // draft all n_max tokens with one chained decode (in-graph argmax
         // feeds each next step); replaces n_max sequential draft decodes
-        chain_graph = !is_mem_shared && !chain_heads && chain_enabled;
         if (chain_graph) {
             // the chain decode absorbs the deferred catch-up rows, one eval per round
             defer_enabled = true;
@@ -1441,14 +1458,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        // a floor above the ceiling would pin the depth below the floor, so the
-        // configuration is invalid
-        if (this->params.n_min_adaptive < 1 || this->params.n_min_adaptive > this->params.n_max) {
-            GGML_ABORT("%s: invalid adaptive draft range: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max])",
-                    __func__, this->params.n_min_adaptive, this->params.n_max);
-        }
-
         if (adaptive) {
+            if (this->params.n_min_adaptive < 1 || this->params.n_min_adaptive > this->params.n_max) {
+                GGML_ABORT("%s: invalid adaptive draft range: n_min_adaptive=%d, n_max=%d (n_min_adaptive must be in [1, n_max])",
+                        __func__, this->params.n_min_adaptive, this->params.n_max);
+            }
+
             adaptive_ctrl.assign(n_seq, common_speculative_adaptive());
             for (uint32_t s = 0; s < n_seq; ++s) {
                 // start at the floor max(1, n_min_adaptive), bounded by n_max;
@@ -1615,10 +1630,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared && defer_enabled && n_tokens <= defer_max) {
+        const int32_t defer_cap = defer_capacity();
+        if (!is_mem_shared && defer_enabled && n_tokens <= defer_cap) {
             // defer the catch-up rows; the first draft decode absorbs them, which saves
             // one eval per round. Flush first if rows from an undrafted round remain.
-            if (!defer.tok.empty() && (int32_t) defer.tok.size() + n_tokens > defer_max) {
+            if (!defer.tok.empty() && (int32_t) defer.tok.size() + n_tokens > defer_cap) {
                 if (!flush_deferred()) {
                     return false;
                 }
@@ -2664,7 +2680,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.n_outputs_max = params.n_parallel;
 
     // chained MTP drafting outputs logits for every chain step in one decode
-    if (params_spec.chain || getenv("LLAMA_SPEC_CHAIN") != nullptr) {
+    if (common_speculative_mtp_chain_enabled(params_spec)) {
         const int32_t per_seq = std::max(1, params_spec.n_max);
         result.n_outputs_max = std::max(result.n_outputs_max, params.n_parallel * per_seq);
     }

@@ -1258,6 +1258,12 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+
+        const bool adaptive_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
+        if (adaptive_mtp && (params.speculative.draft.n_min_adaptive < 1 || params.speculative.draft.n_min_adaptive > params.speculative.draft.n_max)) {
+            throw std::invalid_argument("error: --spec-draft-n-min-adaptive must be in [1, --spec-draft-n-max]");
+        }
+
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -4105,14 +4111,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-chain"}, "0|1|N",
-        string_format("chained MTP drafting: all draft tokens in one GPU decode (default: off). Use --spec-chain N to enable and set depth (e.g. --spec-chain 8)."),
+        "chained MTP drafting: all draft tokens in one GPU decode (default: off). Use --spec-chain N to enable and set depth (e.g. --spec-chain 8).",
         [](common_params & params, const std::string & value) {
             if (is_truthy(value)) {
                 params.speculative.draft.chain = true;
             } else if (is_falsey(value)) {
                 params.speculative.draft.chain = false;
             } else {
-                // numeric value: enable chain and set depth
                 int n = std::stoi(value);
                 if (n < 1) throw std::invalid_argument("spec-chain depth must be >= 1");
                 params.speculative.draft.chain = true;
