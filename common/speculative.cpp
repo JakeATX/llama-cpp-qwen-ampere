@@ -1632,7 +1632,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
                 const llama_pos pos_min_in = batch_in.pos[i_batch_beg[seq_id]];
-                llama_memory_seq_rm(mem_dft, seq_id, pos_min_in, -1);
+                if (!llama_memory_seq_rm(mem_dft, seq_id, pos_min_in, -1)) {
+                    SPC_ERR("failed to trim draft memory for sequence %d from position %d\n",
+                            seq_id, (int) pos_min_in);
+                    return false;
+                }
             }
         }
 
