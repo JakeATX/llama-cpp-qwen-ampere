@@ -810,7 +810,7 @@ static bool moe_cache_grow_device(
         const size_t old_capacity = capacity;
         if (!moe_cache_cuda_ok(
                     device, cudaFree(*pointer), "scratch replacement free", true)) {
-            cudaFree(fresh);
+            (void)cudaFree(fresh);
             return false;
         }
         moe_cache_budget_reallocation(device, old_capacity, requested);
@@ -1010,7 +1010,7 @@ static bool moe_cache_grow_host(
         return false;
     }
     if (*pointer) {
-        cudaFreeHost(*pointer);
+        (void)cudaFreeHost(*pointer);
     }
     *pointer = fresh;
     capacity = requested;
@@ -1069,7 +1069,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             cudaError_t alloc_error = cudaMallocHost((void **)&fresh, job.bytes);
             if (alloc_error == cudaSuccess) {
                 if (stage) {
-                    cudaFreeHost(stage);
+                    (void)cudaFreeHost(stage);
                 }
                 stage = fresh;
                 stage_capacity = job.bytes;
@@ -1143,11 +1143,11 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
     }
 
     if (stream) {
-        cudaStreamSynchronize(stream);
-        cudaStreamDestroy(stream);
+        (void)cudaStreamSynchronize(stream);
+        (void)cudaStreamDestroy(stream);
     }
     if (stage) {
-        cudaFreeHost(stage);
+        (void)cudaFreeHost(stage);
     }
 }
 
@@ -1264,7 +1264,7 @@ static bool moe_cache_allocate_pool(
 
     std::unique_ptr<moe_cache_pool> pool(new (std::nothrow) moe_cache_pool());
     if (!pool) {
-        cudaFree(slab);
+        (void)cudaFree(slab);
         moe_cache_budget_allocation(device, allocated, false);
         return false;
     }
@@ -1282,7 +1282,7 @@ static bool moe_cache_allocate_pool(
         }
         device.pools.push_back(std::move(pool));
     } catch (...) {
-        cudaFree(slab);
+        (void)cudaFree(slab);
         moe_cache_budget_allocation(device, allocated, false);
         return false;
     }
@@ -1291,7 +1291,7 @@ static bool moe_cache_allocate_pool(
     device.allocated_bytes += allocated;
 
     if (!moe_cache_start_worker(session, device)) {
-        cudaFree(device.pools.back()->slab);
+        (void)cudaFree(device.pools.back()->slab);
         moe_cache_budget_allocation(device, allocated, false);
         device.pools.back()->slab = nullptr;
         device.pools.pop_back();
@@ -1646,41 +1646,41 @@ static void moe_cache_cancel_queue_locked(
 static void moe_cache_free_device(moe_cache_device & device) {
     ggml_cuda_set_device(device.logical);
     if (device.compute_stream) {
-        cudaStreamSynchronize(device.compute_stream);
+        (void)cudaStreamSynchronize(device.compute_stream);
     }
     for (auto & pool_ptr : device.pools) {
         if (pool_ptr->slab) {
-            cudaFree(pool_ptr->slab);
+            (void)cudaFree(pool_ptr->slab);
             moe_cache_budget_allocation(
                     device, (size_t)pool_ptr->n_slots * pool_ptr->expert_size, false);
             pool_ptr->slab = nullptr;
         }
     }
     if (device.d_input) {
-        cudaFree(device.d_input);
+        (void)cudaFree(device.d_input);
         moe_cache_budget_allocation(device, device.d_input_cap, false);
         device.d_input = nullptr;
     }
     if (device.d_act_q8) {
-        cudaFree(device.d_act_q8);
+        (void)cudaFree(device.d_act_q8);
         moe_cache_budget_allocation(device, device.act_q8_cap, false);
         device.d_act_q8 = nullptr;
     }
     if (device.d_out) {
-        cudaFree(device.d_out);
+        (void)cudaFree(device.d_out);
         moe_cache_budget_allocation(device, device.d_out_cap, false);
         device.d_out = nullptr;
     }
     if (device.h_input) {
-        cudaFreeHost(device.h_input);
+        (void)cudaFreeHost(device.h_input);
         device.h_input = nullptr;
     }
     if (device.h_out) {
-        cudaFreeHost(device.h_out);
+        (void)cudaFreeHost(device.h_out);
         device.h_out = nullptr;
     }
     if (device.compute_stream) {
-        cudaStreamDestroy(device.compute_stream);
+        (void)cudaStreamDestroy(device.compute_stream);
         device.compute_stream = nullptr;
     }
     device.pools.clear();
@@ -2531,7 +2531,7 @@ static int moe_cache_dispatch_internal(
     }
 
     if (!ok) {
-        cudaStreamSynchronize(device.compute_stream);
+        (void)cudaStreamSynchronize(device.compute_stream);
         std::lock_guard<std::mutex> lock(session.mu);
         device.dispatch_failures++;
         return 0;
@@ -2586,7 +2586,7 @@ static int moe_cache_collect(
                 device, cudaStreamSynchronize(device.compute_stream),
                 "output synchronization", true);
     } else {
-        cudaStreamSynchronize(device.compute_stream);
+        (void)cudaStreamSynchronize(device.compute_stream);
     }
     node->dispatched = false;
 
