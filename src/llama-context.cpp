@@ -122,6 +122,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.mtp_chain               = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -712,6 +713,8 @@ void llama_context::sched_reserve() {
             __func__, moe_cache_requested,
             moe_cache_eligible ? moe_cache_requested : "off");
 
+    gf_res_alloced = nullptr;
+
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
@@ -842,6 +845,20 @@ void llama_context::sched_reserve() {
         }
     }
 
+    // experimental: per-shape scheduler pool for small decode graphs. Every recurring
+    // batch shape keeps its own scheduler, allocation, and cached graph, so shapes
+    // alternating under speculative decoding stop evicting each other. Off unless
+    // LLAMA_SCHED_POOL=N (number of slots).
+    static const int sched_pool_env = [] {
+        const char * env = getenv("LLAMA_SCHED_POOL");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    if (sched_pool_env > 0 && !model.hparams.no_alloc) {
+        sched_pool_max = std::min(sched_pool_env, 16);
+    }
+
+    sched_active = sched.get();
+
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -879,6 +896,10 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    for (auto & s : sched_pool) {
+        ggml_backend_sched_synchronize(s.sched.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -976,10 +997,16 @@ bool llama_context::memory_update(bool optimize) {
                 }
         }
 
-        // reset the previous graph result to make sure that it won't be reused
+        // reset the previous graph results to make sure that they won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        gf_res_alloced = nullptr;
+
+        for (auto & s : sched_pool) {
+            s.gf_res->reset();
+            s.alloced = nullptr;
+        }
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1352,6 +1379,10 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_mtp_chain(bool value) {
+    cparams.mtp_chain = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1654,7 +1685,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        // chain mode: logits are [2, n_chain] (token_id, prob) pairs, not [n_vocab, n_tokens]
+        const size_t logits_bytes = cparams.mtp_chain ? ggml_nbytes(t_logits) : (size_t) n_tokens * n_vocab * sizeof(float);
+        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, logits_bytes);
     }
 
     // extract embeddings
@@ -2097,9 +2130,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
             if (n_outputs) {
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // chain mode: logits are [2, n_chain] pairs, not [n_vocab, n_outputs]
+                const size_t extract_bytes = cparams.mtp_chain
+                    ? ggml_nbytes(t_logits)
+                    : (size_t) n_outputs * n_vocab * sizeof(float);
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, extract_bytes);
             }
         }
 
@@ -3953,6 +3988,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_mtp_chain(llama_context * ctx, bool value) {
+    ctx->set_mtp_chain(value);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
