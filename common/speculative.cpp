@@ -1510,6 +1510,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
+        // defer only ever grows on the !is_mem_shared path (deferral requires
+        // chain_graph, which requires !is_mem_shared). Keep that invariant local:
+        // the trim below on shared memory would delete target KV.
+        GGML_ASSERT(!is_mem_shared);
+
         auto * ctx_dft = this->params.ctx_dft;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1526,7 +1531,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     pos_min = pos_min < 0 ? defer.pos[k] : std::min(pos_min, defer.pos[k]);
                 }
             }
-            if (pos_min >= 0 && !llama_memory_seq_rm(mem_dft, seq_id, pos_min, -1)) {
+            if (pos_min < 0) {
+                continue;
+            }
+            // In the normal flow the flush rows start right past the draft KV max,
+            // so an overlap means a stale-state producer this trim is papering over.
+            // Log it: a silently firing trim leaves no forensic signal.
+            const llama_pos pos_max_pre = llama_memory_seq_pos_max(mem_dft, seq_id);
+            if (pos_max_pre >= pos_min) {
+                SPC_WRN("stale draft KV for seq %d at deferred flush: pos_max %d >= flush start %d, trimming\n",
+                        (int) seq_id, (int) pos_max_pre, (int) pos_min);
+            }
+            if (!llama_memory_seq_rm(mem_dft, seq_id, pos_min, -1)) {
                 SPC_ERR("failed to trim draft memory for sequence %d at deferred flush\n", (int) seq_id);
                 return false;
             }
@@ -1651,6 +1667,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
                 const llama_pos pos_min_in = batch_in.pos[i_batch_beg[seq_id]];
+                // The server trims draft KV to the target's pre-draft max after every
+                // draft, so overlap here means an unidentified stale-state producer.
+                // Log it: a silently firing trim leaves no forensic signal.
+                const llama_pos pos_max_pre = llama_memory_seq_pos_max(mem_dft, seq_id);
+                if (pos_max_pre >= pos_min_in) {
+                    SPC_WRN("stale draft KV for seq %d at process: pos_max %d >= batch start %d, trimming\n",
+                            (int) seq_id, (int) pos_max_pre, (int) pos_min_in);
+                }
                 if (!llama_memory_seq_rm(mem_dft, seq_id, pos_min_in, -1)) {
                     SPC_ERR("failed to trim draft memory for sequence %d from position %d\n",
                             seq_id, (int) pos_min_in);
@@ -1880,6 +1904,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         pos_min = std::min(pos_min, batch.pos[k]);
                     }
                     auto * mem_dft = llama_get_memory(ctx_dft);
+                    // Normal flow: the chain batch starts right past the draft KV max,
+                    // so an overlap means a stale-state producer this trim is papering
+                    // over. Log it: a silently firing trim leaves no forensic signal.
+                    const llama_pos pos_max_pre = llama_memory_seq_pos_max(mem_dft, seq_one);
+                    if (pos_max_pre >= pos_min) {
+                        SPC_WRN("stale draft KV for seq %d before chain decode: pos_max %d >= batch start %d, trimming\n",
+                                (int) seq_one, (int) pos_max_pre, (int) pos_min);
+                    }
                     if (!llama_memory_seq_rm(mem_dft, seq_one, pos_min, -1)) {
                         SPC_ERR("failed to trim draft memory for sequence %d before chain decode\n", (int) seq_one);
                         return;
@@ -1938,6 +1970,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // earlier positions, so they must precede the draft rows: recurrent state
         // advances in batch order. If nothing drafts this round they stay deferred
         // and process() flushes them later.
+        //
+        // For every seq drafting this round, deferred rows at or past its n_past are
+        // candidates the verify just rejected (the committed prefix ends at
+        // n_past - 1, same as the chain path). Merging them would decode a rejected
+        // token and this round's first draft row at the same position in the same
+        // batch: duplicate-position draft KV cells, no X < Y error, silent quality
+        // loss. Only reachable at n_parallel > 1 (a single drafting seq takes the
+        // chain path, which already drops these).
+        if (any_drafting && !defer.tok.empty()) {
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (dparams[seq_id].drafting) {
+                    drop_deferred_from(seq_id, dparams[seq_id].n_past);
+                }
+            }
+        }
         if (any_drafting && !defer.tok.empty()) {
             for (size_t k = 0; k < defer.tok.size(); ++k) {
                 common_batch_add(batch, defer.tok[k], defer.pos[k], { defer.seq[k] }, false);
