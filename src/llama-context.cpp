@@ -122,6 +122,7 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    cparams.mtp_chain               = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -269,6 +270,21 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    if (cparams.n_rs_seq > 0) {
+        const uint32_t n_batch_min = cparams.n_rs_seq + 2;
+        if (cparams.n_ctx < n_batch_min) {
+            throw std::runtime_error(format("n_ctx (%u) must be at least n_rs_seq + 2 (%u)", cparams.n_ctx, n_batch_min));
+        }
+        if (cparams.n_batch < n_batch_min) {
+            LLAMA_LOG_WARN("%s: n_batch (%u) is too small for n_rs_seq=%u; increasing to %u\n", __func__, cparams.n_batch, cparams.n_rs_seq, n_batch_min);
+            cparams.n_batch = n_batch_min;
+        }
+        if (cparams.n_ubatch < n_batch_min) {
+            LLAMA_LOG_WARN("%s: n_ubatch (%u) is too small for n_rs_seq=%u; increasing to %u\n", __func__, cparams.n_ubatch, cparams.n_rs_seq, n_batch_min);
+            cparams.n_ubatch = n_batch_min;
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
 
@@ -1352,6 +1368,10 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_mtp_chain(bool value) {
+    cparams.mtp_chain = value;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1654,7 +1674,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        // chain mode: logits are [2, n_chain] (token_id, prob) pairs, not [n_vocab, n_tokens]
+        const size_t logits_bytes = cparams.mtp_chain ? ggml_nbytes(t_logits) : (size_t) n_tokens * n_vocab * sizeof(float);
+        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, logits_bytes);
     }
 
     // extract embeddings
@@ -2097,9 +2119,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
             if (n_outputs) {
-                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // chain mode: logits are [2, n_chain] pairs, not [n_vocab, n_outputs]
+                const size_t extract_bytes = cparams.mtp_chain
+                    ? ggml_nbytes(t_logits)
+                    : (size_t) n_outputs * n_vocab * sizeof(float);
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, extract_bytes);
             }
         }
 
@@ -3953,6 +3977,14 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+bool llama_model_supports_mtp_chain(const llama_model * model) {
+    return model != nullptr && model->arch == LLM_ARCH_QWEN35;
+}
+
+void llama_set_mtp_chain(llama_context * ctx, bool value) {
+    ctx->set_mtp_chain(value);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
