@@ -377,12 +377,26 @@ static void launch_cooperative_type(
     }
 }
 
-#ifndef GGML_CUDA_CR_ROWS_PER_CTA
-#define GGML_CUDA_CR_ROWS_PER_CTA 4
-#endif
-
-static_assert(GGML_CUDA_CR_ROWS_PER_CTA == 2 || GGML_CUDA_CR_ROWS_PER_CTA == 4,
-    "GGML_CUDA_CR_ROWS_PER_CTA must be 2 or 4");
+static void launch_cooperative_tuned(
+        ggml_type type, const void * weights, const float * x, float * y,
+        int64_t m, int64_t n, int64_t k, cudaStream_t stream) {
+    switch (type) {
+        case GGML_TYPE_Q5_CR:
+            launch_cooperative<GGML_TYPE_Q5_CR, 4>(weights, x, y, m, n, k, stream);
+            break;
+        case GGML_TYPE_Q6_CR:
+            // Four rows increases register pressure for Q6_CR and is slower on
+            // production decode shapes. The other CR formats benefit from the
+            // additional activation reuse without that register increase.
+            launch_cooperative<GGML_TYPE_Q6_CR, 2>(weights, x, y, m, n, k, stream);
+            break;
+        case GGML_TYPE_Q8_CR:
+            launch_cooperative<GGML_TYPE_Q8_CR, 4>(weights, x, y, m, n, k, stream);
+            break;
+        default:
+            GGML_ABORT("unsupported CR type");
+    }
+}
 
 bool ggml_cuda_mul_mat_vec_cr(
         ggml_type type,
@@ -410,8 +424,7 @@ bool ggml_cuda_mul_mat_vec_cr(
     if (m <= 2) {
         launch_cooperative_type<2>(type, weights, x, y, m, n, k, stream);
     } else {
-        launch_cooperative_type<GGML_CUDA_CR_ROWS_PER_CTA>(
-            type, weights, x, y, m, n, k, stream);
+        launch_cooperative_tuned(type, weights, x, y, m, n, k, stream);
     }
     return true;
 }
