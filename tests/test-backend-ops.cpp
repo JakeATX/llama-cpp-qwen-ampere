@@ -10431,6 +10431,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
 
+    for (ggml_type type_a : {GGML_TYPE_Q8_CR, GGML_TYPE_Q5_CR, GGML_TYPE_Q6_CR}) {
+        for (int64_t n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat_cr(
+                type_a, 33, n, 1024, cr_activation_pattern::RANDOM));
+            test_cases.emplace_back(new test_mul_mat_cr(
+                type_a, 10240, n, 5120, cr_activation_pattern::RANDOM));
+        }
+    }
+
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 64));
