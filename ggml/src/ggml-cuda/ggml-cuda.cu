@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmv-cr.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1960,11 +1961,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (src0->type == GGML_TYPE_Q8_CR ||
             src0->type == GGML_TYPE_Q5_CR ||
             src0->type == GGML_TYPE_Q6_CR) {
-        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 &&
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] <= 2 &&
                 src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
-            ggml_cuda_mul_mat_vec_cr(src0->type, src0->data, (const float *) src1->data,
-                (float *) dst->data, src0->ne[1], src0->ne[0], ctx.stream());
+                ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                ggml_cuda_mul_mat_vec_cr(src0->type, src0->data, (const float *) src1->data,
+                    (float *) dst->data, src0->ne[1], src1->ne[1], src0->ne[0], cc, ctx.stream())) {
             return;
         }
         if (!ggml_cuda_mul_mat_cr_tiled(ctx, src0, src1, dst)) {

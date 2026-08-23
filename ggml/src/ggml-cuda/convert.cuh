@@ -16,9 +16,6 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
-void ggml_cuda_mul_mat_vec_cr(ggml_type type, const void * weights, const float * x, float * y,
-    int64_t m, int64_t k, cudaStream_t stream);
-
 // TODO more general support for non-contiguous inputs
 
 template<typename T>
