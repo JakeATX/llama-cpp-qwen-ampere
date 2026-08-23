@@ -9319,8 +9319,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
 
-        // Tiny outputs are cancellation-sensitive under Q8_1 activation
-        // preparation; cover token counts on both sides of the old n <= 2 edge.
+        // Tiny outputs are cancellation-sensitive under Q8_1; test both sides of the old n <= 2 edge.
         for (int64_t m : {1, 3, 4}) {
             for (int64_t n : {3, 8, 9}) {
                 for (cr_activation_pattern pattern : {
@@ -9349,9 +9348,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_cr(
             type_a, 10240, 2, 5120, cr_activation_pattern::RANDOM));
 
-        // n_groups >= 1024 selects the register-only producer. Exercise both
-        // ordinary MMVQ output and MMQ's D4 layout, including CUDA-produced
-        // activations, padded K groups, and an inactive tail warp.
+        // n_groups >= 1024 selects the register producer; cover MMVQ, MMQ D4, CUDA inputs, K padding, and a tail warp.
         test_cases.emplace_back(new test_mul_mat_cr(
             type_a, 33, 8, 5120, cr_activation_pattern::RANDOM,
             {8, 1}, {1, 1}, true));

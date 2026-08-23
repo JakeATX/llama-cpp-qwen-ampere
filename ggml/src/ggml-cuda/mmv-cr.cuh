@@ -4,8 +4,7 @@
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// Returns true when a CR inverse kernel was launched. A false result tells the
-// caller to retain the existing rotated-activation fallback.
+// Returns true when a CR inverse kernel was launched.
 bool ggml_cuda_mul_mat_vec_cr(
         ggml_type type,
         const void * weights,

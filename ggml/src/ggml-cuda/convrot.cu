@@ -45,8 +45,7 @@ static __device__ __forceinline__ void convrot_transform_group(
     }
 }
 
-// one warp per group of QK8_CR elements: radix-4 butterfly over shared memory,
-// identical to ggml_convrot_rotate_group_f32 in ggml-quants.c
+// One warp transforms one QK8_CR group with the radix-4 butterfly from ggml-quants.c.
 template <int warps_per_block>
 __global__ void convrot_rotate_cuda(
         const float * src_ptr,
@@ -82,8 +81,7 @@ __global__ void convrot_rotate_cuda(
     }
 }
 
-// One 256-thread CTA transforms one ConvRot group. The eight resident warps
-// then quantize its eight Q8_1 blocks in parallel.
+// One 256-thread CTA transforms and quantizes one ConvRot group.
 template <bool mmq_layout>
 __global__ void convrot_quantize_q8_1_cuda(
         const float * src_ptr,
@@ -125,7 +123,7 @@ __global__ void convrot_quantize_q8_1_cuda(
         {-1.0f,  1.0f,  1.0f,  1.0f},
     };
 
-    // The len=4 and len=16 stages never cross a warp boundary.
+    // The first two stages use warp shuffles.
 #pragma unroll
     for (int len = 4, shift = 0; len <= 16; len *= 4, shift += 2) {
         const int half = len >> 2;
@@ -141,7 +139,7 @@ __global__ void convrot_quantize_q8_1_cuda(
         x = acc;
     }
 
-    // Only the len=64 and len=256 stages need cross-warp exchange.
+    // The last two stages use shared memory.
     __shared__ float buf[2][QK8_CR];
     buf[0][tid] = x;
     __syncthreads();
@@ -191,8 +189,7 @@ __global__ void convrot_quantize_q8_1_cuda(
     }
 }
 
-// High-throughput variant for prompt processing. Each warp owns one complete
-// ConvRot group and keeps all 256 values in registers throughout the transform.
+// Register-only prompt producer; each warp owns one ConvRot group.
 template <int warps_per_block, bool mmq_layout>
 __global__ void convrot_quantize_q8_1_warp_cuda(
         const float * src_ptr,

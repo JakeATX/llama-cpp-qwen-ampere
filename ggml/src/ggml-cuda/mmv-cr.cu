@@ -388,9 +388,7 @@ static void launch_cooperative_tuned(
             launch_cooperative<GGML_TYPE_Q5_CR, 4>(weights, x, y, m, n, k, stream);
             break;
         case GGML_TYPE_Q6_CR:
-            // Four rows increases register pressure for Q6_CR and is slower on
-            // production decode shapes. The other CR formats benefit from the
-            // additional activation reuse without that register increase.
+            // Four rows increase Q6_CR register pressure; the other CR formats benefit from activation reuse.
             launch_cooperative<GGML_TYPE_Q6_CR, 2>(weights, x, y, m, n, k, stream);
             break;
         case GGML_TYPE_Q8_CR:
@@ -411,8 +409,7 @@ bool ggml_cuda_mul_mat_vec_cr(
         int64_t k,
         int cc,
         cudaStream_t stream) {
-    // Each token is an independent grid-Y slice. Keep the exact path available
-    // for tiny output matrices across the full CUDA grid-Y range.
+    // Each token is an independent grid-Y slice; support the full range for tiny output matrices.
     if (k % QK8_CR != 0 || n < 1 || n > 65535) {
         return false;
     }
