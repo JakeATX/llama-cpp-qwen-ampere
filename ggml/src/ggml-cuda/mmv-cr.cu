@@ -411,7 +411,9 @@ bool ggml_cuda_mul_mat_vec_cr(
         int64_t k,
         int cc,
         cudaStream_t stream) {
-    if (k % QK8_CR != 0 || n < 1 || n > 2) {
+    // Each token is an independent grid-Y slice. Keep the exact path available
+    // for tiny output matrices across the full CUDA grid-Y range.
+    if (k % QK8_CR != 0 || n < 1 || n > 65535) {
         return false;
     }
     if (m == 0 || k == 0) {

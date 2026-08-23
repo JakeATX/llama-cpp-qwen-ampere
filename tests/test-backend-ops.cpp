@@ -9319,6 +9319,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
 
+        // Tiny outputs are cancellation-sensitive under Q8_1 activation
+        // preparation; cover token counts on both sides of the old n <= 2 edge.
+        for (int64_t m : {1, 3, 4}) {
+            for (int64_t n : {3, 8, 9}) {
+                for (cr_activation_pattern pattern : {
+                        cr_activation_pattern::RANDOM,
+                        cr_activation_pattern::CANCELLATION}) {
+                    test_cases.emplace_back(new test_mul_mat_cr(type_a, m, n, 512, pattern));
+                }
+            }
+        }
+
         for (cr_activation_pattern pattern : {
                 cr_activation_pattern::ZERO,
                 cr_activation_pattern::IMPULSE,
@@ -9336,8 +9348,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             type_a, 10240, 1, 5120, cr_activation_pattern::RANDOM));
         test_cases.emplace_back(new test_mul_mat_cr(
             type_a, 10240, 2, 5120, cr_activation_pattern::RANDOM));
+
+        // n_groups >= 1024 selects the register-only producer. Exercise both
+        // ordinary MMVQ output and MMQ's D4 layout, including CUDA-produced
+        // activations, padded K groups, and an inactive tail warp.
+        test_cases.emplace_back(new test_mul_mat_cr(
+            type_a, 33, 8, 5120, cr_activation_pattern::RANDOM,
+            {8, 1}, {1, 1}, true));
+        test_cases.emplace_back(new test_mul_mat_cr(
+            type_a, 33, 513, 256, cr_activation_pattern::RANDOM));
         test_cases.emplace_back(new test_mul_mat_cr(
             type_a, 33, 64, 5120, cr_activation_pattern::RANDOM));
+        for (cr_activation_pattern pattern : {
+                cr_activation_pattern::ZERO,
+                cr_activation_pattern::OUTLIER,
+                cr_activation_pattern::CANCELLATION}) {
+            test_cases.emplace_back(new test_mul_mat_cr(type_a, 33, 64, 5120, pattern));
+        }
         test_cases.emplace_back(new test_mul_mat_cr(
             type_a, 33, 1, 1024, cr_activation_pattern::RANDOM,
             {1, 1}, {1, 1}, true));
@@ -10463,10 +10490,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 type_a, 10240, n, 5120, cr_activation_pattern::RANDOM));
         }
     }
-    test_cases.emplace_back(new test_mul_mat(
-        GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 256, 5120, {1, 1}, {1, 1}));
-    test_cases.emplace_back(new test_mul_mat_cr(
-        GGML_TYPE_Q6_CR, 10240, 256, 5120, cr_activation_pattern::RANDOM));
+    for (const auto & pair : {
+            std::pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_CR},
+            std::pair{GGML_TYPE_Q5_0, GGML_TYPE_Q5_CR},
+            std::pair{GGML_TYPE_Q6_K, GGML_TYPE_Q6_CR}}) {
+        test_cases.emplace_back(new test_mul_mat(
+            pair.first, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(
+            pair.first, GGML_TYPE_F32, 10240, 256, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_cr(
+            pair.second, 10240, 256, 5120, cr_activation_pattern::RANDOM));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

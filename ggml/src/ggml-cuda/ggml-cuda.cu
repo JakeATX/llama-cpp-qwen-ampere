@@ -1918,7 +1918,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (is_cr) {
         const int cc = ggml_cuda_info().devices[ctx.device].cc;
         const bool direct_inverse = (cc <= GGML_CUDA_CC_PASCAL && src1->ne[1] == 1) ||
-                                    (src0->ne[1] <= 4 && src1->ne[1] <= 2);
+                                    src0->ne[1] <= 4;
         if (direct_inverse && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
                 src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
                 ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
