@@ -255,6 +255,21 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
+// Q8_CR / Q5_CR: same block layout as Q8_0 / Q5_0, but the blocks encode a
+// tensor rotated along rows in groups of QK8_CR with the normalized
+// Kronecker-Hadamard matrix (see ggml-quants.c). mul_mat must rotate the other
+// operand the same way before the dot products.
+#define QK8_CR 256
+typedef struct {
+    block_q8_0 blocks[QK8_CR/QK8_0];
+} block_q8_cr;
+static_assert(sizeof(block_q8_cr) == QK8_CR/QK8_0*(sizeof(ggml_half) + QK8_0), "wrong q8_cr block size/padding");
+
+typedef struct {
+    block_q5_0 blocks[QK8_CR/QK5_0];
+} block_q5_cr;
+static_assert(sizeof(block_q5_cr) == QK8_CR/QK5_0*(sizeof(ggml_half) + sizeof(uint32_t) + QK5_0/2), "wrong q5_cr block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {
@@ -410,6 +425,7 @@ typedef struct {
 } block_q3_K;
 static_assert(sizeof(block_q3_K) == sizeof(ggml_half) + QK_K / 4 + QK_K / 8 + 12, "wrong q3_K block size/padding");
 
+
 // 4-bit quantization
 // 8 blocks of 32 elements each
 // weight is represented as x = a * q + b
@@ -456,6 +472,11 @@ typedef struct {
     ggml_half d;             // super-block scale
 } block_q6_K;
 static_assert(sizeof(block_q6_K) == sizeof(ggml_half) + QK_K / 16 + 3*QK_K/4, "wrong q6_K block size/padding");
+
+// Q6_CR: same block layout as Q6_K, but the block encodes a ConvRot-rotated group of QK_K weights.
+// QK_K == QK8_CR == 256, so one block_q6_K is exactly one ConvRot group.
+typedef block_q6_K block_q6_cr;
+static_assert(sizeof(block_q6_cr) == sizeof(ggml_half) + QK_K / 16 + 3*QK_K/4, "wrong q6_cr block size/padding");
 
 // This is only used for intermediate quantization and dot products
 typedef struct {
