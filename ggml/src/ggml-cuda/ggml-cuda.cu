@@ -1960,6 +1960,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (src0->type == GGML_TYPE_Q8_CR ||
             src0->type == GGML_TYPE_Q5_CR ||
             src0->type == GGML_TYPE_Q6_CR) {
+        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 &&
+                src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            ggml_cuda_mul_mat_vec_cr(src0->type, src0->data, (const float *) src1->data,
+                (float *) dst->data, src0->ne[1], src0->ne[0], ctx.stream());
+            return;
+        }
         if (!ggml_cuda_mul_mat_cr_tiled(ctx, src0, src1, dst)) {
             ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         }
