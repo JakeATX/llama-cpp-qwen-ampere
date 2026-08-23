@@ -1911,6 +1911,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const ggml_tensor * src0 = src0_;
     const ggml_tensor * src1 = src1_;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (src0->type == GGML_TYPE_Q6_CR) {
+        ggml_tensor dst_f32 = *dst;
+        dst_f32.op_params[0] = GGML_PREC_F32;
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, &dst_f32);
+        return;
+    }
     const bool is_cr = src0->type == GGML_TYPE_Q8_CR ||
                        src0->type == GGML_TYPE_Q5_CR ||
                        src0->type == GGML_TYPE_Q6_CR;
