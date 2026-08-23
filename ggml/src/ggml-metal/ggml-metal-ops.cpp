@@ -2305,6 +2305,46 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             return ggml_metal_op_fwht(ctx, idx);
         }
     }
+
+    ggml_tensor op_cr;
+    ggml_tensor src0_base;
+    ggml_tensor src1_rot;
+
+    const bool is_cr = op->src[0]->type == GGML_TYPE_Q8_CR ||
+                       op->src[0]->type == GGML_TYPE_Q5_CR ||
+                       op->src[0]->type == GGML_TYPE_Q6_CR;
+    if (is_cr) {
+        GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+        GGML_ASSERT(op->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(op->src[1]));
+        GGML_ASSERT(op->src[1]->ne[0] % 256 == 0);
+
+        const int64_t n_groups = ggml_nelements(op->src[1]) / 256;
+        ggml_metal_buffer_id bid_rot = ggml_metal_get_buffer_id(op);
+        bid_rot.offs += ggml_nbytes(op);
+
+        auto pipeline = ggml_metal_library_get_pipeline_convrot(lib);
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 0);
+        ggml_metal_encoder_set_buffer(enc, bid_rot, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, n_groups, 1, 1, 64, 1, 1);
+        ggml_metal_op_concurrency_reset(ctx);
+
+        src0_base = *op->src[0];
+        src0_base.type = op->src[0]->type == GGML_TYPE_Q8_CR ? GGML_TYPE_Q8_0 :
+                         op->src[0]->type == GGML_TYPE_Q5_CR ? GGML_TYPE_Q5_0 : GGML_TYPE_Q6_K;
+        src0_base.nb[0] = ggml_type_size(src0_base.type);
+
+        src1_rot = *op->src[1];
+        src1_rot.buffer = op->buffer;
+        src1_rot.data = (char *) op->data + ggml_nbytes(op);
+
+        op_cr = *op;
+        op_cr.src[0] = &src0_base;
+        op_cr.src[1] = &src1_rot;
+        op = &op_cr;
+    }
+
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);

@@ -18248,6 +18248,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_type src0_type = op->src[0]->type;
+                if (src0_type == GGML_TYPE_Q8_CR || src0_type == GGML_TYPE_Q5_CR || src0_type == GGML_TYPE_Q6_CR) {
+                    return false;
+                }
                 if (op->op == GGML_OP_MUL_MAT_ID) {
                     // The TurboQuant weight types now have mul_mat_vec_id pipelines, so MoE
                     // decode runs on the GPU. Prompt processing does not: there is still no TQ

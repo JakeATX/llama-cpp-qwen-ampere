@@ -217,6 +217,14 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
+        case GGML_OP_MUL_MAT:
+            if (tensor->src[0] != nullptr &&
+                    (tensor->src[0]->type == GGML_TYPE_Q8_CR ||
+                     tensor->src[0]->type == GGML_TYPE_Q5_CR ||
+                     tensor->src[0]->type == GGML_TYPE_Q6_CR)) {
+                res += ggml_nbytes(tensor->src[1]);
+            }
+            break;
         case GGML_OP_MUL_MAT_ID:
             {
                 res += ggml_metal_op_mul_mat_id_extra_tpe(tensor);

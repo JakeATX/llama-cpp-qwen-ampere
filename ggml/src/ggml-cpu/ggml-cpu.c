@@ -224,6 +224,18 @@ static void ggml_vec_dot_turbo2_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
 static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+static void ggml_vec_dot_q8_cr_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                   const void * GGML_RESTRICT vx, size_t bx,
+                                   const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+static void ggml_vec_dot_q5_cr_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                   const void * GGML_RESTRICT vx, size_t bx,
+                                   const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+static void ggml_vec_dot_q6_cr_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                   const void * GGML_RESTRICT vx, size_t bx,
+                                   const void * GGML_RESTRICT vy, size_t by, int nrc);
 static void ggml_vec_dot_tq3_1s_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
                                        const void * GGML_RESTRICT vx, size_t bx,
                                        const void * GGML_RESTRICT vy, size_t by, int nrc);
@@ -301,6 +313,24 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_Q8_1] = {
         .from_float               = quantize_row_q8_1,
         .vec_dot_type             = GGML_TYPE_Q8_1,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q8_CR] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q8_cr_ref,
+        .vec_dot                  = ggml_vec_dot_q8_cr_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q5_CR] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q5_cr_ref,
+        .vec_dot                  = ggml_vec_dot_q5_cr_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_Q6_CR] = {
+        .from_float               = (ggml_from_float_t) quantize_row_q6_cr_ref,
+        .vec_dot                  = ggml_vec_dot_q6_cr_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_MXFP4] = {
@@ -4052,6 +4082,44 @@ static void ggml_vec_dot_turbo4_0_f32(int n, float * GGML_RESTRICT s, size_t bs,
 
     ggml_vec_dot_turbo_f32_impl(GGML_TYPE_TURBO4_0, n, s, vx, vy);
 }
+
+static void ggml_vec_dot_cr_f32_impl(enum ggml_type type_x, int n, float * GGML_RESTRICT s,
+                                     const void * GGML_RESTRICT vx, const void * GGML_RESTRICT vy) {
+    const struct ggml_type_traits * trx = ggml_get_type_traits(type_x);
+    const int64_t blk = trx->blck_size;
+
+    GGML_ASSERT(n % QK8_CR == 0);
+
+    const char  * x = (const char *) vx;
+    const float * y = (const float *) vy;
+    float xb[QK8_CR];
+    float sum = 0.0f;
+
+    for (int64_t i = 0; i < n; i += QK8_CR) {
+        trx->to_float(x, xb, QK8_CR);
+        for (int64_t j = 0; j < QK8_CR; ++j) {
+            sum += xb[j] * y[i + j];
+        }
+        x += (QK8_CR / blk) * trx->type_size;
+    }
+
+    *s = sum;
+}
+
+#define GGML_VEC_DOT_CR_F32(type_name, type_enum) \
+    static void ggml_vec_dot_##type_name##_f32(int n, float * GGML_RESTRICT s, size_t bs, \
+                                                const void * GGML_RESTRICT vx, size_t bx, \
+                                                const void * GGML_RESTRICT vy, size_t by, int nrc) { \
+        GGML_ASSERT(nrc == 1); \
+        GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc); \
+        ggml_vec_dot_cr_f32_impl(type_enum, n, s, vx, vy); \
+    }
+
+GGML_VEC_DOT_CR_F32(q8_cr, GGML_TYPE_Q8_CR)
+GGML_VEC_DOT_CR_F32(q5_cr, GGML_TYPE_Q5_CR)
+GGML_VEC_DOT_CR_F32(q6_cr, GGML_TYPE_Q6_CR)
+
+#undef GGML_VEC_DOT_CR_F32
 
 // TQ3_1S vec_dot: dequantize tq3_1s block to f32, then dot with q8_0.
 // TODO: optimize with SIMD intrinsics for ARM NEON / AVX2

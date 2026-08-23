@@ -20,6 +20,7 @@
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/convert.cuh"
 #include "ggml-cuda/count-equal.cuh"
+#include "ggml-cuda/convrot.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
 #include "ggml-cuda/cumsum.cuh"
@@ -1809,6 +1810,13 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // CR weights need their activations rotated first, not supported by the fused kernels
+    if (ffn_up->src[0]->type == GGML_TYPE_Q8_CR ||
+            ffn_up->src[0]->type == GGML_TYPE_Q5_CR ||
+            ffn_up->src[0]->type == GGML_TYPE_Q6_CR) {
+        return false;
+    }
+
     if (ffn_up->src[1] != ffn_gate->src[1]) {
         return false;
     }
@@ -1868,6 +1876,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && !is_tq_weight &&
+                             src0->type != GGML_TYPE_Q8_CR &&
+                             src0->type != GGML_TYPE_Q5_CR &&
+                             src0->type != GGML_TYPE_Q6_CR &&
                              src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
@@ -1888,7 +1899,73 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
+    // Q8_CR weights are stored rotated: rotate the activations with the same
+    // matrix and run the standard Q8_0 kernels (the rotations cancel)
+    ggml_cuda_pool_alloc<float> src1_rot_buf;
+    ggml_tensor src1_rot;
+    ggml_tensor src0_q8_0;
+    ggml_tensor src0_q5_0;
+    ggml_tensor src0_q6_K_cr;
+
+    const ggml_tensor * src0 = src0_;
+    const ggml_tensor * src1 = src1_;
+
+    if (src0->type == GGML_TYPE_Q8_CR) {
+        if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src1) || src1->ne[0] % QK8_CR != 0) {
+            GGML_ABORT("%s: Q8_CR requires f32 contiguous activations with rows divisible by QK8_CR", __func__);
+        }
+
+        src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
+
+        src1_rot   = *src1;
+        src1_rot.data = src1_rot_buf.get();
+        ggml_cuda_convrot_rotate(ctx, src1, (float *) src1_rot.data);
+
+        src0_q8_0 = *src0;
+        src0_q8_0.type = GGML_TYPE_Q8_0;
+        src0_q8_0.nb[0] = sizeof(block_q8_0);
+
+        src0 = &src0_q8_0;
+        src1 = &src1_rot;
+    } else if (src0->type == GGML_TYPE_Q5_CR) {
+        if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src1) || src1->ne[0] % QK8_CR != 0) {
+            GGML_ABORT("%s: Q5_CR requires f32 contiguous activations with rows divisible by QK8_CR", __func__);
+        }
+
+        src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
+
+        src1_rot   = *src1;
+        src1_rot.data = src1_rot_buf.get();
+        ggml_cuda_convrot_rotate(ctx, src1, (float *) src1_rot.data);
+
+        src0_q5_0 = *src0;
+        src0_q5_0.type = GGML_TYPE_Q5_0;
+        src0_q5_0.nb[0] = sizeof(block_q5_0);
+
+        src0 = &src0_q5_0;
+        src1 = &src1_rot;
+    } else if (src0->type == GGML_TYPE_Q6_CR) {
+        if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(src1) || src1->ne[0] % QK8_CR != 0) {
+            GGML_ABORT("%s: Q6_CR requires f32 contiguous activations with rows divisible by QK8_CR", __func__);
+        }
+
+        src1_rot_buf.alloc(ctx.pool(), ggml_nelements(src1));
+
+        src1_rot   = *src1;
+        src1_rot.data = src1_rot_buf.get();
+        ggml_cuda_convrot_rotate(ctx, src1, (float *) src1_rot.data);
+
+        src0_q6_K_cr = *src0;
+        src0_q6_K_cr.type = GGML_TYPE_Q6_K;
+
+        src0 = &src0_q6_K_cr;
+        src1 = &src1_rot;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -4959,6 +5036,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16) {
                     return false;
+                }
+                if (a->type == GGML_TYPE_Q8_CR || a->type == GGML_TYPE_Q5_CR || a->type == GGML_TYPE_Q6_CR) {
+#ifdef GGML_USE_MUSA
+                    return false;
+#endif
+                    if (op->op != GGML_OP_MUL_MAT) {
+                        return false; // MoE experts are never quantized to CR types
+                    }
+                    return b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32
+                        && ggml_is_contiguous(b) && ggml_is_contiguous(op)
+                        && b->ne[0] % QK8_CR == 0;
                 }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
