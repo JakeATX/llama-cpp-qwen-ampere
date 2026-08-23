@@ -1910,9 +1910,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const ggml_tensor * src0 = src0_;
     const ggml_tensor * src1 = src1_;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     const bool is_cr = src0->type == GGML_TYPE_Q8_CR ||
                        src0->type == GGML_TYPE_Q5_CR ||
                        src0->type == GGML_TYPE_Q6_CR;
+#endif
 
     if (src0->type == GGML_TYPE_Q8_CR) {
         if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -1986,6 +1988,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
     // Full-model CUDA inference with CR weights is not numerically reliable through
     // MMVQ/MMQ even though the small random operator tests pass. Keep the CUDA
     // activation rotation, then use the dequantize + cuBLAS path until the fast
@@ -1994,6 +1997,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
+#endif
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
