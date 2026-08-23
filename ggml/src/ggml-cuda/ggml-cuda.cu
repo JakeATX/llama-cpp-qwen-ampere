@@ -2171,11 +2171,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
+    // TQ weights: small batch uses the capture-safe device-routed matvec (ggml_cuda_mul_mat_id_tq);
+    // large batch falls through to the dequant-to-f16 cuBLAS path, which synchronizes the stream.
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+            if (is_tq_weight_id && ggml_is_contiguous(src1)) {
+                // Device-side expert routing: no host sync, so the whole decode step is graph-capturable.
+                ggml_cuda_mul_mat_id_tq(ctx, src0, src1, ids, dst);
+                return;
+            }
             if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -2824,8 +2830,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || is_tq_w || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+            // The mul_mat_id operation synchronizes the stream (forbidding graph capture) unless it
+            // takes a device-routed path. TQ weights now have a capture-safe device-routed matvec at
+            // small batch with contiguous src1 (ggml_cuda_mul_mat_id_tq); only the large-batch cuBLAS
+            // fallback still synchronizes. Other quantized weights use mmvq up to mmvq_mmid_max.
+            // Keep this condition in sync with the dispatch in ggml_cuda_mul_mat_id.
+            const bool needs_sync = is_tq_w
+                ? (node->ne[2] > MMVQ_MAX_BATCH_SIZE || !ggml_is_contiguous(node->src[1]))
+                : (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max);
+            if (needs_sync) {
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;

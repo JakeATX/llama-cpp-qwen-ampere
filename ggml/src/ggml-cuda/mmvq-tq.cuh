@@ -10,6 +10,11 @@ inline void ggml_cuda_mul_mat_vec_tq(ggml_backend_cuda_context & ctx, const ggml
     ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
 }
 
+// Capture-safe MoE (MUL_MAT_ID) matvec for TQ weights at small batch (decode / light
+// speculative). Reads ids on-device; no host sync, so it can be recorded into a CUDA graph.
+// Caller must ensure src1 is contiguous and dst->ne[2] (n_tokens) <= MMVQ_MAX_BATCH_SIZE.
+void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+
 // Large prefill: runtime TQ4_1S → q8_0 scratch + cuBLAS
 void ggml_cuda_mul_mat_tq4_1s_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
