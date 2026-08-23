@@ -4654,18 +4654,37 @@ static const char * cr_activation_pattern_name(cr_activation_pattern pattern) {
 
 struct test_mul_mat_cr : public test_mul_mat {
     const cr_activation_pattern pattern;
+    const bool preprocess_activation;
 
     test_mul_mat_cr(ggml_type type_a, int64_t m, int64_t n, int64_t k,
             cr_activation_pattern pattern,
             std::array<int64_t, 2> bs = {1, 1},
-            std::array<int64_t, 2> nr = {1, 1})
+            std::array<int64_t, 2> nr = {1, 1},
+            bool preprocess_activation = false)
         : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, bs, nr),
-          pattern(pattern) {
+          pattern(pattern),
+          preprocess_activation(preprocess_activation) {
     }
 
     std::string vars() override {
-        return test_mul_mat::vars() + ",cr_pattern=" + cr_activation_pattern_name(pattern);
+        return test_mul_mat::vars() + ",cr_pattern=" + cr_activation_pattern_name(pattern) +
+            ",preprocess_activation=" + (preprocess_activation ? "true" : "false");
     }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        if (!preprocess_activation) {
+            return out;
+        }
+
+        ggml_tensor * activation = ggml_scale(ctx, out->src[1], 0.5f);
+        ggml_set_name(activation, "b_scaled");
+        out = ggml_mul_mat(ctx, out->src[0], activation);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    bool run_whole_graph() override { return preprocess_activation; }
 
     double err(const float * a, const float * b, size_t n_values) override {
         if (pattern != cr_activation_pattern::ZERO) {
@@ -9317,6 +9336,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             type_a, 10240, 1, 5120, cr_activation_pattern::RANDOM));
         test_cases.emplace_back(new test_mul_mat_cr(
             type_a, 10240, 2, 5120, cr_activation_pattern::RANDOM));
+        test_cases.emplace_back(new test_mul_mat_cr(
+            type_a, 33, 64, 5120, cr_activation_pattern::RANDOM));
+        test_cases.emplace_back(new test_mul_mat_cr(
+            type_a, 33, 1, 1024, cr_activation_pattern::RANDOM,
+            {1, 1}, {1, 1}, true));
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
@@ -10439,6 +10463,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 type_a, 10240, n, 5120, cr_activation_pattern::RANDOM));
         }
     }
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 256, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat_cr(
+        GGML_TYPE_Q6_CR, 10240, 256, 5120, cr_activation_pattern::RANDOM));
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

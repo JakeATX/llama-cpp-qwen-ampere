@@ -284,12 +284,15 @@ static void launch_reference(
 
 template <ggml_type type, int rows_per_cta>
 static __global__ void mul_mat_vec_cr_cooperative(
-        const void * __restrict__ weights,
-        const float * __restrict__ x,
-        float * __restrict__ y,
+        const void * weights_ptr,
+        const float * x_ptr,
+        float * y_ptr,
         int64_t m,
         int64_t n,
         int64_t k) {
+    const void * GGML_CUDA_RESTRICT weights = weights_ptr;
+    const float * GGML_CUDA_RESTRICT x = x_ptr;
+    float * GGML_CUDA_RESTRICT y = y_ptr;
     static_assert(rows_per_cta == 2 || rows_per_cta == 4, "unsupported CR CTA geometry");
 
     const int p = threadIdx.x;
