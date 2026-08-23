@@ -1910,6 +1910,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const ggml_tensor * src0 = src0_;
     const ggml_tensor * src1 = src1_;
+    const bool is_cr = src0->type == GGML_TYPE_Q8_CR ||
+                       src0->type == GGML_TYPE_Q5_CR ||
+                       src0->type == GGML_TYPE_Q6_CR;
 
     if (src0->type == GGML_TYPE_Q8_CR) {
         if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
@@ -1979,6 +1982,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
+    // Full-model CUDA inference with CR weights is not numerically reliable through
+    // MMVQ/MMQ even though the small random operator tests pass. Keep the CUDA
+    // activation rotation, then use the dequantize + cuBLAS path until the fast
+    // quantized kernels have production-shape correctness coverage.
+    if (is_cr) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
