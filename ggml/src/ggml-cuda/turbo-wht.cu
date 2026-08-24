@@ -66,18 +66,37 @@ static __global__ void k_turbo_wht_f32(const float * __restrict__ src,
     // In stage h, threads where (t % (2h)) < h read x[t] and x[t+h],
     // then write x[t] = a+b and x[t+h] = a-b.  Each active thread
     // owns a disjoint pair, so no intra-stage conflicts exist.
-#define WHT_STAGE(h) \
-    if (t % (2*(h)) < (h)) { float a = x[t], b = x[t+(h)]; x[t] = a+b; x[t+(h)] = a-b; } \
+    const int lane = t & 31;
+    float val = x[t];
+
+    // Intra-warp butterfly (h = 1, 2, 4, 8, 16)
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+
+    x[t] = val;
     __syncthreads();
 
-    WHT_STAGE(1)
-    WHT_STAGE(2)
-    WHT_STAGE(4)
-    WHT_STAGE(8)
-    WHT_STAGE(16)
-    if (group_size >= 64) { WHT_STAGE(32) }
-    if (group_size == 128) { WHT_STAGE(64) }
-#undef WHT_STAGE
+    // Inter-warp butterfly (h = 32, 64)
+    if (group_size >= 64) {
+        if (t % 64 < 32) {
+            float a = x[t], b = x[t + 32];
+            x[t] = a + b;
+            x[t + 32] = a - b;
+        }
+        __syncthreads();
+    }
+
+    if (group_size == 128) {
+        if (t % 128 < 64) {
+            float a = x[t], b = x[t + 64];
+            x[t] = a + b;
+            x[t + 64] = a - b;
+        }
+        __syncthreads();
+    }
 
     // Normalize and apply second sign array, write to output
     constexpr float inv_sqrt = (group_size == 128) ? 0.08838834764831845f :
