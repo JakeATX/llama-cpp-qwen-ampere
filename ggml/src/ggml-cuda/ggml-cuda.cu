@@ -32,6 +32,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmv-cr.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1737,52 +1738,6 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-static bool ggml_cuda_mul_mat_cr_tiled(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
-        const ggml_tensor * src1, ggml_tensor * dst) {
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguously_allocated(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
-            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
-        return false;
-    }
-
-    const int64_t k = src0->ne[0];
-    const int64_t m = src0->ne[1];
-    const int64_t n = src1->ne[1];
-    GGML_ASSERT(src1->ne[0] == k);
-
-    constexpr size_t max_weight_scratch = 256ull * 1024 * 1024;
-    const int64_t rows_per_tile = std::max<int64_t>(
-        1, std::min<int64_t>(m, max_weight_scratch / (k * sizeof(half))));
-
-    ggml_cuda_pool_alloc<half> weights(ctx.pool(), rows_per_tile * k);
-    ggml_cuda_pool_alloc<half> activations(ctx.pool(), ggml_nelements(src1));
-    const to_fp16_cuda_t to_fp16_weights = ggml_get_to_fp16_cuda(src0->type);
-    const to_fp16_cuda_t to_fp16_activations = ggml_get_to_fp16_cuda(src1->type);
-    GGML_ASSERT(to_fp16_weights != nullptr && to_fp16_activations != nullptr);
-
-    cudaStream_t stream = ctx.stream();
-    to_fp16_activations(src1->data, activations.get(), ggml_nelements(src1), stream);
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    for (int64_t row = 0; row < m; row += rows_per_tile) {
-        const int64_t rows = std::min<int64_t>(rows_per_tile, m - row);
-        const char * src0_row = (const char *) src0->data + row*src0->nb[1];
-        to_fp16_weights(src0_row, weights.get(), rows*k, stream);
-
-        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                rows, n, k,
-                &alpha, weights.get(), CUDA_R_16F, k,
-                        activations.get(), CUDA_R_16F, k,
-                &beta, (float *) dst->data + row, CUDA_R_32F, dst->ne[0],
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    }
-    return true;
-}
-#endif
-
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -1957,24 +1912,56 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const ggml_tensor * src0 = src0_;
     const ggml_tensor * src1 = src1_;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (src0->type == GGML_TYPE_Q8_CR ||
-            src0->type == GGML_TYPE_Q5_CR ||
-            src0->type == GGML_TYPE_Q6_CR) {
-        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 &&
-                src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
-            ggml_cuda_mul_mat_vec_cr(src0->type, src0->data, (const float *) src1->data,
-                (float *) dst->data, src0->ne[1], src0->ne[0], ctx.stream());
-            return;
-        }
-        if (!ggml_cuda_mul_mat_cr_tiled(ctx, src0, src1, dst)) {
-            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        }
-        return;
-    }
     const bool is_cr = src0->type == GGML_TYPE_Q8_CR ||
                        src0->type == GGML_TYPE_Q5_CR ||
                        src0->type == GGML_TYPE_Q6_CR;
+    if (is_cr) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        const bool direct_inverse = (cc <= GGML_CUDA_CC_PASCAL && src1->ne[1] == 1) ||
+                                    src0->ne[1] <= 4;
+        if (direct_inverse && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            if (ggml_cuda_mul_mat_vec_cr(src0->type, src0->data, (const float *) src1->data,
+                    (float *) dst->data, src0->ne[1], src1->ne[1], src0->ne[0], cc, ctx.stream())) {
+                return;
+            }
+        }
+
+        const bool bad_padding_clear =
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+        if (cc > GGML_CUDA_CC_PASCAL && !bad_padding_clear &&
+                src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                src1->ne[0] % QK8_CR == 0 && ggml_is_contiguously_allocated(src0) &&
+                ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            const ggml_tensor * src0_fast = nullptr;
+            if (src0->type == GGML_TYPE_Q8_CR) {
+                src0_q8_0 = *src0;
+                src0_q8_0.type = GGML_TYPE_Q8_0;
+                src0_q8_0.nb[0] = sizeof(block_q8_0);
+                src0_fast = &src0_q8_0;
+            } else if (src0->type == GGML_TYPE_Q5_CR) {
+                src0_q5_0 = *src0;
+                src0_q5_0.type = GGML_TYPE_Q5_0;
+                src0_q5_0.nb[0] = sizeof(block_q5_0);
+                src0_fast = &src0_q5_0;
+            } else {
+                src0_q6_K_cr = *src0;
+                src0_q6_K_cr.type = GGML_TYPE_Q6_K;
+                src0_fast = &src0_q6_K_cr;
+            }
+
+            if (ggml_cuda_should_use_mmvq(src0_fast->type, cc, src1->ne[1])) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0_fast, src1, nullptr, dst, nullptr, true);
+                return;
+            }
+            if (ggml_cuda_should_use_mmq(src0_fast->type, cc, src1->ne[1], /*n_experts =*/ 0)) {
+                ggml_cuda_mul_mat_q(ctx, src0_fast, src1, nullptr, dst, true);
+                return;
+            }
+        }
+    }
 #endif
 
     if (src0->type == GGML_TYPE_Q8_CR) {
@@ -2048,17 +2035,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // Full-model CUDA inference with CR weights is not numerically reliable through
-    // MMVQ/MMQ even though the small random operator tests pass. Keep the CUDA
-    // activation rotation, then use the dequantize + cuBLAS path until the fast
-    // quantized kernels have production-shape correctness coverage.
-    if (is_cr) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
-    }
-#endif
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
