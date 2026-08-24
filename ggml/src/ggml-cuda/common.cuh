@@ -1427,6 +1427,14 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // [TAG_FA_F16_CUDA_GRAPHS] Set once per compute call in ggml_backend_cuda_graph_compute: true
+    // when the current cgraph is graph-enabled AND graph-compatible (i.e. it will be captured).
+    // On HIP the flash-attention launcher reads this to place its f16 KV-dequant temp buffers in the
+    // capture-safe memory pool instead of raw cudaMalloc/cudaFree, which are illegal while a CUDA
+    // graph is being captured. Left false for graph-incompatible graphs so those keep the raw
+    // release-after-use path (avoids the legacy pool retaining the temp; ref llama.cpp #22107).
+    bool fa_f16_use_pool = false;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
