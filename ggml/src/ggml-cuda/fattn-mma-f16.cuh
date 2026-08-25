@@ -538,7 +538,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
             const int c_end       = min(D2, blk_col_end);
 
             const block_turbo4_0 * blk = (const block_turbo4_0 *)(row_ptr) + blk_idx;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             const float norm = __half2float(__ldcs((const half *)&blk->norm));
 #else
             const float norm = __half2float(blk->norm);
@@ -552,7 +552,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo4_load_tile(
 
             for (; c < c_end; ++c) {
                 const int in_blk = (col_offset + c) % (QK_TURBO4 / 2);
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
                 const uint8_t byte = __ldcs(&blk->qs[in_blk]);
 #else
                 const uint8_t byte = blk->qs[in_blk];
@@ -591,7 +591,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
             const int c_end       = min(D2, blk_col_end);
 
             const block_turbo3_0 * blk = (const block_turbo3_0 *)(row_ptr) + blk_idx;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             const float norm = __half2float(__ldcs((const half *)&blk->norm));
 #else
             const float norm = __half2float(blk->norm);
@@ -606,7 +606,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
             for (; c < c_end; ++c) {
                 const int in_blk = (col_offset + c) % (QK_TURBO3 / 2);
                 const int j0     = in_blk * 2;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
                 const uint8_t qs_byte  = __ldcs(&blk->qs[j0 / 4]);
                 const uint8_t sgn_byte = __ldcs(&blk->signs[j0 / 8]);
 #else
@@ -647,7 +647,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo2_load_tile(
             const int c_end       = min(D2, blk_col_end);
 
             const block_turbo2_0 * blk = (const block_turbo2_0 *)(row_ptr) + blk_idx;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             const float norm = __half2float(__ldcs((const half *)&blk->norm));
 #else
             const float norm = __half2float(blk->norm);
@@ -662,7 +662,7 @@ static __device__ __forceinline__ void flash_attn_ext_turbo2_load_tile(
             for (; c < c_end; ++c) {
                 const int in_blk = (col_offset + c) % (QK_TURBO2 / 2);
                 const int j0     = in_blk * 2;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
                 const uint8_t qs_byte = __ldcs(&blk->qs[j0 / 4]);
 #else
                 const uint8_t qs_byte = blk->qs[j0 / 4];
