@@ -139,12 +139,26 @@ static __global__ void tq_prerotate_activation(
     dst[offset] = val;
 }
 
-static __device__ __forceinline__ uint8_t tq3_extract_index(const uint8_t * __restrict__ qs, int lane) {
-    const int group = lane / 8;
-    const int lane_in_group = lane % 8;
+static __device__ __forceinline__ float tq3_cent_reg(uint32_t idx) {
+    switch (idx & 7u) {
+        case 0: return -1.996684f;
+        case 1: return -1.291398f;
+        case 2: return -0.740341f;
+        case 3: return -0.247508f;
+        case 4: return  0.230106f;
+        case 5: return  0.725222f;
+        case 6: return  1.277503f;
+        case 7: return  1.988943f;
+        default: return 0.0f;
+    }
+}
+
+static __device__ __forceinline__ uint32_t tq3_extract_index_fast(const uint8_t * __restrict__ qs, int lane) {
+    const int group = lane >> 3;
+    const int shift = (lane & 7) * 3;
     const uint8_t * qp = qs + group * 3;
     const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
-    return (packed >> (lane_in_group * 3)) & 7;
+    return (packed >> shift) & 7u;
 }
 
 // ============================================================================
@@ -234,12 +248,6 @@ static __global__ void mul_mat_tq3_1s_multi(
         const int stride_col_y,
         const int stride_col_dst) {
 
-    __shared__ float s_lut[8];
-    if (threadIdx.y == 0 && threadIdx.x < 8) {
-        s_lut[threadIdx.x] = TQ3_CENTROIDS_WEIGHT[threadIdx.x];
-    }
-    __syncthreads();
-
     const int row  = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
     if (row >= nrows_x) return;
 
@@ -251,13 +259,13 @@ static __global__ void mul_mat_tq3_1s_multi(
 
     for (int ib = 0; ib < blocks_per_row; ib++) {
         const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint8_t idx = tq3_extract_index(x_row[ib].qs, lane);
-        const float w = s_lut[idx] * d;
+        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+        const float w = tq3_cent_reg(idx) * d;
 
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++) {
             const float act = vy_rot[j * stride_col_y + ib * QK_TQ3_0 + lane];
-            sumf[j] += act * w;
+            sumf[j] = __fmaf_rn(act, w, sumf[j]);
         }
     }
 
@@ -401,12 +409,6 @@ static __global__ void mul_mat_tq3_1s_moe(
         const int64_t stride_channel_dst,      // elements to next expert slot in dst
         const int64_t stride_sample_dst) {     // elements to next sample in dst
 
-    __shared__ float s_lut[8];
-    if (threadIdx.y == 0 && threadIdx.x < 8) {
-        s_lut[threadIdx.x] = TQ3_CENTROIDS_WEIGHT[threadIdx.x];
-    }
-    __syncthreads();
-
     const int row = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
     if (row >= nrows_x) return;
 
@@ -425,9 +427,9 @@ static __global__ void mul_mat_tq3_1s_moe(
     float sumf = 0.0f;
     for (int ib = 0; ib < blocks_per_row; ib++) {
         const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint8_t idx = tq3_extract_index(x_row[ib].qs, lane);
-        const float w = s_lut[idx] * d;
-        sumf += act[ib * QK_TQ3_0 + lane] * w;
+        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+        const float w = tq3_cent_reg(idx) * d;
+        sumf = __fmaf_rn(act[ib * QK_TQ3_0 + lane], w, sumf);
     }
 
     #pragma unroll
