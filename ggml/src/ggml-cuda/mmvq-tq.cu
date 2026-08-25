@@ -523,6 +523,121 @@ static void launch_tq4_1s_wmma(
 }
 
 // ============================================================================
+// Multi-token TQ3_1S WMMA Tensor Core kernel (ncols_dst > 8, prompt processing)
+// ============================================================================
+
+template <int NWARPS>
+static __global__ void mul_mat_tq3_1s_wmma_kernel(
+        const void  * __restrict__ vx,
+        const float * __restrict__ vy_rot,
+        float       * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const int stride_col_y,
+        const int stride_col_dst) {
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x % 32;
+
+    const int warp_id_in_grid_m = blockIdx.y * NWARPS + warp_id;
+    const int warp_id_in_grid_n = blockIdx.x;
+
+    const int m_base = warp_id_in_grid_m * WMMA_M;
+    const int n_base = warp_id_in_grid_n * WMMA_N;
+
+    if (m_base >= nrows_x || n_base >= ncols_dst) return;
+
+    __shared__ half sh_a[NWARPS][WMMA_M][WMMA_K + 1];
+    __shared__ half sh_b[NWARPS][WMMA_K][WMMA_N + 1];
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> frag_b;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_c;
+
+    wmma::fill_fragment(frag_c, 0.0f);
+
+    const int blocks_per_row = ncols_x / QK_TQ3_0;
+
+    for (int k_outer = 0; k_outer < ncols_x; k_outer += WMMA_K) {
+        const int elem_idx = lane * 8;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int flat = elem_idx + e;
+            const int r_local = flat / WMMA_K;
+            const int k_local = flat % WMMA_K;
+            const int r_global = m_base + r_local;
+            const int k_global = k_outer + k_local;
+
+            if (r_global < nrows_x && k_global < ncols_x) {
+                const int ib = k_global / QK_TQ3_0;
+                const int lane_in_blk = k_global % QK_TQ3_0;
+                const block_tq3_1s * blk = ((const block_tq3_1s *)vx) + (int64_t)r_global * blocks_per_row + ib;
+
+                const float d = (lane_in_blk < 16) ? __half2float(blk->d0) : __half2float(blk->d1);
+                const uint32_t idx = tq3_extract_index_fast(blk->qs, lane_in_blk);
+                sh_a[warp_id][r_local][k_local] = __float2half(tq3_cent_reg(idx) * d);
+            } else {
+                sh_a[warp_id][r_local][k_local] = __float2half(0.0f);
+            }
+        }
+
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int flat = elem_idx + e;
+            const int k_local = flat / WMMA_N;
+            const int n_local = flat % WMMA_N;
+            const int k_global = k_outer + k_local;
+            const int n_global = n_base + n_local;
+
+            if (n_global < ncols_dst && k_global < ncols_x) {
+                const float act = vy_rot[n_global * stride_col_y + k_global];
+                sh_b[warp_id][k_local][n_local] = __float2half(act);
+            } else {
+                sh_b[warp_id][k_local][n_local] = __float2half(0.0f);
+            }
+        }
+
+        __syncwarp();
+
+        wmma::load_matrix_sync(frag_a, &sh_a[warp_id][0][0], WMMA_K + 1);
+        wmma::load_matrix_sync(frag_b, &sh_b[warp_id][0][0], WMMA_N + 1);
+
+        wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+    }
+
+    __shared__ float sh_dst[NWARPS][WMMA_M][WMMA_N + 1];
+    wmma::store_matrix_sync(&sh_dst[warp_id][0][0], frag_c, WMMA_N + 1, wmma::mem_row_major);
+    __syncwarp();
+
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const int flat = lane * 8 + e;
+        const int r_local = flat / WMMA_N;
+        const int n_local = flat % WMMA_N;
+        const int r_global = m_base + r_local;
+        const int n_global = n_base + n_local;
+
+        if (r_global < nrows_x && n_global < ncols_dst) {
+            dst[n_global * stride_col_dst + r_global] = sh_dst[warp_id][r_local][n_local];
+        }
+    }
+}
+
+static void launch_tq3_1s_wmma(
+        const void * src0_d, const float * act_buf,
+        float * dst_d, int ncols_x, int nrows_x, int ncols_dst,
+        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+
+    constexpr int NWARPS = 4;
+    const dim3 block(NWARPS * 32, 1);
+    const dim3 grid((ncols_dst + WMMA_N - 1) / WMMA_N, (nrows_x + (WMMA_M * NWARPS) - 1) / (WMMA_M * NWARPS));
+
+    mul_mat_tq3_1s_wmma_kernel<NWARPS><<<grid, block, 0, stream>>>(
+        src0_d, act_buf, dst_d, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
+}
+
+// ============================================================================
 // MoE (MUL_MAT_ID) matvec: capture-safe device-side expert routing.
 //
 // Replaces the generic ggml_cuda_mul_mat_id host-sync fallback for TQ weights at
@@ -894,21 +1009,11 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                 case 8: LAUNCH_SCALAR(8, src0_d, act_buf.get(), dst_d); break;
             }
         } else {
-            // Large prefill: batch in groups of 8
-            for (int j = 0; j < ncols_dst; j += 8) {
-                const int batch = min(8, ncols_dst - j);
-                const float * act_j = act_buf.get() + j * ncols_x;
-                float * dst_j = dst_d + j * nrows_x;
-                switch (batch) {
-                    case 1: LAUNCH_SCALAR(1, src0_d, act_j, dst_j); break;
-                    case 2: LAUNCH_SCALAR(2, src0_d, act_j, dst_j); break;
-                    case 3: LAUNCH_SCALAR(3, src0_d, act_j, dst_j); break;
-                    case 4: LAUNCH_SCALAR(4, src0_d, act_j, dst_j); break;
-                    case 5: LAUNCH_SCALAR(5, src0_d, act_j, dst_j); break;
-                    case 6: LAUNCH_SCALAR(6, src0_d, act_j, dst_j); break;
-                    case 7: LAUNCH_SCALAR(7, src0_d, act_j, dst_j); break;
-                    case 8: LAUNCH_SCALAR(8, src0_d, act_j, dst_j); break;
-                }
+            // Large prefill: Fused Tensor Core (WMMA) path
+            if (is_tq4) {
+                launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+            } else {
+                launch_tq3_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
             }
         }
         #undef LAUNCH_SCALAR
