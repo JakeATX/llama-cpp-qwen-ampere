@@ -9,8 +9,11 @@
 #include "turbo-quant.cuh"
 #include "convert.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <mma.h>
 using namespace nvcuda;
+#define GGML_CUDA_USE_WMMA
+#endif
 
 #define MMVQ_TQ_NWARPS 4
 #define WMMA_M 16
@@ -385,6 +388,7 @@ static void launch_tq3_1s_multi(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
+#if defined(GGML_CUDA_USE_WMMA)
 // ============================================================================
 // Multi-token TQ4_1S WMMA Tensor Core kernel (ncols_dst > 8, prompt processing)
 // ============================================================================
@@ -636,6 +640,7 @@ static void launch_tq3_1s_wmma(
     mul_mat_tq3_1s_wmma_kernel<NWARPS><<<grid, block, 0, stream>>>(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
 }
+#endif // defined(GGML_CUDA_USE_WMMA)
 
 // ============================================================================
 // MoE (MUL_MAT_ID) matvec: capture-safe device-side expert routing.
@@ -964,6 +969,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                 case 8: launch_tq4_1s_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
             }
         } else {
+#if defined(GGML_CUDA_USE_WMMA)
             // Large prefill: Fused Tensor Core (WMMA) path
             ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_total_elements);
             {
@@ -974,6 +980,23 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                 tq_prerotate_activation<<<grid, block, 0, stream>>>(src1_d, act_buf.get(), n_total_elements);
             }
             launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+#else
+            for (int j = 0; j < ncols_dst; j += 8) {
+                const int batch = min(8, ncols_dst - j);
+                const block_q8_1 * q8_j = q8_1_buf.get() + j * stride_col_y;
+                float * dst_j = dst_d + j * nrows_x;
+                switch (batch) {
+                    case 1: launch_tq4_1s_multi<1>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 2: launch_tq4_1s_multi<2>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 3: launch_tq4_1s_multi<3>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 4: launch_tq4_1s_multi<4>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 5: launch_tq4_1s_multi<5>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 6: launch_tq4_1s_multi<6>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 7: launch_tq4_1s_multi<7>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 8: launch_tq4_1s_multi<8>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                }
+            }
+#endif
         }
     } else {
         // Scalar float path: TQ3_1S (all vendors) + TQ4_1S on AMD (dp4a regresses on RDNA4).
@@ -1009,12 +1032,30 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                 case 8: LAUNCH_SCALAR(8, src0_d, act_buf.get(), dst_d); break;
             }
         } else {
+#if defined(GGML_CUDA_USE_WMMA)
             // Large prefill: Fused Tensor Core (WMMA) path
             if (is_tq4) {
                 launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
             } else {
                 launch_tq3_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
             }
+#else
+            for (int j = 0; j < ncols_dst; j += 8) {
+                const int batch = min(8, ncols_dst - j);
+                const float * act_j = act_buf.get() + j * ncols_x;
+                float * dst_j = dst_d + j * nrows_x;
+                switch (batch) {
+                    case 1: LAUNCH_SCALAR(1, src0_d, act_j, dst_j); break;
+                    case 2: LAUNCH_SCALAR(2, src0_d, act_j, dst_j); break;
+                    case 3: LAUNCH_SCALAR(3, src0_d, act_j, dst_j); break;
+                    case 4: LAUNCH_SCALAR(4, src0_d, act_j, dst_j); break;
+                    case 5: LAUNCH_SCALAR(5, src0_d, act_j, dst_j); break;
+                    case 6: LAUNCH_SCALAR(6, src0_d, act_j, dst_j); break;
+                    case 7: LAUNCH_SCALAR(7, src0_d, act_j, dst_j); break;
+                    case 8: LAUNCH_SCALAR(8, src0_d, act_j, dst_j); break;
+                }
+            }
+#endif
         }
         #undef LAUNCH_SCALAR
     }
