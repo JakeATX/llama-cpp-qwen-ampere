@@ -212,6 +212,18 @@ class Keys:
         COUNT                = "{arch}.hyper_connection.count"
         SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"
         EPSILON              = "{arch}.hyper_connection.epsilon"
+        # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
+        LOW_RANK             = "{arch}.hyper_connection.low_rank"
+
+    class PLE:
+        LAYERS             = "{arch}.ple.layers"
+        NGRAM_SIZE         = "{arch}.ple.ngram_size"
+        HEADS_PER_NGRAM    = "{arch}.ple.heads_per_ngram"
+        CONV_KERNEL        = "{arch}.ple.conv_kernel"
+        LAYER_MULTIPLIERS  = "{arch}.ple.layer_multipliers"
+        HEAD_OFFSETS       = "{arch}.ple.head_offsets"
+        HEAD_VOCAB_SIZES   = "{arch}.ple.head_vocab_sizes"
+        EOS_TOKEN_ID       = "{arch}.ple.eos_token_id"
 
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
@@ -2442,6 +2454,58 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HNORM,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_HEAD,
         MODEL_TENSOR.NEXTN_SHARED_HEAD_NORM,
+    ],
+    MODEL_ARCH.QWEN4EXP: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        # no OUTPUT_NORM / ATTN_NORM / ATTN_POST_NORM: hyper-connections replace every layer norm
+        MODEL_TENSOR.HC_HEAD_NORM,
+        MODEL_TENSOR.HC_HEAD_DOWN,
+        MODEL_TENSOR.HC_HEAD_UP,
+        MODEL_TENSOR.HC_ATTN_NORM,
+        MODEL_TENSOR.HC_ATTN_DOWN,
+        MODEL_TENSOR.HC_ATTN_UP,
+        MODEL_TENSOR.HC_ATTN_INJECT,
+        MODEL_TENSOR.HC_FFN_NORM,
+        MODEL_TENSOR.HC_FFN_DOWN,
+        MODEL_TENSOR.HC_FFN_UP,
+        MODEL_TENSOR.HC_FFN_INJECT,
+        # full attention layers: ATTN_Q holds [q|gate] interleaved per head
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.INDEXER_Q_PROJ,
+        MODEL_TENSOR.INDEXER_K_PROJ,
+        MODEL_TENSOR.INDEXER_Q_NORM,
+        MODEL_TENSOR.INDEXER_K_NORM,
+        MODEL_TENSOR.ATTN_QKV,
+        MODEL_TENSOR.ATTN_GATE,
+        MODEL_TENSOR.SSM_A,
+        MODEL_TENSOR.SSM_CONV1D,
+        MODEL_TENSOR.SSM_DT,
+        MODEL_TENSOR.SSM_NORM,
+        MODEL_TENSOR.SSM_BETA,
+        MODEL_TENSOR.SSM_ALPHA,
+        MODEL_TENSOR.SSM_OUT,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_GATE_UP_EXP,
+        MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
+        MODEL_TENSOR.PLE_KEY,
+        MODEL_TENSOR.PLE_VALUE,
+        MODEL_TENSOR.PLE_NORM_KEY,
+        MODEL_TENSOR.PLE_NORM_QUERY,
+        MODEL_TENSOR.PLE_NORM_CONV,
+        MODEL_TENSOR.PLE_CONV1D,
     ],
     MODEL_ARCH.PLAMO: [
         MODEL_TENSOR.TOKEN_EMBD,
