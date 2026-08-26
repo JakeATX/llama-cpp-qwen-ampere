@@ -121,7 +121,16 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return []
 
         if ".ngram_embedding.shard_" in name:
-            return self._place_ple_shard(data_torch, name)
+            idx = int(name.rpartition(".shard_")[2].partition(".")[0])
+            self._ple_shards[idx] = data_torch
+            self._ple_row_dim = int(data_torch.shape[-1])
+            n_parts = self.hparams["split_ngram_parts"]
+            if len(self._ple_shards) < n_parts:
+                return []
+            table = torch.cat([self._ple_shards[i] for i in range(n_parts)], dim=0)
+            self._ple_shards.clear()
+            name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD]
+            return [(name + ".weight", table)]
 
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
@@ -134,8 +143,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             ]
 
         # Gemma zero-centred gammas the inherited norm.weight rule misses
-        if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight",
-                          ".indexer.q_layernorm.weight", ".indexer.k_layernorm.weight")):
+        if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight")):
             return [(self.map_tensor_name(name), data_torch + 1)]
 
         if name.endswith(".ple.conv1d.weight"):
