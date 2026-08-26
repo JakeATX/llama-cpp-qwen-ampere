@@ -148,6 +148,7 @@ static __global__ void tq_prerotate_activation(
     dst[offset] = val;
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static __device__ __forceinline__ float tq3_cent_reg(uint32_t idx) {
     switch (idx & 7u) {
         case 0: return -1.996684f;
@@ -161,6 +162,7 @@ static __device__ __forceinline__ float tq3_cent_reg(uint32_t idx) {
         default: return 0.0f;
     }
 }
+#endif
 
 static __device__ __forceinline__ uint32_t tq3_extract_index_fast(const uint8_t * __restrict__ qs, int lane) {
     const int group = lane >> 3;
@@ -257,6 +259,14 @@ static __global__ void mul_mat_tq3_1s_multi(
         const int stride_col_y,
         const int stride_col_dst) {
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    __shared__ float s_lut[8];
+    if (threadIdx.y == 0 && threadIdx.x < 8) {
+        s_lut[threadIdx.x] = TQ3_CENTROIDS_WEIGHT[threadIdx.x];
+    }
+    __syncthreads();
+#endif
+
     const int row  = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
     if (row >= nrows_x) return;
 
@@ -269,7 +279,11 @@ static __global__ void mul_mat_tq3_1s_multi(
     for (int ib = 0; ib < blocks_per_row; ib++) {
         const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
         const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         const float w = tq3_cent_reg(idx) * d;
+#else
+        const float w = s_lut[idx] * d;
+#endif
 
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++) {
@@ -675,6 +689,14 @@ static __global__ void mul_mat_tq3_1s_moe(
     const int row = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
     if (row >= nrows_x) return;
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    __shared__ float s_lut[8];
+    if (threadIdx.y == 0 && threadIdx.x < 8) {
+        s_lut[threadIdx.x] = TQ3_CENTROIDS_WEIGHT[threadIdx.x];
+    }
+    __syncthreads();
+#endif
+
     const int expert_slot = blockIdx.y;
     const int sample      = blockIdx.z;
     const int expert      = ids[sample * ids_stride + expert_slot];
@@ -691,7 +713,11 @@ static __global__ void mul_mat_tq3_1s_moe(
     for (int ib = 0; ib < blocks_per_row; ib++) {
         const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
         const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         const float w = tq3_cent_reg(idx) * d;
+#else
+        const float w = s_lut[idx] * d;
+#endif
         sumf = __fmaf_rn(act[ib * QK_TQ3_0 + lane], w, sumf);
     }
 
