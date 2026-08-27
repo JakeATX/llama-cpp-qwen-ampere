@@ -9,7 +9,16 @@
 #include "turbo-quant.cuh"
 #include "convert.cuh"
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <mma.h>
+using namespace nvcuda;
+#define GGML_CUDA_USE_WMMA
+#endif
+
 #define MMVQ_TQ_NWARPS 4
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 // ============================================================================
 // Pre-rotate activation to q8_1 format (for TQ4_1S dp4a path)
@@ -139,12 +148,28 @@ static __global__ void tq_prerotate_activation(
     dst[offset] = val;
 }
 
-static __device__ __forceinline__ uint8_t tq3_extract_index(const uint8_t * __restrict__ qs, int lane) {
-    const int group = lane / 8;
-    const int lane_in_group = lane % 8;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __device__ __forceinline__ float tq3_cent_reg(uint32_t idx) {
+    switch (idx & 7u) {
+        case 0: return -1.996684f;
+        case 1: return -1.291398f;
+        case 2: return -0.740341f;
+        case 3: return -0.247508f;
+        case 4: return  0.230106f;
+        case 5: return  0.725222f;
+        case 6: return  1.277503f;
+        case 7: return  1.988943f;
+        default: return 0.0f;
+    }
+}
+#endif
+
+static __device__ __forceinline__ uint32_t tq3_extract_index_fast(const uint8_t * __restrict__ qs, int lane) {
+    const int group = lane >> 3;
+    const int shift = (lane & 7) * 3;
     const uint8_t * qp = qs + group * 3;
     const uint32_t packed = (uint32_t)qp[0] | ((uint32_t)qp[1] << 8) | ((uint32_t)qp[2] << 16);
-    return (packed >> (lane_in_group * 3)) & 7;
+    return (packed >> shift) & 7u;
 }
 
 // ============================================================================
@@ -234,11 +259,13 @@ static __global__ void mul_mat_tq3_1s_multi(
         const int stride_col_y,
         const int stride_col_dst) {
 
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     __shared__ float s_lut[8];
     if (threadIdx.y == 0 && threadIdx.x < 8) {
         s_lut[threadIdx.x] = TQ3_CENTROIDS_WEIGHT[threadIdx.x];
     }
     __syncthreads();
+#endif
 
     const int row  = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
     if (row >= nrows_x) return;
@@ -251,13 +278,17 @@ static __global__ void mul_mat_tq3_1s_multi(
 
     for (int ib = 0; ib < blocks_per_row; ib++) {
         const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint8_t idx = tq3_extract_index(x_row[ib].qs, lane);
+        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const float w = tq3_cent_reg(idx) * d;
+#else
         const float w = s_lut[idx] * d;
+#endif
 
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++) {
             const float act = vy_rot[j * stride_col_y + ib * QK_TQ3_0 + lane];
-            sumf[j] += act * w;
+            sumf[j] = __fmaf_rn(act, w, sumf[j]);
         }
     }
 
@@ -371,6 +402,260 @@ static void launch_tq3_1s_multi(
         src0_d, act_buf, dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst);
 }
 
+#if defined(GGML_CUDA_USE_WMMA)
+// ============================================================================
+// Multi-token TQ4_1S WMMA Tensor Core kernel (ncols_dst > 8, prompt processing)
+// ============================================================================
+
+static __device__ __forceinline__ float tq4_cent_float(uint32_t idx) {
+    switch (idx & 0xFu) {
+        case 0:  return -2.732590f;
+        case 1:  return -2.069017f;
+        case 2:  return -1.618046f;
+        case 3:  return -1.256231f;
+        case 4:  return -0.942340f;
+        case 5:  return -0.656759f;
+        case 6:  return -0.388048f;
+        case 7:  return -0.128395f;
+        case 8:  return  0.128395f;
+        case 9:  return  0.388048f;
+        case 10: return  0.656759f;
+        case 11: return  0.942340f;
+        case 12: return  1.256231f;
+        case 13: return  1.618046f;
+        case 14: return  2.069017f;
+        case 15: return  2.732590f;
+        default: return  0.0f;
+    }
+}
+
+template <int NWARPS>
+static __global__ void mul_mat_tq4_1s_wmma_kernel(
+        const void  * __restrict__ vx,
+        const float * __restrict__ vy_rot,
+        float       * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const int stride_col_y,
+        const int stride_col_dst) {
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x % 32;
+
+    const int warp_id_in_grid_m = blockIdx.y * NWARPS + warp_id;
+    const int warp_id_in_grid_n = blockIdx.x;
+
+    const int m_base = warp_id_in_grid_m * WMMA_M;
+    const int n_base = warp_id_in_grid_n * WMMA_N;
+
+    if (m_base >= nrows_x || n_base >= ncols_dst) return;
+
+    __shared__ half sh_a[NWARPS][WMMA_M][WMMA_K + 1];
+    __shared__ half sh_b[NWARPS][WMMA_K][WMMA_N + 1];
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> frag_b;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_c;
+
+    wmma::fill_fragment(frag_c, 0.0f);
+
+    const int blocks_per_row = ncols_x / QK_TQ4_1S;
+
+    for (int k_outer = 0; k_outer < ncols_x; k_outer += WMMA_K) {
+        const int elem_idx = lane * 8;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int flat = elem_idx + e;
+            const int r_local = flat / WMMA_K;
+            const int k_local = flat % WMMA_K;
+            const int r_global = m_base + r_local;
+            const int k_global = k_outer + k_local;
+
+            if (r_global < nrows_x && k_global < ncols_x) {
+                const int ib = k_global / QK_TQ4_1S;
+                const int lane_in_blk = k_global % QK_TQ4_1S;
+                const block_tq4_1s * blk = ((const block_tq4_1s *)vx) + (int64_t)r_global * blocks_per_row + ib;
+
+                const float d = (lane_in_blk < 16) ? __half2float(blk->d0) : __half2float(blk->d1);
+                const uint8_t idx = (blk->qs[lane_in_blk / 2] >> ((lane_in_blk & 1) * 4)) & 0xFu;
+                sh_a[warp_id][r_local][k_local] = __float2half(tq4_cent_float(idx) * d);
+            } else {
+                sh_a[warp_id][r_local][k_local] = __float2half(0.0f);
+            }
+        }
+
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int flat = elem_idx + e;
+            const int k_local = flat / WMMA_N;
+            const int n_local = flat % WMMA_N;
+            const int k_global = k_outer + k_local;
+            const int n_global = n_base + n_local;
+
+            if (n_global < ncols_dst && k_global < ncols_x) {
+                const float act = vy_rot[n_global * stride_col_y + k_global];
+                sh_b[warp_id][k_local][n_local] = __float2half(act);
+            } else {
+                sh_b[warp_id][k_local][n_local] = __float2half(0.0f);
+            }
+        }
+
+        __syncwarp();
+
+        wmma::load_matrix_sync(frag_a, &sh_a[warp_id][0][0], WMMA_K + 1);
+        wmma::load_matrix_sync(frag_b, &sh_b[warp_id][0][0], WMMA_N + 1);
+
+        wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+    }
+
+    __shared__ float sh_dst[NWARPS][WMMA_M][WMMA_N + 1];
+    wmma::store_matrix_sync(&sh_dst[warp_id][0][0], frag_c, WMMA_N + 1, wmma::mem_row_major);
+    __syncwarp();
+
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const int flat = lane * 8 + e;
+        const int r_local = flat / WMMA_N;
+        const int n_local = flat % WMMA_N;
+        const int r_global = m_base + r_local;
+        const int n_global = n_base + n_local;
+
+        if (r_global < nrows_x && n_global < ncols_dst) {
+            dst[n_global * stride_col_dst + r_global] = sh_dst[warp_id][r_local][n_local];
+        }
+    }
+}
+
+static void launch_tq4_1s_wmma(
+        const void * src0_d, const float * act_buf,
+        float * dst_d, int ncols_x, int nrows_x, int ncols_dst,
+        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+
+    constexpr int NWARPS = 4;
+    const dim3 block(NWARPS * 32, 1);
+    const dim3 grid((ncols_dst + WMMA_N - 1) / WMMA_N, (nrows_x + (WMMA_M * NWARPS) - 1) / (WMMA_M * NWARPS));
+
+    mul_mat_tq4_1s_wmma_kernel<NWARPS><<<grid, block, 0, stream>>>(
+        src0_d, act_buf, dst_d, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
+}
+
+// ============================================================================
+// Multi-token TQ3_1S WMMA Tensor Core kernel (ncols_dst > 8, prompt processing)
+// ============================================================================
+
+template <int NWARPS>
+static __global__ void mul_mat_tq3_1s_wmma_kernel(
+        const void  * __restrict__ vx,
+        const float * __restrict__ vy_rot,
+        float       * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const int stride_col_y,
+        const int stride_col_dst) {
+
+    const int warp_id = threadIdx.x / 32;
+    const int lane    = threadIdx.x % 32;
+
+    const int warp_id_in_grid_m = blockIdx.y * NWARPS + warp_id;
+    const int warp_id_in_grid_n = blockIdx.x;
+
+    const int m_base = warp_id_in_grid_m * WMMA_M;
+    const int n_base = warp_id_in_grid_n * WMMA_N;
+
+    if (m_base >= nrows_x || n_base >= ncols_dst) return;
+
+    __shared__ half sh_a[NWARPS][WMMA_M][WMMA_K + 1];
+    __shared__ half sh_b[NWARPS][WMMA_K][WMMA_N + 1];
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> frag_b;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> frag_c;
+
+    wmma::fill_fragment(frag_c, 0.0f);
+
+    const int blocks_per_row = ncols_x / QK_TQ3_0;
+
+    for (int k_outer = 0; k_outer < ncols_x; k_outer += WMMA_K) {
+        const int elem_idx = lane * 8;
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int flat = elem_idx + e;
+            const int r_local = flat / WMMA_K;
+            const int k_local = flat % WMMA_K;
+            const int r_global = m_base + r_local;
+            const int k_global = k_outer + k_local;
+
+            if (r_global < nrows_x && k_global < ncols_x) {
+                const int ib = k_global / QK_TQ3_0;
+                const int lane_in_blk = k_global % QK_TQ3_0;
+                const block_tq3_1s * blk = ((const block_tq3_1s *)vx) + (int64_t)r_global * blocks_per_row + ib;
+
+                const float d = (lane_in_blk < 16) ? __half2float(blk->d0) : __half2float(blk->d1);
+                const uint32_t idx = tq3_extract_index_fast(blk->qs, lane_in_blk);
+                sh_a[warp_id][r_local][k_local] = __float2half(tq3_cent_reg(idx) * d);
+            } else {
+                sh_a[warp_id][r_local][k_local] = __float2half(0.0f);
+            }
+        }
+
+        #pragma unroll
+        for (int e = 0; e < 8; e++) {
+            const int flat = elem_idx + e;
+            const int k_local = flat / WMMA_N;
+            const int n_local = flat % WMMA_N;
+            const int k_global = k_outer + k_local;
+            const int n_global = n_base + n_local;
+
+            if (n_global < ncols_dst && k_global < ncols_x) {
+                const float act = vy_rot[n_global * stride_col_y + k_global];
+                sh_b[warp_id][k_local][n_local] = __float2half(act);
+            } else {
+                sh_b[warp_id][k_local][n_local] = __float2half(0.0f);
+            }
+        }
+
+        __syncwarp();
+
+        wmma::load_matrix_sync(frag_a, &sh_a[warp_id][0][0], WMMA_K + 1);
+        wmma::load_matrix_sync(frag_b, &sh_b[warp_id][0][0], WMMA_N + 1);
+
+        wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+    }
+
+    __shared__ float sh_dst[NWARPS][WMMA_M][WMMA_N + 1];
+    wmma::store_matrix_sync(&sh_dst[warp_id][0][0], frag_c, WMMA_N + 1, wmma::mem_row_major);
+    __syncwarp();
+
+    #pragma unroll
+    for (int e = 0; e < 8; e++) {
+        const int flat = lane * 8 + e;
+        const int r_local = flat / WMMA_N;
+        const int n_local = flat % WMMA_N;
+        const int r_global = m_base + r_local;
+        const int n_global = n_base + n_local;
+
+        if (r_global < nrows_x && n_global < ncols_dst) {
+            dst[n_global * stride_col_dst + r_global] = sh_dst[warp_id][r_local][n_local];
+        }
+    }
+}
+
+static void launch_tq3_1s_wmma(
+        const void * src0_d, const float * act_buf,
+        float * dst_d, int ncols_x, int nrows_x, int ncols_dst,
+        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+
+    constexpr int NWARPS = 4;
+    const dim3 block(NWARPS * 32, 1);
+    const dim3 grid((ncols_dst + WMMA_N - 1) / WMMA_N, (nrows_x + (WMMA_M * NWARPS) - 1) / (WMMA_M * NWARPS));
+
+    mul_mat_tq3_1s_wmma_kernel<NWARPS><<<grid, block, 0, stream>>>(
+        src0_d, act_buf, dst_d, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
+}
+#endif // defined(GGML_CUDA_USE_WMMA)
+
 // ============================================================================
 // MoE (MUL_MAT_ID) matvec: capture-safe device-side expert routing.
 //
@@ -401,14 +686,16 @@ static __global__ void mul_mat_tq3_1s_moe(
         const int64_t stride_channel_dst,      // elements to next expert slot in dst
         const int64_t stride_sample_dst) {     // elements to next sample in dst
 
+    const int row = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
+    if (row >= nrows_x) return;
+
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     __shared__ float s_lut[8];
     if (threadIdx.y == 0 && threadIdx.x < 8) {
         s_lut[threadIdx.x] = TQ3_CENTROIDS_WEIGHT[threadIdx.x];
     }
     __syncthreads();
-
-    const int row = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
-    if (row >= nrows_x) return;
+#endif
 
     const int expert_slot = blockIdx.y;
     const int sample      = blockIdx.z;
@@ -425,9 +712,13 @@ static __global__ void mul_mat_tq3_1s_moe(
     float sumf = 0.0f;
     for (int ib = 0; ib < blocks_per_row; ib++) {
         const float d = (lane < 16) ? __half2float(x_row[ib].d0) : __half2float(x_row[ib].d1);
-        const uint8_t idx = tq3_extract_index(x_row[ib].qs, lane);
+        const uint32_t idx = tq3_extract_index_fast(x_row[ib].qs, lane);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        const float w = tq3_cent_reg(idx) * d;
+#else
         const float w = s_lut[idx] * d;
-        sumf += act[ib * QK_TQ3_0 + lane] * w;
+#endif
+        sumf = __fmaf_rn(act[ib * QK_TQ3_0 + lane], w, sumf);
     }
 
     #pragma unroll
@@ -692,15 +983,46 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
         const int stride_col_y   = ncols_x / 32;  // q8_1 blocks per column
         const int stride_col_dst = nrows_x;
 
-        switch (ncols_dst) {
-            case 1: launch_tq4_1s_multi<1>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-            case 2: launch_tq4_1s_multi<2>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-            case 3: launch_tq4_1s_multi<3>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-            case 4: launch_tq4_1s_multi<4>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-            case 5: launch_tq4_1s_multi<5>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-            case 6: launch_tq4_1s_multi<6>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-            case 7: launch_tq4_1s_multi<7>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-            case 8: launch_tq4_1s_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+        if (ncols_dst <= 8) {
+            switch (ncols_dst) {
+                case 1: launch_tq4_1s_multi<1>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 2: launch_tq4_1s_multi<2>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 3: launch_tq4_1s_multi<3>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 4: launch_tq4_1s_multi<4>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 5: launch_tq4_1s_multi<5>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 6: launch_tq4_1s_multi<6>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 7: launch_tq4_1s_multi<7>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                case 8: launch_tq4_1s_multi<8>(src0_d, q8_1_buf.get(), dst_d, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+            }
+        } else {
+#if defined(GGML_CUDA_USE_WMMA)
+            // Large prefill: Fused Tensor Core (WMMA) path
+            ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_total_elements);
+            {
+                const int n_total_blocks = n_total_elements / 32;
+                const int wpb = 4;
+                const dim3 block(32, wpb);
+                const dim3 grid((n_total_blocks + wpb - 1) / wpb);
+                tq_prerotate_activation<<<grid, block, 0, stream>>>(src1_d, act_buf.get(), n_total_elements);
+            }
+            launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+#else
+            for (int j = 0; j < ncols_dst; j += 8) {
+                const int batch = min(8, ncols_dst - j);
+                const block_q8_1 * q8_j = q8_1_buf.get() + j * stride_col_y;
+                float * dst_j = dst_d + j * nrows_x;
+                switch (batch) {
+                    case 1: launch_tq4_1s_multi<1>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 2: launch_tq4_1s_multi<2>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 3: launch_tq4_1s_multi<3>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 4: launch_tq4_1s_multi<4>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 5: launch_tq4_1s_multi<5>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 6: launch_tq4_1s_multi<6>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 7: launch_tq4_1s_multi<7>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    case 8: launch_tq4_1s_multi<8>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                }
+            }
+#endif
         }
     } else {
         // Scalar float path: TQ3_1S (all vendors) + TQ4_1S on AMD (dp4a regresses on RDNA4).
@@ -736,7 +1058,14 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                 case 8: LAUNCH_SCALAR(8, src0_d, act_buf.get(), dst_d); break;
             }
         } else {
-            // Large prefill: batch in groups of 8
+#if defined(GGML_CUDA_USE_WMMA)
+            // Large prefill: Fused Tensor Core (WMMA) path
+            if (is_tq4) {
+                launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+            } else {
+                launch_tq3_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+            }
+#else
             for (int j = 0; j < ncols_dst; j += 8) {
                 const int batch = min(8, ncols_dst - j);
                 const float * act_j = act_buf.get() + j * ncols_x;
@@ -752,6 +1081,7 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
                     case 8: LAUNCH_SCALAR(8, src0_d, act_j, dst_j); break;
                 }
             }
+#endif
         }
         #undef LAUNCH_SCALAR
     }

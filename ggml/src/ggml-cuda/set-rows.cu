@@ -331,19 +331,33 @@ static __global__ void k_set_rows_turbo3(
     }
     __syncthreads();
 
-#define WHT_STAGE_SHARED(h) \
-    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    const int lane = j & 31;
+    float val = x[j];
+
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+
+    x[j] = val;
     __syncthreads();
 
-    // Butterfly stages: loop from h=1 to h<GROUP_SIZE, doubling each time
-    WHT_STAGE_SHARED(1)
-    WHT_STAGE_SHARED(2)
-    WHT_STAGE_SHARED(4)
-    WHT_STAGE_SHARED(8)
-    WHT_STAGE_SHARED(16)
-    WHT_STAGE_SHARED(32)
-    if (GROUP_SIZE == 128) { WHT_STAGE_SHARED(64) }
-#undef WHT_STAGE_SHARED
+    if (j % 64 < 32) {
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b;
+        x[j + 32] = a - b;
+    }
+    __syncthreads();
+
+    if (GROUP_SIZE == 128) {
+        if (j % 128 < 64) {
+            float a = x[j], b = x[j + 64];
+            x[j] = a + b;
+            x[j + 64] = a - b;
+        }
+        __syncthreads();
+    }
 
     constexpr float inv_sqrt_group = (GROUP_SIZE == 128) ? 0.08838834764831845f : 0.125f;
     if (GROUP_SIZE == 128) {
@@ -360,7 +374,6 @@ static __global__ void k_set_rows_turbo3(
     // ---- Step 6: Pack qs and signs (warp-cooperative, no atomics) ----
     // Each warp handles 32 elements. With QK_TURBO3 > WARP_SIZE, multiple warps
     // share one block and write to different byte offsets within it.
-    const int lane    = j % WARP_SIZE;
     const int elem_in_block = j % QK_TURBO3;
     block_turbo3_0 * blk = blk_base + (j / QK_TURBO3);
 
@@ -699,18 +712,33 @@ static __global__ void k_set_rows_turbo2(
     }
     __syncthreads();
 
-#define WHT_STAGE_SHARED_T2(h) \
-    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    const int lane = j & 31;
+    float val = x[j];
+
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+
+    x[j] = val;
     __syncthreads();
 
-    WHT_STAGE_SHARED_T2(1)
-    WHT_STAGE_SHARED_T2(2)
-    WHT_STAGE_SHARED_T2(4)
-    WHT_STAGE_SHARED_T2(8)
-    WHT_STAGE_SHARED_T2(16)
-    WHT_STAGE_SHARED_T2(32)
-    if (GROUP_SIZE == 128) { WHT_STAGE_SHARED_T2(64) }
-#undef WHT_STAGE_SHARED_T2
+    if (j % 64 < 32) {
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b;
+        x[j + 32] = a - b;
+    }
+    __syncthreads();
+
+    if (GROUP_SIZE == 128) {
+        if (j % 128 < 64) {
+            float a = x[j], b = x[j + 64];
+            x[j] = a + b;
+            x[j + 64] = a - b;
+        }
+        __syncthreads();
+    }
 
     constexpr float inv_sqrt_group = (GROUP_SIZE == 128) ? 0.08838834764831845f : 0.125f;
     if (GROUP_SIZE == 128) {
@@ -727,7 +755,6 @@ static __global__ void k_set_rows_turbo2(
     // ---- Step 6: Pack qs (warp-cooperative, no atomics) ----
     // Each warp handles 32 elements. With QK_TURBO2 > WARP_SIZE, multiple warps
     // share one block and write to different byte offsets within it.
-    const int lane    = j % WARP_SIZE;
     const int elem_in_block = j % QK_TURBO2;
     block_turbo2_0 * blk = blk_base + (j / QK_TURBO2);
 
@@ -1037,18 +1064,31 @@ static __global__ void k_set_rows_turbo4(
     x[j] *= TURBO_WHT_SIGNS1[j];
     __syncthreads();
 
-#define WHT_STAGE_SHARED_T4(h) \
-    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    const int lane = j & 31;
+    float val = x[j];
+
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+
+    x[j] = val;
     __syncthreads();
 
-    WHT_STAGE_SHARED_T4(1)
-    WHT_STAGE_SHARED_T4(2)
-    WHT_STAGE_SHARED_T4(4)
-    WHT_STAGE_SHARED_T4(8)
-    WHT_STAGE_SHARED_T4(16)
-    WHT_STAGE_SHARED_T4(32)
-    WHT_STAGE_SHARED_T4(64)
-#undef WHT_STAGE_SHARED_T4
+    if (j % 64 < 32) {
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b;
+        x[j + 32] = a - b;
+    }
+    __syncthreads();
+
+    if (j % 128 < 64) {
+        float a = x[j], b = x[j + 64];
+        x[j] = a + b;
+        x[j + 64] = a - b;
+    }
+    __syncthreads();
 
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
     x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
@@ -1061,7 +1101,6 @@ static __global__ void k_set_rows_turbo4(
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
     // 2 elements per byte, 4 bits each.
     // Thread pairs (j, j+1) share a qs byte.
-    const int lane = j % WARP_SIZE;
     const uint8_t my_nibble = idx & 0xF;
     uint8_t qs_byte = 0;
     // Gather nibble from partner thread
