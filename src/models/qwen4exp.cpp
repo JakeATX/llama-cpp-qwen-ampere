@@ -29,21 +29,6 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer_all, false);
 
-    ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
-    ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM, hparams.ple_heads_per_ngram);
-    ml.get_key(LLM_KV_PLE_CONV_KERNEL,     hparams.ple_conv_kernel);
-    ml.get_key(LLM_KV_PLE_EOS_TOKEN_ID,    hparams.ple_eos_token_id);
-    ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
-
-    hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
-    hparams.ple_head_dim = hparams.n_embd_per_layer;
-    GGML_ASSERT(hparams.ple_ngram_size >= 2 && hparams.ple_ngram_size <= LLAMA_MAX_PLE_NGRAM);
-    GGML_ASSERT(hparams.ple_n_heads > 0 && hparams.ple_n_heads <= LLAMA_MAX_PLE_HEADS);
-
-    ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
-    ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_head_offsets);
-    ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_head_vocab_sizes);
-
     std::fill(hparams.is_ple_impl.begin(), hparams.is_ple_impl.end(), 0);
     hparams.ple_n_heads = 0;
 
@@ -110,12 +95,14 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     }
 
     // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
-    const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-    const auto * ple_w = ml.get_weight(ple_name.c_str());
-    GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
-    const int64_t ple_rows = ple_w->tensor->ne[1];
-    per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                       { hparams.ple_head_dim, ple_rows }, 0);
+    if (hparams.ple_n_heads > 0) {
+        const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        const auto * ple_w = ml.get_weight(ple_name.c_str());
+        GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
+        const int64_t ple_rows = ple_w->tensor->ne[1];
+        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                           { hparams.ple_head_dim, ple_rows }, 0);
+    }
 
     for (int il = 0; il < n_layer; ++il) {
         auto & layer = layers[il];
