@@ -599,6 +599,8 @@ struct llama_model {
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
+    // kimi-k3 final cross-layer residual mix
+    struct ggml_tensor * output_res_score = nullptr;
 
     // NVFP4 per-tensor scale2, input_scale for LM head
     struct ggml_tensor * output_s    = nullptr;
@@ -612,6 +614,11 @@ struct llama_model {
     struct ggml_tensor * hc_head_fn    = nullptr;
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
+
+    // qwen4exp final hyper-connection mixer
+    struct ggml_tensor * hc_head_norm = nullptr;
+    struct ggml_tensor * hc_head_down = nullptr;
+    struct ggml_tensor * hc_head_up   = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
