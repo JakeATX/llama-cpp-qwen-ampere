@@ -695,6 +695,35 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
     tensor_config tc = get_tensor_config();
+
+    const bool arch_splits_attention_by_kv_group =
+            ud->model->arch == LLM_ARCH_QWEN3NEXT ||
+            ud->model->arch == LLM_ARCH_QWEN35     ||
+            ud->model->arch == LLM_ARCH_QWEN35MOE  ||
+            ud->model->arch == LLM_ARCH_QWEN4EXP;
+    const bool is_attention_tensor =
+            std::regex_match(tensor_name, pattern_q_weight)        ||
+            std::regex_match(tensor_name, pattern_kv_weight)       ||
+            std::regex_match(tensor_name, pattern_qkv_weight)      ||
+            std::regex_match(tensor_name, pattern_q_bias)          ||
+            std::regex_match(tensor_name, pattern_kv_bias)         ||
+            std::regex_match(tensor_name, pattern_qkv_bias)        ||
+            std::regex_match(tensor_name, pattern_qk_norm)         ||
+            std::regex_match(tensor_name, pattern_kv_cache)        ||
+            std::regex_match(tensor_name, pattern_attn_sinks)      ||
+            std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+            std::regex_match(tensor_name, pattern_attn_out_weight) ||
+            std::regex_match(tensor_name, pattern_attn_out_bias);
+
+    // Dense GQA attention is split in whole KV groups. If there are fewer groups than devices,
+    // the rounded split contains zero-width slices. The meta backend cannot execute that graph
+    // correctly, so replicate only the affected attention subgraph and keep the rest of the
+    // layer tensor-split.
+    if (arch_splits_attention_by_kv_group && is_attention_tensor && !hparams.is_recr(tc.il) &&
+            hparams.n_head_kv(tc.il) < ud->n_devices) {
+        tc.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+    }
+
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
