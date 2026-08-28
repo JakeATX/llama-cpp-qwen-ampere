@@ -462,11 +462,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_ds4_q_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
             }
-            if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-            }
-            if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            if (std::regex_match(tensor_name, pattern_attn_out_a_weight) ||
+                    std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
@@ -807,9 +805,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(g_s > 0);
             const int64_t n_units = (ne_s + g_s - 1) / g_s;
             if (n_units < (int64_t) ud->n_devices) {
+                if (n_units == 1) {
+                    GGML_ABORT("cannot tensor-split %s: segment %zu has only one splittable unit for %zu devices; "
+                            "this tensor must be mirrored or use a different split mode",
+                            tensor_name.c_str(), is, ud->n_devices);
+                }
                 GGML_ABORT("cannot tensor-split %s: segment %zu has only %lld splittable units for %zu devices; "
-                        "use fewer devices or a different split mode",
-                        tensor_name.c_str(), is, (long long) n_units, ud->n_devices);
+                            "use at most %lld devices or a different split mode",
+                            tensor_name.c_str(), is, (long long) n_units, ud->n_devices, (long long) n_units);
             }
 
             int64_t low = 0;
