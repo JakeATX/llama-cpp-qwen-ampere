@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterable
 
 import torch
@@ -8,13 +9,12 @@ from torch import Tensor
 import gguf
 import numpy as np
 
-from .base import ModelBase, MmprojModel
+from .base import ModelBase
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
-@ModelBase.example("unsloth/Qwen3.8-Flash-Next")
 class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     """Qwen3.8-Flash-Next.
 
@@ -36,8 +36,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_shard_rows: dict[int, int] = {}
         self._ple_row_dim: int | None = None
         self._ple_rows_per_shard: int | None = None
-        self._ple_map = None
-        self._ple_path = None
+        self._ple_map: np.memmap | None = None
+        self._ple_path: Path | None = None
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -106,6 +106,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if isinstance(eos, list):
             # the PLE hash resets n-grams on the primary EOS
             return int(eos[-1])
+        if eos is None:
+            raise ValueError("eos_token_id is required: the PLE hash resets its n-grams on it")
         return int(eos)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
@@ -121,16 +123,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return []
 
         if ".ngram_embedding.shard_" in name:
-            idx = int(name.rpartition(".shard_")[2].partition(".")[0])
-            self._ple_shards[idx] = data_torch
-            self._ple_row_dim = int(data_torch.shape[-1])
-            n_parts = self.hparams["split_ngram_parts"]
-            if len(self._ple_shards) < n_parts:
-                return []
-            table = torch.cat([self._ple_shards[i] for i in range(n_parts)], dim=0)
-            self._ple_shards.clear()
-            name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD]
-            return [(name + ".weight", table)]
+            return self._place_ple_shard(data_torch, name)
 
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
@@ -143,7 +136,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             ]
 
         # Gemma zero-centred gammas the inherited norm.weight rule misses
-        if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight")):
+        if name.endswith((".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight",
+                          ".indexer.q_layernorm.weight", ".indexer.k_layernorm.weight")):
             return [(self.map_tensor_name(name), data_torch + 1)]
 
         if name.endswith(".ple.conv1d.weight"):
@@ -194,6 +188,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         return [(gguf_name + ".weight", table)]
 
     def _write_ple_shard(self, idx: int, shard: Tensor) -> None:
+        assert self._ple_map is not None and self._ple_rows_per_shard is not None
 
         rows = int(shard.shape[0])
         if idx != self.hparams["split_ngram_parts"] - 1 and rows != self._ple_rows_per_shard:
@@ -211,6 +206,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         del eager
 
     def _finish_ple_table(self, total_rows: int):
+        assert self._ple_map is not None and self._ple_path is not None
+        assert self._ple_row_dim is not None
 
         self._ple_map.flush()
         del self._ple_map
@@ -242,6 +239,5 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration")
-@ModelBase.example("unsloth/Qwen3.8-Flash-Next")
 class Qwen4ExpVisionModel(Qwen3VLVisionModel):
     """The vision tower is an unmodified Qwen3-VL ViT."""

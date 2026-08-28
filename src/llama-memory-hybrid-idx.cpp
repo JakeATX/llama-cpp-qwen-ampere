@@ -55,7 +55,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            nullptr, filter_idx, nullptr, nullptr);
+            nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -249,8 +249,10 @@ static void ple_hist_truncate(llama_memory_hybrid_idx::ple_history & h, llama_po
 
 void llama_memory_hybrid_idx::ple_hist_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id < 0) {
-        for (auto & it : ple_hist) {
-            ple_hist_rm(it.first, p0, p1);
+        for (auto it = ple_hist.begin(); it != ple_hist.end(); ) {
+            const llama_seq_id id = it->first;
+            ++it;
+            ple_hist_rm(id, p0, p1);
         }
         return;
     }
@@ -435,7 +437,7 @@ void llama_memory_hybrid_idx::ple_hist_state_read(llama_io_read_i & io, llama_se
 
         // the window is never longer than ple_ngram_size - 1, so a larger count is a corrupt
         // blob and would size an allocation from the file
-        if (n_toks > 64) {
+        if (n_toks > LLAMA_MAX_PLE_NGRAM - 1) {
             throw std::runtime_error("qwen4exp PLE history: implausible token count in state blob");
         }
 

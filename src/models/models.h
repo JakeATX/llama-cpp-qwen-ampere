@@ -2191,17 +2191,14 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * gate,
                             int   layer);
 
-        // build_rs writes the state tensor in place, so both convolutions share one gather per layer
-        std::map<int, ggml_tensor *> rs_rows;
+        std::map<ggml_tensor *, ggml_tensor *> rs_rows;
 
-        // conv history at an explicit offset: delta-net and PLE share the row
         ggml_tensor * build_conv_state_at(
              llm_graph_input_rs * inp,
                     ggml_tensor * conv_states_all,
                     ggml_tensor * x,
                         int64_t   state_cols,
                         int64_t   channels,
-                        int64_t   row_offset,
                             int   il);
 
         ggml_tensor * build_ple(
@@ -2372,5 +2369,4 @@ struct llm_build_dflash_decode : public llm_graph_context {
 struct llm_build_openai_moe_iswa : public llm_graph_context {
     llm_build_openai_moe_iswa(const llama_model & model, const llm_graph_params & params);
 };
-
 

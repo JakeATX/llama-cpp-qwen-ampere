@@ -11,6 +11,7 @@ GGUF_MAGIC             = 0x46554747  # "GGUF"
 GGUF_VERSION           = 3
 GGUF_DEFAULT_ALIGNMENT = 32
 GGML_QUANT_VERSION     = 2  # GGML_QNT_VERSION from ggml.h
+GGML_MAX_DIMS          = 4  # GGML_MAX_DIMS from ggml.h
 
 #
 # metadata keys
@@ -468,6 +469,7 @@ class MODEL_ARCH(IntEnum):
     QWEN3VLMOE       = auto()
     QWEN35           = auto()
     QWEN35MOE        = auto()
+    QWEN4EXP         = auto()
     PHI2             = auto()
     PHI3             = auto()
     PHIMOE           = auto()
@@ -602,6 +604,9 @@ class MODEL_TENSOR(IntEnum):
     HC_HEAD_FN           = auto()
     HC_HEAD_BASE         = auto()
     HC_HEAD_SCALE        = auto()
+    HC_HEAD_NORM         = auto() # qwen4exp
+    HC_HEAD_DOWN         = auto() # qwen4exp
+    HC_HEAD_UP           = auto() # qwen4exp
     ROPE_FREQS           = auto()
     ROPE_FACTORS_LONG    = auto()
     ROPE_FACTORS_SHORT   = auto()
@@ -736,9 +741,23 @@ class MODEL_TENSOR(IntEnum):
     HC_ATTN_FN           = auto()
     HC_ATTN_BASE         = auto()
     HC_ATTN_SCALE        = auto()
+    HC_ATTN_NORM         = auto() # qwen4exp
+    HC_ATTN_DOWN         = auto() # qwen4exp
+    HC_ATTN_UP           = auto() # qwen4exp
+    HC_ATTN_INJECT       = auto() # qwen4exp
     HC_FFN_FN            = auto()
     HC_FFN_BASE          = auto()
     HC_FFN_SCALE         = auto()
+    HC_FFN_NORM          = auto() # qwen4exp
+    HC_FFN_DOWN          = auto() # qwen4exp
+    HC_FFN_UP            = auto() # qwen4exp
+    HC_FFN_INJECT        = auto() # qwen4exp
+    PLE_KEY              = auto() # qwen4exp
+    PLE_VALUE            = auto() # qwen4exp
+    PLE_NORM_KEY         = auto() # qwen4exp
+    PLE_NORM_QUERY       = auto() # qwen4exp
+    PLE_NORM_CONV        = auto() # qwen4exp
+    PLE_CONV1D           = auto() # qwen4exp
     ATTN_COMPRESSOR_WKV  = auto()
     ATTN_COMPRESSOR_WGATE = auto()
     ATTN_COMPRESSOR_APE  = auto()
@@ -1027,6 +1046,10 @@ class MODEL_TENSOR(IntEnum):
     A_CTC_OUT              = auto()
     A_CTC_OUT_MID          = auto()
     A_ENC_ATTN_REL_POS_EMB = auto()
+    A_ENC_SE_CONV1         = auto() # qwen3tts
+    A_ENC_SE_CONV2         = auto() # qwen3tts
+    A_ENC_ASP_ATTN         = auto() # qwen3tts
+    A_ENC_ASP_TDNN         = auto() # qwen3tts
     # audio qformer projector
     A_QF_PROJ_QUERY        = auto()
     A_QF_PROJ_NORM         = auto()
@@ -1081,6 +1104,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.QWEN3VLMOE:       "qwen3vlmoe",
     MODEL_ARCH.QWEN35:           "qwen35",
     MODEL_ARCH.QWEN35MOE:        "qwen35moe",
+    MODEL_ARCH.QWEN4EXP:         "qwen4exp",
     MODEL_ARCH.PHI2:             "phi2",
     MODEL_ARCH.PHI3:             "phi3",
     MODEL_ARCH.PHIMOE:           "phimoe",
@@ -1210,6 +1234,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_HEAD_FN:                "output_hc_fn",
     MODEL_TENSOR.HC_HEAD_BASE:              "output_hc_base",
     MODEL_TENSOR.HC_HEAD_SCALE:             "output_hc_scale",
+    MODEL_TENSOR.HC_HEAD_NORM:              "output_hc_norm",                 # qwen4exp
+    MODEL_TENSOR.HC_HEAD_DOWN:              "output_hc_down",                 # qwen4exp
+    MODEL_TENSOR.HC_HEAD_UP:                "output_hc_up",                   # qwen4exp
     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
     MODEL_TENSOR.OUTPUT:                    "output",
     MODEL_TENSOR.DENSE_2_OUT:               "dense_2", # embeddinggemma 2_Dense
@@ -1351,9 +1378,23 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_ATTN_FN:                "blk.{bid}.hc_attn_fn",
     MODEL_TENSOR.HC_ATTN_BASE:              "blk.{bid}.hc_attn_base",
     MODEL_TENSOR.HC_ATTN_SCALE:             "blk.{bid}.hc_attn_scale",
+    MODEL_TENSOR.HC_ATTN_NORM:              "blk.{bid}.hc_attn_norm",         # qwen4exp
+    MODEL_TENSOR.HC_ATTN_DOWN:              "blk.{bid}.hc_attn_down",         # qwen4exp
+    MODEL_TENSOR.HC_ATTN_UP:                "blk.{bid}.hc_attn_up",           # qwen4exp
+    MODEL_TENSOR.HC_ATTN_INJECT:            "blk.{bid}.hc_attn_inject",       # qwen4exp
     MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
     MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
     MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
+    MODEL_TENSOR.HC_FFN_NORM:               "blk.{bid}.hc_ffn_norm",          # qwen4exp
+    MODEL_TENSOR.HC_FFN_DOWN:               "blk.{bid}.hc_ffn_down",          # qwen4exp
+    MODEL_TENSOR.HC_FFN_UP:                 "blk.{bid}.hc_ffn_up",            # qwen4exp
+    MODEL_TENSOR.HC_FFN_INJECT:             "blk.{bid}.hc_ffn_inject",        # qwen4exp
+    MODEL_TENSOR.PLE_KEY:                   "blk.{bid}.ple_key",              # qwen4exp
+    MODEL_TENSOR.PLE_VALUE:                 "blk.{bid}.ple_value",            # qwen4exp
+    MODEL_TENSOR.PLE_NORM_KEY:              "blk.{bid}.ple_norm_key",         # qwen4exp
+    MODEL_TENSOR.PLE_NORM_QUERY:            "blk.{bid}.ple_norm_query",       # qwen4exp
+    MODEL_TENSOR.PLE_NORM_CONV:             "blk.{bid}.ple_norm_conv",        # qwen4exp
+    MODEL_TENSOR.PLE_CONV1D:                "blk.{bid}.ple_conv1d",           # qwen4exp
     MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_kv",
     MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_gate",
     MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
@@ -1625,6 +1666,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_CTC_OUT:                 "a.enc_ctc_out",
     MODEL_TENSOR.A_CTC_OUT_MID:             "a.enc_ctc_out_mid",
     MODEL_TENSOR.A_ENC_ATTN_REL_POS_EMB:    "a.blk.{bid}.attn_rel_pos_emb",
+    MODEL_TENSOR.A_ENC_SE_CONV1:            "a.blk.{bid}.se_conv1",
+    MODEL_TENSOR.A_ENC_SE_CONV2:            "a.blk.{bid}.se_conv2",
+    MODEL_TENSOR.A_ENC_ASP_ATTN:            "a.asp_attn",
+    MODEL_TENSOR.A_ENC_ASP_TDNN:            "a.asp_tdnn",
     # qformer projector
     MODEL_TENSOR.A_QF_PROJ_QUERY:           "a.proj_query",
     MODEL_TENSOR.A_QF_PROJ_NORM:            "a.proj_norm",
@@ -1854,6 +1899,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.A_CTC_OUT,
         MODEL_TENSOR.A_CTC_OUT_MID,
         MODEL_TENSOR.A_ENC_ATTN_REL_POS_EMB,
+        MODEL_TENSOR.A_ENC_SE_CONV1,
+        MODEL_TENSOR.A_ENC_SE_CONV2,
+        MODEL_TENSOR.A_ENC_ASP_ATTN,
+        MODEL_TENSOR.A_ENC_ASP_TDNN,
         # qformer projector
         MODEL_TENSOR.A_QF_PROJ_QUERY,
         MODEL_TENSOR.A_QF_PROJ_NORM,
@@ -4934,7 +4983,6 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ4_1S        = 44  # except 1d tensors
     MOSTLY_Q5_CR         = 45  # except 1d tensors, ConvRot-rotated Q5_0
     MOSTLY_Q6_CR         = 46  # except 1d tensors, ConvRot-rotated Q6_K
-
 
     GUESSED              = 1024  # not specified in the model file
 
