@@ -462,9 +462,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_ds4_q_b_weight)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_a.weight");
             }
-            if (std::regex_match(tensor_name, pattern_attn_out_a_weight) ||
-                    std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
+                // wo_a stores the output groups consecutively on axis 1
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output_b.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
+                // match wo_a's per-group split along the contraction dimension
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
             }
             if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                     std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
@@ -698,7 +702,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
                 if (std::regex_match(tensor_name, pattern_attn_out_a_weight)) {
                     GGML_ASSERT(segments.size() == 1);
-                    return {1};
+                    GGML_ASSERT(hparams.dsv4_o_lora_rank % blck_size == 0);
+                    return {hparams.dsv4_o_lora_rank};
                 }
                 if (std::regex_match(tensor_name, pattern_attn_out_b_weight)) {
                     GGML_ASSERT(segments.size() == 1);
