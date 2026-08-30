@@ -384,17 +384,21 @@ static __global__ void k_set_rows_turbo3(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[qs_byte_idx] = qs_byte;
 
-    // Pack signs: 8 elements per byte, 1 bit each.  __ballot_sync across warp.
-    // Ballot is per-warp (32 bits); extract local byte, write to global position in block.
-    const uint32_t ballot = __ballot_sync(0xffffffff, (idx >> 2) & 1);
-    const int local_signs_byte = lane / 8;             // byte within 32-bit ballot (0..3)
+    // Pack signs: 8 elements per byte, 1 bit each. Gather each 8-lane group's sign bits
+    // via a width-32 shuffle so the group is self-contained on wave64 (a __ballot_sync
+    // returns a 64-bit mask there and would truncate into uint32_t). Same idiom as qs.
+    const uint8_t my_sign = (idx >> 2) & 1;
     const int global_signs_byte = elem_in_block / 8;   // byte within block's signs array
-    const uint8_t signs_byte = (uint8_t)((ballot >> (local_signs_byte * 8)) & 0xFF);
+    uint8_t signs_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        signs_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
     if (lane % 8 == 0) blk->signs[global_signs_byte] = signs_byte;
 
     // ---- Step 7: Reconstruction norm (parallel, same pattern as step 2) ----
@@ -513,14 +517,18 @@ static __global__ void k_set_rows_turbo3_tail(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[lane / 4] = qs_byte;
 
-    const uint32_t ballot = __ballot_sync(0xffffffff, (idx >> 2) & 1);
+    const uint8_t my_sign = (idx >> 2) & 1;
     const int signs_byte_idx = lane / 8;
-    const uint8_t signs_byte = (uint8_t)((ballot >> (signs_byte_idx * 8)) & 0xFF);
+    uint8_t signs_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        signs_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
     if (lane % 8 == 0) blk->signs[signs_byte_idx] = signs_byte;
 
     // ---- Reconstruction norm ----
@@ -763,7 +771,7 @@ static __global__ void k_set_rows_turbo2(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[elem_in_block / 4] = qs_byte;
@@ -877,7 +885,7 @@ static __global__ void k_set_rows_turbo2_tail(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[lane / 4] = qs_byte;
@@ -1104,7 +1112,7 @@ static __global__ void k_set_rows_turbo4(
     const uint8_t my_nibble = idx & 0xF;
     uint8_t qs_byte = 0;
     // Gather nibble from partner thread
-    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1);
+    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         qs_byte = my_nibble | (partner_nibble << 4);
         blk->qs[j / 2] = qs_byte;
