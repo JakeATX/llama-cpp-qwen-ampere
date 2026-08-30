@@ -125,6 +125,9 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cu
     const ggml_tensor * Q = dst->src[0]; // ncols2 == 8: (1,8),(2,8),(4,8)
     if (Q->ne[1] <= 1) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 1, 8, type_K, type_V>(ctx, dst); return; }
     if (Q->ne[1] <= 2) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 2, 8, type_K, type_V>(ctx, dst); return; }
+    if constexpr (DKQ == 256 && DV == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO3_0) {
+        if (Q->ne[1] > 4) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst); return; }
+    }
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst); // Q->ne[1] in {3,4}
 }
 template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
@@ -193,6 +196,16 @@ static bool ggml_cuda_turbo_mma_fused() {
         return !(s && s[0] == '0');  // default ON (faster GQA-packed MMA, quality-neutral); GGML_TURBO_MMA_FUSED=0 = VEC kill-switch
     }();
     return v;
+}
+
+// Experimental target-specific path: keep opt-in until Q8-K/Turbo3-V output
+// tolerance, ragged masking, and end-to-end crossover tests are complete.
+static bool ggml_cuda_q8_turbo3_mma_fused() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_Q8_TURBO3_MMA_FUSED");
+        return env != nullptr && env[0] == '1';
+    }();
+    return value;
 }
 
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -786,6 +799,21 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    // Qwen3.8 verification fast path: Q8 K and Turbo3 V are decoded directly
+    // into the Stream-K MMA tile. This removes full-cache FP16 conversion and
+    // shares each compressed tile across the packed MTP query rows.
+    {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 3 && Q->ne[1] <= 5 && turing_mma_available(cc)) {
+            ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
+            return;
+        }
+    }
 
     // Fused turbo MMA decode gate (DEFAULT ON — see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
     // Routes turbo4-K==turbo4-V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed

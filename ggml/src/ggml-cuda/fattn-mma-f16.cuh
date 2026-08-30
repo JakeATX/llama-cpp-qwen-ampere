@@ -570,6 +570,35 @@ static __constant__ float TURBO_CENTROIDS_3BIT_FATTN[8] = {
     -0.190207f, -0.118786f, -0.066822f, -0.021663f,
      0.021663f,  0.066822f,  0.118786f,  0.190207f
 };
+
+// Q8_0 tile loader for the fused mixed-KV MMA path. Work is flattened over
+// (row, half2-column) so adjacent CUDA lanes read adjacent quantized values;
+// the decoded tile is then reused by every packed MTP query row.
+template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_q8_0_load_tile(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    const int ne = nbatch_fa * D2;
+
+    for (int linear = tid; linear < ne; linear += nthreads) {
+        const int row = linear / D2;
+        const int col = linear - row * D2;
+        if (oob_check && row >= i_sup) {
+            tile_KV[row * stride_tile + col] = make_half2(0.0f, 0.0f);
+            continue;
+        }
+
+        const int i0 = 2 * (col_offset + col);
+        const block_q8_0 * blocks = (const block_q8_0 *) (KV_raw + (int64_t) row * stride_bytes);
+        const block_q8_0 & block = blocks[i0 / QK8_0];
+        const int iq = i0 % QK8_0;
+        const half d = block.d;
+        tile_KV[row * stride_tile + col] = __half2half2(d) * make_half2(block.qs[iq], block.qs[iq + 1]);
+    }
+}
+
 template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
         const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
@@ -619,6 +648,62 @@ static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile(
                 tile_KV[row*stride_tile + c] = __halves2half2(scaled[idx0], scaled[idx1]);
             }
         }
+    }
+}
+
+// Mixed Q8-K/Turbo3-V variant: distribute packed V elements across lanes so
+// global reads and shared-memory stores are contiguous within a cache row.
+template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_turbo3_load_tile_flat(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int D2, const int stride_bytes, const int col_offset, const int i_sup) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    constexpr int half2_per_chunk = 4; // eight decoded values per lane
+    const int chunks_per_row = D2 / half2_per_chunk;
+    const int nchunks = nbatch_fa * chunks_per_row;
+
+    // A 256-value row has exactly 32 eight-value chunks, so one Ampere warp
+    // consumes it with contiguous packed reads. Each lane writes one aligned
+    // uint4 (four half2 values), avoiding the old lane-per-row strided traffic.
+    for (int linear = tid; linear < nchunks; linear += nthreads) {
+        const int row = linear / chunks_per_row;
+        const int chunk = linear - row * chunks_per_row;
+        const int col = chunk * half2_per_chunk;
+        if (oob_check && row >= i_sup) {
+            *reinterpret_cast<uint4 *>(tile_KV + row * stride_tile + col) = {};
+            continue;
+        }
+
+        const char * row_ptr = KV_raw + (int64_t)row * stride_bytes;
+        const int j0 = 2 * (col_offset + col);
+        const block_turbo3_0 * blk = (const block_turbo3_0 *) row_ptr + j0 / QK_TURBO3;
+        const int in_blk = j0 % QK_TURBO3;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        const float norm = __half2float(__ldcs((const half *)&blk->norm));
+        const uint8_t qs_byte0 = __ldcs(&blk->qs[in_blk / 4 + 0]);
+        const uint8_t qs_byte1 = __ldcs(&blk->qs[in_blk / 4 + 1]);
+        const uint8_t sgn_byte = __ldcs(&blk->signs[in_blk / 8]);
+#else
+        const float norm = __half2float(blk->norm);
+        const uint8_t qs_byte0 = blk->qs[in_blk / 4 + 0];
+        const uint8_t qs_byte1 = blk->qs[in_blk / 4 + 1];
+        const uint8_t sgn_byte = blk->signs[in_blk / 8];
+#endif
+        uint4 decoded;
+        half2 * values = reinterpret_cast<half2 *>(&decoded);
+#pragma unroll
+        for (int i = 0; i < half2_per_chunk; ++i) {
+            const uint8_t qs_byte = i < 2 ? qs_byte0 : qs_byte1;
+            const int shift = (i & 1) * 4;
+            const int sign_shift = 2 * i;
+            const uint8_t idx0 = ((qs_byte >> shift)       & 0x3) | (((sgn_byte >> sign_shift)       & 0x1) << 2);
+            const uint8_t idx1 = ((qs_byte >> (shift + 2)) & 0x3) | (((sgn_byte >> (sign_shift + 1)) & 0x1) << 2);
+            values[i] = make_half2(
+                TURBO_CENTROIDS_3BIT_FATTN[idx0] * norm,
+                TURBO_CENTROIDS_3BIT_FATTN[idx1] * norm);
+        }
+        *reinterpret_cast<uint4 *>(tile_KV + row * stride_tile + col) = decoded;
     }
 }
 
@@ -842,12 +927,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = k0_stop - k0_start;
             // turbo4: stride_K is a RAW BYTE pitch (nb11). Dequantize the (sub)tile of
             // K columns [k0_start, k0_start+k0_diff) into SRAM, then a single sync.
-            static_assert(type_K == GGML_TYPE_TURBO4_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0,
-                          "only turbo2/3/4 K supported on the MMA turbo path");
+            static_assert(type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TURBO4_0 ||
+                          type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0,
+                          "only q8_0 or turbo2/3/4 K supported on the compressed MMA path");
             static_assert(nbatch_K2 == DKQ/2, "turbo MMA load assumes full-row K tiles (nbatch_K2==DKQ/2)");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * K_raw = (const char *) K_h2 + int64_t(k_VKQ_0) * stride_K;
-            if constexpr (type_K == GGML_TYPE_TURBO4_0) {
+            if constexpr (type_K == GGML_TYPE_Q8_0) {
+                flash_attn_ext_q8_0_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
+                    (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
+            } else if constexpr (type_K == GGML_TYPE_TURBO4_0) {
                 flash_attn_ext_turbo4_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup);
             } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
@@ -1223,8 +1312,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 flash_attn_ext_turbo4_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
             } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
-                flash_attn_ext_turbo3_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
-                    (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+                if constexpr (type_K == GGML_TYPE_Q8_0) {
+                    flash_attn_ext_turbo3_load_tile_flat<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                        (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+                } else {
+                    flash_attn_ext_turbo3_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                        (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
+                }
             } else {
                 flash_attn_ext_turbo2_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup);
