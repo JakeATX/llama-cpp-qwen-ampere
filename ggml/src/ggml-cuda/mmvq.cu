@@ -148,6 +148,39 @@ static __device__ __forceinline__ void vec_dot_iq3_s_q8_1_multi(
     }
 }
 
+template<int ncols_dst>
+static __device__ __forceinline__ void vec_dot_iq4_xs_q8_1_multi(
+        const void * __restrict__ vbq, const block_q8_1 * __restrict__ y,
+        const int stride_col_y, const int kby, const int kbx, const int iqs,
+        float (&dots)[ncols_dst]) {
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq + kbx;
+    int sumi[ncols_dst] = {0};
+
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int aux_q4 = get_int_b4(bq4->qs, iqs + j);
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
+#pragma unroll
+        for (int col = 0; col < ncols_dst; ++col) {
+            const block_q8_1 * bq8 = y + col*stride_col_y + kby + iqs/4;
+            const int u0 = get_int_b4(bq8->qs, j + 0);
+            const int u1 = get_int_b4(bq8->qs, j + 4);
+            sumi[col] = ggml_cuda_dp4a(v.x, u0, sumi[col]);
+            sumi[col] = ggml_cuda_dp4a(v.y, u1, sumi[col]);
+        }
+    }
+
+    const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) |
+                   (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);
+    const float dx = __half2float(bq4->d);
+#pragma unroll
+    for (int col = 0; col < ncols_dst; ++col) {
+        const block_q8_1 * bq8 = y + col*stride_col_y + kby + iqs/4;
+        const float d = dx * __low2float(bq8->ds);
+        dots[col] = d * (sumi[col] * (ls - 32));
+    }
+}
+
 static bool ggml_cuda_sm86_exact_reuse() {
     static const bool value = [] {
         const char * env = getenv("GGML_CUDA_SM86_EXACT_REUSE");
@@ -159,6 +192,14 @@ static bool ggml_cuda_sm86_exact_reuse() {
 static bool ggml_cuda_sm86_iq_reuse() {
     static const bool value = [] {
         const char * env = getenv("GGML_CUDA_SM86_IQ_REUSE");
+        return env != nullptr && env[0] == '1';
+    }();
+    return value;
+}
+
+static bool ggml_cuda_sm86_iq4_reuse() {
+    static const bool value = [] {
+        const char * env = getenv("GGML_CUDA_SM86_IQ4_REUSE");
         return env != nullptr && env[0] == '1';
     }();
     return value;
@@ -754,7 +795,8 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ3_S)) {
+        if constexpr (reuse_weights && (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+                                        type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS)) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 float dots[ncols_dst];
@@ -764,8 +806,11 @@ static __global__ void mul_mat_vec_q(
                 } else if constexpr (type == GGML_TYPE_Q5_K) {
                     vec_dot_q5_K_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
-                } else {
+                } else if constexpr (type == GGML_TYPE_IQ3_S) {
                     vec_dot_iq3_s_q8_1_multi<ncols_dst>(
+                        vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
+                } else {
+                    vec_dot_iq4_xs_q8_1_multi<ncols_dst>(
                         vx, y, stride_col_y, kby, kbx_offset + i*stride_row_x + kbx, kqs, dots);
                 }
 #pragma unroll
@@ -1019,11 +1064,14 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ3_S) &&
+    if constexpr ((type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
+                   type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS) &&
                   c_ncols_dst >= 3 && c_ncols_dst <= 5) {
         const int device = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[device].cc;
-        const bool enabled = (type == GGML_TYPE_IQ3_S) ? ggml_cuda_sm86_iq_reuse() : ggml_cuda_sm86_exact_reuse();
+        const bool enabled = type == GGML_TYPE_IQ3_S ? ggml_cuda_sm86_iq_reuse() :
+                             type == GGML_TYPE_IQ4_XS ? ggml_cuda_sm86_iq4_reuse() :
+                             ggml_cuda_sm86_exact_reuse();
         if (cc == 860 && enabled) {
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, true>, launch_params,
                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
