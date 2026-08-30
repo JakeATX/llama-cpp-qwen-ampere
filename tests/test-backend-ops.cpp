@@ -9305,6 +9305,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    // Opt-in target-shape microbenchmarks for the Qwen3.8 SM86 narrow-N work.
+    // Kept out of the normal suite because the large matrices make CPU
+    // correctness comparison and the default performance sweep expensive.
+    if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            for (int64_t n : {3, 4, 5}) {
+                for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
+                        {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
+                        {6144, 5120}, {12288, 5120}, {1024, 5120}}}) {
+                    test_cases.emplace_back(new test_mul_mat(
+                        type_a, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
+                }
+            }
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
@@ -10528,6 +10544,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
+        }
+    }
+
+    if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            for (int64_t n : {3, 4, 5}) {
+                for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
+                        {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
+                        {6144, 5120}, {12288, 5120}, {1024, 5120}}}) {
+                    test_cases.emplace_back(new test_mul_mat(
+                        type_a, GGML_TYPE_F32, shape.first, n, shape.second, {1, 1}, {1, 1}));
+                }
             }
         }
     }
