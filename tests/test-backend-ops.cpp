@@ -7327,6 +7327,51 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+struct test_flash_attn_ext_turbo4_vec : public test_flash_attn_ext {
+    const int64_t head_dim;
+
+    explicit test_flash_attn_ext_turbo4_vec(int64_t head_dim)
+        : test_flash_attn_ext(head_dim, head_dim, 1, {1, 1}, 256, 1, false, false, 0.0f, 0.0f,
+                              GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0),
+          head_dim(head_dim) {
+        GGML_ASSERT(head_dim % ggml_blck_size(GGML_TYPE_TURBO4_0) == 0);
+    }
+
+    std::string vars() override {
+        return "turbo4_vec_q8_0_turbo4_d" + std::to_string(head_dim) + "_kv256";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        constexpr uint8_t turbo4_centroid_index = 10;
+        constexpr uint8_t turbo4_indices = turbo4_centroid_index | (turbo4_centroid_index << 4);
+        const int64_t block_size = ggml_blck_size(GGML_TYPE_TURBO4_0);
+        const size_t block_bytes = ggml_type_size(GGML_TYPE_TURBO4_0);
+        const size_t row_size = ggml_row_size(GGML_TYPE_TURBO4_0, head_dim);
+        GGML_ASSERT(block_bytes == sizeof(ggml_fp16_t) + block_size/2);
+        GGML_ASSERT(row_size == head_dim/block_size*block_bytes);
+
+        const float norm_f32 = 1.0f;
+        ggml_fp16_t norm_f16;
+        ggml_fp32_to_fp16_row(&norm_f32, &norm_f16, 1);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            std::vector<uint8_t> data(ggml_nbytes(t), 0);
+            if (t->type == GGML_TYPE_TURBO4_0) {
+                GGML_ASSERT(t->ne[0] == head_dim);
+                for (int64_t row = 0; row < ggml_nrows(t); ++row) {
+                    uint8_t * row_data = data.data() + row*row_size;
+                    for (int64_t ib = 0; ib < head_dim/block_size; ++ib) {
+                        uint8_t * block = row_data + ib*block_bytes;
+                        memcpy(block, &norm_f16, sizeof(norm_f16));
+                        memset(block + sizeof(norm_f16), turbo4_indices, block_size/2);
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size());
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -10211,6 +10256,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q2_0, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(128));
+    test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(256));
 
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
@@ -10583,6 +10630,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(128));
+    test_cases.emplace_back(new test_flash_attn_ext_turbo4_vec(256));
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
