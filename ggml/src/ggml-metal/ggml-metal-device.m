@@ -1424,7 +1424,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+            // emit_mode==1 (replay ingredients) is implemented in the .metal kernel but has
+            // never been built or run on real Metal hardware (ported by hand from the CPU/CUDA
+            // implementations from a Linux dev machine with no Metal toolchain available) --
+            // decline it here until it's been verified, so callers cleanly fall back to CPU
+            // instead of risking silently wrong output. Flip this once verified.
+            return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0 &&
+                   ggml_get_op_params_i32(op, 1) == 0;
         case GGML_OP_TURBO_WHT:
             return op->src[0]->ne[0] % 128 == 0;
         case GGML_OP_SOLVE_TRI:
