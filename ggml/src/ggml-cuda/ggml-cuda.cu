@@ -736,6 +736,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    // Return the pre-rotation cache buffer before the pools are destroyed
+    // (the legacy pool asserts on outstanding allocations at teardown).
+    if (tq_rot_cache.ptr != nullptr) {
+        pool(tq_rot_cache.dev).free(tq_rot_cache.ptr, tq_rot_cache.cap);
+        tq_rot_cache.ptr = nullptr;
+    }
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -4460,6 +4467,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+    // New graph eval: invalidate the TQ pre-rotation cache (see tq_rot_cache in common.cuh).
+    cuda_ctx->graph_epoch++;
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
