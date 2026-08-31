@@ -25,6 +25,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                     bool   gdn_replay_req,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -35,13 +36,15 @@ llama_memory_recurrent::llama_memory_recurrent(
     this->n_rs_seq = n_rs_seq;
     rs_idx.assign(n_seq_max, 0);
 
-    // DRC phase 2: opt-in via LLAMA_GDN_REPLAY (mirrors the LLAMA_SPEC_CHAIN env-gate pattern in
-    // common/speculative.cpp), off by default. Only meaningful when n_rs_seq > 0 and the arch
-    // exposes a nonzero n_embd_s_ingredient() (GDN/KDA layers).
+    // DRC: opt-in via --gdn-replay (threaded through common_params/cparams) or, for quick
+    // testing without touching CLI args, LLAMA_GDN_REPLAY=1 (mirrors the LLAMA_SPEC_CHAIN
+    // env-gate pattern in common/speculative.cpp). Off by default either way. Only meaningful
+    // when n_rs_seq > 0 and the arch exposes a nonzero n_embd_s_ingredient() (GDN/KDA layers).
     {
         const char * env = getenv("LLAMA_GDN_REPLAY");
+        const bool   env_forces = env != nullptr && strcmp(env, "0") != 0;
         this->gdn_replay = n_rs_seq > 0 && hparams.n_embd_s_ingredient() > 0 &&
-            env != nullptr && strcmp(env, "0") != 0;
+            (gdn_replay_req || env_forces);
     }
     replay_len.assign(n_seq_max, 0);
 
