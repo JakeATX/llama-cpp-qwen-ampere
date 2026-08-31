@@ -6365,10 +6365,14 @@ struct ggml_tensor * ggml_gated_delta_net(
     // emit_mode == 0: K full [S_v, S_v, H] snapshots -> K * S_v rows per snap.
     // emit_mode == 1: K ingredient sets (k, v, g, beta), each width S_v -> K * 4 rows per snap,
     //                 plus one trailing full [S_v, S_v, H] final-state block (S_v rows, not
-    //                 scaled by K) so the true end-of-batch state is always available.
-    const int64_t state_rows = emit_mode == 0
+    //                 scaled by K) so the true end-of-batch state is always available, plus (only
+    //                 when n_tokens > K) one further such block: the state immediately before the
+    //                 K-token retained window starts, free to capture since the recurrence already
+    //                 passes through it en route to the final state.
+    const bool    needs_ckpt  = emit_mode == 1 && n_tokens > K;
+    const int64_t state_rows  = emit_mode == 0
         ? K * S_v * n_seqs
-        : K * 4 * n_seqs + S_v * n_seqs;
+        : K * 4 * n_seqs + S_v * n_seqs + (needs_ckpt ? S_v * n_seqs : 0);
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 

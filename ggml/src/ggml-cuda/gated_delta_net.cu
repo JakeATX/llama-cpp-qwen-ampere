@@ -163,20 +163,23 @@ gated_delta_net_cuda(const float * q,
             if (target_slot >= 0 && target_slot < K) {
                 if constexpr (emit_ingredients_t) {
                     // ingredients: k (offset 0, full vector), v (offset S_v, this warp's column
-                    // only), g (offset 2*S_v, raw/non-exponentiated), beta (offset 3*S_v) --
-                    // k/g/beta don't vary by column, so every warp redundantly writes the same
-                    // values (safe: identical writes, matches the CPU reference layout exactly).
+                    // only), g (offset 2*S_v, raw/non-exponentiated), beta (offset 3*S_v). k/g/beta
+                    // don't vary by column, so only one warp (col == 0) needs to write them --
+                    // every warp doing so redundantly would cost O(S_v) writes each, i.e. O(S_v^2)
+                    // total per component, which is what this design is supposed to avoid.
                     float * ingr_slot = state_out + (int64_t) target_slot * state_slot_stride;
+                    if (col == 0) {
 #pragma unroll
-                    for (int r = 0; r < rows_per_lane; r++) {
-                        const int i    = r * warp_size + lane;
-                        ingr_slot[i]   = k_reg[r];
-                        if constexpr (KDA) {
-                            ingr_slot[2 * S_v + i] = g_t[i];
-                        } else {
-                            ingr_slot[2 * S_v + i] = *g_t;
+                        for (int r = 0; r < rows_per_lane; r++) {
+                            const int i    = r * warp_size + lane;
+                            ingr_slot[i]   = k_reg[r];
+                            if constexpr (KDA) {
+                                ingr_slot[2 * S_v + i] = g_t[i];
+                            } else {
+                                ingr_slot[2 * S_v + i] = *g_t;
+                            }
+                            ingr_slot[3 * S_v + i] = beta_val;
                         }
-                        ingr_slot[3 * S_v + i] = beta_val;
                     }
                     if (lane == 0) {
                         ingr_slot[S_v + col] = v_t[col];
@@ -187,6 +190,21 @@ gated_delta_net_cuda(const float * q,
                     for (int r = 0; r < rows_per_lane; r++) {
                         const int i = r * warp_size + lane;
                         curr_state[col * S_v + i] = s_shard[r];
+                    }
+                }
+            }
+
+            if constexpr (emit_ingredients_t) {
+                // state immediately before the K-token retained window starts, captured inline
+                // (free relative to a second op call over the same prefix) when n_tokens > K.
+                const int t_ckpt = (int) n_tokens - K - 1;
+                if (t_ckpt >= 0 && t == t_ckpt) {
+                    float * ckpt_slot = state + (int64_t) K * state_slot_stride +
+                                         S_v * S_v * H * n_seqs + (sequence * H + h_idx) * S_v * S_v;
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        const int i = r * warp_size + lane;
+                        ckpt_slot[col * S_v + i] = s_shard[r];
                     }
                 }
             }

@@ -725,22 +725,20 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_cpy(ctx0, ggml_reshape_2d(ctx0, final_state, hparams.n_embd_s(), n_seqs), final_dst));
 
     // update the oldest-edge-of-window checkpoint for the NEXT decode's replay base.
+    //
+    // Perf note: n_seq_tokens > n_rs_seq is NOT the rare case it looks like -- the verify batch
+    // is always exactly one token longer than the retained window by construction (n_draft + 1
+    // vs n_rs_seq = n_draft), so this branch fires on every decode, not occasionally. An earlier
+    // version of this code recomputed the prefix via a second ggml_gated_delta_net(K=1) call here,
+    // which measured as a real per-round latency regression (+0.6 to +2.0 ms/round across
+    // --spec-chain 2/4/6/8 against the real model). Fixed by having the *main* call above capture
+    // this same state as a further fixed-cost trailing block when n_tokens > K (ggml.h's emit_mode
+    // == 1 contract) -- the recurrence already passes through it on the way to the final state, so
+    // extracting it here is a view, not a second kernel launch.
     if (n_seq_tokens > (int64_t) n_rs_seq) {
-        // enough tokens in this batch to compute the true "n_rs_seq tokens before the end"
-        // position directly: replay is never needed for a batch this long anyway (it always
-        // exceeds the retained window), so recompute the prefix's end state from base_state.
-        const int64_t prefix_len = n_seq_tokens - n_rs_seq;
-        auto slice_prefix = [&](ggml_tensor * t) {
-            // ggml_cont defensively: a prefix view stays contiguous only when n_seqs == 1 (the
-            // real deployment's case); for n_seqs > 1 the truncated token dim leaves gaps between
-            // sequences, which ggml_gated_delta_net's g/beta contiguity assert would catch.
-            return ggml_cont(ctx0, ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], prefix_len, t->ne[3],
-                t->nb[1], t->nb[2], t->nb[3], 0));
-        };
-        ggml_tensor * ckpt_out = ggml_gated_delta_net(ctx0,
-            slice_prefix(q), slice_prefix(k), slice_prefix(v), slice_prefix(g), slice_prefix(b),
-            base_state, /*K=*/1, /*emit_mode=*/0);
-        ggml_tensor * new_ckpt = extract_state_k1(ckpt_out, prefix_len);
+        ggml_tensor * new_ckpt = ggml_view_2d(ctx0, gdn_out, S_v * H_v, S_v * n_seqs,
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            (attn_score_elems + ingr_elems_total + S_v * S_v * H_v * n_seqs) * ggml_element_size(gdn_out));
         ggml_tensor * ckpt_dst = ggml_view_2d(ctx0, ckpt_all, hparams.n_embd_s(), n_seqs,
             ckpt_all->nb[1], (size_t) kv_head * state_row_size_bytes);
         ggml_build_forward_expand(gf,

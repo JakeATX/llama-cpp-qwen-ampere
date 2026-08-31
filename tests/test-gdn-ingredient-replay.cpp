@@ -173,6 +173,32 @@ int main() {
         return 1;
     }
 
+    // when n_tokens > K, a further trailing block ("ckpt_state") should hold the state
+    // immediately before the K-token retained window starts -- i.e. after the first
+    // (n_tokens - K) tokens -- captured inline instead of via a second op call over the prefix.
+    // This is the fix for the always-triggered redundant prefix-recompute found in the Phase 3
+    // benchmark (see the DRC plan). Use K=4 < N=6 here specifically to exercise it.
+    const int64_t K_small = 4;
+    std::vector<float> out_ingr_ckpt = run_gdn(backend.get(),
+        q_full, k_full, v_full, g_full, beta_full, s0,
+        S_v, H, /*n_tokens=*/N, /*K=*/K_small, /*emit_mode=*/1);
+    const int64_t prefix_len = N - K_small;
+    std::vector<float> out_truth_prefix = run_gdn(backend.get(),
+        slice(q_full, S_v * H, 0, prefix_len), slice(k_full, S_v * H, 0, prefix_len), slice(v_full, S_v * H, 0, prefix_len),
+        slice(g_full, H, 0, prefix_len), slice(beta_full, H, 0, prefix_len), s0,
+        S_v, H, /*n_tokens=*/prefix_len, /*K=*/1, /*emit_mode=*/0);
+    const int64_t attn_prefix = S_v * H * prefix_len;
+    std::vector<float> state_truth_prefix(out_truth_prefix.begin() + attn_prefix, out_truth_prefix.begin() + attn_prefix + S_v * S_v * H);
+    const int64_t ckpt_offset = attn_N + K_small * snap_size + S_v * S_v * H; // ingredients, then final-state, then ckpt
+    std::vector<float> ckpt_state_ingr(out_ingr_ckpt.begin() + ckpt_offset, out_ingr_ckpt.begin() + ckpt_offset + S_v * S_v * H);
+    const float max_diff_ckpt = max_abs(ckpt_state_ingr.data(), state_truth_prefix.data(), ckpt_state_ingr.size());
+    printf("[gdn-ingredient-replay] emit_mode=1 ckpt_state (n_tokens=%lld > K=%lld) vs from-scratch %lld-token prefix run: max_abs=%.3e\n",
+           (long long) N, (long long) K_small, (long long) prefix_len, max_diff_ckpt);
+    if (max_diff_ckpt > 1e-4f) {
+        fprintf(stderr, "FAIL: emit_mode=1's ckpt_state block does not match a from-scratch prefix run (max_abs=%.3e)\n", max_diff_ckpt);
+        return 1;
+    }
+
     // extract ingredients for tokens [c, r) in forward order, building a synthetic replay batch
     const int64_t n_replay = r - c;
     std::vector<float> q_replay(S_v * H * n_replay, 0.0f); // dummy: q doesn't affect state

@@ -2597,7 +2597,14 @@ extern "C" {
     //     the same state as that trailing final-state block (or as slot 0 of the emit_mode == 0
     //     output) -- at O(S_v) storage per retained step instead of O(S_v^2), since q is not
     //     needed to reconstruct state (only to produce attention output, which the replay caller
-    //     is expected to discard).
+    //     is expected to discard). When n_tokens > K, ONE further extra full [S_v, S_v, H_v] block
+    //     follows the final-state block: the state after processing the first (n_tokens - K)
+    //     tokens, i.e. immediately before the K-token retained window starts -- also a fixed,
+    //     once-per-call cost. This lets a caller replaying a partial-accept rollback start from
+    //     "the state before the whole uncertain window" without a second op call to recompute it:
+    //     the recurrence already passes through that exact intermediate value on its way to the
+    //     final state, so capturing it here is free relative to a separate K=1 call over the same
+    //     prefix. Omitted (and not counted in the output size) when n_tokens <= K.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

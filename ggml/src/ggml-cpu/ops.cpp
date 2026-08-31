@@ -10835,17 +10835,23 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     float * delta       = (float *)params->wdata + ith * per_thread + CACHE_LINE_SIZE_F32;
     float * state_work  = use_scratch ? (delta + S_v) : nullptr;
 
-    // output layout: [attn_scores | new_states (| final_state, emit_mode==1 only)]
+    // output layout: [attn_scores | new_states (| final_state | ckpt_state), emit_mode==1 only]
     // attn_scores: S_v * H * n_tokens * n_seqs                                  floats
     // new_states (emit_mode==0): S_v * S_v * H * n_seqs * K                     floats
     // new_states (emit_mode==1): 4   * S_v * H * n_seqs * K                     floats (k,v,g,beta rows)
     // final_state (emit_mode==1 only): S_v * S_v * H * n_seqs                   floats (fixed, not scaled by K)
+    // ckpt_state (emit_mode==1 && n_tokens>K only): S_v * S_v * H * n_seqs      floats (state before
+    //   the K-token retained window starts -- free to capture, the recurrence already passes
+    //   through it; lets a caller reconstruct a rollback without a second op call over the prefix)
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     const int64_t snap_rows_per_head  = (emit_mode == 0) ? S_v : 4;
     const int64_t state_size_per_snap = snap_rows_per_head * S_v * H * n_seqs;
+    const bool    needs_ckpt          = (emit_mode == 1) && (n_tokens > K);
+    const int64_t t_ckpt              = n_tokens - K - 1; // token index whose post-step state to save
     float * attn_out_base   = (float *)dst->data;
     float * state_out_base  = (float *)dst->data + attn_score_elems;
     float * final_state_out = state_out_base + K * state_size_per_snap; // emit_mode==1 only
+    float * ckpt_state_out  = final_state_out + S_v * S_v * H * n_seqs; // emit_mode==1 && needs_ckpt only
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -10955,6 +10961,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                         }
                     }
                 }
+            }
+
+            if (needs_ckpt && t == t_ckpt) {
+                // state immediately before the retained window starts -- captured inline as the
+                // recurrence passes through it, instead of a second op call over the prefix.
+                float * ckpt_o = ckpt_state_out + (iv3 * H + iv1) * S_v * S_v;
+                memcpy(ckpt_o, s_out, S_v * S_v * sizeof(float));
             }
         }
 
