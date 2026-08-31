@@ -10936,7 +10936,14 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             attn_data += S_v * H; // advance to next token
 
             if (use_scratch) {
-                const int64_t target_slot = n_tokens - 1 - t;
+                // emit_mode==0 keeps the established most-recent-first convention (slot 0 =
+                // final state), matched by the s_copy/rs_idx row-selection mechanism elsewhere.
+                // emit_mode==1 uses chronological order instead (slot 0 = oldest of the K
+                // retained tokens): ingredients are consumed only by this op's own replay call
+                // site, which needs a straight forward-order prefix, not a reversed one -- with
+                // this convention "replay the accepted (K - replay_len) ingredients" is exactly
+                // slots [0, K - replay_len), a single contiguous view, not a per-slot reversal.
+                const int64_t target_slot = (emit_mode == 0) ? (n_tokens - 1 - t) : (t - (n_tokens - K));
                 if (target_slot >= 0 && target_slot < K) {
                     if (emit_mode == 0) {
                         float * curr_state_o = state_out_base + target_slot * state_size_per_snap +

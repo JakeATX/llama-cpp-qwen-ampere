@@ -208,8 +208,8 @@ int main() {
     std::vector<float> beta_replay(H * n_replay);
 
     for (int64_t rt = 0; rt < n_replay; rt++) {
-        const int64_t t    = c + rt;          // original token index
-        const int64_t slot = N - 1 - t;       // slot 0 = most recent (token N-1), slot s = s tokens back
+        const int64_t t    = c + rt;   // original token index
+        const int64_t slot = t;        // emit_mode=1 chronological order; K=N here so slot == t directly
         for (int64_t h = 0; h < H; h++) {
             const float * ingr = &out_ingr[attn_N + slot * snap_size + h * 4 * S_v];
             std::copy(ingr,               ingr + S_v, &k_replay[rt * S_v * H + h * S_v]);

@@ -157,9 +157,12 @@ gated_delta_net_cuda(const float * q,
         attn_data += S_v * H;
 
         if constexpr (keep_rs_t) {
-            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
-            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
-            const int target_slot = (int) n_tokens - 1 - t;
+            // emit_ingredients_t==false: most-recent-first (slot 0 = final state), matching the
+            // s_copy/rs_idx row-selection convention used elsewhere. emit_ingredients_t==true:
+            // chronological (slot 0 = oldest of the K retained tokens) -- ingredients are only
+            // ever consumed by this op's own replay call site, which needs a straight forward
+            // prefix view, not a reversed one; see the CPU reference for the full rationale.
+            const int target_slot = emit_ingredients_t ? ((int) t - ((int) n_tokens - K)) : ((int) n_tokens - 1 - t);
             if (target_slot >= 0 && target_slot < K) {
                 if constexpr (emit_ingredients_t) {
                     // ingredients: k (offset 0, full vector), v (offset S_v, this warp's column
