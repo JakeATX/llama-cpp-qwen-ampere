@@ -6330,7 +6330,9 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        int64_t               K) {
+        int64_t               K,
+        int32_t               emit_mode) {
+    GGML_ASSERT(emit_mode == 0 || emit_mode == 1);
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6360,11 +6362,18 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(state->ne[2] == H);
     GGML_ASSERT(state->ne[3] == n_seqs);
     GGML_ASSERT(K >= 1);
-    const int64_t state_rows = K * S_v * n_seqs;
+    // emit_mode == 0: K full [S_v, S_v, H] snapshots -> K * S_v rows per snap.
+    // emit_mode == 1: K ingredient sets (k, v, g, beta), each width S_v -> K * 4 rows per snap,
+    //                 plus one trailing full [S_v, S_v, H] final-state block (S_v rows, not
+    //                 scaled by K) so the true end-of-batch state is always available.
+    const int64_t state_rows = emit_mode == 0
+        ? K * S_v * n_seqs
+        : K * 4 * n_seqs + S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, emit_mode);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
