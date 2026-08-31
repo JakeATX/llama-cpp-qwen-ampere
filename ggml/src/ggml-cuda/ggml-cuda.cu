@@ -67,6 +67,7 @@
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mmvq-tq.cuh"
+#include "ggml-cuda/chain.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -3521,6 +3522,172 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// Elementwise chain ("midi-kernel"): collapse a run of consecutive same-shape elementwise
+// ops into a single kernel that keeps the value in a register across the whole run. Saves a
+// dispatch AND a full HBM round trip per elided op. Typical runs on hybrid MoE graphs are
+// SIGMOID->MUL->ADD->ADD, ADD->SOFTPLUS->MUL, CLAMP->DIV, SILU->MUL.
+// Returns the number of extra nodes fused (len - 1) or -1 when nothing was fused. Lives in its
+// own function (not inline in ggml_cuda_try_fuse) so its locals do not add to that function's
+// frame; gcc 13 reported a stringop-overflow false positive in an unrelated fusion there once
+// the frame grew.
+static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    if (i + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    static bool disable_chain = getenv("GGML_CUDA_FUSE_CHAIN") != nullptr && std::atoi(getenv("GGML_CUDA_FUSE_CHAIN")) == 0;
+
+    auto chain_code = [](const ggml_tensor * t, int & code, float & p0, float & p1) -> bool {
+        switch (t->op) {
+            case GGML_OP_ADD:   code = TQ_CHAIN_ADD;   return true;
+            case GGML_OP_MUL:   code = TQ_CHAIN_MUL;   return true;
+            case GGML_OP_DIV:   code = TQ_CHAIN_DIV;   return true;
+            case GGML_OP_SCALE: code = TQ_CHAIN_SCALE;
+                memcpy(&p0, (const char *) t->op_params + 0*sizeof(float), sizeof(float));
+                memcpy(&p1, (const char *) t->op_params + 1*sizeof(float), sizeof(float));
+                return true;
+            case GGML_OP_CLAMP: code = TQ_CHAIN_CLAMP;
+                memcpy(&p0, (const char *) t->op_params + 0*sizeof(float), sizeof(float));
+                memcpy(&p1, (const char *) t->op_params + 1*sizeof(float), sizeof(float));
+                return true;
+            case GGML_OP_SQR:   code = TQ_CHAIN_SQR;   return true;
+            case GGML_OP_UNARY:
+                switch (ggml_get_unary_op(t)) {
+                    case GGML_UNARY_OP_SILU:     code = TQ_CHAIN_SILU;     return true;
+                    case GGML_UNARY_OP_SIGMOID:  code = TQ_CHAIN_SIGMOID;  return true;
+                    case GGML_UNARY_OP_SOFTPLUS: code = TQ_CHAIN_SOFTPLUS; return true;
+                    case GGML_UNARY_OP_GELU:     code = TQ_CHAIN_GELU;     return true;
+                    case GGML_UNARY_OP_RELU:     code = TQ_CHAIN_RELU;     return true;
+                    case GGML_UNARY_OP_NEG:      code = TQ_CHAIN_NEG;      return true;
+                    default: return false;
+                }
+            default: return false;
+        }
+    };
+
+    auto chain_ok_tensor = [](const ggml_tensor * t) -> bool {
+        return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t);
+    };
+
+    tq_chain_desc desc = {};
+    const ggml_tensor * head_src = nullptr;
+    int len = 0;
+
+    if (!disable_chain) {
+        const ggml_tensor * prev = nullptr;
+        for (int j = i; j < cgraph->n_nodes && len < TQ_CHAIN_MAX_OPS; ++j) {
+            ggml_tensor * nd = cgraph->nodes[j];
+            int code = 0; float p0 = 0.0f, p1 = 0.0f;
+
+            if (!chain_ok_tensor(nd) || !chain_code(nd, code, p0, p1)) break;
+            if (len > 0 && !ggml_are_same_shape(nd, cgraph->nodes[i])) break;
+
+            const bool binary = (nd->op == GGML_OP_ADD || nd->op == GGML_OP_MUL || nd->op == GGML_OP_DIV);
+            const ggml_tensor * a = nd->src[0];
+            const ggml_tensor * b = binary ? nd->src[1] : nullptr;
+
+            if (!chain_ok_tensor(a)) break;
+            if (binary && !chain_ok_tensor(b)) break;
+            // operand may be same-shape, or a single value broadcast over the run
+            const bool a_b = chain_ok_tensor(a) && (ggml_are_same_shape(a, nd) || ggml_nelements(a) == 1);
+            const bool b_b = !binary || (chain_ok_tensor(b) && (ggml_are_same_shape(b, nd) || ggml_nelements(b) == 1));
+            if (!a_b || !b_b) break;
+
+            const ggml_tensor * other = nullptr;
+            int chain_lhs = 1;
+
+            if (len == 0) {
+                // the value we carry must be a full-size tensor, not the broadcast scalar
+                if (ggml_nelements(a) != ggml_nelements(nd)) break;
+                head_src = a;
+                other    = b;
+            } else {
+                // must consume the previous node's output
+                if (a == prev)              { other = b; chain_lhs = 1; }
+                else if (binary && b == prev) { other = a; chain_lhs = 0; }
+                else break;
+            }
+
+            // The other operand must not be a node this chain elides: those are never written
+            // (e.g. t0 = SILU(x); out = MUL(t0, t0) passes the subgraph check because both uses
+            // are inside it, but t0->data would be read unset).
+            if (other) {
+                bool is_intermediate = false;
+                for (int k = i; k < j; ++k) {
+                    if (cgraph->nodes[k] == other) { is_intermediate = true; break; }
+                }
+                if (is_intermediate) break;
+            }
+
+            desc.bcast[len]         = other ? (ggml_nelements(other) == 1 ? 1 : 0) : 0;
+            desc.code[len]          = code;
+            desc.other[len]         = other ? (const float *) other->data : nullptr;
+            desc.chain_is_lhs[len]  = chain_lhs;
+            desc.p0[len]            = p0;
+            desc.p1[len]            = p1;
+            len++;
+            prev = nd;
+        }
+    }
+
+    if (len >= 2) {
+        ggml_tensor * out = cgraph->nodes[i + len - 1];
+        ggml_op ops_ch[TQ_CHAIN_MAX_OPS];
+        for (int k = 0; k < len; ++k) {
+            ops_ch[k] = cgraph->nodes[i + k]->op;
+        }
+        const int out_ch[1] = { i + len - 1 };
+
+        // Aliasing. ggml_cuda_check_fusion_memory_ranges() is not used here on purpose: it
+        // vetoes any overlap between the output and an input, and exact in-place aliasing is
+        // the common case for this pattern (galloc hands residual adds their input's buffer).
+        // Every same-shape operand is read at index i and dst is written at index i after
+        // that read, so an output that aliases an operand exactly is safe and must NOT be
+        // vetoed. Anything else
+        // that overlaps the output is not: a broadcast operand is read at index 0 by every
+        // thread, and a same-shape operand at a different offset is read at index i after
+        // another thread may already have written it.
+        bool alias_veto = false;
+        {
+            const char * db = (const char *) out->data;
+            const size_t dn = ggml_nbytes(out);
+            auto overlaps = [&](const void * ptr, size_t n) {
+                const char * ob = (const char *) ptr;
+                return ob < db + dn && db < ob + n;
+            };
+            auto exact = [&](const void * ptr, size_t n) {
+                return ptr == (const void *) db && n == dn;
+            };
+            if (overlaps(head_src->data, ggml_nbytes(head_src)) && !exact(head_src->data, ggml_nbytes(head_src))) {
+                alias_veto = true;
+            }
+            for (int k = 0; k < len && !alias_veto; ++k) {
+                if (!desc.other[k]) {
+                    continue;
+                }
+                const ggml_tensor * nd = cgraph->nodes[i + k];
+                const ggml_tensor * ot = desc.chain_is_lhs[k] ? nd->src[1] : nd->src[0];
+                const size_t on = ggml_nbytes(ot);
+                if (desc.bcast[k]) {
+                    alias_veto |= overlaps(ot->data, on);
+                } else {
+                    alias_veto |= overlaps(ot->data, on) && !exact(ot->data, on);
+                }
+            }
+        }
+
+        if (!alias_veto &&
+            ggml_are_same_shape(out, cgraph->nodes[i]) &&
+            ggml_can_fuse_subgraph(cgraph, i, len, ops_ch, out_ch, 1)) {
+
+            desc.n_ops = len;
+            ggml_cuda_op_elem_chain(ctx, (const float *) head_src->data,
+                                    (float *) out->data, ggml_nelements(out), desc);
+            return len - 1;   // nodes consumed beyond this one
+        }
+    }
+    return -1;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3551,6 +3718,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
+        ops.reserve(16);   // gcc 13 -Werror=stringop-overflow trips on the insert() calls below otherwise
 
         if (can_fuse) {
             const ggml_tensor * logits  = node->src[0];
@@ -3618,6 +3786,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     return ops.size() - 1;
                 }
             }
+        }
+    }
+
+    // Elementwise chain ("midi-kernel"), see ggml_cuda_fuse_elem_chain().
+    {
+        const int n_fused = ggml_cuda_fuse_elem_chain(*cuda_ctx, cgraph, i);
+        if (n_fused >= 0) {
+            return n_fused;
         }
     }
 
