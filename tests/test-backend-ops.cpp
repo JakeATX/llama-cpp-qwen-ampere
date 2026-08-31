@@ -9321,6 +9321,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Opt-in SM86 large-N prefill coverage for aligned and ragged J=128 boundaries.
+    if (getenv("GGML_QWEN38_MMQ_PREFILL_TEST") != nullptr) {
+        for (ggml_type type_a : {
+                GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S,
+                GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS}) {
+            for (int64_t m : {256, 257}) {
+                for (int64_t n : {127, 128, 129}) {
+                    for (int64_t k : {512, 1024}) {
+                        test_cases.emplace_back(new test_mul_mat(
+                            type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                    }
+                }
+            }
+        }
+    }
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 256, { 1,  1}, {1, 1}));
