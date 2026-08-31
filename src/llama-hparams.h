@@ -381,6 +381,10 @@ struct llama_hparams {
     // dimension of the recurrent state embeddings
     uint32_t n_embd_s() const;
 
+    // dimension of one ggml_gated_delta_net emit_mode==1 ingredient slot (4 rows of head_dim,
+    // one each for k/v/g/beta) -- only meaningful for GDN/KDA-style layers (n_embd_head_kda != 0).
+    uint32_t n_embd_s_ingredient() const;
+
     uint32_t n_pos_per_embd() const;
 
     // note: currently only support if either all or none of the layers are MLA

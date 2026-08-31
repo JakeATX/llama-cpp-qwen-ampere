@@ -4142,6 +4142,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_CHAIN"));
 
     add_opt(common_arg(
+        {"--gdn-replay"},
+        "[EXPERIMENTAL] for Gated DeltaNet models (Qwen3.5/3.5-MoE) with MTP rollback enabled: "
+        "record small per-token ingredients and replay them to reconstruct rolled-back state, "
+        "instead of eagerly storing a full state snapshot for every retained draft position "
+        "(default: off). Reduces VRAM and lets rollback avoid a full graph rebuild's worth of "
+        "redundant snapshot bandwidth; only implemented for GDN/KDA recurrent layers and the "
+        "CPU/CUDA backends so far.",
+        [](common_params & params) {
+            params.gdn_replay = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_GDN_REPLAY"));
+
+    add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
         string_format("speculative decoding split probability (default: %.2f)", (double)params.speculative.draft.p_split),
         [](common_params & params, const std::string & value) {

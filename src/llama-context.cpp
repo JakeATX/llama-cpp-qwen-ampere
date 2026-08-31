@@ -118,6 +118,7 @@ llama_context::llama_context(
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
     }
+    cparams.gdn_replay = params.gdn_replay;
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -3781,6 +3782,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.gdn_replay                  =*/ false,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,

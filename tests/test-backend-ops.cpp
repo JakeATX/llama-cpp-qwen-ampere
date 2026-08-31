@@ -4393,16 +4393,17 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const int32_t emit_mode; // 0 = full state snapshots, 1 = replay ingredients (k,v,g,beta)
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, emit_mode);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, int32_t emit_mode = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), emit_mode(emit_mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4431,7 +4432,7 @@ struct test_gated_delta_net : public test_case {
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
-        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K, emit_mode);
         return out;
     }
 
@@ -10372,6 +10373,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // emit_mode == 1 (replay ingredients): CPU-only for now (see ggml_backend_cuda_device_supports_op).
+    // Same shape matrix as the K > 1 block above -- sanity-checks the ingredient path builds,
+    // runs, and produces finite output; bit-exact replay-vs-snapshot equivalence is checked
+    // separately in test-gdn-ingredient-replay.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16,   2, 1, 1, false, false, /*K=*/2, /*emit_mode=*/1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   4, 1, 1, false, false, /*K=*/4, /*emit_mode=*/1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4, /*emit_mode=*/1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3, /*emit_mode=*/1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
