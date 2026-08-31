@@ -399,7 +399,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1, /*emit_mode=*/0);
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
     } else {
@@ -560,19 +560,131 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         return output;
     }
 
-    const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    ggml_tensor * ingr_all = mctx_cur->get_ingr_l(il);
+    const bool gdn_replay = ingr_all != nullptr;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // helper: extract the [S_v,S_v,H_v,n_seqs] final-state block from a K=1, emit_mode=0
+    // gated_delta_net output computed over `ntok` tokens.
+    auto extract_state_k1 = [&](ggml_tensor * out, int64_t ntok) {
+        const int64_t attn_elems = S_v * H_v * ntok * n_seqs;
+        return ggml_view_4d(ctx0, out, S_v, S_v, H_v, n_seqs,
+            ggml_row_size(out->type, S_v),
+            ggml_row_size(out->type, S_v * S_v),
+            ggml_row_size(out->type, S_v * S_v * H_v),
+            attn_elems * ggml_element_size(out));
+    };
+
+    if (!gdn_replay) {
+        const int64_t D = S_v * S_v * H_v;
+        const int64_t K = cparams.n_rs_seq + 1;
+
+        // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K, /*emit_mode=*/0);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
+        }
+
+        const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
+        const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
+
+        ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
+            S_v, H_v, n_seq_tokens, n_seqs,
+            ggml_row_size(gdn_out->type, S_v),
+            ggml_row_size(gdn_out->type, S_v * H_v),
+            ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+            0);
+        cb(output, "attn_output", il);
+
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+        // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
+        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+        // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
+        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
+            D, n_seqs, n_written,
+            ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, state_size_per_snap),
+            ggml_row_size(gdn_out->type, attn_score_elems));
+
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
+            D, n_seqs, n_written,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+
+        return output;
+    }
+
+    // --- DRC phase 2: gdn_replay path ---
+    //
+    // s_l holds the OPTIMISTIC final state (as if every token in the last decode's batch got
+    // accepted) -- correct to use directly when nothing rolls back. But delta-net's rank-1
+    // update has no inverse: once a rollback is discovered, s_l already holds the (now known
+    // wrong) state that ran past the rejected tail, and there is no way to "undo" that from its
+    // own ingredients. Replaying ingredients only ever moves state forward, so the checkpoint to
+    // replay from must predate the whole uncertain trailing window -- that's s_ckpt_l, the state
+    // as of n_rs_seq tokens before the end of the last decode (the window's oldest edge).
+    ggml_tensor * ckpt_all = mctx_cur->get_s_ckpt_l(il);
+    GGML_ASSERT(ckpt_all != nullptr);
+
+    ggml_tensor * s_ckpt = build_rs(inp, ckpt_all, hparams.n_embd_s(), n_seqs);
+    s_ckpt = ggml_reshape_4d(ctx0, s_ckpt, S_v, S_v, H_v, n_seqs);
+
+    const uint32_t n_rs_seq   = cparams.n_rs_seq;
+    const uint32_t replay_len = mctx_cur->get_replay_len();
+    GGML_ASSERT(replay_len <= n_rs_seq);
+
+    ggml_tensor * base_state = s; // no rollback pending: the optimistic state is already correct
+
+    if (replay_len > 0) {
+        // replay the accepted (n_rs_seq - replay_len) ingredients forward from s_ckpt, oldest
+        // first, to reconstruct "state as of replay_len tokens back from the end".
+        const bool   kda            = (g->ne[0] == S_v);
+        const size_t ingr_elemsize  = ggml_element_size(ingr_all);
+        const size_t ingr_row_size  = (size_t) hparams.n_embd_s_ingredient() * ingr_elemsize;
+
+        ggml_tensor * cur = s_ckpt;
+        for (uint32_t slot = n_rs_seq; slot-- > replay_len; ) {
+            const size_t slot_off = (size_t) (slot * mem_size + kv_head) * ingr_row_size;
+
+            // ggml_gated_delta_net requires g/beta (and, transitively via q_dummy, q) to be fully
+            // contiguous; these are strided views into the packed per-head ingredient ring, so
+            // materialize them. k/v only need contiguous *rows*, which the views already satisfy,
+            // but ggml_cont them too for safety against stricter checks in other backends later.
+            ggml_tensor * k_step = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, S_v, H_v, 1, n_seqs,
+                4 * S_v * ingr_elemsize, 4 * S_v * H_v * ingr_elemsize, mem_size * ingr_row_size,
+                slot_off));
+            ggml_tensor * v_step = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, S_v, H_v, 1, n_seqs,
+                4 * S_v * ingr_elemsize, 4 * S_v * H_v * ingr_elemsize, mem_size * ingr_row_size,
+                slot_off + S_v * ingr_elemsize));
+            ggml_tensor * g_step = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, kda ? S_v : 1, H_v, 1, n_seqs,
+                4 * S_v * ingr_elemsize, 4 * S_v * H_v * ingr_elemsize, mem_size * ingr_row_size,
+                slot_off + 2 * S_v * ingr_elemsize));
+            ggml_tensor * beta_step = ggml_cont(ctx0, ggml_view_4d(ctx0, ingr_all, 1, H_v, 1, n_seqs,
+                4 * S_v * ingr_elemsize, 4 * S_v * H_v * ingr_elemsize, mem_size * ingr_row_size,
+                slot_off + 3 * S_v * ingr_elemsize));
+            ggml_tensor * q_dummy = ggml_scale(ctx0, k_step, 0.0f); // q doesn't affect state, only the (discarded) attn output
+
+            ggml_tensor * step_out = ggml_gated_delta_net(ctx0, q_dummy, k_step, v_step, g_step, beta_step, cur, /*K=*/1, /*emit_mode=*/0);
+            cur = extract_state_k1(step_out, /*ntok=*/1);
+        }
+        base_state = cur;
+    }
+
+    // main call: emit_mode=1 records ingredients (+ the trailing final-state block) instead of
+    // K full snapshots.
+    const int64_t K = n_rs_seq;
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, base_state, K, /*emit_mode=*/1);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, gdn_out, il});
     }
-
-    const int64_t attn_score_elems    = S_v * H_v * n_seq_tokens * n_seqs;
-    const int64_t state_size_per_snap = S_v * S_v * H_v * n_seqs;
 
     ggml_tensor * output = ggml_view_4d(ctx0, gdn_out,
         S_v, H_v, n_seq_tokens, n_seqs,
@@ -582,25 +694,64 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         0);
     cb(output, "attn_output", il);
 
-    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+    const int64_t attn_score_elems      = S_v * H_v * n_seq_tokens * n_seqs;
+    const int64_t ingr_size_per_snap    = 4 * S_v * H_v * n_seqs;
+    const int64_t ingr_elems_total      = K * ingr_size_per_snap;
+    const int64_t n_written             = std::min<int64_t>(n_seq_tokens, K);
+    const size_t  ingr_row_size_bytes   = (size_t) hparams.n_embd_s_ingredient() * ggml_element_size(ingr_all);
+    const size_t  state_row_size_bytes  = (size_t) hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
-
-    // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
-    ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
-        D, n_seqs, n_written,
-        ggml_row_size(gdn_out->type, D),
-        ggml_row_size(gdn_out->type, state_size_per_snap),
+    // scatter the K produced ingredient slots into the ring (slot i -> rollback group i, same
+    // most-recent-first convention as the old K-snapshot scatter).
+    ggml_tensor * ingr_src = ggml_view_3d(ctx0, gdn_out,
+        4 * S_v * H_v, n_seqs, n_written,
+        ggml_row_size(gdn_out->type, 4 * S_v * H_v),
+        ggml_row_size(gdn_out->type, ingr_size_per_snap),
         ggml_row_size(gdn_out->type, attn_score_elems));
+    ggml_tensor * ingr_dst = ggml_view_3d(ctx0, ingr_all,
+        4 * S_v * H_v, n_seqs, n_written,
+        ingr_all->nb[1],
+        (size_t) mem_size * ingr_row_size_bytes,
+        (size_t) kv_head * ingr_row_size_bytes);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ingr_src, ingr_dst));
 
-    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
-        ssm_states_all->nb[1],
-        (size_t) mem_size * row_size,
-        (size_t) kv_head * row_size);
+    // scatter the trailing final-state block into s_l (single row, no widening).
+    ggml_tensor * final_state = ggml_view_2d(ctx0, gdn_out, S_v * H_v, S_v * n_seqs,
+        ggml_row_size(gdn_out->type, S_v * H_v),
+        (attn_score_elems + ingr_elems_total) * ggml_element_size(gdn_out));
+    ggml_tensor * final_dst = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs,
+        ssm_states_all->nb[1], (size_t) kv_head * state_row_size_bytes);
+    ggml_build_forward_expand(gf,
+        ggml_cpy(ctx0, ggml_reshape_2d(ctx0, final_state, hparams.n_embd_s(), n_seqs), final_dst));
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    // update the oldest-edge-of-window checkpoint for the NEXT decode's replay base.
+    if (n_seq_tokens > (int64_t) n_rs_seq) {
+        // enough tokens in this batch to compute the true "n_rs_seq tokens before the end"
+        // position directly: replay is never needed for a batch this long anyway (it always
+        // exceeds the retained window), so recompute the prefix's end state from base_state.
+        const int64_t prefix_len = n_seq_tokens - n_rs_seq;
+        auto slice_prefix = [&](ggml_tensor * t) {
+            // ggml_cont defensively: a prefix view stays contiguous only when n_seqs == 1 (the
+            // real deployment's case); for n_seqs > 1 the truncated token dim leaves gaps between
+            // sequences, which ggml_gated_delta_net's g/beta contiguity assert would catch.
+            return ggml_cont(ctx0, ggml_view_4d(ctx0, t, t->ne[0], t->ne[1], prefix_len, t->ne[3],
+                t->nb[1], t->nb[2], t->nb[3], 0));
+        };
+        ggml_tensor * ckpt_out = ggml_gated_delta_net(ctx0,
+            slice_prefix(q), slice_prefix(k), slice_prefix(v), slice_prefix(g), slice_prefix(b),
+            base_state, /*K=*/1, /*emit_mode=*/0);
+        ggml_tensor * new_ckpt = extract_state_k1(ckpt_out, prefix_len);
+        ggml_tensor * ckpt_dst = ggml_view_2d(ctx0, ckpt_all, hparams.n_embd_s(), n_seqs,
+            ckpt_all->nb[1], (size_t) kv_head * state_row_size_bytes);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, ggml_reshape_2d(ctx0, new_ckpt, hparams.n_embd_s(), n_seqs), ckpt_dst));
+    } else {
+        // batch shorter than the retained window: base_state itself is still "before the window".
+        ggml_tensor * ckpt_dst = ggml_view_2d(ctx0, ckpt_all, hparams.n_embd_s(), n_seqs,
+            ckpt_all->nb[1], (size_t) kv_head * state_row_size_bytes);
+        ggml_build_forward_expand(gf,
+            ggml_cpy(ctx0, ggml_reshape_2d(ctx0, base_state, hparams.n_embd_s(), n_seqs), ckpt_dst));
+    }
 
     return output;
 }
