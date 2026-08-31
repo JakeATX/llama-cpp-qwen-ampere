@@ -315,13 +315,15 @@ std::vector<std::vector<int32_t>> select_anchors(const std::vector<observation> 
 }
 
 struct projection {
-    int64_t               n_head  = 0;
-    int64_t               n_token = 0;
-    int64_t               d       = 0;
-    std::vector<uint16_t> assignment;
-    std::vector<float>    gamma;
-    std::vector<float>    residual;
-    std::vector<uint8_t>  is_anchor;
+    int64_t                  n_head   = 0;
+    int64_t                  n_token  = 0;
+    int64_t                  n_anchor = 0;
+    int64_t                  d        = 0;
+    std::vector<ggml_bf16_t> anchors;
+    std::vector<uint16_t>    assignment;
+    std::vector<float>       gamma;
+    std::vector<float>       residual;
+    std::vector<uint8_t>     is_anchor;
 
     const float * residual_row(int64_t token, int64_t head) const {
         return residual.data() + (head * n_token + token) * d;
@@ -329,10 +331,14 @@ struct projection {
 };
 
 projection build_projection(const tensor_series & x, const std::vector<std::vector<int32_t>> & anchors) {
+    GGML_ASSERT(!anchors.empty() && !anchors.front().empty());
     projection p;
-    p.n_head  = x.h;
-    p.n_token = x.n;
-    p.d       = x.d;
+    p.n_head   = x.h;
+    p.n_token  = x.n;
+    p.d        = x.d;
+    p.n_anchor = int64_t(anchors.front().size());
+    GGML_ASSERT(p.n_anchor <= UINT16_MAX);
+    p.anchors.resize(size_t(p.n_head * p.n_anchor * p.d));
     p.assignment.resize(size_t(x.h * x.n));
     p.gamma.resize(size_t(x.h * x.n));
     p.residual.resize(size_t(x.h * x.n * x.d));
@@ -341,13 +347,16 @@ projection build_projection(const tensor_series & x, const std::vector<std::vect
     parallel_heads(x.h, [&](int64_t h) {
         std::vector<float> anchor_data(size_t(anchors[size_t(h)].size() * x.d));
         std::vector<float> anchor_norm2(anchors[size_t(h)].size());
+        GGML_ASSERT(int64_t(anchors[size_t(h)].size()) == p.n_anchor);
         for (size_t a = 0; a < anchors[size_t(h)].size(); ++a) {
             const int32_t pos                  = anchors[size_t(h)][a];
             p.is_anchor[size_t(h * x.n + pos)] = 1;
             float *       stored               = anchor_data.data() + a * size_t(x.d);
             const float * source               = x.row(pos, h);
             for (int64_t j = 0; j < x.d; ++j) {
-                stored[j] = ggml_bf16_to_fp32(ggml_fp32_to_bf16(source[j]));
+                const ggml_bf16_t value = ggml_fp32_to_bf16(source[j]);
+                stored[j]               = ggml_bf16_to_fp32(value);
+                p.anchors[(size_t(h) * size_t(p.n_anchor) + a) * size_t(p.d) + size_t(j)] = value;
             }
             anchor_norm2[a] = norm_sq(stored, x.d);
         }
@@ -600,52 +609,128 @@ std::vector<size_t> rank_candidates(const std::vector<float> & utility,
     return order;
 }
 
-tensor_series reconstruct(const tensor_series &       exact,
-                          const projection &          p,
-                          const std::vector<size_t> & order,
-                          size_t                      n_residual,
-                          ggml_type                   residual_type = GGML_TYPE_TURBO2_0) {
-    tensor_series out = exact;
-    out.data.assign(exact.data.size(), 0.0f);
-    std::vector<uint8_t> selected(size_t(p.n_head * p.n_token), 0);
-    for (size_t i = 0; i < std::min(n_residual, order.size()); ++i) {
-        selected[order[i]] = 1;
+// The persistent slot map follows Giveen's AnchorKV CPU reference. The format here uses TurboQuant residual rows.
+struct packed_projection {
+    int64_t                  n_head        = 0;
+    int64_t                  n_token       = 0;
+    int64_t                  n_anchor      = 0;
+    int64_t                  d             = 0;
+    ggml_type                residual_type = GGML_TYPE_TURBO2_0;
+    std::vector<ggml_bf16_t> anchors;
+    std::vector<uint16_t>    assignment;
+    std::vector<ggml_bf16_t> gamma;
+    std::vector<uint32_t>    residual_slot;
+    std::vector<uint8_t>     residual_data;
+
+    size_t row_size() const { return ggml_row_size(residual_type, d); }
+
+    size_t serialized_size() const {
+        return anchors.size() * sizeof(anchors[0]) + assignment.size() * sizeof(assignment[0]) +
+               gamma.size() * sizeof(gamma[0]) + residual_slot.size() * sizeof(residual_slot[0]) + residual_data.size();
+    }
+};
+
+size_t packed_projection_base_size(const projection & p) {
+    return size_t(p.n_head * p.n_anchor * p.d) * sizeof(ggml_bf16_t) +
+           size_t(p.n_head * p.n_token) * (sizeof(uint16_t) + sizeof(ggml_bf16_t) + sizeof(uint32_t));
+}
+
+void encode_residual(ggml_type type, const float * source, int64_t d, uint8_t * destination) {
+    if (type == GGML_TYPE_F16) {
+        for (int64_t j = 0; j < d; ++j) {
+            const ggml_fp16_t value = ggml_fp32_to_fp16(source[j]);
+            std::memcpy(destination + size_t(j) * sizeof(value), &value, sizeof(value));
+        }
+    } else if (type == GGML_TYPE_TURBO2_0) {
+        quantize_row_turbo2_0_ref(source, destination, d);
+    } else if (type == GGML_TYPE_TURBO3_0) {
+        quantize_row_turbo3_0_ref(source, destination, d);
+    } else {
+        quantize_row_turbo4_0_ref(source, destination, d);
+    }
+}
+
+void decode_residual(ggml_type type, const uint8_t * source, int64_t d, float * destination) {
+    if (type == GGML_TYPE_F16) {
+        for (int64_t j = 0; j < d; ++j) {
+            ggml_fp16_t value;
+            std::memcpy(&value, source + size_t(j) * sizeof(value), sizeof(value));
+            destination[j] = ggml_fp16_to_fp32(value);
+        }
+        return;
+    }
+    if (type == GGML_TYPE_TURBO2_0) {
+        dequantize_row_turbo2_0(source, destination, d);
+    } else if (type == GGML_TYPE_TURBO3_0) {
+        dequantize_row_turbo3_0(source, destination, d);
+    } else {
+        dequantize_row_turbo4_0(source, destination, d);
+    }
+    for (int64_t off = 0; off < d; off += 128) {
+        turbo_cpu_fwht_inverse(destination + off, 128);
+    }
+}
+
+packed_projection pack_projection(const projection &          p,
+                                  const std::vector<size_t> & order,
+                                  size_t                      n_residual,
+                                  ggml_type                   residual_type) {
+    packed_projection packed;
+    packed.n_head        = p.n_head;
+    packed.n_token       = p.n_token;
+    packed.n_anchor      = p.n_anchor;
+    packed.d             = p.d;
+    packed.residual_type = residual_type;
+    packed.anchors       = p.anchors;
+    packed.assignment    = p.assignment;
+    packed.gamma.resize(p.gamma.size());
+    for (size_t i = 0; i < p.gamma.size(); ++i) {
+        packed.gamma[i] = ggml_fp32_to_bf16(p.gamma[i]);
     }
 
-    parallel_heads(p.n_head, [&](int64_t h) {
-        const size_t         q_size = ggml_row_size(residual_type, p.d);
-        std::vector<uint8_t> q(q_size);
-        std::vector<float>   decoded(size_t(p.d));
-        for (int64_t t = 0; t < p.n_token; ++t) {
-            const size_t  ti     = size_t(h * p.n_token + t);
-            const float * source = exact.row(t, h);
-            const float * r      = p.residual_row(t, h);
-            float *       dst    = out.data.data() + size_t((t * p.n_head + h) * p.d);
-            for (int64_t j = 0; j < p.d; ++j) {
-                dst[j] = source[j] - r[j];
+    const size_t count = std::min(n_residual, order.size());
+    packed.residual_slot.assign(size_t(p.n_head * p.n_token), UINT32_MAX);
+    packed.residual_data.resize(count * packed.row_size());
+    for (size_t slot = 0; slot < count; ++slot) {
+        GGML_ASSERT(slot < UINT32_MAX);
+        packed.residual_slot[order[slot]] = uint32_t(slot);
+    }
+    parallel_heads(int64_t(count), [&](int64_t slot) {
+        const size_t  ti = order[size_t(slot)];
+        const int64_t h  = int64_t(ti) / p.n_token;
+        const int64_t t  = int64_t(ti) % p.n_token;
+        encode_residual(residual_type, p.residual_row(t, h), p.d,
+                        packed.residual_data.data() + size_t(slot) * packed.row_size());
+    });
+    return packed;
+}
+
+tensor_series unpack_projection(const packed_projection & packed) {
+    tensor_series out;
+    out.d = packed.d;
+    out.h = packed.n_head;
+    out.n = packed.n_token;
+    out.data.resize(size_t(out.d * out.h * out.n));
+
+    parallel_heads(packed.n_head, [&](int64_t h) {
+        std::vector<float> residual(size_t(packed.d));
+        for (int64_t t = 0; t < packed.n_token; ++t) {
+            const size_t   ti = size_t(h * packed.n_token + t);
+            const uint16_t ai = packed.assignment[ti];
+            GGML_ASSERT(ai < packed.n_anchor);
+            const ggml_bf16_t * anchor = packed.anchors.data() + (size_t(h * packed.n_anchor) + ai) * size_t(packed.d);
+            const float         gamma  = ggml_bf16_to_fp32(packed.gamma[ti]);
+            float *             dst    = out.data.data() + size_t((t * packed.n_head + h) * packed.d);
+            for (int64_t j = 0; j < packed.d; ++j) {
+                dst[j] = gamma * ggml_bf16_to_fp32(anchor[j]);
             }
-            if (selected[ti]) {
-                if (residual_type == GGML_TYPE_F16) {
-                    for (int64_t j = 0; j < p.d; ++j) {
-                        decoded[size_t(j)] = ggml_fp16_to_fp32(ggml_fp32_to_fp16(r[j]));
-                    }
-                } else {
-                    if (residual_type == GGML_TYPE_TURBO2_0) {
-                        quantize_row_turbo2_0_ref(r, q.data(), p.d);
-                        dequantize_row_turbo2_0(q.data(), decoded.data(), p.d);
-                    } else if (residual_type == GGML_TYPE_TURBO3_0) {
-                        quantize_row_turbo3_0_ref(r, q.data(), p.d);
-                        dequantize_row_turbo3_0(q.data(), decoded.data(), p.d);
-                    } else {
-                        quantize_row_turbo4_0_ref(r, q.data(), p.d);
-                        dequantize_row_turbo4_0(q.data(), decoded.data(), p.d);
-                    }
-                    for (int64_t off = 0; off < p.d; off += 128) {
-                        turbo_cpu_fwht_inverse(decoded.data() + off, 128);
-                    }
-                }
-                for (int64_t j = 0; j < p.d; ++j) {
-                    dst[j] += decoded[size_t(j)];
+            const uint32_t slot = packed.residual_slot[ti];
+            if (slot != UINT32_MAX) {
+                GGML_ASSERT((size_t(slot) + 1) * packed.row_size() <= packed.residual_data.size());
+                decode_residual(packed.residual_type, packed.residual_data.data() + size_t(slot) * packed.row_size(),
+                                packed.d, residual.data());
+                for (int64_t j = 0; j < packed.d; ++j) {
+                    dst[j] += residual[size_t(j)];
                 }
             }
         }
@@ -835,22 +920,20 @@ bool cache_roundtrip(llama_context *               ctx,
         const auto               order_k = rank_candidates(empty_k, projection_k, "norm", 123);
         const auto               order_v = rank_candidates(empty_v, projection_v, "norm", 456);
 
-        const int64_t n_projected = n_token - window_layer;
-        const int64_t words       = (n_projected + 63) / 64;
-        const size_t  bytes_base  = size_t(n_head * (4LL * anchor_budget * d_k + 8LL * (anchor_budget - window_layer) +
-                                                   8LL * n_projected + 24LL * words) +
-                                           8LL * (n_head + 1) + 4LL * n_projected);
-        const size_t  bytes_k     = ggml_row_size(residual_type, d_k);
-        const size_t  bytes_v     = bytes_k + 1;
-        const size_t  target      = bytes_full / size_t(ratio);
-        const size_t  available   = target > bytes_base ? target - bytes_base : 0;
-        const size_t  n_k         = std::min(size_t(std::floor(0.5 * available / bytes_k)), order_k.size());
-        const size_t  n_v         = std::min(size_t(std::floor(0.5 * available / bytes_v)), order_v.size());
-        const size_t  bytes_used  = bytes_base + n_k * bytes_k + n_v * bytes_v;
+        const size_t bytes_base = packed_projection_base_size(projection_k) + packed_projection_base_size(projection_v);
+        const size_t bytes_k    = ggml_row_size(residual_type, d_k);
+        const size_t bytes_v    = ggml_row_size(residual_type, d_v);
+        const size_t target     = bytes_full / size_t(ratio);
+        const size_t available  = target > bytes_base ? target - bytes_base : 0;
+        const size_t n_k        = std::min(size_t(std::floor(0.5 * available / bytes_k)), order_k.size());
+        const size_t n_v        = std::min(size_t(std::floor(0.5 * available / bytes_v)), order_v.size());
+        const packed_projection packed_k   = pack_projection(projection_k, order_k, n_k, residual_type);
+        const packed_projection packed_v   = pack_projection(projection_v, order_v, n_v, residual_type);
+        const size_t            bytes_used = packed_k.serialized_size() + packed_v.serialized_size();
 
-        const tensor_series reconstructed_k_native = reconstruct(source_k, projection_k, order_k, n_k, residual_type);
+        const tensor_series reconstructed_k_native = unpack_projection(packed_k);
         const tensor_series reconstructed_k = rope ? rope->apply(reconstructed_k_native) : reconstructed_k_native;
-        const tensor_series reconstructed_v = reconstruct(exact_v.series, projection_v, order_v, n_v, residual_type);
+        const tensor_series reconstructed_v = unpack_projection(packed_v);
         cache_tensor_write(tensor_k, cells, reconstructed_k, exact_k.raw);
         cache_tensor_write(tensor_v, cells, reconstructed_v, exact_v.raw);
 
@@ -1185,6 +1268,10 @@ int run_ppl_mode(llama_context *                  ctx,
         std::fprintf(stderr, "failed to save baseline state\n");
         return 1;
     }
+    if (!state_restore(ctx, state)) {
+        std::fprintf(stderr, "failed to normalize baseline state through restore\n");
+        return 1;
+    }
     const suffix_eval baseline = evaluate_suffix(ctx, vocab, tokens, first_input);
     if (baseline.targets.empty() || !state_restore(ctx, state)) {
         std::fprintf(stderr, "failed to evaluate or restore baseline state\n");
@@ -1248,6 +1335,9 @@ int run_generate_mode(llama_context *                  ctx,
     }
     std::vector<uint8_t> state;
     if (!state_save(ctx, state)) {
+        return 1;
+    }
+    if (!state_restore(ctx, state)) {
         return 1;
     }
     const auto baseline = generate_greedy(ctx, vocab, tokens[final], llama_pos(final), n_generate);
@@ -1379,15 +1469,67 @@ bool self_test_residual_codecs() {
     const std::vector<std::vector<int32_t>> anchors = { { 0 } };
     const projection                        p       = build_projection(exact, anchors);
     const std::vector<float>                utility(size_t(p.n_token), 0.0f);
-    const auto                              order   = rank_candidates(utility, p, "norm", 42);
-    const tensor_series                     turbo2  = reconstruct(exact, p, order, order.size(), GGML_TYPE_TURBO2_0);
-    const tensor_series                     turbo4  = reconstruct(exact, p, order, order.size(), GGML_TYPE_TURBO4_0);
-    const tensor_series                     f16     = reconstruct(exact, p, order, order.size(), GGML_TYPE_F16);
-    const double                            error2  = self_test_reconstruction_error(exact, turbo2);
-    const double                            error4  = self_test_reconstruction_error(exact, turbo4);
-    const double                            error16 = self_test_reconstruction_error(exact, f16);
-    return std::isfinite(error2) && std::isfinite(error4) && std::isfinite(error16) && error4 < error2 &&
+    const auto                              order    = rank_candidates(utility, p, "norm", 42);
+    const packed_projection                 packed2  = pack_projection(p, order, order.size(), GGML_TYPE_TURBO2_0);
+    const packed_projection                 packed4  = pack_projection(p, order, order.size(), GGML_TYPE_TURBO4_0);
+    const packed_projection                 packed16 = pack_projection(p, order, order.size(), GGML_TYPE_F16);
+    const tensor_series                     turbo2   = unpack_projection(packed2);
+    const tensor_series                     turbo4   = unpack_projection(packed4);
+    const tensor_series                     f16      = unpack_projection(packed16);
+    const double                            error2   = self_test_reconstruction_error(exact, turbo2);
+    const double                            error4   = self_test_reconstruction_error(exact, turbo4);
+    const double                            error16  = self_test_reconstruction_error(exact, f16);
+    const bool                              slots    = packed2.residual_slot[order.front()] == 0 &&
+                       packed2.residual_slot[order.back()] == uint32_t(order.size() - 1) &&
+                       packed2.serialized_size() == packed_projection_base_size(p) + order.size() * packed2.row_size();
+    return slots && std::isfinite(error2) && std::isfinite(error4) && std::isfinite(error16) && error4 < error2 &&
            error16 < error4;
+}
+
+bool self_test_packed_slots() {
+    tensor_series exact;
+    exact.d = 128;
+    exact.h = 2;
+    exact.n = 5;
+    exact.data.resize(size_t(exact.d * exact.h * exact.n));
+    for (size_t i = 0; i < exact.data.size(); ++i) {
+        exact.data[i] = std::sin(float(i + 3) * 0.043f) + 0.2f * std::cos(float(i + 11) * 0.019f);
+    }
+    const std::vector<std::vector<int32_t>> anchors = {
+        { 0, 4 },
+        { 0, 4 }
+    };
+    const projection         p = build_projection(exact, anchors);
+    const std::vector<float> utility(size_t(p.n_head * p.n_token), 0.0f);
+    const auto               order   = rank_candidates(utility, p, "norm", 42);
+    const packed_projection  packed  = pack_projection(p, order, 3, GGML_TYPE_TURBO4_0);
+    const tensor_series      decoded = unpack_projection(packed);
+
+    size_t selected = 0;
+    for (uint32_t slot : packed.residual_slot) {
+        selected += slot != UINT32_MAX;
+    }
+    if (selected != 3 || packed.residual_slot[order[0]] != 0 || packed.residual_slot[order[1]] != 1 ||
+        packed.residual_slot[order[2]] != 2 || packed.residual_slot[order[3]] != UINT32_MAX ||
+        packed.serialized_size() != packed_projection_base_size(p) + 3 * packed.row_size()) {
+        return false;
+    }
+
+    const size_t  selected_ti    = order[0];
+    const int64_t selected_h     = int64_t(selected_ti) / p.n_token;
+    const int64_t selected_t     = int64_t(selected_ti) % p.n_token;
+    const size_t  omitted_ti     = order[3];
+    const int64_t omitted_h      = int64_t(omitted_ti) / p.n_token;
+    const int64_t omitted_t      = int64_t(omitted_ti) % p.n_token;
+    double        selected_error = 0.0;
+    double        omitted_error  = 0.0;
+    for (int64_t j = 0; j < p.d; ++j) {
+        const double selected_delta = exact.row(selected_t, selected_h)[j] - decoded.row(selected_t, selected_h)[j];
+        const double omitted_delta  = exact.row(omitted_t, omitted_h)[j] - decoded.row(omitted_t, omitted_h)[j];
+        selected_error += selected_delta * selected_delta;
+        omitted_error += omitted_delta * omitted_delta;
+    }
+    return selected_error < omitted_error;
 }
 
 int run_self_tests() {
@@ -1395,9 +1537,10 @@ int run_self_tests() {
     const bool anchors   = self_test_uniform_anchors();
     const bool ranking   = self_test_norm_ranking();
     const bool residuals = self_test_residual_codecs();
-    std::printf("TurboAnchorKV self-test: rope=%s anchors=%s ranking=%s residuals=%s\n", rope ? "ok" : "fail",
-                anchors ? "ok" : "fail", ranking ? "ok" : "fail", residuals ? "ok" : "fail");
-    return rope && anchors && ranking && residuals ? 0 : 1;
+    const bool slots     = self_test_packed_slots();
+    std::printf("TurboAnchorKV self-test: rope=%s anchors=%s ranking=%s residuals=%s slots=%s\n", rope ? "ok" : "fail",
+                anchors ? "ok" : "fail", ranking ? "ok" : "fail", residuals ? "ok" : "fail", slots ? "ok" : "fail");
+    return rope && anchors && ranking && residuals && slots ? 0 : 1;
 }
 
 }  // namespace
@@ -1524,17 +1667,14 @@ int main(int argc, char ** argv) {
     const auto v_order = rank_candidates(utility.v, pv, rank_mode, uint32_t(seed + 414));
     std::printf("Residual ranking: %.3f s\n", elapsed_seconds(start));
 
-    const int64_t   S             = capture.k_post.n;
-    const int64_t   H             = capture.k_post.h;
-    const int64_t   D             = capture.k_post.d;
-    const int64_t   P             = S - window;
-    const int64_t   words         = (P + 63) / 64;
-    const ggml_type residual_type = residual_type_from_env();
-    const size_t    full_bytes    = size_t(4 * S * H * D);
-    const size_t    base_bytes =
-        size_t(H * (4 * anchor_budget * D + 8 * (anchor_budget - window) + 8 * P + 24 * words) + 8 * (H + 1) + 4 * P);
-    const size_t k_residual_bytes = ggml_row_size(residual_type, D);
-    const size_t v_residual_bytes = k_residual_bytes + 1;
+    const int64_t   S                = capture.k_post.n;
+    const int64_t   H                = capture.k_post.h;
+    const int64_t   D                = capture.k_post.d;
+    const ggml_type residual_type    = residual_type_from_env();
+    const size_t    full_bytes       = size_t(4 * S * H * D);
+    const size_t    base_bytes       = packed_projection_base_size(pk) + packed_projection_base_size(pv);
+    const size_t    k_residual_bytes = ggml_row_size(residual_type, D);
+    const size_t    v_residual_bytes = ggml_row_size(residual_type, capture.v.d);
     std::printf("Bytes: FullKV=%zu base=%zu (%.2fx floor) residual=%s K=%zu V=%zu\n", full_bytes, base_bytes,
                 double(full_bytes) / base_bytes, ggml_type_name(residual_type), k_residual_bytes, v_residual_bytes);
     std::printf("ratio,ksplit,nk,nv,actual_ratio,mean_rel_l2,p95_rel_l2,max_rel_l2,reconstruct_s,evaluate_s\n");
@@ -1545,20 +1685,21 @@ int main(int argc, char ** argv) {
         const size_t target    = full_bytes / size_t(ratio);
         const size_t available = target > base_bytes ? target - base_bytes : 0;
         for (double split : splits) {
-            size_t nk         = size_t(std::floor(available * split / k_residual_bytes));
-            size_t nv         = size_t(std::floor(available * (1.0 - split) / v_residual_bytes));
-            nk                = std::min(nk, k_order.size());
-            nv                = std::min(nv, v_order.size());
-            const size_t used = base_bytes + nk * k_residual_bytes + nv * v_residual_bytes;
-
-            start                             = clock_type::now();
-            const tensor_series khat_native   = reconstruct(k_source, pk, k_order, nk, residual_type);
-            const tensor_series khat          = use_pre_rope ? rope.apply(khat_native) : khat_native;
-            const tensor_series vhat          = reconstruct(capture.v, pv, v_order, nv, residual_type);
-            const double        reconstruct_s = elapsed_seconds(start);
-            start                             = clock_type::now();
-            const error_stats error           = attention_error(observations, khat, vhat);
-            const double      evaluate_s      = elapsed_seconds(start);
+            size_t nk                             = size_t(std::floor(available * split / k_residual_bytes));
+            size_t nv                             = size_t(std::floor(available * (1.0 - split) / v_residual_bytes));
+            nk                                    = std::min(nk, k_order.size());
+            nv                                    = std::min(nv, v_order.size());
+            start                                 = clock_type::now();
+            const packed_projection packed_k      = pack_projection(pk, k_order, nk, residual_type);
+            const packed_projection packed_v      = pack_projection(pv, v_order, nv, residual_type);
+            const size_t            used          = packed_k.serialized_size() + packed_v.serialized_size();
+            const tensor_series     khat_native   = unpack_projection(packed_k);
+            const tensor_series     khat          = use_pre_rope ? rope.apply(khat_native) : khat_native;
+            const tensor_series     vhat          = unpack_projection(packed_v);
+            const double            reconstruct_s = elapsed_seconds(start);
+            start                                 = clock_type::now();
+            const error_stats error               = attention_error(observations, khat, vhat);
+            const double      evaluate_s          = elapsed_seconds(start);
             std::printf("%d,%.2f,%zu,%zu,%.4f,%.8f,%.8f,%.8f,%.3f,%.3f\n", ratio, split, nk, nv,
                         double(full_bytes) / used, error.mean, error.p95, error.max, reconstruct_s, evaluate_s);
         }

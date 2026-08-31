@@ -1,6 +1,6 @@
 # TurboAnchorKV experiment
 
-`llama-turboanchorkv` is an offline research and evaluation tool for a two-tier KV representation derived from AnchorKV and TurboQuant+. It can analyze one layer, round-trip real dense cache state for continuation PPL and logit drift, and compare baseline versus compressed greedy generation. It does not reduce runtime memory because the compact attention kernel does not exist yet.
+`llama-turboanchorkv` is an offline research and evaluation tool for a two-tier KV representation derived from AnchorKV and TurboQuant+. It can analyze one layer, pack and reconstruct real cache state for continuation PPL and logit drift, and compare baseline versus compressed greedy generation. It does not reduce runtime memory because the compact attention kernel does not exist yet.
 
 The evaluator is currently built on non-Windows platforms. It intentionally uses internal cache inspection interfaces whose symbols are not exported by the Windows shared-library build.
 
@@ -8,7 +8,7 @@ Tracking issue: [#332](https://github.com/TheTom/llama-cpp-turboquant/issues/332
 
 ## Algorithm
 
-The default analysis configuration stores the final 32 positions exactly, distributes the remaining `S/128` anchor slots uniformly over the old prompt, assigns K and V independently to their nearest bf16 anchors, ranks residuals by squared norm, and encodes selected residuals with the existing block-128 TurboQuant codec. The dense evaluator can use turbo2, turbo3, turbo4, or f16 residuals.
+The default analysis configuration retains the final 32 positions as bf16 anchors, distributes the remaining `S/128` anchor slots uniformly over the old prompt, assigns K and V independently to their nearest anchors, ranks residuals by squared norm, and encodes selected residuals with the existing block-128 TurboQuant codec. The packed representation stores bf16 anchors and coefficients, uint16 assignments, uint32 O(1) residual-slot maps, and contiguous TurboQuant residual rows. Its byte budget includes every packed array. The dense evaluator can use turbo2, turbo3, turbo4, or f16 residuals.
 
 The tool keeps the paper-style attention anchor selection, observation-output utility ranking, random controls, and post-RoPE projection as ablation modes. Dense evaluation reconstructs the existing f16 cache in place and therefore measures quality without measuring compact-cache memory or decode speed.
 
@@ -26,7 +26,11 @@ cmake --build build --target llama-turboanchorkv test-turbo-quant -j 12
 ctest --test-dir build -R '^test-turboanchorkv$' --output-on-failure
 ```
 
-The self-test checks synthetic RoPE recovery, deterministic uniform anchor placement, residual-norm ordering, and residual codec quality ordering. It needs no model.
+The self-test checks synthetic RoPE recovery, deterministic uniform anchor placement, residual-norm ordering, residual codec quality ordering, partial residual-slot lookup, and exact serialized byte accounting. It needs no model.
+
+## Implementation lineage
+
+The packed storage and O(1) residual-slot design were adapted from [Giveen's AnchorKV CPU reference](https://github.com/giveen/llama-cpp-turboquant/tree/feature/anchor-kv-cpu-reference), especially the [initial storage format](https://github.com/giveen/llama-cpp-turboquant/commit/875a1f370), [precomputed slot indices](https://github.com/giveen/llama-cpp-turboquant/commit/db851cea8), and the [slot-order bug fix](https://github.com/giveen/llama-cpp-turboquant/commit/6ac311a72). TurboAnchorKV substitutes the ablated uniform-anchor, residual-norm, and existing TurboQuant codec choices. The reference branch's cache lifecycle, shared scratch, graph operator, and CUDA path are not included here.
 
 ## Modes
 
@@ -132,9 +136,9 @@ Gemma 4 12B Q4_K_XL, Metal, f16 KV, about 8.5K prefix tokens:
 | Test | Simulated ratio | Result |
 |---|---:|---|
 | Dense identity control | 1.0x | 0 PPL delta, 0 KL, 1.0 top-1 agreement |
-| Docs continuation, turbo2 | 10.0x | +54.17% PPL, KL 0.670, 78.9% top-1 |
-| Docs continuation, turbo4 | 5.0x | +8.59% PPL over 512 tokens, KL 0.895, 78.7% top-1 |
-| Wikitext-2 excerpt, turbo4 | 5.0x | +26.09% PPL over 512 tokens, KL 1.154, 66.2% top-1 |
+| Docs continuation, packed turbo2 | 10.0x | +58.49% PPL, KL 0.685, 78.9% top-1 |
+| Docs continuation, packed turbo4 | 5.0x | +10.70% PPL over 512 tokens, KL 0.894, 78.7% top-1 |
+| Wikitext-2 excerpt, packed turbo4 | 5.0x | +23.86% PPL over 512 tokens, KL 1.166, 66.2% top-1 |
 | Needle at 10%, 50%, and 90%, turbo4 | 5.0x | Exact baseline match and correct retrieval at all depths |
 | Needle at 10%, turbo2 | 10.0x | Exact baseline match and correct retrieval |
 
