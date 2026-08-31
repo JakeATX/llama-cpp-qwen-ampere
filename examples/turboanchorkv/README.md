@@ -2,6 +2,8 @@
 
 `llama-turboanchorkv` is an offline research and evaluation tool for a two-tier KV representation derived from AnchorKV and TurboQuant+. It can analyze one layer, round-trip real dense cache state for continuation PPL and logit drift, and compare baseline versus compressed greedy generation. It does not reduce runtime memory because the compact attention kernel does not exist yet.
 
+The evaluator is currently built on non-Windows platforms. It intentionally uses internal cache inspection interfaces whose symbols are not exported by the Windows shared-library build.
+
 Tracking issue: [#332](https://github.com/TheTom/llama-cpp-turboquant/issues/332)
 
 ## Algorithm
