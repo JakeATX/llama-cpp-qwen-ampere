@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "moe-devsort.cuh"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -32,6 +33,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmv-cr.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -1737,52 +1739,6 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
     }
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-static bool ggml_cuda_mul_mat_cr_tiled(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
-        const ggml_tensor * src1, ggml_tensor * dst) {
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguously_allocated(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
-            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
-        return false;
-    }
-
-    const int64_t k = src0->ne[0];
-    const int64_t m = src0->ne[1];
-    const int64_t n = src1->ne[1];
-    GGML_ASSERT(src1->ne[0] == k);
-
-    constexpr size_t max_weight_scratch = 256ull * 1024 * 1024;
-    const int64_t rows_per_tile = std::max<int64_t>(
-        1, std::min<int64_t>(m, max_weight_scratch / (k * sizeof(half))));
-
-    ggml_cuda_pool_alloc<half> weights(ctx.pool(), rows_per_tile * k);
-    ggml_cuda_pool_alloc<half> activations(ctx.pool(), ggml_nelements(src1));
-    const to_fp16_cuda_t to_fp16_weights = ggml_get_to_fp16_cuda(src0->type);
-    const to_fp16_cuda_t to_fp16_activations = ggml_get_to_fp16_cuda(src1->type);
-    GGML_ASSERT(to_fp16_weights != nullptr && to_fp16_activations != nullptr);
-
-    cudaStream_t stream = ctx.stream();
-    to_fp16_activations(src1->data, activations.get(), ggml_nelements(src1), stream);
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), stream));
-
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    for (int64_t row = 0; row < m; row += rows_per_tile) {
-        const int64_t rows = std::min<int64_t>(rows_per_tile, m - row);
-        const char * src0_row = (const char *) src0->data + row*src0->nb[1];
-        to_fp16_weights(src0_row, weights.get(), rows*k, stream);
-
-        CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                rows, n, k,
-                &alpha, weights.get(), CUDA_R_16F, k,
-                        activations.get(), CUDA_R_16F, k,
-                &beta, (float *) dst->data + row, CUDA_R_32F, dst->ne[0],
-                CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-    }
-    return true;
-}
-#endif
-
 static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate,
                                           const ggml_tensor * glu,
@@ -1957,24 +1913,56 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const ggml_tensor * src0 = src0_;
     const ggml_tensor * src1 = src1_;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    if (src0->type == GGML_TYPE_Q8_CR ||
-            src0->type == GGML_TYPE_Q5_CR ||
-            src0->type == GGML_TYPE_Q6_CR) {
-        if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 &&
-                src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-                ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
-            ggml_cuda_mul_mat_vec_cr(src0->type, src0->data, (const float *) src1->data,
-                (float *) dst->data, src0->ne[1], src0->ne[0], ctx.stream());
-            return;
-        }
-        if (!ggml_cuda_mul_mat_cr_tiled(ctx, src0, src1, dst)) {
-            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        }
-        return;
-    }
     const bool is_cr = src0->type == GGML_TYPE_Q8_CR ||
                        src0->type == GGML_TYPE_Q5_CR ||
                        src0->type == GGML_TYPE_Q6_CR;
+    if (is_cr) {
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        const bool direct_inverse = (cc <= GGML_CUDA_CC_PASCAL && src1->ne[1] == 1) ||
+                                    src0->ne[1] <= 4;
+        if (direct_inverse && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+                ggml_is_contiguously_allocated(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            if (ggml_cuda_mul_mat_vec_cr(src0->type, src0->data, (const float *) src1->data,
+                    (float *) dst->data, src0->ne[1], src1->ne[1], src0->ne[0], cc, ctx.stream())) {
+                return;
+            }
+        }
+
+        const bool bad_padding_clear =
+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+        if (cc > GGML_CUDA_CC_PASCAL && !bad_padding_clear &&
+                src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                src1->ne[0] % QK8_CR == 0 && ggml_is_contiguously_allocated(src0) &&
+                ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            const ggml_tensor * src0_fast = nullptr;
+            if (src0->type == GGML_TYPE_Q8_CR) {
+                src0_q8_0 = *src0;
+                src0_q8_0.type = GGML_TYPE_Q8_0;
+                src0_q8_0.nb[0] = sizeof(block_q8_0);
+                src0_fast = &src0_q8_0;
+            } else if (src0->type == GGML_TYPE_Q5_CR) {
+                src0_q5_0 = *src0;
+                src0_q5_0.type = GGML_TYPE_Q5_0;
+                src0_q5_0.nb[0] = sizeof(block_q5_0);
+                src0_fast = &src0_q5_0;
+            } else {
+                src0_q6_K_cr = *src0;
+                src0_q6_K_cr.type = GGML_TYPE_Q6_K;
+                src0_fast = &src0_q6_K_cr;
+            }
+
+            if (ggml_cuda_should_use_mmvq(src0_fast->type, cc, src1->ne[1])) {
+                ggml_cuda_mul_mat_vec_q(ctx, src0_fast, src1, nullptr, dst, nullptr, true);
+                return;
+            }
+            if (ggml_cuda_should_use_mmq(src0_fast->type, cc, src1->ne[1], /*n_experts =*/ 0)) {
+                ggml_cuda_mul_mat_q(ctx, src0_fast, src1, nullptr, dst, true);
+                return;
+            }
+        }
+    }
 #endif
 
     if (src0->type == GGML_TYPE_Q8_CR) {
@@ -2048,17 +2036,6 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
-
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // Full-model CUDA inference with CR weights is not numerically reliable through
-    // MMVQ/MMQ even though the small random operator tests pass. Keep the CUDA
-    // activation rotation, then use the dequantize + cuBLAS path until the fast
-    // quantized kernels have production-shape correctness coverage.
-    if (is_cr) {
-        ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
-        return;
-    }
-#endif
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
@@ -2171,11 +2148,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    // TQ weight types use dequant-to-f16 cuBLAS path only (no mmvq/mmq kernels)
+    // TQ weights: small batch uses the capture-safe device-routed matvec (ggml_cuda_mul_mat_id_tq);
+    // large batch falls through to the dequant-to-f16 cuBLAS path, which synchronizes the stream.
     const bool is_tq_weight_id = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+            if (is_tq_weight_id && ggml_is_contiguous(src1)) {
+                // Device-side expert routing: no host sync, so the whole decode step is graph-capturable.
+                ggml_cuda_mul_mat_id_tq(ctx, src0, src1, ids, dst);
+                return;
+            }
             if (ggml_is_quantized(src0->type) && !is_tq_weight_id) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -2217,41 +2200,60 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
 
-    std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
-
     ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
-
-    std::vector<int32_t> tokens_per_expert(ne02);
+    std::vector<int32_t> tokens_per_expert(ne02, 0);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // Build the expert routing: ids_to_sorted | ids_from_sorted packed into ids_buf_dev,
+    // plus tokens_per_expert. By default this is done on-device (a counting sort) so the
+    // GPU is not left idle copying ids to the host and sorting token-slots by expert on
+    // the CPU. Set GGML_MOE_HOST_ROUTE=1 to force the original host-side routing loop.
+    static const bool moe_host_route = (getenv("GGML_MOE_HOST_ROUTE") != nullptr);
+    if (!moe_host_route) {
+        ggml_cuda_pool_alloc<int32_t> tpe_dev(ctx.pool(), ne02);
+        ggml_cuda_pool_alloc<int32_t> off_dev(ctx.pool(), ne02);
+        ggml_cuda_pool_alloc<int32_t> fill_dev(ctx.pool(), ne02);
+        ggml_cuda_moe_build_sorted_ids(
+            ids->data, (int)ne12, (int)n_expert_used, (int)ne02, (int)ne11,
+            ids->nb[0], ids->nb[1],
+            ids_buf_dev.ptr, ids_buf_dev.ptr + ne_get_rows,
+            tpe_dev.ptr, off_dev.ptr, fill_dev.ptr, stream);
+        // Only tokens_per_expert (ne02 ints) needs to reach the host, for GEMM sizing.
+        CUDA_CHECK(cudaMemcpyAsync(tokens_per_expert.data(), tpe_dev.ptr, ne02*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        std::vector<int32_t> ids_to_sorted_host;
+        ids_to_sorted_host.reserve(2*ne_get_rows);
+        std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
-        for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
-            for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
-                    tokens_per_expert[i02]++;
-                    break;
+        std::vector<char> ids_host(ggml_nbytes(ids));
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
+            for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
+                for (int64_t iex = 0; iex < n_expert_used; ++iex) {
+                    const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                    assert(expert_to_use >= 0 && expert_to_use < ne02);
+                    if (expert_to_use == i02) {
+                        ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
+                        ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
+                        tokens_per_expert[i02]++;
+                        break;
+                    }
                 }
             }
         }
+
+        GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+
+        ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
+
+        CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
-
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
-
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
@@ -2824,8 +2826,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || is_tq_w || node->ne[2] > mmvq_mmid_max) {
-                // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+            // The mul_mat_id operation synchronizes the stream (forbidding graph capture) unless it
+            // takes a device-routed path. TQ weights now have a capture-safe device-routed matvec at
+            // small batch with contiguous src1 (ggml_cuda_mul_mat_id_tq); only the large-batch cuBLAS
+            // fallback still synchronizes. Other quantized weights use mmvq up to mmvq_mmid_max.
+            // Keep this condition in sync with the dispatch in ggml_cuda_mul_mat_id.
+            const bool needs_sync = is_tq_w
+                ? (node->ne[2] > MMVQ_MAX_BATCH_SIZE || !ggml_is_contiguous(node->src[1]))
+                : (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max);
+            if (needs_sync) {
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
                 use_cuda_graph = false;
@@ -4432,6 +4441,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // [TAG_FA_F16_CUDA_GRAPHS] default: no graph will be captured for this cgraph, so HIP flash-
+    // attention keeps its raw (release-after-use) f16 temp path. Set true below only when the graph
+    // is enabled and compatible, i.e. it will actually be captured.
+    cuda_ctx->fa_f16_use_pool = false;
+
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
@@ -4440,6 +4454,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        // [TAG_FA_F16_CUDA_GRAPHS] this graph will be captured -> HIP flash-attention must use the
+        // capture-safe pool for its f16 KV-dequant temp buffers instead of raw cudaMalloc/cudaFree.
+        cuda_ctx->fa_f16_use_pool = graph_compatible;
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 

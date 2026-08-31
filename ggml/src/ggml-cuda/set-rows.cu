@@ -304,7 +304,7 @@ static __global__ void k_set_rows_turbo3(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset);
+        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -331,19 +331,33 @@ static __global__ void k_set_rows_turbo3(
     }
     __syncthreads();
 
-#define WHT_STAGE_SHARED(h) \
-    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    const int lane = j & 31;
+    float val = x[j];
+
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+
+    x[j] = val;
     __syncthreads();
 
-    // Butterfly stages: loop from h=1 to h<GROUP_SIZE, doubling each time
-    WHT_STAGE_SHARED(1)
-    WHT_STAGE_SHARED(2)
-    WHT_STAGE_SHARED(4)
-    WHT_STAGE_SHARED(8)
-    WHT_STAGE_SHARED(16)
-    WHT_STAGE_SHARED(32)
-    if (GROUP_SIZE == 128) { WHT_STAGE_SHARED(64) }
-#undef WHT_STAGE_SHARED
+    if (j % 64 < 32) {
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b;
+        x[j + 32] = a - b;
+    }
+    __syncthreads();
+
+    if (GROUP_SIZE == 128) {
+        if (j % 128 < 64) {
+            float a = x[j], b = x[j + 64];
+            x[j] = a + b;
+            x[j + 64] = a - b;
+        }
+        __syncthreads();
+    }
 
     constexpr float inv_sqrt_group = (GROUP_SIZE == 128) ? 0.08838834764831845f : 0.125f;
     if (GROUP_SIZE == 128) {
@@ -360,7 +374,6 @@ static __global__ void k_set_rows_turbo3(
     // ---- Step 6: Pack qs and signs (warp-cooperative, no atomics) ----
     // Each warp handles 32 elements. With QK_TURBO3 > WARP_SIZE, multiple warps
     // share one block and write to different byte offsets within it.
-    const int lane    = j % WARP_SIZE;
     const int elem_in_block = j % QK_TURBO3;
     block_turbo3_0 * blk = blk_base + (j / QK_TURBO3);
 
@@ -371,24 +384,28 @@ static __global__ void k_set_rows_turbo3(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[qs_byte_idx] = qs_byte;
 
-    // Pack signs: 8 elements per byte, 1 bit each.  __ballot_sync across warp.
-    // Ballot is per-warp (32 bits); extract local byte, write to global position in block.
-    const uint32_t ballot = __ballot_sync(0xffffffff, (idx >> 2) & 1);
-    const int local_signs_byte = lane / 8;             // byte within 32-bit ballot (0..3)
+    // Pack signs: 8 elements per byte, 1 bit each. Gather each 8-lane group's sign bits
+    // via a width-32 shuffle so the group is self-contained on wave64 (a __ballot_sync
+    // returns a 64-bit mask there and would truncate into uint32_t). Same idiom as qs.
+    const uint8_t my_sign = (idx >> 2) & 1;
     const int global_signs_byte = elem_in_block / 8;   // byte within block's signs array
-    const uint8_t signs_byte = (uint8_t)((ballot >> (local_signs_byte * 8)) & 0xFF);
+    uint8_t signs_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        signs_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
     if (lane % 8 == 0) blk->signs[global_signs_byte] = signs_byte;
 
     // ---- Step 7: Reconstruction norm (parallel, same pattern as step 2) ----
     const float c = TURBO_CENTROIDS_3BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset);
+        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();
@@ -473,7 +490,7 @@ static __global__ void k_set_rows_turbo3_tail(
     __shared__ float warp_accum[4];  // max 3 warps (tail ≤ 96)
     float v2 = val * val;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset);
+        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = v2;
     __syncthreads();
 
@@ -500,21 +517,25 @@ static __global__ void k_set_rows_turbo3_tail(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_low2, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[lane / 4] = qs_byte;
 
-    const uint32_t ballot = __ballot_sync(0xffffffff, (idx >> 2) & 1);
+    const uint8_t my_sign = (idx >> 2) & 1;
     const int signs_byte_idx = lane / 8;
-    const uint8_t signs_byte = (uint8_t)((ballot >> (signs_byte_idx * 8)) & 0xFF);
+    uint8_t signs_byte = 0;
+#pragma unroll
+    for (int sb = 0; sb < 8; sb++) {
+        signs_byte |= (uint8_t)(__shfl_sync(0xffffffff, my_sign, (lane & ~7) + sb, WARP_SIZE) << sb);
+    }
     if (lane % 8 == 0) blk->signs[signs_byte_idx] = signs_byte;
 
     // ---- Reconstruction norm ----
     const float c = TURBO_CENTROIDS_3BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset);
+        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = rc;
     __syncthreads();
 
@@ -672,7 +693,7 @@ static __global__ void k_set_rows_turbo2(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset);
+        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -699,18 +720,33 @@ static __global__ void k_set_rows_turbo2(
     }
     __syncthreads();
 
-#define WHT_STAGE_SHARED_T2(h) \
-    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    const int lane = j & 31;
+    float val = x[j];
+
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+
+    x[j] = val;
     __syncthreads();
 
-    WHT_STAGE_SHARED_T2(1)
-    WHT_STAGE_SHARED_T2(2)
-    WHT_STAGE_SHARED_T2(4)
-    WHT_STAGE_SHARED_T2(8)
-    WHT_STAGE_SHARED_T2(16)
-    WHT_STAGE_SHARED_T2(32)
-    if (GROUP_SIZE == 128) { WHT_STAGE_SHARED_T2(64) }
-#undef WHT_STAGE_SHARED_T2
+    if (j % 64 < 32) {
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b;
+        x[j + 32] = a - b;
+    }
+    __syncthreads();
+
+    if (GROUP_SIZE == 128) {
+        if (j % 128 < 64) {
+            float a = x[j], b = x[j + 64];
+            x[j] = a + b;
+            x[j + 64] = a - b;
+        }
+        __syncthreads();
+    }
 
     constexpr float inv_sqrt_group = (GROUP_SIZE == 128) ? 0.08838834764831845f : 0.125f;
     if (GROUP_SIZE == 128) {
@@ -727,7 +763,6 @@ static __global__ void k_set_rows_turbo2(
     // ---- Step 6: Pack qs (warp-cooperative, no atomics) ----
     // Each warp handles 32 elements. With QK_TURBO2 > WARP_SIZE, multiple warps
     // share one block and write to different byte offsets within it.
-    const int lane    = j % WARP_SIZE;
     const int elem_in_block = j % QK_TURBO2;
     block_turbo2_0 * blk = blk_base + (j / QK_TURBO2);
 
@@ -736,7 +771,7 @@ static __global__ void k_set_rows_turbo2(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[elem_in_block / 4] = qs_byte;
@@ -747,7 +782,7 @@ static __global__ void k_set_rows_turbo2(
     const float c = TURBO_CENTROIDS_2BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset);
+        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();
@@ -823,7 +858,7 @@ static __global__ void k_set_rows_turbo2_tail(
     __shared__ float warp_accum[4];
     float v2 = val * val;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset);
+        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = v2;
     __syncthreads();
 
@@ -850,7 +885,7 @@ static __global__ void k_set_rows_turbo2_tail(
     uint8_t qs_byte = 0;
 #pragma unroll
     for (int k = 0; k < 4; k++) {
-        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k);
+        uint8_t contrib = __shfl_sync(0xffffffff, my_bits, (lane & ~3) + k, WARP_SIZE);
         qs_byte |= contrib << (k * 2);
     }
     if (lane % 4 == 0) blk->qs[lane / 4] = qs_byte;
@@ -859,7 +894,7 @@ static __global__ void k_set_rows_turbo2_tail(
     const float c = TURBO_CENTROIDS_2BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset);
+        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
     if (lane == 0) warp_accum[warp_id] = rc;
     __syncthreads();
 
@@ -1014,7 +1049,7 @@ static __global__ void k_set_rows_turbo4(
     float v = x[j];
     float v2 = v * v;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        v2 += __shfl_xor_sync(0xffffffff, v2, offset);
+        v2 += __shfl_xor_sync(0xffffffff, v2, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = v2;
     __syncthreads();
@@ -1037,18 +1072,31 @@ static __global__ void k_set_rows_turbo4(
     x[j] *= TURBO_WHT_SIGNS1[j];
     __syncthreads();
 
-#define WHT_STAGE_SHARED_T4(h) \
-    if (j % (2*(h)) < (h)) { float a = x[j], b = x[j+(h)]; x[j] = a+b; x[j+(h)] = a-b; } \
+    const int lane = j & 31;
+    float val = x[j];
+
+#pragma unroll
+    for (int h = 1; h < 32; h <<= 1) {
+        float o = __shfl_xor_sync(0xffffffff, val, h);
+        val = (lane & h) ? (o - val) : (val + o);
+    }
+
+    x[j] = val;
     __syncthreads();
 
-    WHT_STAGE_SHARED_T4(1)
-    WHT_STAGE_SHARED_T4(2)
-    WHT_STAGE_SHARED_T4(4)
-    WHT_STAGE_SHARED_T4(8)
-    WHT_STAGE_SHARED_T4(16)
-    WHT_STAGE_SHARED_T4(32)
-    WHT_STAGE_SHARED_T4(64)
-#undef WHT_STAGE_SHARED_T4
+    if (j % 64 < 32) {
+        float a = x[j], b = x[j + 32];
+        x[j] = a + b;
+        x[j + 32] = a - b;
+    }
+    __syncthreads();
+
+    if (j % 128 < 64) {
+        float a = x[j], b = x[j + 64];
+        x[j] = a + b;
+        x[j + 64] = a - b;
+    }
+    __syncthreads();
 
     constexpr float inv_sqrt_128 = 0.08838834764831845f;
     x[j] = x[j] * inv_sqrt_128 * TURBO_WHT_SIGNS2[j];
@@ -1061,11 +1109,10 @@ static __global__ void k_set_rows_turbo4(
     // ---- Step 6: Pack qs (nibble packed, warp-cooperative) ----
     // 2 elements per byte, 4 bits each.
     // Thread pairs (j, j+1) share a qs byte.
-    const int lane = j % WARP_SIZE;
     const uint8_t my_nibble = idx & 0xF;
     uint8_t qs_byte = 0;
     // Gather nibble from partner thread
-    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1);
+    uint8_t partner_nibble = __shfl_sync(0xffffffff, my_nibble, lane ^ 1, WARP_SIZE);
     if (j % 2 == 0) {
         qs_byte = my_nibble | (partner_nibble << 4);
         blk->qs[j / 2] = qs_byte;
@@ -1075,7 +1122,7 @@ static __global__ void k_set_rows_turbo4(
     const float c = TURBO_CENTROIDS_4BIT[idx];
     float rc = c * c;
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        rc += __shfl_xor_sync(0xffffffff, rc, offset);
+        rc += __shfl_xor_sync(0xffffffff, rc, offset, WARP_SIZE);
     if (j % WARP_SIZE == 0)
         warp_accum[j / WARP_SIZE] = rc;
     __syncthreads();

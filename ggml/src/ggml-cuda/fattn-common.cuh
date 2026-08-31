@@ -1390,34 +1390,51 @@ void launch_fattn(
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
 #ifdef GGML_USE_HIP
-    // HIP/ROCm: bypass the memory pool for f16 temp buffers.
-    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently
-    // because free() stores buffers for reuse rather than releasing them.
-    // On HIP without VMM support (RDNA 3/4), this means the f16 dequant temp buffers
-    // for quantized KV stay allocated after use, consuming more VRAM than the KV
-    // compression saves — causing OOM before f16 at equivalent context lengths.
-    // Using raw cudaMalloc/cudaFree ensures memory is released after the kernel completes.
+    // HIP/ROCm: allocate the f16 KV-dequant temp buffers in a CUDA-graph-capture-aware way.
+    //
+    // Default (no graph capture): bypass the memory pool and use raw cudaMalloc/cudaFree so the
+    // temp buffer (up to ~2x the quantized KV size) is released the moment the kernel completes.
+    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently on HIP
+    // without VMM support (RDNA 3/4) because free() stores buffers for reuse rather than releasing
+    // them; pooling this temp would negate the KV compression and OOM at long context.
     // Ref: https://github.com/ggml-org/llama.cpp/issues/22107
+    //
+    // While a CUDA graph is being captured, cudaMalloc/cudaFree/cudaStreamSynchronize are all
+    // illegal. When the current graph will be captured (ctx.fa_f16_use_pool, set for graph-enabled
+    // and graph-compatible cgraphs), use the pool instead: capture only begins once the shape is
+    // stable (see ggml_cuda_graph_update_required), so this temp is a single fixed-size buffer that
+    // the pool allocates during the eager warmup passes and then reuses across every graph replay
+    // — exactly the capture-safe path the non-HIP build always takes. Holding it is required anyway
+    // for replay to reference a stable buffer address.
+    const bool fa_f16_use_pool = ctx.fa_f16_use_pool;
     struct hip_f16_alloc {
         half * ptr = nullptr;
         cudaStream_t stream;
-        hip_f16_alloc(cudaStream_t s) : stream(s) {}
+        bool use_pool;
+        ggml_cuda_pool_alloc<half> pool_alloc;
+        hip_f16_alloc(cudaStream_t s, ggml_cuda_pool & p, bool use_pool)
+            : stream(s), use_pool(use_pool), pool_alloc(p) {}
         hip_f16_alloc(const hip_f16_alloc &) = delete;
         hip_f16_alloc & operator=(const hip_f16_alloc &) = delete;
         ~hip_f16_alloc() {
-            if (ptr) {
-                // Destructor: cannot propagate errors, and under HIP both calls are
-                // [[nodiscard]], which is fatal under -Werror. Discard explicitly.
-                (void) cudaStreamSynchronize(stream);
-                (void) cudaFree(ptr);
+            if (use_pool || ptr == nullptr) {
+                return;  // pool_alloc releases back to the pool; nothing to do if unused
             }
+            // Destructor: cannot propagate errors, and under HIP both calls are
+            // [[nodiscard]], which is fatal under -Werror. Discard explicitly.
+            (void) cudaStreamSynchronize(stream);
+            (void) cudaFree(ptr);
         }
         void alloc(size_t nelements) {
-            CUDA_CHECK(cudaMalloc(&ptr, nelements * sizeof(half)));
+            if (use_pool) {
+                ptr = pool_alloc.alloc(nelements);
+            } else {
+                CUDA_CHECK(cudaMalloc(&ptr, nelements * sizeof(half)));
+            }
         }
     };
-    hip_f16_alloc K_f16(main_stream);
-    hip_f16_alloc V_f16(main_stream);
+    hip_f16_alloc K_f16(main_stream, pool, fa_f16_use_pool);
+    hip_f16_alloc V_f16(main_stream, pool, fa_f16_use_pool);
 #else
     ggml_cuda_pool_alloc<half>   K_f16(pool);
     ggml_cuda_pool_alloc<half>   V_f16(pool);

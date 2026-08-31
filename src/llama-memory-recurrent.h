@@ -123,6 +123,7 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> p_l;
 
     // per layer, only allocated when gdn_replay is true: [n_embd_s_ingredient(), mem_size * n_rs_seq]
     std::vector<ggml_tensor *> ingr_l;
@@ -149,6 +150,7 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
@@ -196,6 +198,7 @@ public:
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_ingr_l(int32_t il) const;    // nullptr unless mem->gdn_replay
     ggml_tensor * get_s_ckpt_l(int32_t il) const;  // nullptr unless mem->gdn_replay
+    ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
 
