@@ -9693,6 +9693,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // TurboQuant MUL_MAT_ID at the shapes a real MoE model uses. The sweep above runs 4 experts
+    // with k=256, which is nothing like a real router: Qwen3.6-35B-A3B (qwen35moe) has 256
+    // experts with 8 used per token, gate/up of [2048 x 512] and down of [512 x 2048]. Expert
+    // counts in the hundreds change how the routing is built and how few slots each expert
+    // gets, and n spans both sides of MMVQ_MAX_BATCH_SIZE so this covers the decode matvec and
+    // the MMQ prefill path rather than only one of them.
+    for (ggml_type type_a : {GGML_TYPE_TQ3_1S, GGML_TYPE_TQ4_1S}) {
+        for (int n : {1, 9, 32}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false,  512, n, 2048)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 256, 8, false, 2048, n,  512)); // down
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
             for (int n_mats : {4, 8}) {
