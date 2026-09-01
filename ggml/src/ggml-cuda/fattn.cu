@@ -6,14 +6,6 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-static bool sm86_qwen_gqa6_fattn48_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_SM86_QWEN_GQA6_FATTN48");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -71,13 +63,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
-
-    if constexpr (DKQ == 256 && DV == 256) {
-        if (cc == 860 && sm86_qwen_gqa6_fattn48_enabled() && use_gqa_opt && gqa_ratio == 6 && Q->ne[1] > 8) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 6>(ctx, dst);
-            return;
-        }
-    }
 
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
