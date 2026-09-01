@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -88,6 +89,16 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool qwen38_shared_galloc_enabled() {
+    const char * value = std::getenv("GGML_QWEN38_SHARED_GALLOC");
+    return value != nullptr && (
+            std::strcmp(value, "1") == 0 ||
+            std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "TRUE") == 0 ||
+            std::strcmp(value, "on") == 0 ||
+            std::strcmp(value, "ON") == 0);
 }
 
 llama_context::llama_context(
@@ -484,6 +495,18 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        if (qwen38_shared_galloc_enabled() &&
+            model.arch_name() == "qwen35" &&
+            hparams.n_layer_nextn == 1 &&
+            cparams.n_seq_max == 1 &&
+            model.n_devices() == 1 &&
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            params.ctx_other != nullptr &&
+            &params.ctx_other->get_model() == &model) {
+            shared_galloc_target = params.ctx_other;
+            LLAMA_LOG_WARN("QWEN38_SHARED_GALLOC: eligible MTP context; schedulers remain independent\n");
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -737,6 +760,15 @@ void llama_context::sched_reserve() {
             moe_cache_eligible ? moe_cache_requested : "off");
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    if (shared_galloc_target != nullptr) {
+        auto * target_sched = shared_galloc_target->get_sched();
+        if (target_sched == nullptr || !ggml_backend_sched_share_galloc(sched.get(), target_sched)) {
+            throw std::runtime_error("QWEN38_SHARED_GALLOC: incompatible target/MTP graph allocators");
+        }
+        LLAMA_LOG_WARN("%s: QWEN38_SHARED_GALLOC sharing target compute arena\n", __func__);
+    }
+
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib);
@@ -1622,7 +1654,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool galloc_owner_switched =
+            qwen38_shared_galloc_enabled() &&
+            ggml_backend_sched_activate_galloc(sched.get(), this);
+
+    if (!graph_reuse_disable && !galloc_owner_switched && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running

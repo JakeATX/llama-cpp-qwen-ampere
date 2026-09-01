@@ -354,6 +354,10 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // Default-off experiment: an MTP context may share only the target's
+    // backing graph allocator while retaining its own scheduler.
+    llama_context * shared_galloc_target = nullptr;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;

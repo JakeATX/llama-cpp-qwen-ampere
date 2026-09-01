@@ -317,6 +317,19 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Experimental capacity path: keep schedulers independent while sharing
+    // only the graph allocator and its backing compute buffers. Buffer types
+    // and backend ordering must match exactly.
+    GGML_API bool ggml_backend_sched_share_galloc(
+            ggml_backend_sched_t dst,
+            ggml_backend_sched_t src);
+
+    // Returns true when a shared compute arena changes owner. The previous
+    // scheduler is synchronized before ownership changes.
+    GGML_API bool ggml_backend_sched_activate_galloc(
+            ggml_backend_sched_t sched,
+            const void * owner);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
