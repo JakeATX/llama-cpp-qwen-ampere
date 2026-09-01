@@ -208,25 +208,6 @@ static bool ggml_cuda_q8_turbo3_mma_fused() {
     return value;
 }
 
-static bool ggml_cuda_sm86_q8_turbo3_prefill() {
-    static const bool value = [] {
-        const char * env = getenv("GGML_CUDA_SM86_Q8_T3_PREFILL");
-        return env != nullptr && env[0] == '1';
-    }();
-    return value;
-}
-
-static bool ggml_cuda_use_q8_turbo3_direct_prefill(const int cc, const ggml_tensor * dst) {
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-
-    return ggml_cuda_sm86_q8_turbo3_prefill() && cc == 860 &&
-           K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
-           Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 16 && Q->ne[1] <= 1024 &&
-           Q->ne[2] == 6 * K->ne[2];
-}
-
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -810,11 +791,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
-    if (ggml_cuda_use_q8_turbo3_direct_prefill(ggml_cuda_info().devices[device].cc, dst)) {
-        need_f16_K = false;
-        need_f16_V = false;
-    }
-
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
@@ -832,10 +808,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const bool grouped_decode = ggml_cuda_q8_turbo3_mma_fused() &&
-            K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
-            Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 3 && Q->ne[1] <= 5;
-        if ((grouped_decode || ggml_cuda_use_q8_turbo3_direct_prefill(cc, dst)) && turing_mma_available(cc)) {
+        if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 3 && Q->ne[1] <= 5 && turing_mma_available(cc)) {
             ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
             return;
         }
