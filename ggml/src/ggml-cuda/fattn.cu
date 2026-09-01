@@ -4,7 +4,6 @@
 #include "fattn-mma-turbo.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
-#include "fattn-vec-gqa-sm86.cuh"
 #include "fattn.cuh"
 
 template <int DKQ, int DV, int ncols2>
@@ -204,14 +203,6 @@ static bool ggml_cuda_turbo_mma_fused() {
 static bool ggml_cuda_q8_turbo3_mma_fused() {
     static const bool value = [] {
         const char * env = getenv("GGML_Q8_TURBO3_MMA_FUSED");
-        return env != nullptr && env[0] == '1';
-    }();
-    return value;
-}
-
-static bool ggml_cuda_sm86_q8_t3_gqa_warp() {
-    static const bool value = [] {
-        const char * env = getenv("GGML_CUDA_SM86_Q8_T3_GQA_WARP");
         return env != nullptr && env[0] == '1';
     }();
     return value;
@@ -808,24 +799,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-
-    // Qwen3.8 singleton GQA prototype: one packed KV load feeds three
-    // independent query-head consumer warps. Exact/generic dispatch remains
-    // available when the default-off flag or any shape gate is not satisfied.
-    {
-        const ggml_tensor * Q = dst->src[0];
-        const ggml_tensor * K = dst->src[1];
-        const ggml_tensor * V = dst->src[2];
-        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        const int gqa_ratio = Q->ne[2] / K->ne[2];
-        if (ggml_cuda_sm86_q8_t3_gqa_warp() && cc == 860 &&
-                K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
-                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] == 1 &&
-                gqa_ratio == 6) {
-            ggml_cuda_flash_attn_ext_vec_q8_t3_gqa3_sm86(ctx, dst);
-            return;
-        }
-    }
 
     // Qwen3.8 verification fast path: Q8 K and Turbo3 V are decoded directly
     // into the Stream-K MMA tile. This removes full-cache FP16 conversion and
