@@ -3,6 +3,8 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -22,7 +24,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * s,
         int           il) {
     const int64_t S_k      = q->ne[0];
-    const int64_t H_k      = q->ne[1];
+    int64_t       H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
     const int64_t n_seqs   = q->ne[3];
 
@@ -41,6 +43,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     GGML_ASSERT(                   g->ne[1] == H_v && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
     GGML_ASSERT(b->ne[0] == 1   && b->ne[1] == H_v && b->ne[2] == n_tokens && b->ne[3] == n_seqs);
     GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v      && s->ne[3] == n_seqs);
+
+    // The normal graph fallback repeats Q/K to the value-head count in the
+    // architecture builder.  The diagnostic graph-reference dispatch below
+    // bypasses that choice, so perform the same exact broadcast locally.
+    if (H_k != H_v) {
+        q = ggml_repeat_4d(ctx0, q, S_k, H_v, n_tokens, n_seqs);
+        k = ggml_repeat_4d(ctx0, k, S_k, H_v, n_tokens, n_seqs);
+        H_k = H_v;
+    }
 
     const float scale = 1.0f / sqrtf(S_k);
 
@@ -437,6 +448,15 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
             return build_delta_net_fused(q, k, v, g, b, s, il);
         }
         return build_delta_net_autoregressive(q, k, v, g, b, s, il);
+    }
+
+    static const bool graph_chunk_reference = [] {
+        const char * env = std::getenv("GGML_CUDA_SM86_GDN_GRAPH_REFERENCE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+
+    if (graph_chunk_reference) {
+        return build_delta_net_chunking(q, k, v, g, b, s, il);
     }
 
     if (cparams.fused_gdn_ch) {
