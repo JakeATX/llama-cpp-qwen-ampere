@@ -3,13 +3,12 @@
 // SM86 Qwen3.8 singleton attention prototype.
 //
 // One CTA owns three query heads that share one KV head. Warp 0 stages packed
-// Q8_0 K and Turbo3 V rows. Warps 1..6 form three two-warp consumer pairs;
-// each pair owns one query head and splits KV positions. This avoids making any
-// lane retain two head accumulators, the source of the spills in the archived
-// GQA2 prototype, while restoring intra-head sequence parallelism.
+// Q8_0 K and Turbo3 V rows; warps 1..3 independently own one query head and
+// its D=256 online-softmax/output state. This avoids making any lane retain two
+// head accumulators, the source of the spills in the archived GQA2 prototype.
 
 template <int TILE>
-__launch_bounds__(224, 1)
+__launch_bounds__(128, 1)
 static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
         const char * Q_ptr,
         const char * K_ptr,
@@ -35,8 +34,6 @@ static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
 #if defined(FLASH_ATTN_AVAILABLE) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
     constexpr int D = 256;
     constexpr int GQA_GROUP = 3;
-    constexpr int HEAD_WARPS = 2;
-    constexpr int NCONSUMERS = GQA_GROUP * HEAD_WARPS;
     constexpr int NQ_I32 = D / int(sizeof(int));
     constexpr int NQ_DS  = D / QK8_1;
     constexpr int K_BYTES = (D / QK8_0) * int(sizeof(block_q8_0));
@@ -50,15 +47,10 @@ static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
     __shared__ __align__(16) unsigned char V_stage[TILE][V_BYTES];
     __shared__ int    Q_i32_shared[GQA_GROUP][NQ_I32];
     __shared__ float2 Q_ds_shared [GQA_GROUP][NQ_DS];
-    __shared__ float  partial_out [NCONSUMERS][D];
-    __shared__ float  partial_max [NCONSUMERS];
-    __shared__ float  partial_sum [NCONSUMERS];
 
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
     const int consumer = warp - 1;
-    const int consumer_head = consumer / HEAD_WARPS;
-    const int consumer_split = consumer - consumer_head * HEAD_WARPS;
 
     const int groups_per_kv = 2; // Qwen3.8 GQA ratio 6, three consumers per CTA.
     const int groups_per_sequence = ne12 * groups_per_kv;
@@ -86,26 +78,23 @@ static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
     ggml_cuda_pdl_sync();
 
     if (warp > 0) {
-        head = head0 + consumer_head;
+        head = head0 + consumer;
         const float * Q = (const float *) (Q_ptr + nb03 * sequence + nb02 * head);
-        if (consumer_split == 0) {
 #pragma unroll
-            for (int i0 = 0; i0 < NQ_I32; i0 += WARP_SIZE) {
-                quantize_q8_1_to_shared<float2, WARP_SIZE>(
-                    Q + i0 * int(sizeof(int)), scale,
-                    Q_i32_shared[consumer_head] + i0,
-                    Q_ds_shared[consumer_head] + i0 / QI8_1);
-            }
+        for (int i0 = 0; i0 < NQ_I32; i0 += WARP_SIZE) {
+            quantize_q8_1_to_shared<float2, WARP_SIZE>(
+                Q + i0 * int(sizeof(int)), scale,
+                Q_i32_shared[consumer] + i0,
+                Q_ds_shared[consumer] + i0 / QI8_1);
         }
+        __syncwarp();
+        q_i32[0] = Q_i32_shared[consumer][lane];
+        q_i32[1] = Q_i32_shared[consumer][WARP_SIZE + lane];
+        q_ds[0] = Q_ds_shared[consumer][lane / QI8_1];
+        q_ds[1] = Q_ds_shared[consumer][(WARP_SIZE + lane) / QI8_1];
         slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
     }
     __syncthreads();
-    if (warp > 0) {
-        q_i32[0] = Q_i32_shared[consumer_head][lane];
-        q_i32[1] = Q_i32_shared[consumer_head][WARP_SIZE + lane];
-        q_ds[0] = Q_ds_shared[consumer_head][lane / QI8_1];
-        q_ds[1] = Q_ds_shared[consumer_head][(WARP_SIZE + lane) / QI8_1];
-    }
 
     for (int tile0 = blockIdx.y * TILE; tile0 < k_max; tile0 += gridDim.y * TILE) {
         if (warp == 0) {
@@ -133,7 +122,7 @@ static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
             float logits[TILE];
             float tile_max = -FLT_MAX / 2.0f;
 #pragma unroll
-            for (int p = consumer_split; p < TILE; p += HEAD_WARPS) {
+            for (int p = 0; p < TILE; ++p) {
                 const int pos = tile0 + p;
                 float logit = -FLT_MAX / 2.0f;
                 if (pos < k_max) {
@@ -161,7 +150,7 @@ static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
             kq_max = new_max;
 
 #pragma unroll
-            for (int p = consumer_split; p < TILE; p += HEAD_WARPS) {
+            for (int p = 0; p < TILE; ++p) {
                 if (tile0 + p >= k_max) {
                     continue;
                 }
@@ -182,31 +171,6 @@ static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
     }
 
     if (warp > 0) {
-#pragma unroll
-        for (int d = 0; d < 8; ++d) {
-            partial_out[consumer][lane * 8 + d] = out[d];
-        }
-        if (lane == 0) {
-            partial_max[consumer] = kq_max;
-            partial_sum[consumer] = kq_sum;
-        }
-    }
-    __syncthreads();
-
-    if (warp > 0 && consumer_split == 0) {
-        const float max0 = partial_max[consumer + 0];
-        const float max1 = partial_max[consumer + 1];
-        kq_max = fmaxf(max0, max1);
-        const float scale0 = __expf(max0 - kq_max);
-        const float scale1 = __expf(max1 - kq_max);
-        kq_sum = scale0 * partial_sum[consumer + 0] + scale1 * partial_sum[consumer + 1];
-#pragma unroll
-        for (int d = 0; d < 8; ++d) {
-            const int index = lane * 8 + d;
-            out[d] = scale0 * partial_out[consumer + 0][index] +
-                     scale1 * partial_out[consumer + 1][index];
-        }
-
         if (sinks_ptr && blockIdx.y == 0) {
             const float sink = ((const float *) sinks_ptr)[head];
             const float new_max = fmaxf(sink, kq_max);
@@ -245,8 +209,9 @@ static __global__ void flash_attn_ext_vec_q8_t3_gqa3_sm86(
 static void ggml_cuda_flash_attn_ext_vec_q8_t3_gqa3_sm86(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int TILE = 8;
-    constexpr int nwarps = 7;
+    constexpr int nwarps = 4;
     constexpr size_t nbytes_shared = 0;
     fattn_kernel_t kernel = flash_attn_ext_vec_q8_t3_gqa3_sm86<TILE>;
     launch_fattn<256, 1, 3>(ctx, dst, kernel, nwarps, nbytes_shared, TILE, false, false, false);
 }
+
