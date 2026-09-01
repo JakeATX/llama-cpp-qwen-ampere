@@ -1,7 +1,6 @@
 #pragma once
 
 #include "common.cuh"
-#include "cp-async.cuh"
 
 #include <climits>
 #include <cstdint>
@@ -871,8 +870,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const int stride_row_x, const int ncols_y, const int stride_col_dst,
-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop,
-        const bool sm86_ub_mmq_pipe) {
+        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
 
     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
     constexpr int              nwarps     = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
@@ -884,9 +882,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y = data_mul_mat_q + J;
-    constexpr int tile_y_stride = GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
-    int * tile_y_next = tile_y + tile_y_stride;
-    int * tile_x = tile_y + tile_y_stride * (sm86_ub_mmq_pipe ? 2 : 1);
+    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -904,40 +900,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        if (sm86_ub_mmq_pipe) {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
-            constexpr int tile_y_bytes = J * MMQ_TILE_Y_K * sizeof(int);
-            constexpr int async_copies = tile_y_bytes / 16;
-            const int tid = threadIdx.y * warp_size + threadIdx.x;
-
-#pragma unroll
-            for (int c = tid; c < async_copies; c += nwarps * warp_size) {
-                cp_async_cg_16<128>(
-                    ggml_cuda_cvta_generic_to_shared(reinterpret_cast<char *>(tile_y) + c * 16),
-                    reinterpret_cast<const char *>(by0) + c * 16);
-            }
-            cp_async_wait_all();
-            __syncthreads();
-
-            const int * by1 = by0 + ncols_y * sz;
-#pragma unroll
-            for (int c = tid; c < async_copies; c += nwarps * warp_size) {
-                cp_async_cg_16<128>(
-                    ggml_cuda_cvta_generic_to_shared(reinterpret_cast<char *>(tile_y_next) + c * 16),
-                    reinterpret_cast<const char *>(by1) + c * 16);
-            }
-
-            vec_dot(tile_x, tile_y, sum, 0);
-
-            cp_async_wait_all();
-            __syncthreads();
-
-            vec_dot(tile_x, tile_y_next, sum, MMQ_TILE_NE_K);
-
-            __syncthreads();
-            continue;
-        }
-
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -990,7 +952,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const bool sm86_ub_mmq_pipe) {
+        const uint3 ntx) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1087,7 +1049,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, sm86_ub_mmq_pipe);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
         return;
     }
 
@@ -1181,7 +1143,7 @@ static __global__ void mul_mat_q(
         mul_mat_q_process_tile<type, J, fallback, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
              stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, sm86_ub_mmq_pipe);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -1265,7 +1227,7 @@ static __global__ void mul_mat_q(
     mul_mat_q_process_tile<type, J, fallback, fixup>
         (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
          stride_row_x, ncols_y, stride_col_dst,
-         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, sm86_ub_mmq_pipe);
+         tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1415,26 +1377,11 @@ struct mmq_args {
     int64_t ncols_max;
 };
 
-static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc, const bool sm86_ub_mmq_pipe = false) {
+static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
-    const size_t nbs_y = config.J * sizeof(block_q8_1_mmq) * (sm86_ub_mmq_pipe ? 2 : 1);
+    const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
-}
-
-static bool sm86_ub_mmq_pipe_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_SM86_UB_MMQ_PIPE");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
-template <ggml_type type>
-static constexpr bool sm86_ub_mmq_pipe_type() {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K ||
-           type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_IQ3_S ||
-           type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ2_S;
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1447,12 +1394,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
     GGML_ASSERT(config.nthreads % warp_size == 0);
     const int nwarps = config.nthreads / warp_size;
-    const bool sm86_ub_mmq_pipe = sm86_ub_mmq_pipe_enabled() && cc == 860 && J == 128 && !fallback &&
-                                  sm86_ub_mmq_pipe_type<type>() &&
-                                  (args.ncols_y == 512 || args.ncols_y == 1024) &&
-                                  args.ncols_max == args.ncols_y &&
-                                  mmq_get_nbytes_shared(config, cc, true) <= ggml_cuda_info().devices[id].smpbo;
-    const int nbytes_shared = mmq_get_nbytes_shared(config, cc, sm86_ub_mmq_pipe);
+    const int nbytes_shared = mmq_get_nbytes_shared(config, cc);
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
@@ -1482,7 +1424,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, sm86_ub_mmq_pipe);
+             ntx_fd);
         return;
     }
 
@@ -1511,7 +1453,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, sm86_ub_mmq_pipe);
+         ntx_fd);
 
     if (!fixup_needed) {
         return;
