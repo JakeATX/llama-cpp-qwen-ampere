@@ -71,6 +71,7 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 4,  64, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 4,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 48,  96, 2,  32, 128, 128, 128, 2, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  32, 128, 128, 128, 2, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 128, 128, 128, 1, false);
@@ -363,6 +364,19 @@ static constexpr __device__ int get_cols_per_thread() {
 #else
     return 2; // This is specifically KQ columns, Volta only has a single VKQ column.
 #endif // defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+}
+
+// The established kernels arrange a tile as query-major groups of 1/2/4/8 heads.
+// Qwen's six-head group is instead stored as three independent 8-query x 2-head
+// MMA stripes so each 16-column warp owns a complete, power-of-two sub-group.
+template <int ncols2>
+static constexpr __device__ int fattn_gqa_j(const int jc) {
+    return ncols2 == 6 ? (jc % 16) / 2 : jc / ncols2;
+}
+
+template <int ncols2>
+static constexpr __device__ int fattn_gqa_c(const int jc) {
+    return ncols2 == 6 ? 2 * (jc / 16) + jc % 2 : jc % ncols2;
 }
 
 static __host__ int get_cols_per_warp(const int cc) {
@@ -1042,7 +1056,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     const int i = i0 + T_C_KQ::get_i(l);
-                    const int j = ((threadIdx.y / np)*T_C_KQ::J + T_C_KQ::get_j(l)) / ncols2;
+                    const int j = fattn_gqa_j<ncols2>((threadIdx.y / np)*T_C_KQ::J + T_C_KQ::get_j(l));
 
                     KQ_C[i00/(np*T_C_KQ::I)].x[l] += slope * __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
                 }
@@ -1108,7 +1122,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                 for (int l = 0; l < T_C_KQ::ne; ++l) {
                     const int i = i0 + T_C_KQ::get_j(l);
-                    const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l)) / ncols2;
+                    const int j = fattn_gqa_j<ncols2>((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l));
 
                     KQ_C[i00/(np*T_C_KQ::J)].x[l] += __half2float(tile_mask[j*(nbatch_fa + 8) + i]);
                 }
@@ -1116,7 +1130,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #pragma unroll
                 for (int l0 = 0; l0 < T_C_KQ::ne; l0 += 2) {
                     const int i = (i0 + T_C_KQ::get_j(l0)) / 2;
-                    const int j = ((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l0)) / ncols2;
+                    const int j = fattn_gqa_j<ncols2>((threadIdx.y / np)*cols_per_warp + T_C_KQ::get_i(l0));
 
                     const float2 tmp = __half22float2(((const half2 *)tile_mask)[j*(nbatch_fa/2 + 4) + i]);
                     KQ_C[i00/(np*T_C_KQ::J)].x[l0 + 0] += slope*tmp.x;
@@ -1537,7 +1551,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         return;
     }
 
-    static_assert(nwarps * (cols_per_warp/ncols2) % ncols1 == 0, "bad nwarps");
+    static_assert(ncols2 == 6 ? nwarps == 3 : nwarps * (cols_per_warp/ncols2) % ncols1 == 0, "bad nwarps");
 
     constexpr int stride_tile_Q = DKQ/2     + 4;
     constexpr int stride_tile_K = nbatch_K2 + 4;
@@ -1590,8 +1604,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 break;
             }
 
-            const int j = jc / ncols2;
-            const int c = jc % ncols2;
+            const int j = fattn_gqa_j<ncols2>(jc);
+            const int c = fattn_gqa_c<ncols2>(jc);
 
             if ((ncols1 == 1 || jt*ncols1 + j < int(ne01.z)) && (ncols2 == 1 || zt_gqa*ncols2 + c < gqa_ratio)) {
 #pragma unroll
@@ -1726,7 +1740,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #pragma unroll
         for (int col = 0; col < cols_per_thread; ++col) {
             const int jc = (threadIdx.y/np)*cols_per_warp + (cols_per_warp == 8 ? T_C_KQ::get_j(col) : T_C_KQ::get_i(2*col));
-            const float sink = sinks_f[jc % ncols2];
+            const float sink = sinks_f[fattn_gqa_c<ncols2>(jc)];
 
             const float KQ_max_new = fmaxf(KQ_max[col], sink);
             const float KQ_max_diff = KQ_max[col] - KQ_max_new;
@@ -2023,8 +2037,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
                     const int jc_tile_K = (jc_dst/cols_per_warp)*(np*cols_per_warp) + jc_dst % cols_per_warp;
 
-                    const int j_dst = jc_dst / ncols2;
-                    const int c_dst = jc_dst % ncols2;
+                    const int j_dst = fattn_gqa_j<ncols2>(jc_dst);
+                    const int c_dst = fattn_gqa_c<ncols2>(jc_dst);
 
                     if (!is_fixup && ((ncols1 > 1 && jt*ncols1 + j_dst >= int(ne01.z)) || (ncols2 > 1 && zt_gqa*ncols2 + c_dst >= gqa_ratio))) {
                         continue;
@@ -2380,6 +2394,9 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2( 96,  96,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112, 112,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128, 128,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256, 256,  64)
+
+extern DECL_FATTN_MMA_F16_CASE(256, 256, 8, 6);
+
 
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  2);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  2);
