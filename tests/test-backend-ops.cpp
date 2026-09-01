@@ -9309,7 +9309,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Kept out of the normal suite because the large matrices make CPU
     // correctness comparison and the default performance sweep expensive.
     if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS}) {
             for (int64_t n : {3, 4, 5}) {
                 for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
                         {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
@@ -10549,7 +10549,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS}) {
             for (int64_t n : {3, 4, 5}) {
                 for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
                         {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
