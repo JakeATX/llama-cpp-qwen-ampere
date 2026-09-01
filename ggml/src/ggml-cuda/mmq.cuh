@@ -1595,4 +1595,12 @@ void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst, bool convrot = false);
 
+// Large-N dense pair with identical activation and weight layout.  Quantizes
+// src1 to Q8_1 once, then launches the two ordinary exact MMQ kernels.
+void ggml_cuda_mul_mat_q_pair(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0_a, const ggml_tensor * src0_b,
+        const ggml_tensor * src1,
+        ggml_tensor * dst_a, ggml_tensor * dst_b);
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

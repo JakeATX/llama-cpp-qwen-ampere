@@ -3454,6 +3454,43 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // UB512/1024 feed-forward gate/up projections consume the same activation.
+    // Reuse its exact Q8_1 preparation when both weights require the same MMQ
+    // layout.  Keep this narrow and opt-in until its end-to-end ceiling clears
+    // the product gate.
+    static const bool prepared_q8_1 = [] {
+        const char * env = getenv("GGML_CUDA_PREPARED_Q8_1");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    if (prepared_q8_1 && ggml_cuda_info().devices[cuda_ctx->device].cc == GGML_CUDA_CC_AMPERE + 60 &&
+            i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+            cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
+        ggml_tensor * mm_a = cgraph->nodes[i];
+        ggml_tensor * mm_b = cgraph->nodes[i + 1];
+        ggml_tensor * glu  = cgraph->nodes[i + 2];
+        const bool feeds_glu = (glu->src[0] == mm_a && glu->src[1] == mm_b) ||
+                               (glu->src[0] == mm_b && glu->src[1] == mm_a);
+        const bool same_input = mm_a->src[1] == mm_b->src[1];
+        const bool compatible_weights =
+                                  mmq_get_q8_1_ds_layout(mm_a->src[0]->type) ==
+                                      mmq_get_q8_1_ds_layout(mm_b->src[0]->type) &&
+                                  ggml_are_same_shape(mm_a->src[0], mm_b->src[0]);
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        if (feeds_glu && same_input && compatible_weights && mm_a->src[1]->type == GGML_TYPE_F32 &&
+                mm_a->type == GGML_TYPE_F32 && mm_b->type == GGML_TYPE_F32 &&
+                ggml_cuda_should_use_mmq(mm_a->src[0]->type, cc, mm_a->src[1]->ne[1], 0)) {
+            static bool logged = false;
+            if (!logged) {
+                fprintf(stderr, "prepared Q8_1 pair dispatched for %s and %s\n", mm_a->name, mm_b->name);
+                logged = true;
+            }
+            ggml_cuda_mul_mat_q_pair(*cuda_ctx, mm_a->src[0], mm_b->src[0], mm_a->src[1], mm_a, mm_b);
+            return 1;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
