@@ -14,6 +14,13 @@ The accepted product is stable. The next high-priority research task is a
 existing WY/triangular algorithm**, followed by the larger Q3_K_XL replacement-
 layout/narrow-integer-MMA decode project.
 
+Do not conflate the two objectives. Chunked WY/GDN is a prompt-ingestion/TTFT
+project: multi-token chunking is unavailable during ordinary singleton decode,
+where GDN has measured only about 1--2% of GPU time. It will not by itself fix
+the smaller 200K decode gain. Long-context generated-token throughput still
+requires Q3-specific MMVQ work and/or a new attention dataflow that reduces the
+ever-growing KV scan.
+
 Do not repeat the graph-level chunked-GDN screen, generic large-N MMQ routing,
 or the exact local Q3 unpack-reuse family. They have already been measured.
 
@@ -146,6 +153,14 @@ output and acceptance, and identical 22,104 MiB peak VRAM. Treat +3.02% as a
 capacity/performance canary, not a precise 200K aggregate. A proper estimate
 would need the same prompt/workload manifest and 512--1024 output tokens at 64K
 and 200K, paired and alternated. Do not rerun it merely to seek a larger number.
+
+Also distinguish the accepted 64K stack from the historical maximum stack. The
+accepted safe 64K coding measurements were approximately +10.94% for MTP3 and
++8.54% for MTP4. The often-cited +21.44% 64K/MTP3 result included the archived
+fast MMVQ implementation that changed the continuation and verification-round
+count and was removed from the product. Comparing that historical +21.44%
+directly with the accepted Q3 200K +3.02% mixes different kernels, quants,
+workloads, and qualification standards.
 
 ## Capacity facts
 
