@@ -14,7 +14,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -2766,10 +2765,6 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
 
 common_params common_base_params_to_speculative(const common_params & params) {
     const bool has_draft = params.speculative.has_dft();
-    const bool spec_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end() ||
-                          std::find(params.speculative.types.begin(), params.speculative.types.end(),
-                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE) != params.speculative.types.end();
 
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
@@ -2789,27 +2784,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
-
-    // Capacity experiment: the native-MTP context executes a much smaller
-    // graph than the target, but historically inherits the target's prompt
-    // batch and physical microbatch.  Cap only the MTP context when explicitly
-    // requested; the target retains its production prefill geometry.
-    if (spec_mtp) {
-        const char * cap_string = std::getenv("GGML_MTP_COMPUTE_BATCH_CAP");
-        if (cap_string != nullptr && cap_string[0] != '\0') {
-            char * cap_end = nullptr;
-            const long cap_long = std::strtol(cap_string, &cap_end, 10);
-            if (cap_end != cap_string && *cap_end == '\0' && cap_long > 0 && cap_long <= INT32_MAX) {
-                const int32_t cap = int32_t(cap_long);
-                result.n_batch  = std::min(result.n_batch,  cap);
-                result.n_ubatch = std::min(result.n_ubatch, cap);
-                LOG_INF("%s: native MTP compute batch capped at %d (n_batch=%d, n_ubatch=%d)\n",
-                        __func__, cap, result.n_batch, result.n_ubatch);
-            } else {
-                LOG_WRN("%s: ignoring invalid GGML_MTP_COMPUTE_BATCH_CAP='%s'\n", __func__, cap_string);
-            }
-        }
-    }
 
     // chained MTP drafting outputs logits for every chain step in one decode
     if (common_speculative_mtp_chain_enabled(params_spec)) {
