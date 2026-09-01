@@ -2067,6 +2067,24 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // TQ weight types use the fused dp4a path (decode) or runtime q8_0 conversion + cuBLAS (prefill),
     // never mmvq/mmq (mmvq's type switch has no TQ cases and aborts).
     const bool is_tq_weight = (src0->type == GGML_TYPE_TQ4_1S || src0->type == GGML_TYPE_TQ3_1S);
+
+    // Diagnostic for the Q3_K_XL frontier: exercise the existing Ampere
+    // integer-MMA dataflow at the real MTP widths before building a dedicated
+    // N=4/5 kernel.  The current large-N MMQ geometry is intentionally the
+    // control for tile/lane waste, not the proposed final implementation.
+    static const bool q3_narrow_imma = [] {
+        const char * env = getenv("GGML_CUDA_SM86_Q3_NARROW_IMMA");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    const bool q3_iq_type = src0->type == GGML_TYPE_IQ3_S ||
+                            src0->type == GGML_TYPE_IQ4_XS ||
+                            src0->type == GGML_TYPE_IQ3_XXS ||
+                            src0->type == GGML_TYPE_IQ2_S;
+    if (q3_narrow_imma && cc == GGML_CUDA_CC_AMPERE + 60 && q3_iq_type && ne11 >= 4 && ne11 <= 5) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11) && !is_tq_weight) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
