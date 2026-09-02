@@ -10,9 +10,11 @@
 #include "convert.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define GGML_CUDA_USE_WMMA
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #include <mma.h>
 using namespace nvcuda;
-#define GGML_CUDA_USE_WMMA
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 #endif
 
 #define MMVQ_TQ_NWARPS 4
@@ -404,8 +406,11 @@ static void launch_tq3_1s_multi(
 
 #if defined(GGML_CUDA_USE_WMMA)
 // ============================================================================
-// Multi-token TQ4_1S WMMA Tensor Core kernel (ncols_dst > 8, prompt processing)
+// Multi-token TQ4_1S / TQ3_1S WMMA Tensor Core kernels (ncols_dst > 8, prompt processing)
+// WMMA needs sm_70+; older arches get NO_DEVICE_CODE stubs
 // ============================================================================
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
 
 static __device__ __forceinline__ float tq4_cent_float(uint32_t idx) {
     switch (idx & 0xFu) {
@@ -527,23 +532,6 @@ static __global__ void mul_mat_tq4_1s_wmma_kernel(
     }
 }
 
-static void launch_tq4_1s_wmma(
-        const void * src0_d, const float * act_buf,
-        float * dst_d, int ncols_x, int nrows_x, int ncols_dst,
-        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
-
-    constexpr int NWARPS = 4;
-    const dim3 block(NWARPS * 32, 1);
-    const dim3 grid((ncols_dst + WMMA_N - 1) / WMMA_N, (nrows_x + (WMMA_M * NWARPS) - 1) / (WMMA_M * NWARPS));
-
-    mul_mat_tq4_1s_wmma_kernel<NWARPS><<<grid, block, 0, stream>>>(
-        src0_d, act_buf, dst_d, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
-}
-
-// ============================================================================
-// Multi-token TQ3_1S WMMA Tensor Core kernel (ncols_dst > 8, prompt processing)
-// ============================================================================
-
 template <int NWARPS>
 static __global__ void mul_mat_tq3_1s_wmma_kernel(
         const void  * __restrict__ vx,
@@ -640,6 +628,51 @@ static __global__ void mul_mat_tq3_1s_wmma_kernel(
             dst[n_global * stride_col_dst + r_global] = sh_dst[warp_id][r_local][n_local];
         }
     }
+}
+
+#else // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+
+template <int NWARPS>
+static __global__ void mul_mat_tq4_1s_wmma_kernel(
+        const void  * __restrict__ vx,
+        const float * __restrict__ vy_rot,
+        float       * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const int stride_col_y,
+        const int stride_col_dst) {
+    GGML_UNUSED_VARS(vx, vy_rot, dst, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
+    NO_DEVICE_CODE;
+}
+
+template <int NWARPS>
+static __global__ void mul_mat_tq3_1s_wmma_kernel(
+        const void  * __restrict__ vx,
+        const float * __restrict__ vy_rot,
+        float       * __restrict__ dst,
+        const int ncols_x,
+        const int nrows_x,
+        const int ncols_dst,
+        const int stride_col_y,
+        const int stride_col_dst) {
+    GGML_UNUSED_VARS(vx, vy_rot, dst, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
+    NO_DEVICE_CODE;
+}
+
+#endif // defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+
+static void launch_tq4_1s_wmma(
+        const void * src0_d, const float * act_buf,
+        float * dst_d, int ncols_x, int nrows_x, int ncols_dst,
+        int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+
+    constexpr int NWARPS = 4;
+    const dim3 block(NWARPS * 32, 1);
+    const dim3 grid((ncols_dst + WMMA_N - 1) / WMMA_N, (nrows_x + (WMMA_M * NWARPS) - 1) / (WMMA_M * NWARPS));
+
+    mul_mat_tq4_1s_wmma_kernel<NWARPS><<<grid, block, 0, stream>>>(
+        src0_d, act_buf, dst_d, ncols_x, nrows_x, ncols_dst, stride_col_y, stride_col_dst);
 }
 
 static void launch_tq3_1s_wmma(
@@ -996,33 +1029,36 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
             }
         } else {
 #if defined(GGML_CUDA_USE_WMMA)
-            // Large prefill: Fused Tensor Core (WMMA) path
-            ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_total_elements);
+            if (fp16_mma_hardware_available(cc)) {
+                // Large prefill: Fused Tensor Core (WMMA) path
+                ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_total_elements);
+                {
+                    const int n_total_blocks = n_total_elements / 32;
+                    const int wpb = 4;
+                    const dim3 block(32, wpb);
+                    const dim3 grid((n_total_blocks + wpb - 1) / wpb);
+                    tq_prerotate_activation<<<grid, block, 0, stream>>>(src1_d, act_buf.get(), n_total_elements);
+                }
+                launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+            } else
+#endif
             {
-                const int n_total_blocks = n_total_elements / 32;
-                const int wpb = 4;
-                const dim3 block(32, wpb);
-                const dim3 grid((n_total_blocks + wpb - 1) / wpb);
-                tq_prerotate_activation<<<grid, block, 0, stream>>>(src1_d, act_buf.get(), n_total_elements);
-            }
-            launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
-#else
-            for (int j = 0; j < ncols_dst; j += 8) {
-                const int batch = min(8, ncols_dst - j);
-                const block_q8_1 * q8_j = q8_1_buf.get() + j * stride_col_y;
-                float * dst_j = dst_d + j * nrows_x;
-                switch (batch) {
-                    case 1: launch_tq4_1s_multi<1>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 2: launch_tq4_1s_multi<2>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 3: launch_tq4_1s_multi<3>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 4: launch_tq4_1s_multi<4>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 5: launch_tq4_1s_multi<5>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 6: launch_tq4_1s_multi<6>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 7: launch_tq4_1s_multi<7>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
-                    case 8: launch_tq4_1s_multi<8>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                for (int j = 0; j < ncols_dst; j += 8) {
+                    const int batch = min(8, ncols_dst - j);
+                    const block_q8_1 * q8_j = q8_1_buf.get() + j * stride_col_y;
+                    float * dst_j = dst_d + j * nrows_x;
+                    switch (batch) {
+                        case 1: launch_tq4_1s_multi<1>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                        case 2: launch_tq4_1s_multi<2>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                        case 3: launch_tq4_1s_multi<3>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                        case 4: launch_tq4_1s_multi<4>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                        case 5: launch_tq4_1s_multi<5>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                        case 6: launch_tq4_1s_multi<6>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                        case 7: launch_tq4_1s_multi<7>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                        case 8: launch_tq4_1s_multi<8>(src0_d, q8_j, dst_j, ncols_x, nrows_x, stride_col_y, stride_col_dst, stream); break;
+                    }
                 }
             }
-#endif
         }
     } else {
         // Scalar float path: TQ3_1S (all vendors) + TQ4_1S on AMD (dp4a regresses on RDNA4).
@@ -1059,29 +1095,32 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
             }
         } else {
 #if defined(GGML_CUDA_USE_WMMA)
-            // Large prefill: Fused Tensor Core (WMMA) path
-            if (is_tq4) {
-                launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
-            } else {
-                launch_tq3_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
-            }
-#else
-            for (int j = 0; j < ncols_dst; j += 8) {
-                const int batch = min(8, ncols_dst - j);
-                const float * act_j = act_buf.get() + j * ncols_x;
-                float * dst_j = dst_d + j * nrows_x;
-                switch (batch) {
-                    case 1: LAUNCH_SCALAR(1, src0_d, act_j, dst_j); break;
-                    case 2: LAUNCH_SCALAR(2, src0_d, act_j, dst_j); break;
-                    case 3: LAUNCH_SCALAR(3, src0_d, act_j, dst_j); break;
-                    case 4: LAUNCH_SCALAR(4, src0_d, act_j, dst_j); break;
-                    case 5: LAUNCH_SCALAR(5, src0_d, act_j, dst_j); break;
-                    case 6: LAUNCH_SCALAR(6, src0_d, act_j, dst_j); break;
-                    case 7: LAUNCH_SCALAR(7, src0_d, act_j, dst_j); break;
-                    case 8: LAUNCH_SCALAR(8, src0_d, act_j, dst_j); break;
+            if (fp16_mma_hardware_available(cc)) {
+                // Large prefill: Fused Tensor Core (WMMA) path
+                if (is_tq4) {
+                    launch_tq4_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+                } else {
+                    launch_tq3_1s_wmma(src0_d, act_buf.get(), dst_d, ncols_x, nrows_x, ncols_dst, ncols_x, nrows_x, stream);
+                }
+            } else
+#endif
+            {
+                for (int j = 0; j < ncols_dst; j += 8) {
+                    const int batch = min(8, ncols_dst - j);
+                    const float * act_j = act_buf.get() + j * ncols_x;
+                    float * dst_j = dst_d + j * nrows_x;
+                    switch (batch) {
+                        case 1: LAUNCH_SCALAR(1, src0_d, act_j, dst_j); break;
+                        case 2: LAUNCH_SCALAR(2, src0_d, act_j, dst_j); break;
+                        case 3: LAUNCH_SCALAR(3, src0_d, act_j, dst_j); break;
+                        case 4: LAUNCH_SCALAR(4, src0_d, act_j, dst_j); break;
+                        case 5: LAUNCH_SCALAR(5, src0_d, act_j, dst_j); break;
+                        case 6: LAUNCH_SCALAR(6, src0_d, act_j, dst_j); break;
+                        case 7: LAUNCH_SCALAR(7, src0_d, act_j, dst_j); break;
+                        case 8: LAUNCH_SCALAR(8, src0_d, act_j, dst_j); break;
+                    }
                 }
             }
-#endif
         }
         #undef LAUNCH_SCALAR
     }
