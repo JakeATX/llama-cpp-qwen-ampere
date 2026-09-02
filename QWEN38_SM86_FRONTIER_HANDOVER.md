@@ -440,3 +440,23 @@ Consequences for the priorities above:
    any pipeline or head-ownership redesign.
 4. `tests/test-backend-ops.cpp` now covers the production GDN shape
    (16 to 48 head broadcast, head size 128, multi-token, K=4 snapshots).
+
+## 2026-09-02 addendum: A1 decode attention result
+
+With Nsight Compute now usable (passwordless `sudo ncu` for the user, env
+passed through an `env` target), the compressed-KV decode attention was
+characterized instead of guessed at: the GQA-packed MMA path was
+latency-bound (load latency 47% of stalls, 8 warps/SM, DRAM 20%), the vector
+singleton path issue-bound (6x per-query-head rescan absorbed by L2 but 5.5x
+the instructions). Two exact changes landed as product defaults:
+`88be730f5` (vectorized q8_0/turbo3 tile loaders) and `a0a53e354` (cp.async
+staging of packed tiles one tile ahead). Outputs are identical; decode at
+MTP3 improved +2.3% (Q3 64K) to +10.9% (Q3 140K), Q4 +3.6% to +7.4%, and
++9.6% at the 200K canary. Record: `frontier/A1_decode_attention_mma/`.
+
+Routing widths 1-2 through the (2,8) MMA instance (`GGML_Q8_TURBO3_MMA_MIN_Q=1
+GGML_Q8_TURBO3_MMA_NCOLS1_MIN=2`) removes a further ~8 points of GPU time per
+round at 100K but is not bit-identical; it stays opt-in until the replay
+KL/PPL and rollback gates pass. Measurement lesson: back-to-back server
+runs show a 4-7% order effect; alternate order and cool down between runs.
+
