@@ -392,3 +392,51 @@ Use accepted EXACT with MTP3, Q8_0 K/Turbo3 V, and UB1024. Use Q3_K_XL for
 The handoff objective is not to retune these flags. It is to build a genuinely
 fused chunked-GDN CUDA implementation and, secondarily, a genuinely narrow Q3
 layout/IMMA dataflow.
+
+## 2026-09-01 addendum: P3C serial-GDN result and revised priorities
+
+Before the fused WY kernel was started, the serial fused GDN kernel was
+characterized instead of assumed. It was latency-bound (about 4,400 GPU cycles
+per token step for roughly 65 instructions per warp) and launched 1.83 waves of
+fixed-length serial blocks. Giving each warp four recurrent-state columns,
+with the per-column FP32 operation order unchanged, fixed both. Full record:
+`qwen38-bench/kernel_cache_investigation/frontier/P3C_gdn_serial_ilp/`
+(hypothesis, commands, raw data, analysis, decision, qualification plan).
+
+Measured against `dd66db0cc` binaries, Q8_0 K / Turbo3 V, `-b 4096`:
+
+| cell | baseline tok/s | P3C tok/s | delta |
+|---|---:|---:|---:|
+| Q3 UB1024 16K | ~1405 | 1483 | +5.6% |
+| Q3 UB1024 64K | ~1106 | 1153 | +4.3% |
+| Q3 UB1024 100K | 958 | 987 | +3.0% |
+| Q3 UB512 16K / 64K | 1353 / 1059 | 1409 / 1098 | +4.1% / +3.7% |
+| Q4 UB1024 16K | 1427 | 1499 | +5.1% |
+| Q4 UB512 16K / 64K | 1368 / 1022 | 1434 / 1113 | +4.9% / +8.9% |
+| Q3 200K server canary (prompt) | 652 | 679 | +4.1% |
+
+GDN kernel time per 1024-token launch: 2219 us to 1582 us (-28.7%). Decode
+tails, output hashes, 200K peak VRAM (22,104 MiB), and MTP rollback state
+hashes are unchanged; perplexity and saved-logit KL are identical; SASS
+per-column FFMA/FADD/FMUL counts match the original. Compute Sanitizer is
+clean. `GGML_CUDA_SM86_GDN_COLS=1` restores the original kernel.
+
+Consequences for the priorities above:
+
+1. The fused chunk-32 WY kernel (Priority 1) now has a 1.58 ms baseline and
+   GDN is about 11% of 16K prefill kernel time, so its end-to-end ceiling is
+   roughly half of what this document implied. It remains worthwhile, but the
+   open design question is numerical policy: chunked WY only wins on tensor
+   cores with reduced-precision operands against the FP32-state rule.
+2. Nsight Compute works under `sudo`; `ERR_NVGPUCTRPERM` only blocks
+   unprivileged users. Capture stall reasons before any further GDN
+   refinement or attention pipeline work.
+3. Decode attention at 100K: the grouped verification kernel moves about 18%
+   of DRAM bandwidth (812 us per layer for ~149 MB of KV) with 8 warps per SM
+   and single-stage synchronous tile loads; the singleton kernel about 10%.
+   The q8_0 K tile loader does a runtime division and three sub-word loads
+   per element pair. Decide load-bound versus issue-bound first
+   (`frontier/A0_attention_discriminator/`), then fix loaders (exact) before
+   any pipeline or head-ownership redesign.
+4. `tests/test-backend-ops.cpp` now covers the production GDN shape
+   (16 to 48 head broadcast, head size 128, multi-token, K=4 snapshots).

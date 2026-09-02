@@ -169,14 +169,8 @@ gated_delta_net_cuda(const float * q,
 }
 
 
-// ---------------------------------------------------------------------------------------------
-// SM86 research path (default off): same per-column arithmetic as gated_delta_net_cuda, but each
-// warp owns NC state columns (independent reduction chains interleave in the issue slots and the
-// grid shrinks to one wave on 84 SMs), and optionally the next token's operands are loaded before
-// the current token's reductions start. Per-column FP32 operation order is unchanged.
-// Enabled with GGML_CUDA_SM86_GDN_COLS=2|4|8 (and GGML_CUDA_SM86_GDN_PREFETCH=1) for multi-token,
-// scalar-gate, S_v == 128 launches only. Singleton decode always uses the original kernel.
-// ---------------------------------------------------------------------------------------------
+// same per-column math as gated_delta_net_cuda, but each warp owns NC state columns so the
+// NC reduction chains interleave; multi-token, scalar-gate, S_v == 128 only (GGML_CUDA_SM86_GDN_COLS)
 template <int S_v, bool keep_rs_t, int NC, bool PREFETCH>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda_ilp(const float * q,
@@ -368,11 +362,12 @@ gated_delta_net_cuda_ilp(const float * q,
     }
 }
 
+// default 4 (qualified on sm86); 1 selects the original kernel
 static int ggml_cuda_sm86_gdn_cols() {
     static const int cols = [] {
         const char * s = getenv("GGML_CUDA_SM86_GDN_COLS");
-        const int v = s ? atoi(s) : 1;
-        return (v == 2 || v == 4 || v == 8) ? v : 1;
+        const int v = s ? atoi(s) : 4;
+        return (v == 1 || v == 2 || v == 4 || v == 8) ? v : 4;
     }();
     return cols;
 }
@@ -413,7 +408,7 @@ static void launch_gated_delta_net_ilp_inst(
         sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 }
 
-// returns false when the research path does not apply (caller falls back to the original kernel)
+// returns false when this path does not apply; caller falls back to the original kernel
 template <bool keep_rs_t>
 static bool launch_gated_delta_net_ilp(
         const float * q_d, const float * k_d, const float * v_d,
