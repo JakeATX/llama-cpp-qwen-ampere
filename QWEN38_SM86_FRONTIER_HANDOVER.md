@@ -460,3 +460,21 @@ round at 100K but is not bit-identical; it stays opt-in until the replay
 KL/PPL and rollback gates pass. Measurement lesson: back-to-back server
 runs show a 4-7% order effect; alternate order and cool down between runs.
 
+## 2026-09-02 addendum: A2 decode idle (CUDA graphs, output buffer)
+
+Nsight traces with OS-runtime calls showed ~13% of decode wall time idle at
+100K: one pinned output-buffer reallocation per request (~60 ms) when the
+first verify batch needed 4 logits rows, and CUDA graph capture plus
+instantiate for every graph shape on every request, because ggml-cuda kept
+one graph per graph identity (verify width and accepted-draft count vary)
+and evicted graphs after 10 s idle. `7296ede65` keys graphs by shape,
+retains them for 300 s (`GGML_CUDA_GRAPH_EVICT_S`), and reserves 8 output
+rows up front. Exact; +5.4% decode at Q3 100K, +1.7% at Q4 64K, 200K within
+noise. `GGML_CUDA_GRAPH_DEBUG=1` prints the first changed graph node per
+call. Record: `frontier/A2_decode_graphs/`.
+
+Also settled: MTP4 gives nothing over MTP3 even with the cheaper verify
+launch; the routing candidate (widths 1-2 on the MMA path) fails the
+generated-task quality protocol by a small consistent margin and stays
+opt-in; the exact path to its speed is an FP32-accumulating (2,8) instance.
+
