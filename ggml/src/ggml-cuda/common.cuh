@@ -1445,11 +1445,18 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
+        // sweep every 5s, evicting cuda graphs unused for GGML_CUDA_GRAPH_EVICT_S seconds (default 300):
+        // decode graphs must survive a long prompt and the gap between requests, or every request
+        // pays capture + instantiate for each graph shape again
+        static const int64_t evict_us = [] {
+            const char * s = getenv("GGML_CUDA_GRAPH_EVICT_S");
+            const int v = s ? atoi(s) : 300;
+            return (int64_t) (v > 0 ? v : 300) * 1'000'000;
+        }();
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (time_now - it->second->last_used_time >= evict_us) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;

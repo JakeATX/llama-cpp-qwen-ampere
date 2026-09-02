@@ -2832,8 +2832,21 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// key the cached CUDA graph by identity and shape: speculative decoding builds the same llama graph
+// with a varying token count (verify width, accepted drafts), and a single per-identity graph would be
+// re-captured or executed eagerly on every change
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    static const bool shape_keys = getenv("GGML_CUDA_GRAPH_NO_SHAPE_KEY") == nullptr;
+    const ggml_tensor * t0 = cgraph->nodes[0];
+    if (!shape_keys) {
+        return t0;
+    }
+    uint64_t h = (uint64_t) (uintptr_t) t0;
+    h ^= (uint64_t) cgraph->n_nodes * 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        h = (h ^ (uint64_t) t0->ne[i]) * 0x100000001B3ull;
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2853,6 +2866,10 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        static const bool dbg2 = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+        if (dbg2) {
+            fprintf(stderr, "cuda-graph-debug: key=%p n_nodes %zu -> %d\n", graph_key, graph->node_props.size(), cgraph->n_nodes);
+        }
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -2870,6 +2887,16 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            static const bool dbg = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+            if (dbg && !res) {
+                const ggml_cuda_graph::node_properties & o = graph->node_props[i];
+                const ggml_tensor * t = cgraph->nodes[i];
+                const char * what = memcmp(o.node.ne, t->ne, sizeof(t->ne)) ? "ne" : memcmp(o.node.nb, t->nb, sizeof(t->nb)) ? "nb" :
+                    o.node.data != t->data ? "data" : o.node.view_offs != t->view_offs ? "view_offs" :
+                    memcmp(o.node.op_params, t->op_params, sizeof(t->op_params)) ? "op_params" : "src/other";
+                fprintf(stderr, "cuda-graph-debug: key=%p n_nodes=%d first change at node %d %s op=%s (%s)\n",
+                    graph_key, cgraph->n_nodes, i, t->name, ggml_op_name(t->op), what);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4457,6 +4484,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    {
+        static const bool dbg3 = getenv("GGML_CUDA_GRAPH_DEBUG") != nullptr;
+        if (dbg3) {
+            fprintf(stderr, "cuda-graph-debug: key=%p n_nodes=%d use_graph=%d update=%d\n", graph_key, cgraph->n_nodes, (int) use_cuda_graph, (int) cuda_graph_update_required);
+        }
+    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
