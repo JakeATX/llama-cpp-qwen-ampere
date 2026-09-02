@@ -1489,6 +1489,9 @@ struct test_case {
             }
 
             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            if (getenv("GGML_TEST_PRINT_ERR") != nullptr) {
+                printf("[%s] NMSE = %.3e ", ggml_op_desc(t1), err);
+            }
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -9309,8 +9312,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Kept out of the normal suite because the large matrices make CPU
     // correctness comparison and the default performance sweep expensive.
     if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-            for (int64_t n : {3, 4, 5}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q6_K, GGML_TYPE_Q3_K}) {
+            for (int64_t n : {1, 2, 3, 4, 5}) {
                 for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
                         {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
                         {6144, 5120}, {12288, 5120}, {1024, 5120}}}) {
@@ -10581,8 +10584,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     if (getenv("GGML_QWEN38_MMVQ_BENCH") != nullptr) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-            for (int64_t n : {3, 4, 5}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q6_K, GGML_TYPE_Q3_K}) {
+            for (int64_t n : {1, 2, 3, 4, 5}) {
                 for (const auto & shape : std::array<std::pair<int64_t, int64_t>, 7>{{
                         {17408, 5120}, {10240, 5120}, {5120, 17408}, {5120, 6144},
                         {6144, 5120}, {12288, 5120}, {1024, 5120}}}) {

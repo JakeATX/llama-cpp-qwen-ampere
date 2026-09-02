@@ -478,3 +478,52 @@ launch; the routing candidate (widths 1-2 on the MMA path) fails the
 generated-task quality protocol by a small consistent margin and stays
 opt-in; the exact path to its speed is an FP32-accumulating (2,8) instance.
 
+
+## 2026-09-02 addendum: D3 narrow-batch matmul, quant formats, replay gate calibration
+
+Paper trail: `frontier/D3_q3_repack/` (HYPOTHESIS.md, ANALYSIS.md, raw/),
+`frontier/V1_vram_lossless/` (RESEARCH.md, HYPOTHESIS.md).
+
+Insights that change how to read the earlier records:
+
+1. Decode is instruction-bound, not bandwidth-bound. MMVQ (the dp4a
+   matrix-vector kernel) is 57% of a Q3 100K MTP3 round; at verify width 4
+   every type runs at 30-60% of DRAM bandwidth (Q4_K 405 GB/s, IQ3_S 409,
+   IQ4_XS 611 on 17408x5120). Width 1 reaches 760-850 GB/s for the 4-5 bit
+   types but only ~520-550 for the 3-bit codebook types (IQ3_S, IQ3_XXS) and
+   ~440-470 for IQ2_S. The instruction budget at 900 GB/s is ~22 thread
+   instructions per weight byte; Q4_K w4 spends 27, IQ3_S 22, IQ4_XS 14.
+2. A warp-per-row MMVQ (no cross-warp reduction, no K tail) regresses widths
+   2-5 by 5-18%: the reduction/barrier structure is not the limiter.
+3. The int8 tensor-core kernel (MMQ, upstream crossover at batch 9) has
+   width-independent time at widths 2-8 and beats MMVQ from width 3 on
+   Q3_K/Q4_K/Q5_K/Q6_K (+22..43% per kernel at width 4) and from width 4 on
+   IQ4_XS (+4..7%); it loses on IQ3_S/IQ3_XXS/IQ2_S with the stock J=8 tile.
+   Higher-occupancy or smaller tiles do not help (occupancy 2 within noise,
+   64-row tiles worse). Policy: `GGML_CUDA_SM86_MMQ_POLICY=1` in mmvq.cu.
+   End to end (sampled, 128 tokens, MTP3): Q4_K_M 100K +17.8%, Q4_K_M 64K
+   +1.9% (trajectory changed), Q3_K_XL 100K -33% (anomaly under
+   investigation with Nsight: `raw/decode_nsys_q3kxl_c100k`).
+4. IQ4_XS is the best format per tensor on this GPU at both widths (60 us
+   w1 / 75 us w4 on 17408x5120) and is faster than IQ3_S (72 / 93 us)
+   despite 24% more bytes; Q3_K is no faster than IQ3_S. Quant mix by bytes:
+   Q3_K_XL = IQ4_XS 40%, IQ3_S 28%, Q5_K 9%, IQ3_XXS 7%, Q4_K 5%, IQ2_S 3%;
+   Q4_K_M = Q5_K 31%, IQ4_XS 30%, Q4_K 22%, Q6_K 12%. Per-tensor maps in
+   `frontier/D3_q3_repack/quant_map_*.txt`. Unsloth publishes
+   `imatrix_unsloth.gguf` and a `UD-IQ4_XS` build (13.27 GiB) in
+   `unsloth/Qwen3.8-27B-GGUF`; the round-time model predicts UD-IQ4_XS or a
+   Q3_K_XL with 2-3 bit tensors raised to IQ4_XS at ~+4-5% over Q3_K_XL.
+5. The frozen replay tolerance (mean KL 1e-6) is a bit-identity test on this
+   model, not a precision test: a pure fp32 summation reorder with no
+   precision change (warp-rows kernel) gives mean KL 2.1e-4, hidden rel L2
+   4.9e-2, and the tensor-core policy gives 2.8-3.3e-4. The 48 GDN
+   recurrent states amplify any rounding difference. Op-level precision vs
+   the CPU reference (NMSE): MMVQ 2.4e-5 all types; MMQ 2.5e-5 for
+   Q6_K/IQ4_XS/Q3_K, 5.6e-5 Q4_K, 3.8e-5 Q5_K (fp16 block-scale products in
+   the MMQ tile; prefill already runs this path). Consequence: non-identical
+   candidates can only be judged by the generated-task protocol; the earlier
+   "KL fails" verdicts (routing, fast MMVQ) were identity verdicts too.
+6. VRAM: `launch_fattn` double-allocates the f16 K/V copies (pool + the
+   buffer-type reservation from upstream f8f0a47a5). Fix in
+   fattn-common.cuh uses the reservation with a pool fallback; passes the
+   FLASH_ATTN_EXT sweep; 200K canary pending. Expected -1.5 GiB peak.
