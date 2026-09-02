@@ -123,8 +123,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
 template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_mma_turbo_dispatch_ncols1_8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0]; // ncols2 == 8: (1,8),(2,8),(4,8)
-    if (Q->ne[1] <= 1) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 1, 8, type_K, type_V>(ctx, dst); return; }
-    if (Q->ne[1] <= 2) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 2, 8, type_K, type_V>(ctx, dst); return; }
+    // research knob: GGML_Q8_TURBO3_MMA_NCOLS1_MIN=2 pads single queries into the (2,8) instance, which is faster at long KV
+    static const int ncols1_min = [] { const char * e = getenv("GGML_Q8_TURBO3_MMA_NCOLS1_MIN"); const int v = e ? atoi(e) : 1; return (v == 2 || v == 4) ? v : 1; }();
+    if (Q->ne[1] <= 1 && ncols1_min == 1) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 1, 8, type_K, type_V>(ctx, dst); return; }
+    if (Q->ne[1] <= 2 && ncols1_min <= 2) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 2, 8, type_K, type_V>(ctx, dst); return; }
     if constexpr (DKQ == 256 && DV == 256 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO3_0) {
         if (Q->ne[1] > 4) { ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 8, type_K, type_V>(ctx, dst); return; }
     }
@@ -204,6 +206,16 @@ static bool ggml_cuda_q8_turbo3_mma_fused() {
     static const bool value = [] {
         const char * env = getenv("GGML_Q8_TURBO3_MMA_FUSED");
         return env != nullptr && env[0] == '1';
+    }();
+    return value;
+}
+
+// research knob: smallest query width routed to the q8_0/turbo3 MMA path (default 3 keeps widths 1-2 on the vector kernel)
+static int ggml_cuda_q8_turbo3_mma_min_q() {
+    static const int value = [] {
+        const char * env = getenv("GGML_Q8_TURBO3_MMA_MIN_Q");
+        const int v = env ? atoi(env) : 3;
+        return (v >= 1 && v <= 5) ? v : 3;
     }();
     return value;
 }
@@ -809,7 +821,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const ggml_tensor * V = dst->src[2];
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         if (ggml_cuda_q8_turbo3_mma_fused() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0 &&
-                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= 3 && Q->ne[1] <= 5 && turing_mma_available(cc)) {
+                Q->ne[0] == 256 && V->ne[0] == 256 && Q->ne[1] >= ggml_cuda_q8_turbo3_mma_min_q() && Q->ne[1] <= 5 && turing_mma_available(cc)) {
             ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>(ctx, dst);
             return;
         }
