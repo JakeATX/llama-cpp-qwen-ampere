@@ -526,4 +526,6 @@ Insights that change how to read the earlier records:
 6. VRAM: `launch_fattn` double-allocates the f16 K/V copies (pool + the
    buffer-type reservation from upstream f8f0a47a5). Fix in
    fattn-common.cuh uses the reservation with a pool fallback; passes the
-   FLASH_ATTN_EXT sweep; 200K canary pending. Expected -1.5 GiB peak.
+   FLASH_ATTN_EXT sweep. 200K canary: identical output, peak 22120 ->
+   20580 MiB; 262K (model max) fits at ready 22596 / peak 22634 MiB.
+   Pushed as 4c593be92 to both product branches.
