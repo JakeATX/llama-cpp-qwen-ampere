@@ -1442,6 +1442,23 @@ struct ggml_backend_cuda_context {
     // release-after-use path (avoids the legacy pool retaining the temp; ref llama.cpp #22107).
     bool fa_f16_use_pool = false;
 
+    // Same idea for the TQ activation pre-rotation (forward block WHT + q8_1 quantize): the MoE
+    // gate and up projections consume the same normed activation, so the rotation ran twice per
+    // layer. Keyed by tensor identity, data pointer, size and graph-eval epoch; main-stream only.
+    struct {
+        char *              ptr  = nullptr;
+        size_t              cap  = 0;
+        int                 dev  = -1;
+        const ggml_tensor * src1 = nullptr;
+        const void *        data = nullptr;
+        uint64_t            epoch = 0;
+        size_t              size = 0;
+        struct retired_buf { char * ptr; size_t cap; int dev; };
+        std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
+    } tq_rot_cache;
+
+    uint64_t graph_epoch = 1;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)

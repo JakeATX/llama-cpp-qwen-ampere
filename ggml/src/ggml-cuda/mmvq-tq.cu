@@ -77,37 +77,31 @@ static constexpr float TQ4_CENTROID_I8_RESCALE = 2.733f / 127.0f;
 // Register-based centroid lookup: maps 4 qs bytes (1 uint32) to 2 packed 4× centroid_i8 for dp4a.
 // Processes a full uint32 at once, sharing nibble extraction across both byte pairs.
 __device__ __forceinline__ void tq4_cents8_reg(uint32_t four_bytes, int &c0, int &c1) {
-    // Centroid i8 values packed into 4 registers (little-endian byte order):
-    // [-127,-96,-75,-58] [-44,-31,-18,-6] [6,18,31,44] [58,75,96,127]
-    constexpr uint32_t CR03 = 0xC6B5A081u;
-    constexpr uint32_t CR47 = 0xFAEEE1D4u;
-    constexpr uint32_t CR8B = 0x2C1F1206u;
-    constexpr uint32_t CRCF = 0x7F604B3Au;
+    // 4 qs bytes -> 8 nibble indices -> 8 int8 centroids, in natural element order
+    // (element 2k = low nibble of byte k, element 2k+1 = high nibble of byte k).
+    //
+    // This uses the hardware byte-permute (v_perm_b32) through get_int_from_table_16, the same
+    // path IQ4_NL/MXFP4 use on ROCm. NOTE: do NOT express this with HIP's __byte_perm() wrapper
+    // -- with a runtime selector its generic fallback lowers through a dynamically indexed byte
+    // union that PromoteAlloca turns into a 32KB LDS staging area plus ds_read_u8 chains, which
+    // caps occupancy and costs ~3x. __builtin_amdgcn_perm maps 1:1 to the instruction.
+    //
+    // The previous shift-based fallback avoided that bug but cost ~100 ALU ops per call (~400
+    // per 32-weight block), which made the TQ decode kernels ALU-bound rather than
+    // bandwidth-bound on CDNA.
+    const int2 v = get_int_from_table_16((int) four_bytes, kvalues_tq4);
 
-    // element j: qs byte j/2, nibble (j&1) — even → low nibble, odd → high nibble
-    const uint32_t lo = four_bytes & 0x0F0F0F0Fu;
-    const uint32_t hi = (four_bytes >> 4) & 0x0F0F0F0Fu;
-
-    // Interleave: bytes 0-1 -> sel0 [n0,n1,n2,n3], bytes 2-3 -> sel1 [n4,n5,n6,n7].
-    // __byte_perm is NOT used for the interleave/LUT: its selector encoding is
-    // compiler-dependent (constant selectors fold differently from runtime ones),
-    // which silently broke the original permute chain on some toolchains.
-    // Plain shifts are deterministic.
-    uint32_t sel0 = (lo & 0xFFu) | ((hi & 0xFFu) << 8) | ((lo & 0xFF00u) << 8) | ((hi & 0xFF00u) << 16);
-    uint32_t sel1 = ((lo >> 16) & 0xFFu) | (((hi >> 16) & 0xFFu) << 8) | (((lo >> 24) & 0xFFu) << 16) | (((hi >> 24) & 0xFFu) << 24);
-
-    // nibble v in 0..15 -> centroid_i8 byte: v<8 selects CR03/CR47, v>=8 selects CR8B/CRCF,
-    // v&4 picks the second register of the pair, byte offset is v&3.
-    auto cent = [&](uint32_t v) -> uint32_t {
-        const uint32_t lo_reg = (v & 4u) ? CR47 : CR03;
-        const uint32_t hi_reg = (v & 4u) ? CRCF : CR8B;
-        return (((v & 8u) ? hi_reg : lo_reg) >> (8u * (v & 3u))) & 0xFFu;
-    };
-
-    c0 = (int)(cent(sel0 & 0xFFu) | (cent((sel0 >> 8) & 0xFFu) << 8)
-             | (cent((sel0 >> 16) & 0xFFu) << 16) | (cent((sel0 >> 24) & 0xFFu) << 24));
-    c1 = (int)(cent(sel1 & 0xFFu) | (cent((sel1 >> 8) & 0xFFu) << 8)
-             | (cent((sel1 >> 16) & 0xFFu) << 16) | (cent((sel1 >> 24) & 0xFFu) << 24));
+    // v.x = centroids for even elements (0,2,4,6), v.y = odd elements (1,3,5,7).
+    // Interleave back to natural order: c0 = [e0,e1,e2,e3], c1 = [e4,e5,e6,e7].
+#if defined(GGML_USE_HIP)
+    c0 = (int) __builtin_amdgcn_perm(v.y, v.x, 0x05010400);
+    c1 = (int) __builtin_amdgcn_perm(v.y, v.x, 0x07030602);
+#else
+    // nvcc / MUSA: prmt selector nibbles pick bytes 0-3 from the first operand and 4-7 from
+    // the second. Same byte order as the HIP form above.
+    c0 = __byte_perm(v.x, v.y, 0x5140);
+    c1 = __byte_perm(v.x, v.y, 0x7362);
+#endif
 }
 
 // ============================================================================
@@ -822,6 +816,7 @@ static __global__ void mul_mat_tq4_1s_scalar_moe(
 // NVIDIA TQ4_1S dp4a MoE variant: same device-side ids routing as the scalar kernels above, but
 // the int8 dp4a inner loop of mul_mat_tq4_1s_dp4a_multi (warp-strided over blocks, q8_1 activations,
 // packed-centroid LUT). One dot product per (row, expert_slot, sample) output element.
+template <int LPR>   // lanes cooperating on one output row (must divide WARP_SIZE)
 static __global__ void mul_mat_tq4_1s_dp4a_moe(
         const void       * __restrict__ vx,
         const block_q8_1 * __restrict__ vy_q8,      // pre-rotated activations (q8_1)
@@ -837,7 +832,15 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
         const int64_t stride_channel_dst,
         const int64_t stride_sample_dst) {
 
-    const int row = blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y;
+    // One row per LPR lanes: each lane covers blocks_per_row/LPR blocks and the cross-lane
+    // reduction is log2(LPR) rounds instead of 5. With LPR == WARP_SIZE this is the classic
+    // one-row-per-warp mapping.
+    constexpr int rows_per_warp = WARP_SIZE / LPR;
+
+    const int lane_in_row = threadIdx.x % LPR;
+    const int row_in_warp = threadIdx.x / LPR;
+
+    const int row = (blockIdx.x * MMVQ_TQ_NWARPS + threadIdx.y) * rows_per_warp + row_in_warp;
     if (row >= nrows_x) return;
 
     const int expert_slot = blockIdx.y;
@@ -845,7 +848,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
     const int expert      = ids[sample * ids_stride + expert_slot];
     const int channel_y   = expert_slot % nchannels_y;
 
-    const int lane = threadIdx.x;
+    const int lane = lane_in_row;
     const int blocks_per_row = ncols_x / QK_TQ4_1S;
     const block_tq4_1s * x_row =
         (const block_tq4_1s *) ((const char *) vx + (int64_t) expert * nb_expert)
@@ -853,7 +856,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
     const block_q8_1 * a_base = vy_q8 + sample * stride_sample_y + (int64_t) channel_y * stride_channel_y;
 
     float sumf = 0.0f;
-    for (int ib = lane; ib < blocks_per_row; ib += WARP_SIZE) {
+    for (int ib = lane; ib < blocks_per_row; ib += LPR) {
         const block_tq4_1s * blk = &x_row[ib];
         const float fd0 = __half2float(blk->d0);
         const float fd1 = __half2float(blk->d1);
@@ -881,13 +884,82 @@ static __global__ void mul_mat_tq4_1s_dp4a_moe(
 
     sumf *= TQ4_CENTROID_I8_RESCALE;
     #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sumf += __shfl_xor_sync(0xffffffff, sumf, offset);
+    for (int offset = LPR / 2; offset > 0; offset >>= 1) {
+        sumf += __shfl_xor_sync(0xffffffff, sumf, offset, LPR);
     }
 
     if (lane == 0) {
         dst[sample * stride_sample_dst + (int64_t) expert_slot * stride_channel_dst + row] = sumf;
     }
+}
+
+// Shared activation pre-rotation (forward block WHT -> q8_1). The MoE gate and up projections
+// consume the same normed activation, so without caching the rotation ran once per projection.
+// Keyed by tensor identity, data pointer, size and graph-eval epoch; main stream only (a sibling
+// stream could otherwise consume the buffer with no cross-stream ordering). Returns a device
+// pointer valid for the rest of this graph eval.
+static const block_q8_1 * tq_prerotate_q8_1_cached(ggml_backend_cuda_context & ctx,
+                                                   const ggml_tensor * src1,
+                                                   const float * src1_d,
+                                                   int n_act_elements,
+                                                   ggml_cuda_pool_alloc<block_q8_1> & fallback) {
+    cudaStream_t stream   = ctx.stream();
+    const int    n_blocks = n_act_elements / 32;
+    const size_t bytes    = (size_t) n_blocks * sizeof(block_q8_1);
+
+    static const bool disabled = getenv("GGML_TQ_ROTCACHE") != nullptr && atoi(getenv("GGML_TQ_ROTCACHE")) == 0;
+
+    auto & rc = ctx.tq_rot_cache;
+    const bool cacheable = !disabled && ctx.curr_stream_no == 0 && bytes <= (1u << 20);
+
+    if (cacheable && rc.epoch == ctx.graph_epoch && rc.src1 == src1 && rc.data == src1->data &&
+        rc.size == bytes && rc.dev == ctx.device) {
+        return (const block_q8_1 *) rc.ptr;
+    }
+
+    block_q8_1 * dst = nullptr;
+    if (cacheable) {
+        if (rc.dev != ctx.device || rc.cap < bytes) {
+            // Never free a buffer here: a CUDA graph captured earlier may still replay
+            // kernels that point at it (several graphs per context with --n-cpu-moe splits).
+            // Retire it and release everything at context teardown instead.
+            if (rc.ptr != nullptr) {
+                rc.retired.push_back({ rc.ptr, rc.cap, rc.dev });
+            }
+            size_t actual = 0;
+            rc.ptr = (char *) ctx.pool().alloc(bytes, &actual);
+            rc.cap = actual;
+            rc.dev = ctx.device;
+        }
+        dst      = (block_q8_1 *) rc.ptr;
+        rc.src1  = src1;
+        rc.data  = src1->data;
+        rc.epoch = ctx.graph_epoch;
+        rc.size  = bytes;
+    } else {
+        dst = fallback.alloc(n_blocks);
+    }
+
+    const int  wpb = 4;
+    const dim3 pblock(32, wpb);
+    const dim3 pgrid((n_blocks + wpb - 1) / wpb);
+    tq_prerotate_q8_1<<<pgrid, pblock, 0, stream>>>(src1_d, dst, n_act_elements);
+    return dst;
+}
+
+// GGML_TQ_LPR debug knob. Only 2/4/8/16/32 have a kernel instantiation, so any other value
+// sizes the grid for one lanes-per-row but launches the 32-lane kernel and leaves rows unwritten.
+static int tq_lpr_env() {
+    const char * env = getenv("GGML_TQ_LPR");
+    if (env == nullptr) {
+        return 0;
+    }
+    const int lpr = atoi(env);
+    if (lpr != 2 && lpr != 4 && lpr != 8 && lpr != 16 && lpr != 32) {
+        GGML_LOG_WARN("%s: ignoring invalid GGML_TQ_LPR=%s (want 2, 4, 8, 16 or 32)\n", __func__, env);
+        return 0;
+    }
+    return lpr;
 }
 
 // Small-batch (decode / light speculative) TQ MoE: single fused, graph-capturable launch.
@@ -932,24 +1004,53 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
 
     // NVIDIA TQ4_1S: int8 dp4a path (matches the non-MoE dispatch in ggml_cuda_mul_mat_tq).
     // TQ3_1S (all vendors) + TQ4_1S on AMD: scalar float path (dp4a regresses on RDNA4; no dp4a TQ3).
-    const bool use_dp4a = !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_TQ4_1S;
+    // CDNA (gfx90a) has proper v_dot4_i32_i8 throughput, unlike RDNA4 where dp4a regresses --
+    // so enable the int8 dp4a decode path on CDNA too, not just NVIDIA.
+    const bool use_dp4a = (!GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc)) && src0->type == GGML_TYPE_TQ4_1S;
 
     if (use_dp4a) {
         // Pre-rotate activations to q8_1, contiguous [ncols_x, nchannels_y, n_tokens].
-        const int n_blocks_total = n_act_elements / 32;
-        ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id), n_blocks_total);
-        {
-            const int wpb = 4;
-            const dim3 pblock(32, wpb);
-            const dim3 pgrid((n_blocks_total + wpb - 1) / wpb);
-            tq_prerotate_q8_1<<<pgrid, pblock, 0, stream>>>(src1_d, q8_buf.get(), n_act_elements);
-        }
+        ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id));
+        const block_q8_1 * q8_act = tq_prerotate_q8_1_cached(ctx, src1, src1_d, n_act_elements, q8_buf);
         const int64_t stride_channel_y = ncols_x / 32;                           // q8_1 blocks to next y-channel
         const int64_t stride_sample_y  = (int64_t) nchannels_y * (ncols_x / 32); // q8_1 blocks to next token
-        mul_mat_tq4_1s_dp4a_moe<<<grid, block, 0, stream>>>(
-            src0->data, q8_buf.get(), dst_d, ids_d, ncols_x, nrows_x,
-            nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y,
-            stride_channel_dst, stride_sample_dst);
+
+        // Pick lanes-per-row so every lane gets a useful number of blocks (>= 4) while keeping
+        // the reduction short. GGML_TQ_LPR overrides for experiments.
+        const int blocks_per_row_h = ncols_x / 32;
+        static const int lpr_env = tq_lpr_env();
+        int lpr = lpr_env;
+        if (lpr == 0) {
+            // 16 measured best on CDNA: 4 reduction rounds instead of 5, while the warp still
+            // reads only two contiguous weight regions (smaller LPR scatters reads across more
+            // rows and loses more to coalescing than it saves on the reduction). Only measured
+            // on AMD, so NVIDIA keeps the previous 32. Never assign more lanes than there are
+            // blocks, so no lane sits idle on narrow projections.
+            lpr = GGML_CUDA_CC_IS_AMD(cc) ? 16 : 32;
+            while (lpr > 2 && blocks_per_row_h < lpr) {   // floor at 2: the switch below has no 1-lane kernel
+                lpr /= 2;
+            }
+        }
+
+        const int rows_per_warp_h = WARP_SIZE / lpr;
+        const int rows_per_wg     = MMVQ_TQ_NWARPS * rows_per_warp_h;
+        const dim3 grid_l((unsigned) ((nrows_x + rows_per_wg - 1) / rows_per_wg),
+                          (unsigned) n_expert_used, (unsigned) n_tokens);
+
+        #define TQ_LAUNCH_MOE(L) mul_mat_tq4_1s_dp4a_moe<L><<<grid_l, block, 0, stream>>>( \
+            src0->data, q8_act, dst_d, ids_d, ncols_x, nrows_x, \
+            nb_expert, ids_stride, nchannels_y, stride_channel_y, stride_sample_y, \
+            stride_channel_dst, stride_sample_dst)
+
+        switch (lpr) {
+            case 32: TQ_LAUNCH_MOE(32); break;
+            case 16: TQ_LAUNCH_MOE(16); break;
+            case  8: TQ_LAUNCH_MOE( 8); break;
+            case  4: TQ_LAUNCH_MOE( 4); break;
+            case  2: TQ_LAUNCH_MOE( 2); break;
+            default: TQ_LAUNCH_MOE(32); break;
+        }
+        #undef TQ_LAUNCH_MOE
     } else {
         // Pre-rotate activations to float (WHT), contiguous [ncols_x, nchannels_y, n_tokens].
         ggml_cuda_pool_alloc<float> act_buf(ctx.pool(id), n_act_elements);
@@ -998,7 +1099,9 @@ void ggml_cuda_mul_mat_tq(ggml_backend_cuda_context & ctx,
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
     const int n_total_elements = ncols_x * ncols_dst;
-    const bool use_dp4a = !GGML_CUDA_CC_IS_AMD(cc) && src0->type == GGML_TYPE_TQ4_1S;
+    // CDNA (gfx90a) has proper v_dot4_i32_i8 throughput, unlike RDNA4 where dp4a regresses --
+    // so enable the int8 dp4a decode path on CDNA too, not just NVIDIA.
+    const bool use_dp4a = (!GGML_CUDA_CC_IS_AMD(cc) || GGML_CUDA_CC_IS_CDNA(cc)) && src0->type == GGML_TYPE_TQ4_1S;
 
     if (use_dp4a) {
         // NVIDIA TQ4_1S: dp4a int8 path (optimized for Turing+ dp4a throughput)
