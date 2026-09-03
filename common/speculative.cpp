@@ -1065,13 +1065,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // image (acceptance fell from ~0.5 to ~0.03 for the rest of the conversation).
         // Skipping them leaves a gap in the draft's cache between the text before and after
         // the image; the draft keeps the target's positions, and the text tokens after the
-        // image carry the image's influence in their injected features. The gap is only
-        // legal with a full-size draft cache (the SWA ring cache cannot place tokens across
-        // it), which the server enables when a projector is loaded.
+        // image carry the image's influence in their injected features. The gap is fine for
+        // the default sliding-window draft cache: every batch it does see has consecutive
+        // positions, which is all find_slot requires (the crash was the image batch itself,
+        // whose tokens all carry one temporal position). No server-side change is involved.
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
         const bool has_tokens     = batch_in.token != nullptr;
         const bool has_embeddings = batch_in.embd  != nullptr;
-        if (has_tokens == has_embeddings || has_embeddings) {
+        if (!has_tokens || has_embeddings) {
             return true;
         }
 
