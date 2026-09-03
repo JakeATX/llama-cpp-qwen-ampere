@@ -2258,6 +2258,26 @@ ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched
     return sched->bufts[backend_index];
 }
 
+bool ggml_backend_sched_set_donor(ggml_backend_sched_t sched, ggml_backend_sched_t donor) {
+    if (sched == NULL) {
+        return false;
+    }
+    if (donor == NULL) {
+        ggml_gallocr_set_donor(sched->galloc, NULL);
+        return true;
+    }
+    if (donor == sched || donor->n_backends != sched->n_backends) {
+        return false;
+    }
+    for (int i = 0; i < sched->n_backends; i++) {
+        if (donor->bufts[i] != sched->bufts[i]) {
+            return false;
+        }
+    }
+    ggml_gallocr_set_donor(sched->galloc, donor->galloc);
+    return true;
+}
+
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

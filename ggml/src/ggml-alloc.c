@@ -396,10 +396,14 @@ static size_t ggml_dyn_tallocr_max_size(struct ggml_dyn_tallocr * alloc, int chu
 
 struct vbuffer {
     ggml_backend_buffer_t chunks[GGML_VBUFFER_MAX_CHUNKS];
+    int refs; // allocators sharing this buffer (see ggml_gallocr_set_donor)
 };
 
 static void ggml_vbuffer_free(struct vbuffer * buf) {
     if (buf == NULL) {
+        return;
+    }
+    if (--buf->refs > 0) {
         return;
     }
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS; ++i) {
@@ -425,6 +429,7 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
     if (buf == NULL) {
         return NULL;
     }
+    buf->refs = 1;
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
@@ -481,6 +486,7 @@ struct node_alloc {
 struct ggml_gallocr {
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
+    struct ggml_gallocr * donor; // optional: adopt this allocator's buffers when they are large enough
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
     int n_buffers;
 
@@ -576,6 +582,24 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
     free(galloc);
+}
+
+void ggml_gallocr_set_donor(ggml_gallocr_t galloc, ggml_gallocr_t donor) {
+    if (galloc == NULL) {
+        return;
+    }
+    if (donor != NULL) {
+        GGML_ASSERT(donor != galloc);
+        GGML_ASSERT(donor->n_buffers == galloc->n_buffers);
+        for (int i = 0; i < galloc->n_buffers; i++) {
+            GGML_ASSERT(donor->bufts[i] == galloc->bufts[i]);
+        }
+    }
+    galloc->donor = donor;
+}
+
+bool ggml_gallocr_shares_buffer(ggml_gallocr_t galloc, int buffer_id) {
+    return galloc != NULL && galloc->buffers[buffer_id] != NULL && galloc->buffers[buffer_id]->refs > 1;
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
@@ -932,9 +956,30 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->buffers[i] = NULL;
+            if (!no_alloc && galloc->donor != NULL && galloc->donor->buffers[i] != NULL) {
+                // adopt the donor's buffer when every chunk is large enough (the graphs never run concurrently)
+                struct vbuffer * db = galloc->donor->buffers[i];
+                bool fits = true;
+                for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                    if (ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c) > ggml_vbuffer_chunk_size(db, c)) {
+                        fits = false;
+                        break;
+                    }
+                }
+                if (fits) {
+                    db->refs++;
+                    galloc->buffers[i] = db;
+                    GGML_LOG_INFO("%s: sharing the %s compute buffer of the donor context (%.02f MiB)\n",
+                        __func__, ggml_backend_buft_name(galloc->bufts[i]), ggml_vbuffer_size(db) / 1024.0 / 1024.0);
+                } else {
+                    GGML_LOG_WARN("%s: donor %s compute buffer too small (%.02f MiB < %.02f MiB needed), allocating privately\n",
+                        __func__, ggml_backend_buft_name(galloc->bufts[i]), ggml_vbuffer_size(db) / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+                }
+            }
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
-            } else {
+            } else if (galloc->buffers[i] == NULL) {
                 galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);

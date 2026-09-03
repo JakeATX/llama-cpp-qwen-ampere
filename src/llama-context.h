@@ -354,6 +354,10 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // another context of the same model whose compute buffers this context shares (target <-> MTP);
+    // the two never compute at the same time, each synchronizes the other before computing
+    llama_context * compute_peer = nullptr;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
