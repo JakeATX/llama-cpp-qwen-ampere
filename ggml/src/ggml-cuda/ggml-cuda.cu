@@ -144,7 +144,7 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
@@ -737,32 +737,23 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-    // Return the cache buffers before the pools are destroyed
-    // (the legacy pool asserts on outstanding allocations at teardown).
-    // The VMM pool also asserts strict LIFO free order, and the retire lists are chronological,
-    // so free every held buffer newest-first: per device the highest address is the newest one.
-    struct held_buf { char * ptr; size_t cap; int dev; };
-    std::vector<held_buf> held;
-    auto hold = [&held](char * ptr, size_t cap, int dev) {
+    // The cache buffers are raw device allocations, not pool memory: the VMM pool frees strict
+    // LIFO and these are taken while transient pool allocations sit below them, so free order
+    // here does not matter.
+    auto free_buf = [](char * ptr, int dev) {
         if (ptr != nullptr) {
-            held.push_back({ ptr, cap, dev });
+            ggml_cuda_set_device(dev);
+            CUDA_CHECK(cudaFree(ptr));
         }
     };
 
-    hold(q8_cache.ptr, q8_cache.cap, q8_cache.dev);
+    free_buf(q8_cache.ptr, q8_cache.dev);
     for (const auto & r : q8_cache.retired) {
-        hold(r.ptr, r.cap, r.dev);
+        free_buf(r.ptr, r.dev);
     }
-    hold(tq_rot_cache.ptr, tq_rot_cache.cap, tq_rot_cache.dev);
+    free_buf(tq_rot_cache.ptr, tq_rot_cache.dev);
     for (const auto & r : tq_rot_cache.retired) {
-        hold(r.ptr, r.cap, r.dev);
-    }
-
-    std::sort(held.begin(), held.end(), [](const held_buf & a, const held_buf & b) {
-        return a.dev != b.dev ? a.dev < b.dev : a.ptr > b.ptr;
-    });
-    for (const auto & h : held) {
-        pool(h.dev).free(h.ptr, h.cap);
+        free_buf(r.ptr, r.dev);
     }
 
     q8_cache.ptr = nullptr;

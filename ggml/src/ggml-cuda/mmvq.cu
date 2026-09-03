@@ -1299,9 +1299,11 @@ void ggml_cuda_mul_mat_vec_q(
                 if (qc.ptr != nullptr) {
                     qc.retired.push_back({ qc.ptr, qc.cap, qc.dev });
                 }
-                size_t actual = 0;
-                qc.ptr = (char *) ctx.pool().alloc(q8_bytes, &actual);
-                qc.cap = actual;
+                // Plain device memory, not pool memory: the pool frees strict LIFO, and this
+                // buffer is taken while transient pool allocations sit below it. CUDA graph
+                // capture runs in relaxed mode, which allows cudaMalloc during capture.
+                CUDA_CHECK(ggml_cuda_device_malloc((void **) &qc.ptr, q8_bytes, ctx.device));
+                qc.cap = q8_bytes;
                 qc.dev = ctx.device;
             }
             src1_q8_1 = qc.ptr;
