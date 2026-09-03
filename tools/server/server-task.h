@@ -635,10 +635,23 @@ struct server_prompt_cache_state {
     }
 };
 
+// an entry of the prompt-cache disk tier: the serialized state lives in `file`, only the tokens stay in RAM
+struct server_prompt_cache_disk_entry {
+    std::string  file;
+    llama_tokens tokens;
+    size_t       size = 0; // bytes on disk
+};
+
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & disk_path = "", int32_t disk_limit_mib = 0) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        this->disk_path    = disk_path;
+        this->disk_limit   = 1024ull*1024ull*(disk_limit_mib < 0 ? 0 : disk_limit_mib);
+
+        if (disk_enabled()) {
+            disk_scan();
+        }
     }
 
     std::list<server_prompt_cache_state> states;
@@ -649,6 +662,18 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // disk tier (opt-in via --cache-disk-path): RAM evictions are spilled here and consulted on a RAM miss
+    std::string disk_path;
+    size_t      disk_limit = 0; // bytes, 0 = no limit
+    std::list<server_prompt_cache_disk_entry> disk_entries;
+
+    // a prompt too large for the RAM budget is staged here and spilled straight to disk on the next update()
+    server_prompt_cache_state staging;
+    bool                      staging_pending = false;
+
+    bool   disk_enabled() const { return !disk_path.empty(); }
+    size_t disk_size() const;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -658,6 +683,19 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+
+private:
+    // move a RAM entry's state into the slot's contexts; clears the entry's data on success
+    bool restore(server_prompt_cache_state & state, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // drop the oldest RAM entry, spilling it to disk first when the disk tier is enabled
+    void evict_front();
+
+    void disk_scan();
+    bool disk_spill(const server_prompt_cache_state & state);
+    bool disk_read(const server_prompt_cache_disk_entry & entry, server_prompt_cache_state & out) const;
+    void disk_remove(std::list<server_prompt_cache_disk_entry>::iterator it);
+    void disk_update();
 };
 
 // used exclusively by router mode

@@ -1672,6 +1672,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk-path"}, "PATH",
+        "directory for a disk tier of the prompt cache: entries evicted from the RAM cache are written here and "
+        "restored on a later cache miss instead of re-processing the prompt (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+            if (!fs_is_directory(params.cache_disk_path)) {
+                throw std::invalid_argument("cache-disk-path must be an existing directory");
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-limit"}, "N",
+        string_format("size limit of the prompt-cache disk tier in MiB (default: %d, 0 = no limit)", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

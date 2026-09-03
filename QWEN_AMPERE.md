@@ -57,6 +57,20 @@ GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS
 
 The three cache flags are what make a long conversation usable rather than merely possible. `--cache-prompt` keeps the conversation's KV cache in the slot between turns, so a new turn on a 200K conversation pays only for the new tokens instead of a 100-second re-prefill. `--ctx-checkpoints` matters specifically for this model: 48 of its layers are recurrent, and a recurrent state cannot be rewound, so when you edit or regenerate a turn the server needs a saved state from before the edit point; it keeps up to 24 of them, at least 10,240 tokens apart (and one at every user turn regardless), in host RAM. Measured on this model, a snapshot is 150 MiB plus 1.5 KiB per token of position, because the MTP drafter's own single-layer KV cache is saved with the recurrent state: about 165 MiB at 10K, 495 MiB at 240K. 24 at 10,240 spacing covers the whole 245,760 window for about 7.8 GiB with at most ten seconds of replay after an edit; denser spacing multiplies that RAM (60 at 4,096 is about 20 GiB at the deep end). `--cache-ram` is a separate host-RAM budget for parking a whole conversation's KV (with its checkpoints) when another conversation takes the slot; a populated 200K conversation is about 7.4 GB, so 8 GiB holds one, and it only does work when you switch between chats. None of this touches VRAM. Budget about 16 GB of host RAM for it at the deep end (up to 8 GiB of snapshots plus the 8 GiB park space) on top of the model's own mapping; on a 32 GB machine keep the desktop light, or drop the count to 12 at 20,480 spacing for half the snapshot RAM.
 
+**Disk tier for the prompt cache (this fork).** `--cache-disk-path DIR [--cache-disk-limit MiB]`
+adds a second tier under the RAM prompt cache: a conversation evicted from RAM, or one too large
+for the RAM budget in the first place (a full 200K-245K session is 7-9 GB), is written to `DIR`
+instead of being dropped, and a later request that matches it is restored from the file with only
+the new tokens processed. The index survives a server restart. Restores run at roughly 1.5 GB/s,
+so a 200K conversation comes back in a few seconds instead of a 100-second re-prefill, and the
+restored state is exact (greedy outputs match an uninterrupted session). Multimodal prompts stay
+RAM-only. Off unless the path is given.
+
+```bash
+--cache-prompt --cache-ram 8192 --cache-disk-path /fast-nvme/llama-cache --cache-disk-limit 65536 \
+--ctx-checkpoints 24 --checkpoint-min-step 10240
+```
+
 Everything the project adds is on by default. `LLAMA_SHARED_COMPUTE=0` disables
 the shared compute arena; the research knobs (`GGML_Q8_TURBO3_MMA_MIN_Q`,
 `GGML_CUDA_SM86_MMQ_POLICY`, `GGML_CUDA_SM86_MMVQ_WARP_ROWS`) stay off unless
