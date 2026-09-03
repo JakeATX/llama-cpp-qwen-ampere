@@ -1901,6 +1901,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// GGML_TQ_MMQ gates the native TQ MMQ prefill path. Read it once: getenv() is short-circuited
+// away on NVIDIA but is a libc call per mul_mat node on the AMD path.
+static bool ggml_cuda_tq_mmq_enabled() {
+    static const bool enabled = ggml_cuda_tq_mmq_enabled();
+    return enabled;
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
@@ -2127,7 +2134,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         return;
     }
     if (is_tq_weight && tq_fast_path_ok && src0->type == GGML_TYPE_TQ4_1S
-            && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) && getenv("GGML_TQ_MMQ") != nullptr) {
+            && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc)) && ggml_cuda_tq_mmq_enabled()) {
         // Phase 2 (gfx90a): native MFMA-i8 MMQ prefill via activation pre-rotation.
         // A/B against the cuBLAS path below (unset GGML_TQ_MMQ to fall back).
         ggml_cuda_mul_mat_tq4_1s_mmq(ctx, src0, src1, dst);
@@ -2186,7 +2193,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // avoiding the 2x-slower dequant-to-f16 cuBLAS fallback so native (GGML_TQ_NATIVE) experts
         // keep their ~1.7x-smaller 5bpw footprint without a prefill penalty. Env-gated by GGML_TQ_MMQ.
         if (is_tq_weight_id && src0->type == GGML_TYPE_TQ4_1S && (amd_mfma_available(cc) || amd_wmma_available(cc) || GGML_CUDA_CC_IS_RDNA2(cc))
-                && ggml_is_contiguous(src1) && getenv("GGML_TQ_MMQ") != nullptr) {
+                && ggml_is_contiguous(src1) && ggml_cuda_tq_mmq_enabled()) {
             ggml_cuda_mul_mat_id_tq4_1s_mmq(ctx, src0, src1, ids, dst);
             return;
         }
