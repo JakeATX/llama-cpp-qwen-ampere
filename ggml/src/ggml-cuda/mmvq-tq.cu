@@ -926,9 +926,11 @@ static const block_q8_1 * tq_prerotate_q8_1_cached(ggml_backend_cuda_context & c
             if (rc.ptr != nullptr) {
                 rc.retired.push_back({ rc.ptr, rc.cap, rc.dev });
             }
-            size_t actual = 0;
-            rc.ptr = (char *) ctx.pool().alloc(bytes, &actual);
-            rc.cap = actual;
+            // Plain device memory, not pool memory: the pool frees strict LIFO, and this
+            // buffer is taken while transient pool allocations sit below it. CUDA graph
+            // capture runs in relaxed mode, which allows cudaMalloc during capture.
+            CUDA_CHECK(ggml_cuda_device_malloc((void **) &rc.ptr, bytes, ctx.device));
+            rc.cap = bytes;
             rc.dev = ctx.device;
         }
         dst      = (block_q8_1 *) rc.ptr;

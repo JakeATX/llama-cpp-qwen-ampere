@@ -6476,6 +6476,213 @@ struct test_topk_moe : public test_case {
     }
 };
 
+// MUL_MAT -> ADD with a full same-shape residual (the bias-epilogue fusion). self_add builds
+// ADD(mm, mm): both inputs are the matmul output, which a fused kernel never materialises, so
+// the fusion must decline it.
+struct test_mul_mat_residual_fusion : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool self_add;
+
+    test_mul_mat_residual_fusion(ggml_type type, int64_t m, int64_t n, int64_t k, bool self_add)
+        : type(type), m(m), n(n), k(k), self_add(self_add) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, self_add);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_RESIDUAL_FUSION";
+    }
+
+    // the graph ends in a quantized matvec, so the same tolerance as test_mul_mat for quantized types
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * mm  = ggml_mul_mat(ctx, a, b);
+        ggml_tensor * res = self_add ? mm : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, m, n);
+        ggml_tensor * out = ggml_add(ctx, mm, res);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// Two quantized matvecs that consume the same activation in one graph: the second one must
+// hit the shared-quantize cache and still match the CPU result.
+struct test_mul_mat_shared_src1 : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    test_mul_mat_shared_src1(ggml_type type, int64_t m, int64_t n, int64_t k)
+        : type(type), m(m), n(n), k(k) {}
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, m, n, k);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SHARED_SRC1";
+    }
+
+    // the graph ends in a quantized matvec, so the same tolerance as test_mul_mat for quantized types
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a1 = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * a2 = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * b  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(a1, "a1");
+        ggml_set_name(a2, "a2");
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul_mat(ctx, a1, b), ggml_mul_mat(ctx, a2, b));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// A run of elementwise ops with same-shape and single-value operands, including the two
+// activations whose fused forms must round exactly like the unary kernels (GELU, SOFTPLUS).
+struct test_elem_chain_fusion : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool with_gelu_softplus;
+    const bool self_mul;   // out = MUL(t0, t0) with t0 = SILU(x): t0 is an elided intermediate used twice
+
+    test_elem_chain_fusion(std::array<int64_t, 4> ne, bool with_gelu_softplus, bool self_mul = false)
+        : ne(ne), with_gelu_softplus(with_gelu_softplus), self_mul(self_mul) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(ne, with_gelu_softplus, self_mul);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ELEM_CHAIN_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x  = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * o1 = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * s  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_set_name(x, "x");
+        ggml_set_name(o1, "o1");
+        ggml_set_name(s, "s");
+
+        ggml_tensor * cur = ggml_silu(ctx, x);
+        if (self_mul) {
+            cur = ggml_mul(ctx, cur, cur);
+            cur = ggml_add(ctx, cur, x);
+            ggml_set_name(cur, "out");
+            return cur;
+        }
+        cur = ggml_mul(ctx, cur, o1);
+        cur = ggml_add(ctx, cur, x);
+        cur = ggml_add(ctx, cur, s);
+        if (with_gelu_softplus) {
+            cur = ggml_gelu(ctx, cur);
+            cur = ggml_softplus(ctx, cur);
+        }
+        cur = ggml_scale(ctx, cur, 0.5f);
+        cur = ggml_clamp(ctx, cur, -4.0f, 4.0f);
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+};
+
+// MUL_MAT_ID -> MUL(weights) -> PERMUTE -> CONT -> SUM_ROWS, the MoE expert-reduce tail as
+// llama.cpp builds it, compared against the CPU graph whether or not a backend fuses it.
+struct test_moe_reduce_fusion : public test_case {
+    const ggml_type type;
+    const int64_t m;
+    const int64_t k;
+    const int n_mats;
+    const int n_used;
+    const int64_t ntok;
+
+    test_moe_reduce_fusion(ggml_type type, int64_t m, int64_t k, int n_mats, int n_used, int64_t ntok)
+        : type(type), m(m), k(k), n_mats(n_mats), n_used(n_used), ntok(ntok) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, m, k, n_mats, n_used, ntok);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_REDUCE_FUSION";
+    }
+
+    // the graph ends in a quantized matvec, so the same tolerance as test_mul_mat for quantized types
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as  = ggml_new_tensor_3d(ctx, type, k, m, n_mats);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, ntok);
+        ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, ntok);
+        ggml_tensor * w   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, ntok);
+        ggml_set_name(as, "as");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * cur = ggml_mul_mat_id(ctx, as, b, ids);       // [m, n_used, ntok]
+        cur = ggml_mul(ctx, cur, w);
+        cur = ggml_permute(ctx, cur, 1, 0, 2, 3);                    // [n_used, m, ntok]
+        cur = ggml_cont(ctx, cur);
+        cur = ggml_sum_rows(ctx, cur);                               // [1, m, ntok]
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) {
+                    continue;
+                }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = i % n_mats;
+                    }
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -8479,6 +8686,21 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // multi-node fusion coverage: residual epilogue, shared-quantize cache, elementwise chain, MoE reduce
+    for (ggml_type type : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_TQ4_1S}) {
+        for (int n : {1, 2, 4, 8}) {
+            test_cases.emplace_back(new test_mul_mat_residual_fusion(type, 64, n, 256, false));
+            test_cases.emplace_back(new test_mul_mat_residual_fusion(type, 64, n, 256, true));
+            test_cases.emplace_back(new test_mul_mat_shared_src1(type, 64, n, 256));
+        }
+        for (int ntok : {1, 4}) {
+            test_cases.emplace_back(new test_moe_reduce_fusion(type, 64, 256, 8, 4, ntok));
+        }
+    }
+    test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
+    test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
+    test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
     std::default_random_engine rng(0);
 
     // unary ops
