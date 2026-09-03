@@ -490,6 +490,25 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // share the target's compute buffers with an MTP context of the same model (default on,
+        // LLAMA_SHARED_COMPUTE=0 disables): the two graphs never run at the same time
+        {
+            const char * env = getenv("LLAMA_SHARED_COMPUTE");
+            const bool enabled = env == nullptr || env[0] != '0';
+            if (getenv("LLAMA_SHARED_COMPUTE_DEBUG") != nullptr) {
+                fprintf(stderr, "shared-compute: enabled=%d ctx_type=%d ctx_other=%p same_model=%d n_devices=%zu other_peer=%p\n",
+                    (int) enabled, (int) cparams.ctx_type, (void *) params.ctx_other,
+                    params.ctx_other ? (int) (&params.ctx_other->get_model() == &model) : -1, model.n_devices(),
+                    params.ctx_other ? (void *) params.ctx_other->compute_peer : nullptr);
+            }
+            if (enabled && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
+                    &params.ctx_other->get_model() == &model && model.n_devices() == 1 &&
+                    params.ctx_other->compute_peer == nullptr) {
+                compute_peer = params.ctx_other;
+                compute_peer->compute_peer = this;
+                LLAMA_LOG_INFO("%s: MTP context will share the target context's compute buffers\n", __func__);
+            }
+        }
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -511,6 +530,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (compute_peer != nullptr) {
+        if (compute_peer->compute_peer == this) {
+            compute_peer->compute_peer = nullptr;
+        }
+        compute_peer = nullptr;
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -743,6 +768,14 @@ void llama_context::sched_reserve() {
             moe_cache_eligible ? moe_cache_requested : "off");
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (getenv("LLAMA_SHARED_COMPUTE_DEBUG") != nullptr) {
+        fprintf(stderr, "shared-compute: sched_reserve peer=%p peer_sched=%p\n", (void *) compute_peer, compute_peer ? (void *) compute_peer->sched.get() : nullptr);
+    }
+    if (compute_peer != nullptr && compute_peer->sched) {
+        if (!ggml_backend_sched_set_donor(sched.get(), compute_peer->sched.get())) {
+            LLAMA_LOG_WARN("%s: could not share compute buffers with the peer context\n", __func__);
+        }
+    }
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib);
@@ -1672,6 +1705,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (compute_peer != nullptr && compute_peer->sched) {
+        // the peer's last graph may still be running on its own stream over the shared buffers
+        ggml_backend_sched_synchronize(compute_peer->sched.get());
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
