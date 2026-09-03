@@ -542,3 +542,21 @@ Insights that change how to read the earlier records:
    Q5_0/Q5_K on the ladder-sensitive tensors + Q8_0 small attention and
    head = fastest per round of everything measured and reference quality;
    the MTP layer (blk.64) must stay Q8_0 (draft acceptance is pure speed).
+
+9. Next items to inspect (2026-09-02 close):
+   - Backend (GPU) sampling during speculation: upstream llama.cpp added
+     multi-output backend sampling (2026-08-10, #25532) and enabled it for
+     DFlash/DSpark (#26958). This server disables backend sampling when a
+     slot speculates, so every round downloads ~4 MB of logits and samples
+     on the CPU. The A2 CPU trace put CPU work between syncs at ~2% of the
+     decode window, so the expected gain is 1-3% of decode, not more.
+   - Rebase: the fork's upstream `origin/feature/turboquant-kv-cache` is
+     80 commits ahead of our base (base 2026-08-25, upstream 2026-08-31).
+     Relevant to this project: `--gdn-replay` ingredient replay for MTP
+     recurrent-state rollback (upstream's version of V1 research item 4,
+     the 4 -> 2 recurrent planes, ~300 MiB), batched rollback replay, MMVQ
+     TQ optimizations (#321), MoE cache calibration, wave64 turbo fixes.
+     A rebase re-validates the product branches with the canaries.
+   - f16 K/V chunked conversion (V1 item 3): after V2 the reservation is
+     800 MiB once; chunking needs the stream-k attention split reworked.
+   - Mask-free causal attention (V1 item 5): 400 MiB after V2.
