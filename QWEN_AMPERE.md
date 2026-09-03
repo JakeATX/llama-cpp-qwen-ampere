@@ -50,12 +50,12 @@ cmake --build build-sm86 -j8 --target llama-server
 GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS.gguf \
   -c 245760 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
   --parallel 1 --jinja --fit off \
-  --cache-prompt --cache-ram 8192 --ctx-checkpoints 8 --checkpoint-min-step 8192 \
+  --cache-prompt --cache-ram 8192 --ctx-checkpoints 10 --checkpoint-min-step 8192 \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.45 \
   --spec-draft-type-k q8_0 --spec-draft-type-v turbo3
 ```
 
-The three cache flags are what make a long conversation usable rather than merely possible. `--cache-prompt` keeps the conversation's KV cache in the slot between turns, so a new turn on a 200K conversation pays only for the new tokens instead of a 100-second re-prefill. `--ctx-checkpoints` matters specifically for this model: 48 of its layers are recurrent, and a recurrent state cannot be rewound, so when you edit or regenerate a turn the server needs a saved state from before the edit point; it keeps up to 8 of them, at least 8,192 tokens apart, in host RAM at roughly 150 MB each. `--cache-ram` is the host-RAM budget for parking a whole conversation's KV when another one takes the slot; a populated 200K conversation is about 7.4 GB, so 8 GiB holds one. None of this touches VRAM. Budget about 9 GB of host RAM for it on top of the model's own mapping.
+The three cache flags are what make a long conversation usable rather than merely possible. `--cache-prompt` keeps the conversation's KV cache in the slot between turns, so a new turn on a 200K conversation pays only for the new tokens instead of a 100-second re-prefill. `--ctx-checkpoints` matters specifically for this model: 48 of its layers are recurrent, and a recurrent state cannot be rewound, so when you edit or regenerate a turn the server needs a saved state from before the edit point; it keeps up to 10 of them, at least 8,192 tokens apart, in host RAM at roughly 150 MB each, which covers edits within the last 80K tokens; older edit points fall back to a full re-prefill. `--cache-ram` is a separate host-RAM budget for parking a whole conversation's KV (with its checkpoints) when another conversation takes the slot; a populated 200K conversation is about 7.4 GB, so 8 GiB holds one, and it only does work when you switch between chats. None of this touches VRAM. Budget about 9.5 GB of host RAM for it on top of the model's own mapping.
 
 Everything the project adds is on by default. `LLAMA_SHARED_COMPUTE=0` disables
 the shared compute arena; the research knobs (`GGML_Q8_TURBO3_MMA_MIN_Q`,
