@@ -558,9 +558,16 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr float TQ4_CENTROID_I8_RESCALE = 2.733f / 127.0f;
     constexpr int   QI_TQ = QK_TQ4_1S / 4;   // 8 ints (int8-quads) per block
 
-    // TQ4_1S MMQ is MFMA-only.
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     int   * x_qs = (int   *)  x_tile;
-    float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+#else
+    // dp4a consumes a different tile layout: rows are padded by one int and the scales start
+    // after the (padded) quant region, not at a fixed 2*MMQ_TILE_NE_K offset.
+    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_TQ4_1S, I);
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + txs.qs);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 
     constexpr int threads_per_row = 32;
     constexpr int nrows = warp_size / threads_per_row;
@@ -575,8 +582,13 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
         const block_tq4_1s * bxi = (const block_tq4_1s *) x + kbx0 + i*stride + kbx;
-        x_qs[i*sram_stride + 0             + txi] = tq4_1s_qs_to_int8x4(bxi[0].qs,                   kqsx);
-        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = tq4_1s_qs_to_int8x4(bxi[MMQ_TILE_NE_K/QI_TQ].qs, kqsx);
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_qs[i*sram_stride           + 0             + txi] = tq4_1s_qs_to_int8x4(bxi[0].qs,                   kqsx);
+        x_qs[i*sram_stride           + MMQ_TILE_NE_K + txi] = tq4_1s_qs_to_int8x4(bxi[MMQ_TILE_NE_K/QI_TQ].qs, kqsx);
+#else
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 0             + txi] = tq4_1s_qs_to_int8x4(bxi[0].qs,                   kqsx);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + MMQ_TILE_NE_K + txi] = tq4_1s_qs_to_int8x4(bxi[MMQ_TILE_NE_K/QI_TQ].qs, kqsx);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 
     // Two per-16 scales per block: slot 2*b = d0 (elems 0-15), slot 2*b+1 = d1 (elems 16-31).
@@ -590,8 +602,13 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
         const block_tq4_1s * bxi = (const block_tq4_1s *) x + kbx0 + i*stride + kbxd;
-        x_df[i*sram_stride + 2*kbxd + 0] = __half2float(bxi->d0) * TQ4_CENTROID_I8_RESCALE;
-        x_df[i*sram_stride + 2*kbxd + 1] = __half2float(bxi->d1) * TQ4_CENTROID_I8_RESCALE;
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+        x_df[i*sram_stride                             + 2*kbxd + 0] = __half2float(bxi->d0) * TQ4_CENTROID_I8_RESCALE;
+        x_df[i*sram_stride                             + 2*kbxd + 1] = __half2float(bxi->d1) * TQ4_CENTROID_I8_RESCALE;
+#else
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbxd + 0] = __half2float(bxi->d0) * TQ4_CENTROID_I8_RESCALE;
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbxd + 1] = __half2float(bxi->d1) * TQ4_CENTROID_I8_RESCALE;
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }
 
