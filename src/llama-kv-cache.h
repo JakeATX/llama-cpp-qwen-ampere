@@ -158,6 +158,8 @@ public:
     uint32_t get_n_stream() const;
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
+    bool get_v_transposed() const;
 
     bool get_has_shift() const;
 
