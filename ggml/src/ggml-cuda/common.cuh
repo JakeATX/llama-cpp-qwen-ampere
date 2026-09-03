@@ -1453,6 +1453,8 @@ struct ggml_backend_cuda_context {
         const void *        data = nullptr;
         uint64_t            epoch = 0;
         size_t              size = 0;
+        struct retired_buf { char * ptr; size_t cap; int dev; };
+        std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
     } tq_rot_cache;
 
     uint64_t graph_epoch = 1;

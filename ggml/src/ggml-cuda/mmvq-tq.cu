@@ -903,7 +903,6 @@ static const block_q8_1 * tq_prerotate_q8_1_cached(ggml_backend_cuda_context & c
                                                    const float * src1_d,
                                                    int n_act_elements,
                                                    ggml_cuda_pool_alloc<block_q8_1> & fallback) {
-    const int    id       = ggml_cuda_get_device();
     cudaStream_t stream   = ctx.stream();
     const int    n_blocks = n_act_elements / 32;
     const size_t bytes    = (size_t) n_blocks * sizeof(block_q8_1);
@@ -921,11 +920,14 @@ static const block_q8_1 * tq_prerotate_q8_1_cached(ggml_backend_cuda_context & c
     block_q8_1 * dst = nullptr;
     if (cacheable) {
         if (rc.dev != ctx.device || rc.cap < bytes) {
-            if (rc.ptr != nullptr && rc.dev == ctx.device) {
-                ctx.pool(rc.dev).free(rc.ptr, rc.cap);
+            // Never free a buffer here: a CUDA graph captured earlier may still replay
+            // kernels that point at it (several graphs per context with --n-cpu-moe splits).
+            // Retire it and release everything at context teardown instead.
+            if (rc.ptr != nullptr) {
+                rc.retired.push_back({ rc.ptr, rc.cap, rc.dev });
             }
             size_t actual = 0;
-            rc.ptr = (char *) ctx.pool(id).alloc(bytes, &actual);
+            rc.ptr = (char *) ctx.pool().alloc(bytes, &actual);
             rc.cap = actual;
             rc.dev = ctx.device;
         }
@@ -943,6 +945,21 @@ static const block_q8_1 * tq_prerotate_q8_1_cached(ggml_backend_cuda_context & c
     const dim3 pgrid((n_blocks + wpb - 1) / wpb);
     tq_prerotate_q8_1<<<pgrid, pblock, 0, stream>>>(src1_d, dst, n_act_elements);
     return dst;
+}
+
+// GGML_TQ_LPR debug knob. Only 2/4/8/16/32 have a kernel instantiation, so any other value
+// sizes the grid for one lanes-per-row but launches the 32-lane kernel and leaves rows unwritten.
+static int tq_lpr_env() {
+    const char * env = getenv("GGML_TQ_LPR");
+    if (env == nullptr) {
+        return 0;
+    }
+    const int lpr = atoi(env);
+    if (lpr != 2 && lpr != 4 && lpr != 8 && lpr != 16 && lpr != 32) {
+        GGML_LOG_WARN("%s: ignoring invalid GGML_TQ_LPR=%s (want 2, 4, 8, 16 or 32)\n", __func__, env);
+        return 0;
+    }
+    return lpr;
 }
 
 // Small-batch (decode / light speculative) TQ MoE: single fused, graph-capturable launch.
@@ -1001,7 +1018,7 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
         // Pick lanes-per-row so every lane gets a useful number of blocks (>= 4) while keeping
         // the reduction short. GGML_TQ_LPR overrides for experiments.
         const int blocks_per_row_h = ncols_x / 32;
-        static const int lpr_env = getenv("GGML_TQ_LPR") ? atoi(getenv("GGML_TQ_LPR")) : 0;
+        static const int lpr_env = tq_lpr_env();
         int lpr = lpr_env;
         if (lpr == 0) {
             // 16 measured best on CDNA: 4 reduction rounds instead of 5, while the warp still
@@ -1010,7 +1027,7 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
             // on AMD, so NVIDIA keeps the previous 32. Never assign more lanes than there are
             // blocks, so no lane sits idle on narrow projections.
             lpr = GGML_CUDA_CC_IS_AMD(cc) ? 16 : 32;
-            while (lpr > 1 && blocks_per_row_h < lpr) {
+            while (lpr > 2 && blocks_per_row_h < lpr) {   // floor at 2: the switch below has no 1-lane kernel
                 lpr /= 2;
             }
         }
