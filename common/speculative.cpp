@@ -1058,14 +1058,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        // Target prefill may contain token IDs or multimodal embeddings. Both
-        // produce the target-layer features used to seed the draft KV cache, so
-        // skipping the embedding batches leaves a hole in the draft's cache and
-        // the next injection fails to initialize.
+        // Target prefill may contain token IDs or multimodal embeddings (image chunks).
+        // Image chunks are not mirrored into the draft: their target-layer features are
+        // vision states the draft was never trained on, and their M-RoPE positions collapse
+        // onto one temporal position, so injecting them poisons every draft after the
+        // image (acceptance fell from ~0.5 to ~0.03 for the rest of the conversation).
+        // Skipping them leaves a gap in the draft's cache between the text before and after
+        // the image; the draft keeps the target's positions, and the text tokens after the
+        // image carry the image's influence in their injected features. The gap is fine for
+        // the default sliding-window draft cache: every batch it does see has consecutive
+        // positions, which is all find_slot requires (the crash was the image batch itself,
+        // whose tokens all carry one temporal position). No server-side change is involved.
         // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
         const bool has_tokens     = batch_in.token != nullptr;
         const bool has_embeddings = batch_in.embd  != nullptr;
-        if (has_tokens == has_embeddings) {
+        if (!has_tokens || has_embeddings) {
             return true;
         }
 
@@ -1200,7 +1207,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t n = (int32_t) dp.n_past;
+            // dp.n_past is the slot's token count. For an M-RoPE target that is no longer the
+            // next position once an image has been in the prompt (image tokens advance the
+            // position by the grid size, not by their count), and a noise block placed at the
+            // token count sits hundreds of positions past the draft's own cache. Take the next
+            // position from the target's memory instead; without images the two are equal.
+            const llama_pos pos_max_tgt = llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), seq_id);
+            const int32_t n = pos_max_tgt >= 0 ? (int32_t) pos_max_tgt + 1 : (int32_t) dp.n_past;
 
             const int32_t n_draft = params.n_max;
 
