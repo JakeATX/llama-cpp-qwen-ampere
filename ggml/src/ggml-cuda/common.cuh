@@ -1021,6 +1021,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q8_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ4_1S> {
+    static constexpr int qk = QK_TQ4_1S;
+    static constexpr int qr = 1;              // QR_TQ4_1S
+    static constexpr int qi = QK_TQ4_1S / 4;  // = QK/(4*QR): 8 int8-quads per block
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK_MXFP4;
     static constexpr int qr = QR_MXFP4;
