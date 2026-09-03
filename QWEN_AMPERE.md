@@ -48,7 +48,7 @@ cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_CUDA_F
 cmake --build build-sm86 -j8 --target llama-server
 
 GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS.gguf \
-  -c 204800 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
+  -c 245760 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
   --parallel 1 --jinja --fit off \
   --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.45 \
   --spec-draft-type-k q8_0 --spec-draft-type-v turbo3
