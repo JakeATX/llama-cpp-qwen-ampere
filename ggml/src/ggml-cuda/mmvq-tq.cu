@@ -993,7 +993,6 @@ void ggml_cuda_mul_mat_id_tq(ggml_backend_cuda_context & ctx,
 
     if (use_dp4a) {
         // Pre-rotate activations to q8_1, contiguous [ncols_x, nchannels_y, n_tokens].
-        const int n_blocks_total = n_act_elements / 32;
         ggml_cuda_pool_alloc<block_q8_1> q8_buf(ctx.pool(id));
         const block_q8_1 * q8_act = tq_prerotate_q8_1_cached(ctx, src1, src1_d, n_act_elements, q8_buf);
         const int64_t stride_channel_y = ncols_x / 32;                           // q8_1 blocks to next y-channel
