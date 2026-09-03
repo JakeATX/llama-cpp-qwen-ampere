@@ -739,21 +739,35 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
     // Return the cache buffers before the pools are destroyed
     // (the legacy pool asserts on outstanding allocations at teardown).
-    if (q8_cache.ptr != nullptr) {
-        pool(q8_cache.dev).free(q8_cache.ptr, q8_cache.cap);
-        q8_cache.ptr = nullptr;
-    }
+    // The VMM pool also asserts strict LIFO free order, and the retire lists are chronological,
+    // so free every held buffer newest-first: per device the highest address is the newest one.
+    struct held_buf { char * ptr; size_t cap; int dev; };
+    std::vector<held_buf> held;
+    auto hold = [&held](char * ptr, size_t cap, int dev) {
+        if (ptr != nullptr) {
+            held.push_back({ ptr, cap, dev });
+        }
+    };
+
+    hold(q8_cache.ptr, q8_cache.cap, q8_cache.dev);
     for (const auto & r : q8_cache.retired) {
-        pool(r.dev).free(r.ptr, r.cap);
+        hold(r.ptr, r.cap, r.dev);
     }
-    q8_cache.retired.clear();
-    if (tq_rot_cache.ptr != nullptr) {
-        pool(tq_rot_cache.dev).free(tq_rot_cache.ptr, tq_rot_cache.cap);
-        tq_rot_cache.ptr = nullptr;
-    }
+    hold(tq_rot_cache.ptr, tq_rot_cache.cap, tq_rot_cache.dev);
     for (const auto & r : tq_rot_cache.retired) {
-        pool(r.dev).free(r.ptr, r.cap);
+        hold(r.ptr, r.cap, r.dev);
     }
+
+    std::sort(held.begin(), held.end(), [](const held_buf & a, const held_buf & b) {
+        return a.dev != b.dev ? a.dev < b.dev : a.ptr > b.ptr;
+    });
+    for (const auto & h : held) {
+        pool(h.dev).free(h.ptr, h.cap);
+    }
+
+    q8_cache.ptr = nullptr;
+    q8_cache.retired.clear();
+    tq_rot_cache.ptr = nullptr;
     tq_rot_cache.retired.clear();
 
     if (copy_event != nullptr) {
