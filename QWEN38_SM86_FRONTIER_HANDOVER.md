@@ -1,13 +1,16 @@
 # Qwen3.8-27B SM86 optimization handover
 
-Updated: 2026-09-01
+Updated: 2026-09-03 (see the 2026-09-03 addendum at the end for the current state; the sections above it are kept as the historical record and corrected only where they would mislead)
 
 ## Read this first
 
 The production target is Qwen3.8-27B on one RTX 3090/3090 Ti (`sm_86`), full
 GPU offload, `--parallel 1`, Flash Attention, Q8_0 K cache, Turbo3 V cache, and
-native MTP3/MTP4. Q3_K_XL is the only currently qualified quant that preserves
-the required 200K populated-context tier at `-ub 1024`.
+native MTP3. As of 2026-09-03 the product quant is **ATX-4-XS**
+(`sjakek/Qwen3.8-27B-ATX-4-XS-GGUF` on Hugging Face): measured populated 200K at
+20.9 GiB ready and a 245,760-token window with a 240K prompt at 22.1 GiB ready,
+on the `main` branch of the renamed repo. Q3_K_XL remains the reference quant
+and still fits its full 262,144 window.
 
 The accepted product is stable. The next high-priority research task is a
 **single fused CUDA chunked Gated DeltaNet (GDN) prefill kernel using the
@@ -26,14 +29,18 @@ or the exact local Q3 unpack-reuse family. They have already been measured.
 
 ## GitHub and branch map
 
-Fork remote:
+Fork remote (renamed 2026-09-03; the old `JakeATX/llama.cpp` URL redirects):
 
-`https://github.com/JakeATX/llama.cpp`
+`https://github.com/JakeATX/llama-cpp-qwen-ampere`
 
 The important branches are:
 
-- `perf/qwen38-sm86-decode-product`: accepted decode product, `c387d38b23b952823f408002d63a5a229b8ba4e3`;
-- `perf/qwen38-sm86-prefill`: accepted prefill/runtime product, `dd66db0ccaec07cd9d325992e9040a53d6271eb6`;
+- `main` (default): the product. `fdfea8123` = the accepted product merged with
+  TheTom's `feature/turboquant-kv-cache` as of 2026-09-03, validated
+  output-identical; later commits on `main` are docs plus the prompt-cache disk
+  tier (`b8c4f3298`). Build from here;
+- `perf/qwen38-sm86-decode-product` and `perf/qwen38-sm86-prefill`: both at
+  `fdfea8123`, kept for existing links (historical tips: `c387d38b2`, `dd66db0cc`);
 - `research/qwen38-sm86-100k-decode-frontier`: decode experiments and this handover; source tip before the handover commit was `2795680c47ce02f83b225ef60c658994d6495c28`;
 - `research/qwen38-sm86-ub512-1024-prefill-frontier`: prefill frontier experiments, tip `685d66faefe1dd754561776042c4c0ead08e0107`;
 - `archive/qwen38-sm86-fast-mmvq`: rejected optional non-exact MMVQ path, `aef2a435527ce4761bbde3218bae4093899b9c81`.
@@ -46,15 +53,31 @@ default-off flags or a subsequent revert.
 Source worktrees:
 
 - accepted/main development tree: `/home/jake-k/TheTom-llama-cpp-turboquant`;
-- accepted decode product: use branch `perf/qwen38-sm86-decode-product`;
+- **current product worktree (branch `main`, validated `build-sm86/`)**:
+  `/home/jake-k/TheTom-llama-cpp-turboquant-qwen38-merge`;
+- clean pre-merge product binary (3612acca6) used as the A/B baseline:
+  `/home/jake-k/TheTom-llama-cpp-turboquant-atx4xs-eval/build-sm86/bin/llama-server`;
+- GDN research tree (branch `research/qwen38-sm86-fused-gdn-chunk`, NOT merged with upstream yet):
+  `/home/jake-k/TheTom-llama-cpp-turboquant-qwen38-fused-gdn`;
 - decode frontier: `/home/jake-k/TheTom-llama-cpp-turboquant-qwen38-frontier-decode`;
 - prefill frontier: `/home/jake-k/TheTom-llama-cpp-turboquant-qwen38-frontier-prefill`;
 - archived FAST diagnostic: `/home/jake-k/TheTom-llama-cpp-turboquant-qwen38-fast-diag`.
 
 Models:
 
+- **ATX-4-XS (product)**: `/home/jake-k/qwen38-bench/models/atx4xs/Qwen3.8-27B-ATX-4-XS.gguf`
+  (sha256 `5cf05ad9...963b`, 15,588,551,712 bytes; map `tensor_types_ATX-4-XS.txt` in the same directory;
+  previous versions `.v1.txt`/`.v2.txt` of the map, and `Qwen3.8-27B-ATX-4-XS-q8ab-fixed-7a92b152.gguf`
+  is the other agent's copy of the intermediate build);
+- BF16 source + Unsloth imatrix for rebuilding: `models/qwen38_27b_bf16/`, `models/unsloth_qwen38_27b_ud_iq4_xs/imatrix_unsloth.gguf`;
 - Q4_K_M: `/home/jake-k/qwen38-bench/models/unsloth_qwen38_27b_ud_q4_k_m/Qwen3.8-27B-UD-Q4_K_M.gguf`;
 - Q3_K_XL: `/home/jake-k/qwen38-bench/models/unsloth_qwen38_27b_ud_q3_k_xl/Qwen3.8-27B-UD-Q3_K_XL.gguf`.
+
+Publication:
+
+- article (markdown): `/home/jake-k/qwen38-bench/ARTICLE_3090_200K_ATX4XS.md`; the web version with charts is a private
+  claude.ai artifact (`f6394cdb-37e7-450f-89d2-e61ee0461011`); its HTML source lives in the session scratchpad, not in Git;
+- HF model card = the artifact's "Run it" section; keep the three in sync.
 
 Benchmark and audit root:
 
@@ -171,6 +194,13 @@ With Q8_0 K, Turbo3 V, MTP3, and UB1024:
 - Q3_K_XL failed the 225K request after 206,848 tokens;
 - Q4_K_M passed 149,000 tokens and failed at 155,000;
 - Q4_K_M cannot initialize the full 200K target/MTP configuration.
+
+The bullets above predate the V1/V2 VRAM fixes (2026-09-02) and the merge. Current facts on `main`:
+
+- Q3_K_XL: 200K populated at 19,204 MiB ready; the full 262,144 window with a 200K prompt at 20,922 MiB;
+- ATX-4-XS: 200K populated at 21,372 MiB ready / 21,422 peak (prefill 694 tok/s, decode 65 tok/s with the window full);
+  245,760 window with a 240K prompt at 22,600 MiB ready / 22,634 peak. 262K not probed;
+- Q4_K_M: 200K loads at 22,208 MiB ready; its max-context cell in the article is still an extrapolation (~230K).
 
 Any replacement/repack design must preserve the Q3 200K tier. Replace the
 device layout of hot tensors rather than retaining a multi-GiB duplicate.
@@ -378,8 +408,9 @@ commit followed by a revert or keep it behind a default-off flag.
 
 ## Current safe recommendation
 
-Use accepted EXACT with MTP3, Q8_0 K/Turbo3 V, and UB1024. Use Q3_K_XL for
-200K. Leave these frontier flags off:
+(Superseded 2026-09-03; see the addendum for the current command.) Use accepted
+EXACT with MTP3, Q8_0 K/Turbo3 V, and UB1024. Use Q3_K_XL for 200K. Leave
+these frontier flags off:
 
 - `GGML_CUDA_SM86_Q8_T3_GQA_WARP`;
 - `GGML_CUDA_SM86_IQ_REUSE`;
@@ -477,4 +508,156 @@ Also settled: MTP4 gives nothing over MTP3 even with the cheaper verify
 launch; the routing candidate (widths 1-2 on the MMA path) fails the
 generated-task quality protocol by a small consistent margin and stays
 opt-in; the exact path to its speed is an FP32-accumulating (2,8) instance.
+
+## 2026-09-03 addendum: upstream merge, ATX-4-XS corrections, capacity, agent-session curve, cache tiers
+
+### Runtime: merged with TurboQuant+ (accepted, pushed)
+
+`fdfea8123` on `main` = product `3612acca6` + `origin/feature/turboquant-kv-cache`
+`1208c5956` (117 upstream commits: MMVQ shared-quantize cache and elementwise
+chain fusion (#343, both default-on), persistent q8/TQ pre-rotation buffers,
+`--gdn-replay` ingredient replay (opt-in), turbo4 vec fix; the rest is
+TQ4_1S/MoE/AMD/Metal/Vulkan work this project does not use). Two real
+conflicts: `gated_delta_net.cu` (our ILP kernel kept, gained upstream's
+`emit_ingredients_t` template parameter, and is skipped when `emit_mode==1`
+because it writes full state snapshots, not ingredients; the snapshot layout
+for `emit_mode==0` is unchanged upstream) and `test-backend-ops.cpp` (both
+sides' cases kept). Validation on the merged build: GDN 48/48, FLASH_ATTN_EXT
+7664/7664, MUL_MAT 1697/1697; Q3 200K capacity canary identical
+(`944b399e...`, ready 19,204 MiB); ATX-4-XS decode A/B old vs merged, 100K two
+alternated pairs and 64K one pair: identical output hashes and draft
+acceptance, +0.16% / +0.29% tok/s (noise). Record:
+`frontier/R1_turboquant_merge_20260903/`. The research branch
+`research/qwen38-sm86-fused-gdn-chunk` was NOT merged with upstream.
+
+### ATX-4-XS corrections (same name, overwritten on HF)
+
+1. The 96 GDN `ssm_alpha`/`ssm_beta` vectors were IQ4_XS; both Unsloth
+   references keep them Q8_0. Fixed (0.01 GiB).
+2. The eight attention K/V tensors Q4_K_M keeps at Q8_0 (V in layers 11, 27, 31,
+   51, 55, 59, 63; K in 31) were Q6_K. Now Q8_0 (+17.6 MiB). ATX-4-XS now holds
+   exactly the same 106 tensors at Q8_0 as Q4_K_M.
+3. The only remaining Q4_K tensor is `token_embd` (1.27 B params, 682 MiB). It
+   never touches the GPU (llama.cpp keeps the input layer on the host), has no
+   imatrix data (lookups are not matmuls), and Q4_K_M keeps it at Q4_K too.
+   Moving it to IQ4_XS would be a small quality downgrade for 38 MiB; Q8_0
+   would be the quality-maximal choice at +606 MiB of host RAM/file size.
+
+Final file: 14.52 GiB, IQ4_XS 71.4% / Q5_0 16.1% / Q6_K 7.4% / Q4_K 4.6% /
+Q8_0 0.5% of weight bytes. Verified by header diff: only the intended tensors
+changed between builds. **Gotcha:** this fork's `llama-quantize` takes the
+FIRST matching regex in `--tensor-type-file`, not the last; overrides must
+replace existing lines. The `-mtp8` variant was not rebuilt (user decision).
+
+### Long-context measurements on the final file (merged runtime)
+
+- Populated 200K: 21,372 MiB ready, 21,422 peak, prefill 694 tok/s, decode 65 tok/s.
+- 245,760 window with a 240K prompt: 22,600 MiB ready, 22,634 peak, output identical.
+- Agent session, 99,922-token agentic prompt (OpenHands SWE trajectory) to
+  245,686 tokens of context, 120,186 generated over 288 ChatML turns (260
+  tool-result turns, 28 follow-up tasks), EOS never suppressed: cumulative
+  decode 51.8 tok/s; 10K-window tok/s 61.5 at 114K context, 55.6 at 175K,
+  47.3 at 198K, 47.1 at 245K; draft acceptance 76% overall (65-88% per window);
+  first prefill 982 tok/s; peak VRAM 23,678 MiB. Harness: session scratchpad
+  `longgen2.py` (checkpoints every 1K tokens with per-window acceptance from
+  `timings_per_token`), results under
+  `frontier/R1_turboquant_merge_20260903/raw/longgen_agentic_multiturn_100k_140k/`.
+- Two harness lessons. (a) `ignore_eos=true` on a single answer collapses into
+  a repeated sign-off within ~12K tokens and reports ~97-100% draft
+  acceptance; such curves are not workload data and were discarded. (b) On the
+  agentic fixtures the model behaves as an agent step machine (reason + tool
+  call, then EOS); a multi-turn harness must answer tool calls with `[TOOL]`
+  result stubs and use real chat turns (ChatML, append-only so the KV prefix
+  stays valid), not raw transcript continuation.
+
+### 5K/5K comparison against vLLM (other agent's run, kept in the article)
+
+Same prompts, native MTP-3 on both: llama.cpp ATX-4-XS 70.8 / 80.2 / 81.9 tok/s
+(agentic / coding / RAG) at 17.1 GiB VRAM vs vLLM W4A16 AWQ 81.8 / 86.2 / 88.2
+at 22.1 GiB with a 12K window and 19.6% more effective bits. Different
+questions: vLLM wins single-request decode at 5K, cannot hold 200K on this card.
+
+### Prompt cache, checkpoints, and the new disk tier
+
+- `--cache-prompt` (default on) keeps the conversation's KV in the slot; a
+  new turn on a 200K conversation costs only the new tokens.
+- Context checkpoints (`--ctx-checkpoints N --checkpoint-min-step S`) are
+  recurrent-state snapshots in host RAM, taken at every user turn and
+  otherwise no closer than S tokens; they are the only way to "rewind" the 48
+  GDN layers after an edit, regenerate, or harness compaction. **Measured size
+  on this model: 150 MiB + 1.47 KiB per token of position** (the MTP drafter's
+  single-layer KV is saved with the recurrent state; `PARTIAL_ONLY` flag), so
+  ~495 MiB at 240K. Full coverage of the 245,760 window under 8 GiB is 24
+  checkpoints at 10,240 spacing (worst replay ~10 s); denser spacing
+  multiplies RAM (60 at 4,096 is ~20 GiB at the deep end).
+- `--cache-ram` is a separate host-RAM budget for parking a displaced
+  conversation (KV + its checkpoints). A conversation larger than the budget
+  is skipped, not parked, and re-prefills on return; 200K is ~7.4 GB of KV,
+  245K ~9.1 GB. Parking transiently duplicates the state in host RAM.
+- **New on `main` (`b8c4f3298`): `--cache-disk-path DIR [--cache-disk-limit MiB]`**,
+  a disk tier under the RAM prompt cache. RAM evictions and prompts too large
+  for the RAM budget are serialized (tokens, target/draft state, checkpoints;
+  format `LCPC` v1) and restored on a later matching request under the same
+  prefix-similarity rule; the directory is indexed at startup. Tested with
+  three rotating conversations at RAM budgets below and equal to one
+  conversation: spill, restore with `cache_n` = full prefix (~360 ms for
+  539 MiB, ~1.5 GB/s), restart re-index, greedy output identical to an
+  uninterrupted control; flag-off path unchanged. Manual test:
+  `tools/server/tests/test_prompt_cache_disk_tier_manual.py`. Multimodal
+  prompts are not spilled.
+
+### Current recommended server command (single user)
+
+```bash
+GGML_Q8_TURBO3_MMA_FUSED=1 ./build-sm86/bin/llama-server -m Qwen3.8-27B-ATX-4-XS.gguf \
+  -c 245760 -b 4096 -ub 1024 -t 8 -tb 8 -ngl 99 -fa on -ctk q8_0 -ctv turbo3 \
+  --parallel 1 --jinja --fit off \
+  --cache-prompt --cache-ram 8192 --cache-disk-path /fast-nvme/llama-cache --cache-disk-limit 65536 \
+  --ctx-checkpoints 24 --checkpoint-min-step 10240 \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.45 \
+  --spec-draft-type-k q8_0 --spec-draft-type-v turbo3
+```
+
+`-c 204800` for 200K at 20.9 GiB ready if anything else needs the card. Host
+RAM for the caches at the deep end: up to ~8 GiB of checkpoints plus the 8 GiB
+park space. `--parallel 1` is structural: a second slot needs its own ~7 GiB
+KV at 200K and its own MTP drafter, and none of the kernel tuning covers it.
+
+### Operations lessons from 2026-09-03
+
+- The host has 30 GB RAM and 8 GB swap. `llama-quantize` from BF16 peaks ~10 GB
+  anon RSS; run it under `systemd-run --user --scope -p MemoryMax=10G` and
+  never concurrently with a vLLM job or the desktop above ~15 GB. Two OOM
+  incidents today: one killed the terminal scope (Claude session included), one
+  filled swap completely (PSI full ~20%) when quantize + vLLM load overlapped.
+- Another agent (hermes) starts GPU jobs from systemd user units without
+  warning (`qwen38-atx4xs-q8fix-eval`, `qwen38-compact-compare-trace`). Gate
+  every GPU chain on `nvidia-smi` memory < 3 GB and no `VLLM::EngineCore`.
+  Use bracketed `pgrep`/`pkill -f "[c]hain.sh"` patterns; a bare pattern
+  matches the calling shell and kills it (happened twice).
+- Long jobs: `setsid nohup ... & disown`, log to a file, watch with a
+  persistent monitor; back-to-back server A/Bs still need alternation and a
+  30-60 s cooldown.
+
+### Heretic abliteration LoRA (audited, not changed)
+
+`models/atx4xs-heretic-adapter{-hf,.gguf}`: the GGUF is a faithful export (all
+128 A/B pairs bit-identical to the safetensors after the grouped-to-tiled
+column permutation on `ssm_out` lora_a; 83 B tensors are exactly zero because
+trial 93's layer windows are o_proj 35-63, down_proj 48-62, out_proj 34-62).
+It derives from the HF bf16 source, targets only ffn_down/attn_output/ssm_out,
+and is unaffected by the quant corrections. The real problem is efficacy: the
+136-trial study never got below 54/100 keyword refusals (baseline 84); the
+pipeline's speed gate found it 5% slower and selected base. A new study, not a
+re-export, is what would change that.
+
+### Open items
+
+- Merge `research/qwen38-sm86-fused-gdn-chunk` with upstream (same two
+  conflict files expected, plus the research knobs).
+- Q4_K_M max-context cell is still an extrapolation; ATX-4-XS at 262K not probed.
+- The other agent's eval report lists the pre-correction ATX hash; its
+  `run_vllm_single_request_compare.py` fails on a `NoneType` rounding.
+- Optional: `token_embd` at Q8_0 as a quality-maximal ATX variant.
+- Optional: rebuild the `-mtp8` variant with both corrections.
 
