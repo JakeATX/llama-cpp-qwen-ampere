@@ -529,3 +529,16 @@ Insights that change how to read the earlier records:
    FLASH_ATTN_EXT sweep. 200K canary: identical output, peak 22120 ->
    20580 MiB; 262K (model max) fits at ready 22596 / peak 22634 MiB.
    Pushed as 4c593be92 to both product branches.
+
+7. V2 (`55f32f819`, product branches carry V1 + V2): the MTP context adopts
+   the target's compute buffers (donor graph allocator, reference counted,
+   peers synchronize each other before computing; `LLAMA_SHARED_COMPUTE=0`
+   disables). Canaries: Q3_K_XL 200K ready 20542 -> 19204 MiB, 262K
+   22596 -> 20922, Q4_K_M 200K now loads (ready 22208), outputs identical,
+   decode within noise. Together with V1 the per-context runtime overhead
+   at 200K dropped by ~2.9 GiB, which is what makes the 13.8-14.3 GiB
+   custom builds (v2e/v3/v5) fit 200K with margin.
+8. Quant builds (`frontier/D3_q3_repack/ANALYSIS.md`): IQ4_XS floor +
+   Q5_0/Q5_K on the ladder-sensitive tensors + Q8_0 small attention and
+   head = fastest per round of everything measured and reference quality;
+   the MTP layer (blk.64) must stay Q8_0 (draft acceptance is pure speed).
