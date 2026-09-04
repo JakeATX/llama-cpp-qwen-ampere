@@ -5,7 +5,7 @@ Qwen3.8-27B on one Ampere card (RTX 3090 / 3090 Ti, 24 GB): a fork of
 (TurboQuant+ KV cache, native MTP speculative decoding) carrying SM86-specific
 kernel and memory work, plus the quantization recipe it was tuned with.
 
-Measured on a 3090 Ti at 350 W with the ATX-4-XS quant:
+Measured on a 3090 Ti at 350 W with the ATX-IQ4_XS-M quant (working name ATX-4-XS, which the filenames keep; IQ4_XS base, M-pattern upgrades, 4.56 bpw):
 
 | | |
 |---|---|
@@ -18,7 +18,7 @@ Single-user configuration: `--parallel 1`, one request at a time.
 
 ## Model
 
-`sjakek/Qwen3.8-27B-ATX-4-XS-GGUF` on Hugging Face: the GGUF, the per-tensor
+`sjakek/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF` on Hugging Face: the GGUF, the per-tensor
 type map, and the recipe. 14.5 GiB file, 13.9 GiB on the GPU. Bulk tensors
 IQ4_XS (the fastest format on SM86 at speculative verification widths), Q5_0 on
 the tensors Unsloth's tier ladder upgrades first, Q6_K on attention K/V, and

@@ -6,8 +6,9 @@ Updated: 2026-09-03 (see the 2026-09-03 addendum at the end for the current stat
 
 The production target is Qwen3.8-27B on one RTX 3090/3090 Ti (`sm_86`), full
 GPU offload, `--parallel 1`, Flash Attention, Q8_0 K cache, Turbo3 V cache, and
-native MTP3. As of 2026-09-03 the product quant is **ATX-4-XS**
-(`sjakek/Qwen3.8-27B-ATX-4-XS-GGUF` on Hugging Face): measured populated 200K at
+native MTP3. As of 2026-09-03 the product quant is **ATX-IQ4_XS-M**
+(`sjakek/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF` on Hugging Face; renamed from the working
+name ATX-4-XS on 2026-09-03, which the GGUF filename, tensor map and every log below keep: IQ4_XS base, M-pattern upgrades, 4.56 bpw): measured populated 200K at
 20.9 GiB ready and a 245,760-token window with a 240K prompt at 22.1 GiB ready,
 on the `main` branch of the renamed repo. Q3_K_XL remains the reference quant
 and still fits its full 262,144 window.
