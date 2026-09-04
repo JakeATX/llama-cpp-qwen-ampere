@@ -76,6 +76,53 @@ the shared compute arena; the research knobs (`GGML_Q8_TURBO3_MMA_MIN_Q`,
 `GGML_CUDA_SM86_MMQ_POLICY`, `GGML_CUDA_SM86_MMVQ_WARP_ROWS`) stay off unless
 you are reproducing a rejected experiment.
 
+## Blackwell (RTX 50 series, RTX PRO 6000): what carries over
+
+This tree was tuned and validated on an RTX 3090 Ti (sm_86). Nothing in it is compiled or tested for
+Blackwell yet, but an audit of every CUDA change against upstream (2026-09-04) found no code path that
+excludes it: the kernels select on capability helpers (`turing_mma_available`, `CP_ASYNC_AVAILABLE`,
+device warp size), never on `cc == 86`, and upstream's CMake adds `120a-real` automatically when the CUDA
+toolkit is 12.8 or newer. The one sm_86-only path is the opt-in MMVQ exact-reuse kernel
+(`GGML_CUDA_SM86_EXACT_REUSE=1`), which stays off elsewhere by design.
+
+Build (CUDA 12.8 or newer is required for sm_120; 12.4 cannot target it):
+
+```
+cmake -B build-sm120 -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DCMAKE_CUDA_ARCHITECTURES=120 -DGGML_NATIVE=ON
+cmake --build build-sm120 -j --target llama-server llama-cli test-backend-ops llama-quantize llama-imatrix
+```
+
+First hour on the card, in this order:
+
+1. `build-sm120/bin/test-backend-ops -o GATED_DELTA_NET`, then `-o FLASH_ATTN_EXT`, then `-o MUL_MAT_VEC`
+   and `-o MUL_MAT`. These cover the GDN ILP kernel, the q8_0/Turbo3 attention loaders and the fused MMA
+   path, and the MMVQ changes. All must pass before any timing is trusted.
+2. Run the server with the same flags as the Ampere command above (the `GGML_Q8_TURBO3_MMA_FUSED=1` fused
+   attention path is opt-in; try with and without it) and confirm output is identical to the sm_86 build on a
+   greedy 16K prompt.
+3. Only then measure. Expect the ranking of formats to shift: Blackwell has about 1.8x the memory bandwidth
+   of the 3090 Ti but roughly 2.6x its integer instruction throughput, so the instruction-bound MMVQ work that
+   made IQ4_XS and Q5_0 the fast choices here shrinks relative to weight streaming. IQ4_XS should still lead on
+   bytes; the Q5_0-over-Q5_K margin may vanish; the int8 tensor-core (MMQ) crossover at speculative widths 3-5
+   that was a wash on the 3090 is worth re-testing.
+
+Kill switches if something regresses on the new card, each restoring the upstream kernel for that stage:
+
+| knob | default | effect |
+|---|---|---|
+| `GGML_CUDA_SM86_GDN_COLS=1` | 4 | falls back to the original gated-delta-net kernel (the ILP kernel is qualified on sm_86 only) |
+| `GGML_Q8_TURBO3_MMA_FUSED` unset | unset | keeps the fused q8_0/Turbo3 MMA attention off (it is opt-in) |
+| `GGML_Q8_TURBO3_MMA_MIN_Q`, `GGML_Q8_TURBO3_MMA_NCOLS1_MIN` | 3, 1 | research knobs for routing narrow queries to the MMA path; leave at defaults |
+| `GGML_CUDA_GRAPH_NO_SHAPE_KEY=1` | unset | disables the per-shape CUDA-graph cache |
+| `GGML_CUDA_GRAPH_EVICT_S` | 300 | seconds an unused CUDA graph is kept |
+
+What needs no porting at all: the prompt cache, the recurrent checkpoints, the disk tier, the graph shape
+cache and the shared compute arena are host-side or arch-independent. What will want retuning: the GDN ILP
+kernel's grid (sized for 84 SMs; on 170-188 SMs a single sequence underfills the chip more), and the
+attention staging, which uses cp.async where Blackwell's TMA would be the native primitive. Blackwell's FP8
+and NVFP4 tensor-core paths are not used by this tree; a Blackwell-native quant on those would be the next
+step there, not a port of the Ampere integer path.
+
 ## Credits
 
 Qwen team for Qwen3.8; TheTom for TurboQuant+; Unsloth for the BF16 GGUF, the
