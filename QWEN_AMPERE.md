@@ -18,7 +18,7 @@ Single-user configuration: `--parallel 1`, one request at a time.
 
 ## Model
 
-`sjakek/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF` on Hugging Face: the GGUF, the per-tensor
+`jakeatx/Qwen3.8-27B-ATX-IQ4_XS-M-GGUF` on Hugging Face: the GGUF, the per-tensor
 type map, and the recipe. 14.5 GiB file, 13.9 GiB on the GPU. Bulk tensors
 IQ4_XS (the fastest format on SM86 at speculative verification widths), Q5_0 on
 the tensors Unsloth's tier ladder upgrades first, Q6_K on attention K/V, and
