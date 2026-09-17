@@ -120,6 +120,7 @@ void main() {
 #else
         const uint buf_ib = r * qf_stride + d / 8;
         const uint buf_iqs = d % 8;
+        const bool qf_in_bounds = r < Br && d / 8 < qf_stride;
 
         vec4 vals = is_in_bounds ? data_qv4[q_offset / 4 + (i * Br + r) * q_stride / 4 + d] * p.scale : vec4(0.0f);
         const vec4 abs_vals = abs(vals);
@@ -130,19 +131,21 @@ void main() {
         const float qd_inv = qd != 0.0f ? 1.0f / qd : 0.0f;
         vals = round(vals * qd_inv);
 
-        Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
+        if (qf_in_bounds) {
+            Qf[buf_ib].qs[buf_iqs] = pack32(i8vec4(vals));
+        }
 
         // Q8_0 K only needs (qd, _); the asymmetric Q4_*/Q5_* family also stores
         // the row-sum scaled by qd, used in k_dot_correction.
         if (FaTypeK == GGML_TYPE_Q8_0) {
-            if (buf_iqs == 0) {
+            if (qf_in_bounds && buf_iqs == 0) {
                 Qf[buf_ib].ds = FLOAT_TYPEV2(qd, 0.0f);
             }
         } else {
             const float thread_sum = vals.x + vals.y + vals.z + vals.w;
             const float sum = subgroupClusteredAdd(thread_sum, 8);
 
-            if (buf_iqs == 0) {
+            if (qf_in_bounds && buf_iqs == 0) {
                 Qf[buf_ib].ds = FLOAT_TYPEV2(qd, sum * qd);
             }
         }
