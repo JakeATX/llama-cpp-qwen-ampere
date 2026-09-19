@@ -1,4 +1,5 @@
 #include "ggml-cuda.h"
+#include "ggml-cuda-kv-stream-testing.h"
 #include "testing.h"
 
 #include <cstdint>

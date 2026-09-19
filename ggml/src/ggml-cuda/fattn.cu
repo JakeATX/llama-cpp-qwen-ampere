@@ -457,61 +457,26 @@ void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache
     cache->stats = {};
 }
 
-bool ggml_cuda_kv_stream_resident_cache_reconfigure(
-        ggml_cuda_kv_stream_resident_cache * cache,
-        size_t scratch_bytes,
-        uint32_t active_pages_per_layer) {
-    if (cache == nullptr) {
-        return false;
-    }
-
-    uint32_t pages_per_layer = 0;
-    std::vector<uint32_t> layer_pages;
-    std::vector<size_t> layer_offsets;
-    if (!kv_stream_resident_cache_layout(
-            cache, cache->pool_bytes, scratch_bytes, active_pages_per_layer,
-            pages_per_layer, layer_pages, layer_offsets)) {
-        return false;
-    }
-
-    const bool scratch_changed = cache->scratch_bytes != scratch_bytes;
-    const bool layout_changed = cache->layer_pages != layer_pages;
-    cache->decode_active_pages = active_pages_per_layer;
-    cache->resident_pages_per_layer = pages_per_layer;
-    if (!scratch_changed && !layout_changed) {
-        return true;
-    }
-
-    // Publish the scratch boundary and concentrated decode layout together.
-    // Both changes alter physical K/V addresses, so one invalidation is
-    // required; applying them separately would discard and reload the same
-    // resident working set twice.
-    cache->scratch_bytes = scratch_bytes;
-    cache->layer_pages = std::move(layer_pages);
-    cache->layer_offsets = std::move(layer_offsets);
-    cache->loaded.assign(cache->layer_offsets.back(), 0);
-    cache->dirty.assign(cache->layer_offsets.back(), 0);
-    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
-    cache->dirty_rows.clear();
-    cache->mutable_pages.clear();
-    cache->all_pages_mutable = false;
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->mirror_by_data.clear();
-    cache->next_layer = 0;
-    if (scratch_changed) {
-        cache->stats = {};
-    }
-    return true;
-}
-
-bool ggml_cuda_kv_stream_resident_cache_resize(
+bool ggml_cuda_kv_stream_resident_cache_reshape(
         ggml_cuda_kv_stream_resident_cache * cache,
         size_t pool_bytes,
         size_t scratch_bytes,
         uint32_t active_pages_per_layer) {
     if (cache == nullptr) {
         return false;
+    }
+
+    // KV_STREAM_KEEP in any position leaves that dimension untouched, so one
+    // entry point covers a pool resize, a scratch repartition, a decode layout
+    // switch, and any combination of them.
+    if (pool_bytes == KV_STREAM_KEEP_BYTES) {
+        pool_bytes = cache->pool_bytes;
+    }
+    if (scratch_bytes == KV_STREAM_KEEP_BYTES) {
+        scratch_bytes = cache->scratch_bytes;
+    }
+    if (active_pages_per_layer == KV_STREAM_KEEP_PAGES) {
+        active_pages_per_layer = cache->decode_active_pages;
     }
 
     uint32_t pages_per_layer = 0;
@@ -533,6 +498,13 @@ bool ggml_cuda_kv_stream_resident_cache_resize(
         return true;
     }
 
+    // Publish the scratch boundary and the layout together. Both change
+    // physical K/V addresses, so one invalidation is required; applying them
+    // separately would discard and reload the same resident working set twice.
+    // Resident storage uses separate contiguous K and V planes per layer, so a
+    // layout change moves both the layer base and the V-plane boundary and
+    // page-sized byte slots cannot be migrated. Reload lazily from the
+    // authoritative host cache instead.
     cache->scratch_bytes = scratch_bytes;
     cache->layer_pages = std::move(layer_pages);
     cache->layer_offsets = std::move(layer_offsets);
@@ -549,78 +521,6 @@ bool ggml_cuda_kv_stream_resident_cache_resize(
     if (pool_changed || scratch_changed) {
         cache->stats = {};
     }
-    return true;
-}
-
-
-bool ggml_cuda_kv_stream_resident_cache_repartition(
-        ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes) {
-    if (cache == nullptr) {
-        return false;
-    }
-    uint32_t pages_per_layer = 0;
-    std::vector<uint32_t> layer_pages;
-    std::vector<size_t> layer_offsets;
-    if (!kv_stream_resident_cache_layout(
-            cache, cache->pool_bytes, scratch_bytes, cache->decode_active_pages,
-            pages_per_layer, layer_pages, layer_offsets)) {
-        return false;
-    }
-    if (cache->scratch_bytes == scratch_bytes && cache->layer_pages == layer_pages) {
-        return true;
-    }
-    cache->scratch_bytes = scratch_bytes;
-    cache->resident_pages_per_layer = pages_per_layer;
-    cache->layer_pages = std::move(layer_pages);
-    cache->layer_offsets = std::move(layer_offsets);
-    cache->loaded.assign(cache->layer_offsets.back(), 0);
-    cache->dirty.assign(cache->layer_offsets.back(), 0);
-    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
-    cache->dirty_rows.clear();
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->mirror_by_data.clear();
-    cache->next_layer = 0;
-    cache->stats = {};
-    return true;
-}
-
-bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
-        ggml_cuda_kv_stream_resident_cache * cache,
-        uint32_t active_pages_per_layer) {
-    if (cache == nullptr) {
-        return false;
-    }
-    uint32_t pages_per_layer = 0;
-    std::vector<uint32_t> layer_pages;
-    std::vector<size_t> layer_offsets;
-    if (!kv_stream_resident_cache_layout(
-            cache, cache->pool_bytes, cache->scratch_bytes, active_pages_per_layer,
-            pages_per_layer, layer_pages, layer_offsets)) {
-        return false;
-    }
-    if (cache->layer_pages == layer_pages) {
-        cache->decode_active_pages = active_pages_per_layer;
-        return true;
-    }
-    // Resident storage uses separate contiguous K and V planes per layer.
-    // A layout change moves both the layer base and the V-plane boundary, so
-    // migrating page-sized byte slots cannot preserve logical K/V pages.
-    // Reload lazily from the authoritative host cache instead.
-    cache->layer_pages = std::move(layer_pages);
-    cache->layer_offsets = std::move(layer_offsets);
-    cache->loaded.assign(cache->layer_offsets.back(), 0);
-    cache->dirty.assign(cache->layer_offsets.back(), 0);
-    cache->precise_dirty_tracking.assign(cache->layer_count, 0);
-    cache->dirty_rows.clear();
-    cache->mutable_pages.clear();
-    cache->all_pages_mutable = false;
-    cache->layer_by_k.clear();
-    cache->layer_by_data.clear();
-    cache->mirror_by_data.clear();
-    cache->next_layer = 0;
-    cache->decode_active_pages = active_pages_per_layer;
-    cache->resident_pages_per_layer = pages_per_layer;
     return true;
 }
 

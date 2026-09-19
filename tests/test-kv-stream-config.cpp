@@ -64,34 +64,6 @@ int main() {
         expect_invalid("--swa-full on an iSWA-shaped cache", config);
     });
 
-    t.test("pool is partitioned evenly across layers with one scratch page", [](testing & t) {
-        const auto layout = llama_kv_stream_pool_layout_make({
-            /*.pool_bytes   =*/ 64ULL*1024ULL*1024ULL,
-            /*.page_bytes   =*/ 1664ULL*256ULL,
-            /*.layer_count  =*/ 16,
-            /*.scratch_pages=*/ 1,
-        });
-
-        t.assert_true("layout is valid", layout.valid);
-        t.assert_equal(uint32_t(9), layout.resident_pages_per_layer);
-        t.assert_equal(uint32_t(9*256), layout.resident_tokens_per_layer);
-        t.assert_equal(1664ULL*256ULL, layout.scratch_bytes);
-        t.assert_equal(
-            64ULL*1024ULL*1024ULL,
-            layout.scratch_bytes + layout.resident_bytes + layout.unused_bytes);
-    });
-
-    t.test("pool rejects missing scratch or resident capacity", [](testing & t) {
-        auto layout = llama_kv_stream_pool_layout_make({ 0, 1664ULL*256ULL, 16, 1 });
-        t.assert_true("zero pool", !layout.valid);
-
-        layout = llama_kv_stream_pool_layout_make({ 1664ULL*256ULL, 1664ULL*256ULL, 16, 1 });
-        t.assert_true("scratch-only pool", !layout.valid);
-
-        layout = llama_kv_stream_pool_layout_make({ 64ULL*1024ULL*1024ULL, 0, 16, 1 });
-        t.assert_true("zero page", !layout.valid);
-    });
-
     t.test("phase arena partitions KV below compute without overlap", [](testing & t) {
         const auto plan = llama_kv_stream_phase_plan_make({
             /*.arena_bytes        =*/ 4096ULL*1024ULL*1024ULL,

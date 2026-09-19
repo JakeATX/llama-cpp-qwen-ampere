@@ -37,16 +37,17 @@ ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
     uint32_t layer_count, uint32_t page_tokens);
 void ggml_cuda_kv_stream_resident_cache_free(ggml_cuda_kv_stream_resident_cache * cache);
 void ggml_cuda_kv_stream_resident_cache_reset(ggml_cuda_kv_stream_resident_cache * cache);
-bool ggml_cuda_kv_stream_resident_cache_reconfigure(
-    ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes,
-    uint32_t active_pages_per_layer);
-bool ggml_cuda_kv_stream_resident_cache_resize(
+// Sentinels for ggml_cuda_kv_stream_resident_cache_reshape: keep the cache's
+// current value for that dimension.
+constexpr size_t   KV_STREAM_KEEP_BYTES = SIZE_MAX;
+constexpr uint32_t KV_STREAM_KEEP_PAGES = UINT32_MAX;
+
+// Recomputes the resident layout for a new pool size, scratch boundary, or
+// decode working set, and invalidates the resident pages when either the
+// scratch boundary or the layout moved.
+bool ggml_cuda_kv_stream_resident_cache_reshape(
     ggml_cuda_kv_stream_resident_cache * cache, size_t pool_bytes,
     size_t scratch_bytes, uint32_t active_pages_per_layer);
-bool ggml_cuda_kv_stream_resident_cache_repartition(
-    ggml_cuda_kv_stream_resident_cache * cache, size_t scratch_bytes);
-bool ggml_cuda_kv_stream_resident_cache_set_decode_layout(
-    ggml_cuda_kv_stream_resident_cache * cache, uint32_t active_pages_per_layer);
 uint32_t ggml_cuda_kv_stream_resident_cache_pages_per_layer(
     const ggml_cuda_kv_stream_resident_cache * cache);
 uint32_t ggml_cuda_kv_stream_resident_cache_decode_active_pages(

@@ -2,6 +2,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml-cuda.h"
+#include "ggml-cuda-kv-stream-testing.h"
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-cuda/kv-stream-span-tuner.h"
 #include "ggml.h"
