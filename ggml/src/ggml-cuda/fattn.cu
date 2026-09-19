@@ -2893,10 +2893,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     FATTN_VEC_CASE(128, type_K, type_V)       \
     FATTN_VEC_CASE(256, type_K, type_V)       \
 
+#define FATTN_VEC_CASE_D512(type_K, type_V)                                                                          \
+    {                                                                                                                \
+        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16);   \
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16);   \
+        if (Q->ne[0] == 512 && type_K_okay && type_V_okay) {                                                        \
+            ggml_cuda_flash_attn_ext_vec_case_d512<type_K, type_V>(ctx, dst);                                       \
+            return;                                                                                                  \
+        }                                                                                                            \
+    }                                                                                                                \
+
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
     ggml_tensor * K = dst->src[1];
     ggml_tensor * V = dst->src[2];
+
+    // D=512 decode (ncols=1) VEC path: K=q8_0 + common V types.
+    FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
+    FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE_D512(GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
 
 #ifdef GGML_CUDA_FA_ALL_QUANTS
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
@@ -3123,6 +3141,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             break;
         case 576:
         case 640:
+#ifdef GGML_USE_HIP
+            // The matching tile kernels exceed HIP's local memory limit and are not compiled.
+            return BEST_FATTN_KERNEL_NONE;
+#endif
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
             }
@@ -3170,19 +3192,24 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
+#ifdef GGML_USE_HIP
+    // D=512 VEC is decode-only (ncols=1) with K=q8_0; turbo K types are register-unsafe at D=512.
+    const bool d512_v_supported = V->type == GGML_TYPE_F16 || V->type == GGML_TYPE_Q8_0 ||
+        V->type == GGML_TYPE_BF16 || V->type == GGML_TYPE_TURBO2_0 ||
+        V->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO4_0;
+    const bool d512_vec_safe = Q->ne[0] == 512 && Q->ne[1] == 1 &&
+        K->type == GGML_TYPE_Q8_0 && d512_v_supported;
+    const bool can_use_vector_kernel = (Q->ne[0] <= 256 || d512_vec_safe)
+                                    && Q->ne[0] % 64 == 0
+                                    && Q->ne[0] != 192
+                                    && K->ne[1] % FATTN_KQ_STRIDE == 0;
+#else
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+#endif
 
 #ifdef GGML_USE_HIP
-    // HIP/ROCm: the TILE/MMA/WMMA FA paths allocate large f16 temp buffers for
-    // quantized KV types (K_f16, V_f16 in launch_fattn). For SMALL batches (decode)
-    // the VEC kernel is preferred: it does inline dequant with zero temp buffer
-    // overhead, it natively supports the TurboQuant types, and it produces a
-    // HIP-graph-safe op stream (no per-call cudaMalloc/cudaFree during capture).
-    // For LARGE batches (prefill) the VEC kernel is far slower (sequential query
-    // processing), so we deliberately fall through to the TILE/MMA path which is
-    // ~3.4x faster; prefill runs eagerly (not captured) so its f16 temp buffer is
-    // allocated/freed raw in launch_fattn without violating graph-capture rules.
-    // Limitation: head_dim > 256 cannot use VEC (falls through to TILE).
+    // Prefer inline-dequant VEC for small quantized-KV batches. D=512 is limited
+    // to the decode-only q8_0 K instances above; larger batches use TILE/MMA.
     if ((ggml_is_quantized(K->type) || ggml_is_quantized(V->type)) && can_use_vector_kernel && Q->ne[1] <= 8) {
         return BEST_FATTN_KERNEL_VEC;
     }

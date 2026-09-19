@@ -1397,56 +1397,16 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
-#ifdef GGML_USE_HIP
-    // HIP/ROCm: allocate the f16 KV-dequant temp buffers in a CUDA-graph-capture-aware way.
-    //
-    // Default (no graph capture): bypass the memory pool and use raw cudaMalloc/cudaFree so the
-    // temp buffer (up to ~2x the quantized KV size) is released the moment the kernel completes.
-    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently on HIP
-    // without VMM support (RDNA 3/4) because free() stores buffers for reuse rather than releasing
-    // them; pooling this temp would negate the KV compression and OOM at long context.
-    // Ref: https://github.com/ggml-org/llama.cpp/issues/22107
-    //
-    // While a CUDA graph is being captured, cudaMalloc/cudaFree/cudaStreamSynchronize are all
-    // illegal. When the current graph will be captured (ctx.fa_f16_use_pool, set for graph-enabled
-    // and graph-compatible cgraphs), use the pool instead: capture only begins once the shape is
-    // stable (see ggml_cuda_graph_update_required), so this temp is a single fixed-size buffer that
-    // the pool allocates during the eager warmup passes and then reuses across every graph replay
-    // — exactly the capture-safe path the non-HIP build always takes. Holding it is required anyway
-    // for replay to reference a stable buffer address.
-    const bool fa_f16_use_pool = ctx.fa_f16_use_pool;
-    struct hip_f16_alloc {
-        half * ptr = nullptr;
-        cudaStream_t stream;
-        bool use_pool;
-        ggml_cuda_pool_alloc<half> pool_alloc;
-        hip_f16_alloc(cudaStream_t s, ggml_cuda_pool & p, bool use_pool)
-            : stream(s), use_pool(use_pool), pool_alloc(p) {}
-        hip_f16_alloc(const hip_f16_alloc &) = delete;
-        hip_f16_alloc & operator=(const hip_f16_alloc &) = delete;
-        ~hip_f16_alloc() {
-            if (use_pool || ptr == nullptr) {
-                return;  // pool_alloc releases back to the pool; nothing to do if unused
-            }
-            // Destructor: cannot propagate errors, and under HIP both calls are
-            // [[nodiscard]], which is fatal under -Werror. Discard explicitly.
-            (void) cudaStreamSynchronize(stream);
-            (void) cudaFree(ptr);
-        }
-        void alloc(size_t nelements) {
-            if (use_pool) {
-                ptr = pool_alloc.alloc(nelements);
-            } else {
-                CUDA_CHECK(cudaMalloc(&ptr, nelements * sizeof(half)));
-            }
-        }
-    };
-    hip_f16_alloc K_f16(main_stream, pool, fa_f16_use_pool);
-    hip_f16_alloc V_f16(main_stream, pool, fa_f16_use_pool);
-#else
-    ggml_cuda_pool_alloc<half>   K_f16(pool);
-    ggml_cuda_pool_alloc<half>   V_f16(pool);
-#endif
+    // The f16 KV-dequant temps live inside the FA op's compute buffer (reserved by
+    // ggml_cuda_flash_attn_ext_get_f16_extra_data and sized via get_alloc_size). That buffer is
+    // allocated once at graph build time (raw cudaMalloc via ggml_cuda_device_malloc - no pool),
+    // reused across evals, and its address is stable, so it is capture-safe by construction and
+    // never touches the memory pool. This is upstream's design and avoids both the per-launch
+    // cudaMalloc/cudaFree churn and the pool's monotonic physical growth on repeated graph
+    // re-capture, which OOMed long growing-context sessions. Ref llama.cpp #22107.
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
@@ -1465,10 +1425,11 @@ void launch_fattn(
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
-        K_f16.alloc(ggml_nelements(K));
+        GGML_ASSERT(f16_extra.K != 0);
+        half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
-            to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+            to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
             nb12 = nb12*bs*sizeof(half)/ts;
@@ -1479,13 +1440,13 @@ void launch_fattn(
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            to_fp16(K_data, K_f16, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
 
             nb11 = K->ne[0] * sizeof(half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
         }
-        K_data = (char *) K_f16.ptr;
+        K_data = (char *) K_f16;
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -1498,11 +1459,12 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            V_f16.alloc(ggml_nelements(V));
+            GGML_ASSERT(f16_extra.V != 0);
+            half * V_f16 = (half *) f16_extra.V;
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
-                to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
-                V_data = (char *) V_f16.ptr;
+                to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
+                V_data = (char *) V_f16;
 
                 nb21 = nb21*bs*sizeof(half)/ts;
                 nb22 = nb22*bs*sizeof(half)/ts;
@@ -1513,13 +1475,13 @@ void launch_fattn(
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                to_fp16(V_data, V_f16, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
 
                 nb21 = V->ne[0] * sizeof(half);
                 nb22 = V->ne[1] * nb21;
                 nb23 = V->ne[2] * nb22;
             }
-            V_data = (char *) V_f16.ptr;
+            V_data = (char *) V_f16;
         }
     }
 

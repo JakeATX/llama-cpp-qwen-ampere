@@ -452,6 +452,10 @@ struct llama_hparams {
     // DFlash draft model
     uint32_t dflash_block_size              = 16;
     uint32_t dflash_mask_token_id           = 0;
+    uint32_t dflash_conv_kernel_size        = 0;
+    uint32_t dflash_conv_group_size         = 0;
+    uint32_t dflash_selector_rank           = 0;
+    uint32_t dflash_selector_top_k          = 0;
 
 
 
