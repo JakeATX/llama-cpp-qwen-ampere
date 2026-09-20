@@ -79,13 +79,37 @@ every streamed KV type pair falls back to F16**, regardless of arena size
 or model. Ordinary (non-streamed) attention is unaffected either way - the
 turbo-native kernel it uses is unconditionally compiled in.
 
-Measured impact (Qwen3.8-27B-AD, `-ctk q8_0 -ctv turbo4`, 8K context,
-single RTX 5090-class GPU): streamed prefill is ~2840 t/s with
-`GGML_CUDA_FA_ALL_QUANTS=ON`, ~1200 t/s on a default build. Every
-benchmark number in the PR description and `benchmarks/results/` was
-measured with the flag on; a default build should expect materially lower
-streamed prefill throughput at the same context and arena size, though
-still functionally correct.
+**The fallback's cost is not a fixed factor - it grows with context**,
+because every streamed page is dequantized again on every ubatch, so the
+dequant work scales with the KV already in the cache. Prefill therefore
+goes from flat to roughly O(n^1.7) as soon as the arena is on. Measured on
+one RTX 5090 (32 GiB, Linux), Qwen3.8-27B-Q5_0, `-c 65536 -b 2048 -ub 512`,
+same prompts and server flags in both builds, prefill t/s:
+
+| prompt tokens | arena off | arena 1024 MiB | arena 4096 MiB |
+|---:|---:|---:|---:|
+| **`GGML_CUDA_FA_ALL_QUANTS=ON`** | | | |
+| 3902 | 3357 | 3293 | 3279 |
+| 11193 | 3336 | 3336 | 3363 |
+| 17490 | 3267 | 3171 | 3202 |
+| 39511 | 2938 | 2810 | 2875 |
+| **default build (flag off)** | | | |
+| 3902 | 3161 | 1743 | 1699 |
+| 11193 | 3188 | 975 | 965 |
+| 17490 | 3180 | 700 | 695 |
+| 39511 | 2914 | 352 | 336 |
+
+With the flag on, streaming costs 4-6% of prefill throughput at 40K tokens.
+Without it, the same run is 8x slower than its own baseline, and the gap
+keeps widening with context - which is the regime this feature exists for.
+Arena size barely matters either way: 4096 MiB lands within 3% of 1024 MiB
+at every length in both builds.
+
+Every benchmark number in the PR description and `benchmarks/results/` was
+measured with the flag on. A default build remains functionally correct -
+output is unchanged - but treat the flag as a practical requirement rather
+than an optimization. Since it is off by default, `llama_kv_cache` logs a
+one-time warning at startup naming the K/V pair that fell back.
 
 **Head dim must be 256 for either path to activate at all.** Both
 `direct_attention` and F16 fallback require `Q->ne[0] == V->ne[0] == 256`

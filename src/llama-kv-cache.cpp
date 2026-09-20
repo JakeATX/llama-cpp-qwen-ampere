@@ -335,6 +335,7 @@ llama_kv_cache::llama_kv_cache(
 
     ggml_backend_dev_t kv_stream_dev = nullptr;
     ggml_backend_buffer_type_t kv_stream_buft = nullptr;
+    bool kv_stream_fallback_warned = false;
     uint32_t kv_stream_layer_count = 0;
     if (kv_stream_stage_bytes != 0) {
         for (uint32_t il = 0; il < n_layer; ++il) {
@@ -432,6 +433,8 @@ llama_kv_cache::llama_kv_cache(
 
                     auto * type_pair_supported_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_type_pair_supported");
+                    auto * type_pair_direct_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_type_pair_direct");
                     auto * page_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
                         reg, "ggml_backend_cuda_kv_stream_page_bytes");
                     auto * workspace_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
@@ -477,6 +480,23 @@ llama_kv_cache::llama_kv_cache(
                         throw std::runtime_error(
                             "block KV streaming does not support K " + std::string(ggml_type_name(type_k)) +
                             " and V " + ggml_type_name(type_v));
+                    }
+
+                    // The F16 fallback dequantizes every streamed page on every ubatch, so its
+                    // cost grows with context rather than being a fixed factor: measured 8x
+                    // slower prefill than direct attention at 40K tokens on one RTX 5090. It is
+                    // selected silently by a build without GGML_CUDA_FA_ALL_QUANTS, which is the
+                    // default, so say so once instead of letting it look like the feature itself
+                    // is this slow.
+                    if (type_pair_direct_fn != nullptr && !type_pair_direct_fn(type_k, type_v) &&
+                            !kv_stream_fallback_warned) {
+                        kv_stream_fallback_warned = true;
+                        LLAMA_LOG_WARN(
+                            "%s: block KV streaming: K %s / V %s has no native streamed attention "
+                            "kernel in this build, falling back to F16 dequantization per page. "
+                            "Rebuild with -DGGML_CUDA_FA_ALL_QUANTS=ON for full prefill speed "
+                            "(see docs/kv-stream.md).\n",
+                            __func__, ggml_type_name(type_k), ggml_type_name(type_v));
                     }
 
                     size_t page_bytes = 0;

@@ -7307,6 +7307,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
                 GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED;
         };
     }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_type_pair_direct") == 0) {
+        return (void *) +[](ggml_type type_k, ggml_type type_v) {
+            return ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v) ==
+                GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT;
+        };
+    }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_page_bytes") == 0) {
         return (void *) +[](ggml_type type_k, ggml_type type_v,
                 uint32_t head_dim_k, uint32_t head_dim_v, uint32_t head_count,
