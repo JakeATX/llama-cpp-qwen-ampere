@@ -209,6 +209,56 @@ most reliable signs it's working:
 - Absent any error, and the model architecture is on the supported list
   above, streaming is active.
 
+## Speculative decoding (MTP)
+
+MTP and block KV streaming compose, and MTP keeps its full speedup on top of
+streaming. The two do not share memory: `common/speculative.cpp` forces
+`kv_stream_arena_mib = 0` on the draft context, so **the MTP draft KV cache
+stays in ordinary VRAM** and only the target cache streams. Rejected draft
+tokens are rolled back with `seq_rm` on the target, which is bookkeeping-only
+and safe while streaming (see `llama_kv_cache::seq_rm`).
+
+Measured on one RTX 5090 (32 GiB, Linux, `GGML_CUDA_FA_ALL_QUANTS=ON`):
+target `Qwen3.8-27B-Q5_0`, draft `mtp-Qwen3.8-27B-Q4_0`,
+`--spec-type draft-mtp`, `-c 16384 -b 2048 -ub 512 -np 1`, 96 generated
+tokens at `temperature 0`, two repetitions per cell. Decode t/s:
+
+**Short prompt (18 tokens - the whole cache is resident, nothing streams):**
+
+| config | no arena | arena 2048 MiB |
+|---|---|---|
+| no MTP | 70.3 / 69.8 | 70.7 / 71.5 |
+| MTP, draft depth 1 | 101.5 / 104.8 | 101.8 / 104.1 |
+| MTP, draft depth 4 | 111.4 / 112.4 | 113.0 / 112.4 |
+
+**9748-token prompt, arena 1024 MiB (39 active vs 54 resident pages/layer -
+still fully resident):**
+
+| config | no arena | arena 1024 MiB |
+|---|---|---|
+| no MTP | 69.0 / 69.1 | 67.7 / 68.4 |
+| MTP, draft depth 4 | 127.1 / 126.4 | 129.3 / 129.4 |
+
+**9748-token prompt, arena 512 MiB - the case where streaming actually
+happens** (39 active pages/layer against 22-31 resident, `copy busy 24.2%`
+on the no-MTP run):
+
+| config | arena 512 MiB |
+|---|---|
+| no MTP | 66.4 |
+| MTP, draft depth 4 | 85.1 |
+
+So the arena costs nothing measurable while the working set is resident
+(within run-to-run noise at every depth), and 3-4% once pages genuinely
+stream. MTP is worth 1.6x at short context, 1.87x at 9748 tokens resident,
+and 1.28x with the cache actively streaming - the ratio shrinks because
+verification steps pay for streamed pages, not because streaming interferes
+with drafting. Draft and accept counts are unchanged by the arena at a given
+context (132/61 and 136/60 with and without it at arena 1024), confirming
+the draft path is untouched; they do shift across arena sizes, which is the
+non-bit-identical behaviour described under [Numerical
+exactness](#numerical-exactness).
+
 ## Known inefficiency: MTP verification batches use the prompt-phase layout
 
 `tools/server/server-context.cpp` never calls `llama_set_decode_phase()`, so
@@ -228,6 +278,15 @@ slots); the one true single-token step got the generation-phase layout
 (1273 resident pages/layer, 12 ring slots). That is a real but modest gap at
 this context size (+2.2% resident pages, +20% ring slots) - measure again at
 larger contexts before assuming it stays this small.
+
+A second, sharper symptom shows up under real streaming pressure. On the
+arena-512 runs above, the no-MTP request reports `samples 26, copy busy
+24.2%` and settles at 31 resident pages/layer, while the MTP request reports
+`samples 0, misses 0, copy busy 0.0%` and only 22 resident pages/layer: a
+verification batch is never classified as generation, so no decode deadline
+feedback is collected at all and the partition controller never adapts away
+from its prefill-shaped split. MTP still wins 1.28x there, so this costs
+throughput it could have had rather than causing a regression.
 
 Fixing this is not just wiring up `llama_set_decode_phase()` in the server:
 the "generation" phase's compute-buffer reservation is sized via
