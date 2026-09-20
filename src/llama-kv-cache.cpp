@@ -824,9 +824,14 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    if (kv_stream_runtime.runtime != nullptr) {
-        throw std::runtime_error("seq_rm is not supported while block KV streaming is active");
-    }
+    // Safe while block KV streaming is active: this only edits cell bookkeeping (which
+    // positions and sequence ids a slot holds). No K/V bytes move, so the host cache stays
+    // authoritative and the resident GPU mirror stays valid - a freed slot is not attended
+    // again until some later ubatch writes it through set_rows, which marks the row dirty
+    // and refreshes the mirror exactly as it does for a slot that was never used.
+    // seq_cp and seq_add (K-shift) still refuse: the first aliases one slot into a second
+    // sequence, the second rewrites K in place on the GPU.
+
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
