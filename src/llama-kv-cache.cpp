@@ -1661,6 +1661,13 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // Block KV streaming refuses seq_add: K-shift rewrites K in place on the GPU while the
+    // host cache is authoritative. Report shifting as unsupported so callers disable context
+    // shift up front (common_init_from_params does exactly that) instead of discovering it
+    // mid-request when the context first fills.
+    if (kv_stream_runtime.runtime != nullptr) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
