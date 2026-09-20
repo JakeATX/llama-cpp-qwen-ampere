@@ -6498,6 +6498,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             if (op->op == GGML_OP_GET_ROWS) {
                 continue;
             }
+            // SET_ROWS reads its destination-row indices (src[1]) once per row: a few KiB at
+            // most, not a streamed tensor. Block KV streaming builds that index in pinned host
+            // memory so the copy engine can consume it, so rejecting it here would push every
+            // streamed KV write to the CPU. The value and destination sources are not admitted.
+            if (op->op == GGML_OP_SET_ROWS && i == 1) {
+                continue;
+            }
             // A MoE expert stack is the one weight that is not really streamed: a token routes to
             // a handful of experts out of hundreds, so the traffic is per-expert rather than the
             // whole tensor. That is what makes it a candidate for living in host memory with only
