@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -16,6 +17,24 @@ namespace {
 constexpr int64_t CACHE_WIDTH = 256*4;
 constexpr int64_t CACHE_ROWS = 512;
 constexpr int64_t UPDATE_ROWS = 3;
+
+// Same probe as test-kv-stream-cuda-attn.cpp, because GGML_CUDA_FA_ALL_QUANTS is private to the
+// ggml-cuda target. Direct streamed attention only exists in those builds; a default build
+// converts every page to F16 (docs/kv-stream.md).
+bool cuda_has_fa_all_quants() {
+    ggml_backend_reg_t reg = ggml_backend_cuda_reg();
+    auto get_features_fn = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_get_features");
+    if (get_features_fn == nullptr) {
+        return false;
+    }
+    for (const ggml_backend_feature * f = get_features_fn(reg); f->name != nullptr; ++f) {
+        if (std::strcmp(f->name, "FA_ALL_QUANTS") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 std::vector<uint8_t> run_set_rows(
         ggml_backend_t backend,
@@ -64,6 +83,7 @@ std::vector<uint8_t> run_set_rows(
 
 int main() {
     testing t;
+    const bool direct_built = cuda_has_fa_all_quants();
 
     t.test("KV stream quant types are classified", [](testing & t) {
         // TurboQuant: this loop asserts every quantized/f32/f16/bf16 type is
@@ -98,18 +118,20 @@ int main() {
         }
     });
 
-    t.test("Q8 K and Q4 V retain direct streamed attention", [](testing & t) {
+    t.test("Q8 K and Q4 V retain direct streamed attention", [direct_built](testing & t) {
         const auto k = ggml_backend_cuda_kv_stream_get_type_capabilities(GGML_TYPE_Q8_0);
         const auto v = ggml_backend_cuda_kv_stream_get_type_capabilities(GGML_TYPE_Q4_0);
 
         t.assert_true("Q8 supports direct attention", k.direct_attention);
         t.assert_true("Q4 supports direct attention", v.direct_attention);
         t.assert_equal(
-            GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT,
+            direct_built ?
+                GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
+                GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
             ggml_backend_cuda_kv_stream_get_attention_mode(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     });
 
-    t.test("all native CUDA flash-attention KV pairs use direct streaming", [](testing & t) {
+    t.test("all native CUDA flash-attention KV pairs use direct streaming", [direct_built](testing & t) {
         const ggml_type native_types[] = {
             GGML_TYPE_F16,
             GGML_TYPE_Q4_0,
@@ -123,13 +145,15 @@ int main() {
         for (const ggml_type type_k : native_types) {
             for (const ggml_type type_v : native_types) {
                 t.assert_equal(
-                    GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT,
+                    direct_built ?
+                        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
+                        GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16,
                     ggml_backend_cuda_kv_stream_get_attention_mode(type_k, type_v));
             }
         }
     });
 
-    t.test("all exposed KV-cache pairs select an optimized execution class", [](testing & t) {
+    t.test("all exposed KV-cache pairs select an optimized execution class", [direct_built](testing & t) {
         const ggml_type kv_types[] = {
             GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
             GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
@@ -142,7 +166,7 @@ int main() {
             const auto k = ggml_backend_cuda_kv_stream_get_type_capabilities(type_k);
             for (const ggml_type type_v : kv_types) {
                 const auto v = ggml_backend_cuda_kv_stream_get_type_capabilities(type_v);
-                const auto expected = k.direct_attention && v.direct_attention ?
+                const auto expected = direct_built && k.direct_attention && v.direct_attention ?
                     GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_DIRECT :
                     GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
                 const auto actual =
@@ -156,8 +180,8 @@ int main() {
                 fallback_pairs += actual == GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_F16;
             }
         }
-        t.assert_equal(size_t(49), direct_pairs);
-        t.assert_equal(size_t(32), fallback_pairs);
+        t.assert_equal(size_t(direct_built ? 49 : 0), direct_pairs);
+        t.assert_equal(size_t(direct_built ? 32 : 81), fallback_pairs);
     });
 
     t.test("every exposed KV-cache type has a GPU online writer", [](testing & t) {
